@@ -115,9 +115,27 @@ pub const PathService = struct {
     pub fn init(roots: ProjectRoots, env: HostEnv) PathService {
         var r = roots;
         var b = r.project.bytes;
-        while (b.len > 1 and isSep(env.os, b[b.len - 1])) b = b[0 .. b.len - 1];
+        while (b.len > 1 and isSep(env.os, b[b.len - 1])) {
+            const cand = b[0 .. b.len - 1];
+            if (env.os == .windows and isWindowsRoot(cand)) break;
+            b = cand;
+        }
         r.project = .{ .bytes = b };
         return .{ .roots = r, .env = env };
+    }
+
+    /// True when `p` (no trailing separator) is a bare drive (`C:`) or a UNC
+    /// share root (`\\server\\share`, or just `\\server`).
+    fn isWindowsRoot(p: []const u8) bool {
+        if (p.len == 2 and p[1] == ':') return true;
+        if (p.len >= 2 and isSep(.windows, p[0]) and isSep(.windows, p[1])) {
+            var seps: usize = 0;
+            for (p[2..]) |c| {
+                if (isSep(.windows, c)) seps += 1;
+            }
+            return seps <= 1;
+        }
+        return false;
     }
 
     fn present(v: ?[]const u8) ?[]const u8 {
@@ -274,6 +292,7 @@ test "join" {
     try std.testing.expectEqualStrings("/x", r.bytes);
     const n = try join(a, .fromTrusted("/a"), &.{"b"});
     defer a.free(n.bytes);
+    if (@import("builtin").os.tag != .windows) try std.testing.expectEqualStrings("/a/b", n.bytes);
 }
 
 test "join rejects bad parts" {
@@ -312,4 +331,37 @@ test "fromEnviron" {
     try std.testing.expectEqualStrings("/home/u", e.home.?);
     try std.testing.expectEqualStrings("/c", e.xdg_cache_home.?);
     try std.testing.expect(e.app_data == null);
+}
+
+test "init keeps windows roots" {
+    const env: HostEnv = .{ .os = .windows, .home = null };
+    const cases = [_][2][]const u8{
+        .{ "C:\\", "C:\\" },
+        .{ "C:\\p\\", "C:\\p" },
+        .{ "C:\\p\\\\", "C:\\p" },
+        .{ "\\\\srv\\share\\", "\\\\srv\\share\\" },
+        .{ "\\\\srv\\share\\d\\", "\\\\srv\\share\\d" },
+    };
+    for (cases) |c| {
+        const svc = PathService.init(.{ .project = .fromTrusted(c[0]) }, env);
+        try std.testing.expectEqualStrings(c[1], svc.roots.project.bytes);
+    }
+    const x = PathService.init(.{ .project = .fromTrusted("C:\\p") }, env);
+    const y = PathService.init(.{ .project = .fromTrusted("C:\\p\\") }, env);
+    try std.testing.expectEqualSlices(u8, &x.projectId(), &y.projectId());
+}
+
+test "importLiteral invalid utf8 and control bytes" {
+    const a = std.testing.allocator;
+    const src = "\xff\x00";
+    const got = try importLiteral(a, .linux, .fromTrusted(src));
+    defer a.free(got);
+    try std.testing.expectEqualStrings("\"\\xff\\x00\"", got);
+    const back = try std.zig.string_literal.parseAlloc(a, got);
+    defer a.free(back);
+    try std.testing.expectEqualSlices(u8, src, back);
+}
+
+test "empty env value counts as unset" {
+    try expectDir(.{ .os = .linux, .home = "/home/u", .xdg_cache_home = "" }, .cache, "/home/u/.cache/ziggurat");
 }
