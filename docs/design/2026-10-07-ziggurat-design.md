@@ -1,6 +1,6 @@
-# Z.I.G.G.U.R.A.T: design (revision 4)
+# Z.I.G.G.U.R.A.T: design (revision 5)
 
-Status: draft, revised after three independent reviews and the Stage 0 spikes (section 16). Date: 2026-10-07; revision 4: 2026-10-13. The project is named Ziggurat, styled **Z.I.G.G.U.R.A.T** in titles and branding (after Projekt J.E.N.O.V.A). Dots are display only: every identifier, file name, package name and Godot class name is plain lowercase `ziggurat`.
+Status: draft, revised after three independent reviews and the Stage 0 spikes (section 16). Date: 2026-10-07; revision 4: 2026-10-13; revision 5: 2026-10-14. The project is named Ziggurat, styled **Z.I.G.G.U.R.A.T** in titles and branding (after Projekt J.E.N.O.V.A). Dots are display only: every identifier, file name, package name and Godot class name is plain lowercase `ziggurat`.
 
 Pins: Zig 0.17.0, Godot 4.7.2 (single precision only), gdzig commit `c8e0768` (2026-10-05). All are enforced at load time (section 3).
 
@@ -10,10 +10,13 @@ How to read claims: **verified** means someone ran it or read the cited source; 
 
 **Goal.** Do for Zig what Projekt J.E.N.O.V.A does for C++: write `.zig` scripts inside a Godot project, attach them to nodes like GDScript, have the editor compile them, and hot-reload them without restarting. gdzig provides the Godot bindings. This project writes no bindings; it is the integration layer on top of gdzig.
 
+**Distribution.** Ziggurat ships as an ordinary add-on in `addons/ziggurat/` for stock Godot 4.7.2: one zip with the extension library for every supported platform, published on the Godot Asset Store (the store the 4.7 editor uses) and as a release download with the same contents. No installer program and no engine fork. The old Asset Library is deprecated and the 4.7 editor no longer reaches it. The zip never contains the Zig compiler: the Asset Store rejects standalone executables, and Zig is 54 to 96 MB per platform. Exported games contain neither Zig nor the editor parts. Details in `../research/integration-distribution.md`.
+
 **Non-goals for v1.**
 - No new bindings and no gdzig fork. Fixes go upstream.
 - No Windows or macOS support yet. Linux x64 comes first, but every decision keeps both in mind (section 4).
-- No networking inside the extension. v1 uses a configured Zig path or the one on `PATH`. A toolchain downloader is stage 7 work and needs a signature check against a pinned public key.
+- No custom Godot builds. Ziggurat is an ordinary add-on for the stock engine (section 1, Distribution).
+- No network library linked into the extension. The Zig download (section 9) uses Godot's own HTTP client, and exported games never download anything.
 - No script-to-script inheritance (the descriptor format reserves room for it).
 - No safe unloading of old module generations (section 6).
 - No Godot version other than 4.7.2, and no double-precision builds.
@@ -149,7 +152,7 @@ pub const GenerationStore = struct { stage(built, extras) !Generation; pin(gen) 
 - **Linux loader.** `dlopen` with `RTLD_NOW | RTLD_LOCAL`. **Windows loader.** `LoadLibraryExW` with explicit search flags and long-path (`\\?\`) handling, and a rename-then-delete policy for locked files. **macOS loader.** `dlopen`. Windows and macOS are compile-time stubs that fail with a clear message until implemented.
 - **Hidden Linux assumptions to avoid.** `lib*.so` names (use `libName`), copying a loaded file, backslashes and quotes in generated `@import` strings, case-insensitive file systems (the build checks that script paths do not differ only by case), spaces and unicode in paths, read-only project folders, two editors sharing one cache folder (a lock file per cache entry).
 - **GenerationStore** stages each build into its own folder, takes a lock file per generation, sweeps stale generations at editor start, and keeps those a running game still uses. A cap on count and total size applies (generations are about 15 to 25 MB each; incremental outputs are sparse files about 2.7 times the non-incremental size, so staging copies keep the holes).
-- **Zig locator.** v1: a configured path, else `PATH`; the version is checked at startup. No downloads in v1.
+- **Zig locator.** In order: the configured path, the Zig that Ziggurat downloaded (section 9), then `PATH`. The version is checked at startup; Ziggurat needs exactly the pinned Zig version, because Zig changes its language and standard library between releases. A wrong or missing Zig gives one clear message naming the needed version and offering the download.
 
 ## 5. L2: build service
 
@@ -268,6 +271,13 @@ Rules:
 
 Build button and Build-on-Play (`_build`), a build panel with diagnostics, errors in the script editor through `_validate`, a registered `EditorSyntaxHighlighter` (otherwise 4.7 shows plain text), script templates, settings (Zig path, backend override, script folders), and per-generation status. Registered at EDITOR initialization level.
 
+**Zig download.** A "Download Zig <pinned version>" action fetches the official release for the editor's platform once into a per-user folder (`<user data>/ziggurat/toolchains/zig-<version>/`, shared by all projects), never into the project. It uses Godot's HTTP client, so no network library is linked into the extension. Rules, following ziglang.org's guidance for download tools:
+- The list of community mirrors is fetched from ziglang.org, cached for about a day, and tried in random order, with ziglang.org itself as the last resort.
+- The archive and its `.minisig` signature come from the same mirror. The signature is checked against Zig's published minisign public key, pinned in the extension (`RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U`). The prehashed (`ED`, BLAKE2b-512) format must be supported. Zig's standard library has Ed25519 and BLAKE2b, so no extra dependency is needed.
+- The `file:` field in the signed comment must equal the requested archive name, which blocks a downgrade to another signed release.
+- The archive is unpacked into a temporary folder next to the target and renamed into place only after the check passes. A failed check deletes it and says so; it never falls back to an unchecked file.
+- The download runs only when the user asks; the editor never downloads on its own.
+
 ## 10. Export
 
 The export plugin builds one library per target platform with every script linked statically and registered at startup (no dynamic module loading, no `dlopen`), and uses a deterministic release build, not the editor's last build. Scenes reference `res://x.zig`, but sources are left out of the package: an `EditorExportPlugin` skips every `.zig` file, and the host's loader answers the path from the linked registry. Godot 4.7.2 release builds hand `res://x.zig` to the loader without checking that the file exists (the existence check is editor-only), so no stub file is needed (verified, Stage 0 spike s5-export; a stub file per script, as C# does, stays the fallback if a later Godot checks first). The plugin is required: a default export ships `.zig` sources verbatim. Open gaps: the spike built Debug, not the deterministic release build; scenes saved by the editor reference scripts by uid, which was not tested with stripped sources; release templates reject `--main-pack`, so tests run the `<exe>.pck` next to the binary. Linux first; the target glibc version is pinned. Web and iOS require static linking, which this design already uses. Android needs the NDK for libc builds.
@@ -301,7 +311,7 @@ The export plugin builds one library per target platform with every script linke
 6. **Real Windows machine:** an LLVM DLL, `LoadLibraryExW`, rename and delete of old generations, MAX_PATH. **Not run:** deferred to stage 7.
 7. **GUI editor:** the spike and the swap run in the real editor (all spike runs were headless). **Automated pass** on a virtual X display; six manual checks on a real desktop are pending.
 
-Then: 1. L1 and L2 (platform and build services). 2. SDK, conversions and descriptors. 3. Script backend, first end-to-end: attach a script, see properties in the Inspector, run `_ready`. 4. Reload: gate, generations, migration, rollback. 5. Editor plugin. 6. Export. 7. Hardening: debug build and lldb setup, Windows and macOS bring-up (including Stage 0 spike 6), verify incremental on real hardware, toolchain downloader with signature check, script inheritance, safe unloading.
+Then: 1. L1 and L2 (platform and build services). 2. SDK, conversions and descriptors. 3. Script backend, first end-to-end: attach a script, see properties in the Inspector, run `_ready`. 4. Reload: gate, generations, migration, rollback. 5. Editor plugin, including the Zig download with signature check (section 9). 6. Export, and the Asset Store package. 7. Hardening: debug build and lldb setup, Windows and macOS bring-up (including Stage 0 spike 6 and the Zig download on both), verify incremental on real hardware, script inheritance, safe unloading.
 
 ## 13. Upstream work and pins
 
@@ -325,6 +335,8 @@ Then: 1. L1 and L2 (platform and build services). 2. SDK, conversions and descri
 11. GUI editor coverage is automated only, on a virtual X display; the six manual checks on a real desktop are pending.
 12. A damaged module file can load if its size is consistent: the ELF check before loading is not an integrity check (section 6), and it skips the section-table bound when `e_shnum` is 0 (extended section numbering; Zig output does not use it).
 13. Safe unloading (stage 7) has two known traps: each script's defaults image points into the module's read-only data, so a module must not be unloaded while a table or a moved field still refers to it; and instances freed after the host's shutdown at SCENE exit leak their data.
+14. The downloaded Zig on macOS is only ad-hoc signed, not notarized. A copy fetched by Godot carries no quarantine flag and should run; a copy the user fetches in a browser is blocked by Gatekeeper until the flag is removed. Not tested on a real Mac (stage 7). On Windows, some antivirus products have flagged Zig and Zig-built programs as false positives.
+15. The Asset Store is labelled beta, lists free assets only, and its rules may change. The release zip is the fallback channel with the same contents.
 
 ## 15. Decisions and open questions
 
@@ -333,6 +345,10 @@ Decided by the user (2026-10-07; the name override confirmed 2026-10-13):
 - **License:** MIT, same as Jenova-Runtime (verified through the GitHub API).
 - **v1 Variant types:** start simple on a base that is tested: builtin value types, engine object pointers and enums. Typed arrays and dictionaries come after the checked conversion layer has tests.
 - **Acronym rule:** copy Godot's algorithm (section 8), with an explicit name override. The override was confirmed with the spec approval on 2026-10-13.
+
+Decided by the user (2026-10-14):
+- **Distribution:** an ordinary add-on for stock Godot, on the Asset Store and as a release zip; no installer program, no engine builds (section 1).
+- **Zig download** moves from stage 7 to stage 5, because Ziggurat needs one exact Zig version and a user's own Zig is often a different one (section 9).
 
 Settled by Stage 0:
 - **Hidden root:** `<project>/.ziggurat_root.zig`; read-only projects build from a mirror copy in the cache folder (section 5).
@@ -372,3 +388,5 @@ Three independent reviews (Godot contract; host and module boundary with gdzig; 
 **Questions the reviews did not settle:** thread races, double precision, Windows and macOS, and everything inside the GUI editor. Stage 0 covered the GUI editor (automated); thread races, double precision, Windows and macOS remain open (sections 2 and 14).
 
 **Revision 4 (2026-10-13): Stage 0 results.** Sections 2, 5, 6, 7, 8, 10, 12, 13, 14 and 15 take in the spike results: hidden root location and read-only fallback, root-owned C exports, migration as a move, the ELF check before loading, the manifest trust rules, required virtuals, stripped-source export, measured warm-up numbers and new risks.
+
+**Revision 5 (2026-10-14): distribution.** Sections 1, 4, 9, 12, 14 and 15: Ziggurat ships as a stock-engine add-on (Asset Store and release zip), and the Zig download with signature check moves to stage 5. Research in `../research/integration-distribution.md`.
