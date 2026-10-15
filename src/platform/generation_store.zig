@@ -39,6 +39,8 @@ pub const SweepReport = struct {
     kept: u32,
     /// Total size of the files in the kept generations.
     bytes_kept: u64,
+    /// Unpinned generations whose delete failed; they count as kept.
+    failed: u32 = 0,
 };
 
 const store_lock_timeout_ms = 30_000;
@@ -71,6 +73,23 @@ pub const GenerationStore = struct {
     /// is checked with `elf.checkComplete` first. On any error no `gen/<n>`
     /// folder is left behind. The caller frees the result with `deinit`.
     pub fn stage(self: *GenerationStore, built: OsPath, extras: []const OsPath) !Generation {
+        var diag: [256]u8 = undefined;
+        return self.stageDiag(built, extras, &diag);
+    }
+
+    /// Like `stage`, and on any failure `diag` holds one NUL-terminated
+    /// sentence (read it with `elf.diagText`): the ELF check's text, or a
+    /// generic sentence naming the error and the built file.
+    pub fn stageDiag(self: *GenerationStore, built: OsPath, extras: []const OsPath, diag: *[256]u8) !Generation {
+        @memset(diag, 0);
+        return self.stageInner(built, extras, diag) catch |e| {
+            if (diag[0] == 0)
+                elf.setDiag(diag, "Staging {s} failed: {s}.", .{ built.bytes, @errorName(e) });
+            return e;
+        };
+    }
+
+    fn stageInner(self: *GenerationStore, built: OsPath, extras: []const OsPath, diag: *[256]u8) !Generation {
         const a = self.a;
         const io = self.io;
         const gen_root = try path.join(a, self.root, &.{"gen"});
@@ -80,16 +99,12 @@ pub const GenerationStore = struct {
         var store_lock = try self.lockStore(.exclusive);
         defer store_lock.release();
 
-        if (isElfTarget(self.os)) {
-            const f = try Dir.cwd().openFile(io, built.bytes, .{});
-            defer f.close(io);
-            var diag: [256]u8 = undefined;
-            try elf.checkComplete(io, f, &diag);
-        }
-
         const gens = try self.listGens(gen_root);
         defer a.free(gens);
-        const n: u32 = if (gens.len == 0) 1 else gens[gens.len - 1] + 1;
+        const n: u32 = if (gens.len == 0) 1 else std.math.add(u32, gens[gens.len - 1], 1) catch {
+            elf.setDiag(diag, "The generation numbers under {s} are used up.", .{gen_root.bytes});
+            return error.GenerationOverflow;
+        };
 
         var nb: [16]u8 = undefined;
         const n_name = try std.fmt.bufPrint(&nb, "{d}", .{n});
@@ -103,6 +118,12 @@ pub const GenerationStore = struct {
         const lib = try path.join(a, dir, &.{lib_name});
         errdefer a.free(lib.bytes);
         try copyFile(io, built.bytes, lib.bytes);
+        if (isElfTarget(self.os)) {
+            // Check the exact bytes that will be loaded, not the original.
+            const f = try Dir.cwd().openFile(io, lib.bytes, .{});
+            defer f.close(io);
+            try elf.checkComplete(io, f, diag);
+        }
 
         for (extras) |extra| {
             const dst = try path.join(a, dir, &.{baseName(extra.bytes)});
@@ -157,11 +178,16 @@ pub const GenerationStore = struct {
 
         const over_count: usize = if (gens.len > self.caps.max_count) gens.len - self.caps.max_count else 0;
         var deleted: u32 = 0;
+        var failed: u32 = 0;
         // The last entry is the newest: never a candidate.
         const candidates = if (gens.len == 0) 0 else gens.len - 1;
         for (gens[0..candidates], sizes[0..candidates], 0..) |n, sz, i| {
             if (i >= over_count and total <= self.caps.max_bytes) continue;
-            if (try self.deleteIfUnpinned(n)) {
+            const gone = self.deleteIfUnpinned(n) catch {
+                failed += 1;
+                continue;
+            };
+            if (gone) {
                 deleted += 1;
                 total -= sz;
             }
@@ -170,6 +196,7 @@ pub const GenerationStore = struct {
             .deleted = deleted,
             .kept = @intCast(gens.len - deleted),
             .bytes_kept = total,
+            .failed = failed,
         };
     }
 
@@ -204,6 +231,10 @@ pub const GenerationStore = struct {
         while (try it.next(self.io)) |entry| {
             if (entry.kind != .directory) continue;
             const n = std.fmt.parseInt(u32, entry.name, 10) catch continue;
+            // Only canonical names ("7", not "007" or "+7").
+            var nb: [16]u8 = undefined;
+            const canon = std.fmt.bufPrint(&nb, "{d}", .{n}) catch continue;
+            if (!std.mem.eql(u8, canon, entry.name)) continue;
             try out.append(self.a, n);
         }
         std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
@@ -418,7 +449,9 @@ test "stage copies, never moves" {
     const copy = try std.Io.Dir.cwd().readFileAlloc(io, g.lib.bytes, a, .limited(1 << 20));
     defer a.free(copy);
     try std.testing.expectEqualSlices(u8, orig, copy);
-    try std.testing.expect(std.mem.endsWith(u8, g.lib.bytes, "libdemo.1.so"));
+    var nbuf: [64]u8 = undefined;
+    const lib_name = try path.libName(&nbuf, os_tag, "demo", 1);
+    try std.testing.expect(std.mem.endsWith(u8, g.lib.bytes, lib_name));
     const ex = try path.join(a, g.dir, &.{"extra.txt"});
     defer a.free(ex.bytes);
     const exb = try std.Io.Dir.cwd().readFileAlloc(io, ex.bytes, a, .limited(1024));
@@ -526,4 +559,90 @@ test "stage refuses a non-ELF output" {
     var s = f.store(a, .{});
     try std.testing.expectError(error.NotElf64, s.stage(built, &.{}));
     try std.testing.expect(!try genExists(a, &f, 1));
+}
+
+test "stageDiag leaves a sentence for a non-ELF output" {
+    if (os_tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    try f.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad.so", .data = "not an elf, just text, long enough to matter here" });
+    const built = try f.p(a, &.{"bad.so"});
+    defer a.free(built.bytes);
+    var s = f.store(a, .{});
+    var diag: [256]u8 = undefined;
+    try std.testing.expectError(error.NotElf64, s.stageDiag(built, &.{}, &diag));
+    try std.testing.expect(elf.diagText(&diag).len > 0);
+    try std.testing.expect(!try genExists(a, &f, 1));
+}
+
+test "stage with a missing extra leaves no folder" {
+    const a = std.testing.allocator;
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    try f.writeElf("built.so", "hello");
+    const built = try f.p(a, &.{"built.so"});
+    defer a.free(built.bytes);
+    const missing = try f.p(a, &.{"nope.txt"});
+    defer a.free(missing.bytes);
+    var s = f.store(a, .{});
+    var diag: [256]u8 = undefined;
+    try std.testing.expectError(error.FileNotFound, s.stageDiag(built, &.{missing}, &diag));
+    try std.testing.expect(elf.diagText(&diag).len > 0);
+    try std.testing.expect(!try genExists(a, &f, 1));
+}
+
+test "pin of a missing generation" {
+    const a = std.testing.allocator;
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    try f.writeElf("built.so", "hello");
+    const built = try f.p(a, &.{"built.so"});
+    defer a.free(built.bytes);
+    var s = f.store(a, .{});
+    _ = try stageOne(a, &s, built);
+    try std.testing.expectError(error.FileNotFound, s.pin(7));
+    try std.testing.expect(!try genExists(a, &f, 7));
+}
+
+test "sweep by bytes keeps a pinned oldest" {
+    const a = std.testing.allocator;
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    try f.writeElf("built.so", "hello");
+    const built = try f.p(a, &.{"built.so"});
+    defer a.free(built.bytes);
+    var s = f.store(a, .{ .max_bytes = 1 });
+    for (0..4) |_| _ = try stageOne(a, &s, built);
+    var pinned = try s.pin(1);
+    defer pinned.release();
+    const rep = try s.sweep();
+    try std.testing.expectEqual(@as(u32, 2), rep.deleted);
+    try std.testing.expectEqual(@as(u32, 0), rep.failed);
+    try std.testing.expect(try genExists(a, &f, 1));
+    try std.testing.expect(!try genExists(a, &f, 2));
+    try std.testing.expect(!try genExists(a, &f, 3));
+    try std.testing.expect(try genExists(a, &f, 4));
+}
+
+test "folders with non-canonical names are ignored" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    try f.writeElf("built.so", "hello");
+    const built = try f.p(a, &.{"built.so"});
+    defer a.free(built.bytes);
+    var s = f.store(a, .{ .max_count = 1 });
+    _ = try stageOne(a, &s, built);
+    const odd = try path.join(a, f.root, &.{ "gen", "007" });
+    defer a.free(odd.bytes);
+    try std.Io.Dir.cwd().createDirPath(io, odd.bytes);
+    const big = try path.join(a, f.root, &.{ "gen", "99999999999" });
+    defer a.free(big.bytes);
+    try std.Io.Dir.cwd().createDirPath(io, big.bytes);
+    try std.testing.expectEqual(@as(u32, 2), try stageOne(a, &s, built));
+    const rep = try s.sweep();
+    try std.testing.expectEqual(@as(u32, 1), rep.deleted);
+    try std.testing.expectEqual(@as(u32, 0), rep.failed);
 }
