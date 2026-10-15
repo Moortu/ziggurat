@@ -292,23 +292,28 @@ const View = struct {
         }
     }
 
+    /// Deepest note nesting accepted; real bundles use one or two levels.
+    const max_note_depth = 16;
+
     /// Checks every index reachable from the root list: messages, their
-    /// strings, source locations, reference traces and notes (one level).
+    /// strings, source locations, reference traces, and notes at every depth.
+    /// Message visits are capped at `extra.len` (a real message takes four
+    /// words), so notes that point back at each other cannot make it slow.
     fn validate(v: View) Error!void {
         if (v.eb.extra.len == 0) return;
         const l = try v.list();
         if (l.compile_log_text != 0) _ = try v.string(l.compile_log_text);
-        for (0..l.len) |i| {
-            const mi = v.eb.extra[l.start + i];
-            try v.checkMessage(mi);
-            for (try v.notes(mi, (try v.message(mi)).notes_len)) |ni| try v.checkMessage(ni);
-        }
+        var budget: u64 = v.eb.extra.len;
+        for (0..l.len) |i| try v.checkMessage(v.eb.extra[l.start + i], 0, &budget);
     }
 
-    fn checkMessage(v: View, mi: u32) Error!void {
+    fn checkMessage(v: View, mi: u32, depth: u32, budget: *u64) Error!void {
+        if (depth > max_note_depth or budget.* == 0) return error.MalformedBundle;
+        budget.* -= 1;
         const m = try v.message(mi);
         _ = try v.string(m.msg);
         if (m.src_loc != 0) try v.checkSourceLocation(m.src_loc, true);
+        for (try v.notes(mi, m.notes_len)) |ni| try v.checkMessage(ni, depth + 1, budget);
     }
 };
 
@@ -422,6 +427,10 @@ test "malformed bundles are rejected" {
         .{ .string_bytes = &.{0}, .extra = &.{ 0xffff_ffff, 0xffff_ffff, 0 } },
         // compile_log_text out of range.
         .{ .string_bytes = &.{0}, .extra = &.{ 0, 3, 77 } },
+        // A note (at 9) whose own note index is past the end.
+        .{ .string_bytes = "\x00ab\x00", .extra = &.{ 1, 3, 0, 4, 1, 1, 0, 1, 9, 1, 1, 0, 1, 999 } },
+        // A note that lists itself as its note: the nesting never ends.
+        .{ .string_bytes = "\x00ab\x00", .extra = &.{ 1, 3, 0, 4, 1, 1, 0, 1, 9, 1, 1, 0, 1, 9 } },
     };
     for (cases) |eb| try testing.expectError(error.MalformedBundle, decode(a, testing.io, eb, &ws));
 }
@@ -520,12 +529,72 @@ fn fuzzInput(comptime extra: []const u32, comptime strings: []const u8) []const 
     }
 }
 
+/// A valid bundle: one message "ab" at /x/b.zig:1:1 with one note "n".
+const seed_extra = [_]u32{ 1, 3, 0, 4, 1, 1, 9, 1, 17, 4, 0, 0, 0, 0, 0, 0, 0, 13, 1, 0, 0 };
+const seed_strings = "\x00ab\x00/x/b.zig\x00n\x00";
+
 test "fuzz decode" {
-    // A valid bundle: one message "ab" at /proj/b.zig:1:1 with one note "n".
-    const valid = comptime fuzzInput(
-        &.{ 1, 3, 0, 4, 1, 1, 9, 1, 17, 4, 0, 0, 0, 0, 0, 0, 0, 13, 1, 0, 0 },
-        "\x00ab\x00/x/b.zig\x00n\x00",
-    );
+    const valid = comptime fuzzInput(&seed_extra, seed_strings);
     const truncated = valid[0 .. valid.len - 9];
     try testing.fuzz({}, fuzzOne, .{ .corpus = &.{ valid, truncated } });
+}
+
+test "the seed bundle decodes as expected" {
+    const ws = fakeWorkspace("/x", "/x/build");
+    const ds = try decode(testing.allocator, testing.io, .{ .string_bytes = seed_strings, .extra = &seed_extra }, &ws);
+    defer free(testing.allocator, ds);
+    try testing.expectEqual(@as(usize, 1), ds.len);
+    try testing.expectEqualStrings("b.zig", ds[0].rel.?);
+    try testing.expectEqual(@as(u32, 1), ds[0].line);
+    try testing.expectEqual(@as(u32, 1), ds[0].column);
+    try testing.expectEqualStrings("ab", ds[0].message);
+    try testing.expectEqual(@as(usize, 1), ds[0].notes.len);
+    try testing.expectEqualStrings("n", ds[0].notes[0]);
+}
+
+test "mutated bundles give MalformedBundle or a valid list" {
+    var prng = std.Random.DefaultPrng.init(0x5eed_7a5c);
+    const rand = prng.random();
+    const ws = fakeWorkspace("/x", "/x/build");
+    var extra: [seed_extra.len]u32 = undefined;
+    var strings: [seed_strings.len]u8 = undefined;
+    var valid: usize = 0;
+    var malformed: usize = 0;
+    for (0..20_000) |_| {
+        extra = seed_extra;
+        strings = seed_strings.*;
+        var extra_len: usize = extra.len;
+        var strings_len: usize = strings.len;
+        const changes = rand.intRangeAtMost(u32, 1, 4);
+        for (0..changes) |_| switch (rand.uintLessThan(u32, 6)) {
+            // Flip one byte of a word.
+            0 => {
+                const bytes = std.mem.sliceAsBytes(&extra);
+                bytes[rand.uintLessThan(usize, bytes.len)] ^= rand.int(u8) | 1;
+            },
+            // Flip one string byte.
+            1 => strings[rand.uintLessThan(usize, strings.len)] ^= rand.int(u8) | 1,
+            // A word just past the end of extra or string_bytes.
+            2 => extra[rand.uintLessThan(usize, extra.len)] = @intCast(extra.len + rand.uintLessThan(u32, 4)),
+            3 => extra[rand.uintLessThan(usize, extra.len)] = @intCast(strings.len + rand.uintLessThan(u32, 4)),
+            // Any value at all.
+            4 => extra[rand.uintLessThan(usize, extra.len)] = rand.int(u32),
+            // Truncate one of the arrays.
+            else => if (rand.boolean()) {
+                extra_len = rand.uintLessThan(usize, extra_len + 1);
+            } else {
+                strings_len = rand.uintLessThan(usize, strings_len + 1);
+            },
+        };
+        const eb: ErrorBundle = .{ .string_bytes = strings[0..strings_len], .extra = extra[0..extra_len] };
+        if (decode(testing.allocator, testing.io, eb, &ws)) |ds| {
+            free(testing.allocator, ds);
+            valid += 1;
+        } else |err| switch (err) {
+            error.MalformedBundle => malformed += 1,
+            else => return err,
+        }
+    }
+    // Both outcomes must occur, or the mutations are not reaching the checks.
+    try testing.expect(valid > 0 and malformed > 0);
 }

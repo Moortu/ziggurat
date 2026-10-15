@@ -14,8 +14,10 @@ pub const UpdateResult = struct {
     /// Owned; checked with `diagnostics.validate`, so the `std.zig.ErrorBundle`
     /// accessors are safe on it.
     bundle: ErrorBundle,
-    /// `<cache-dir>/o/<emit_digest hex>/<lib file name>` from the last
-    /// `emit_digest`, or null when there are errors (or no digest came yet). Owned.
+    /// `<cache-dir>/o/<emit_digest hex>/<lib file name>` from the
+    /// `emit_digest` of this update, or null when there are errors or this
+    /// update sent no digest. In incremental mode the compiler rewrites the
+    /// same file on the next update, so copy it out before updating again. Owned.
     output: ?OsPath,
     /// Wall time of the update round trip.
     ms: u64,
@@ -43,6 +45,9 @@ pub const UpdateError = error{
 pub const stderr_tail_len = 4096;
 /// How long `exit` waits for the server to stop before it kills it.
 pub const exit_grace_ms = 2000;
+/// How long releasing a session waits for the stderr reader to reach end of
+/// file before it cancels the reader.
+pub const drain_grace_ms = 2000;
 /// Largest server message accepted; a bigger one is a protocol violation.
 const max_message_bytes: u32 = 256 * 1024 * 1024;
 
@@ -66,8 +71,10 @@ const State = struct {
     tail: [stderr_tail_len]u8 = undefined,
     cache_dir: []const u8,
     lib_file: []const u8,
-    /// From the last `emit_digest`.
+    /// From the `emit_digest` of the current update; cleared when an update starts.
     out_path: ?[]const u8 = null,
+    /// Set by the stderr reader when it stops.
+    drain_done: std.atomic.Value(bool) = .init(false),
     dead: bool = false,
     /// The process is reaped and the pipes are closed.
     released: bool = false,
@@ -109,8 +116,21 @@ const State = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidPathPart => unreachable,
         };
-        if (st.out_path) |old| st.a.free(old);
+        st.clearOutput();
         st.out_path = p.bytes;
+    }
+
+    fn clearOutput(st: *State) void {
+        if (st.out_path) |old| st.a.free(old);
+        st.out_path = null;
+    }
+
+    fn waitDrain(st: *State, timeout_ms: u32) void {
+        const t0 = std.Io.Clock.awake.now(st.io);
+        while (!st.drain_done.load(.acquire)) {
+            if (t0.durationTo(std.Io.Clock.awake.now(st.io)).toMilliseconds() >= timeout_ms) return;
+            st.io.sleep(.fromMilliseconds(5), .awake) catch return;
+        }
     }
 
     fn pushTail(st: *State, bytes: []const u8) void {
@@ -134,13 +154,14 @@ const State = struct {
         // readers finish.
         st.child.signalKill();
         st.mr.deinit();
-        if (comptime builtin.os.tag == .windows) {
-            st.drain.cancel(st.io);
-        } else {
-            // The whole group is dead, so stderr reaches end of file and the
-            // reader stops by itself after keeping the last bytes.
-            st.drain.await(st.io);
+        if (comptime builtin.os.tag != .windows) {
+            // The whole group is dead, so stderr normally reaches end of file
+            // and the reader stops by itself after keeping the last bytes. A
+            // process outside the group could still hold the pipe open, so
+            // the wait is bounded and the reader is cancelled after it.
+            st.waitDrain(drain_grace_ms);
         }
+        st.drain.cancel(st.io);
         st.child.kill(st.io);
     }
 };
@@ -149,6 +170,7 @@ const State = struct {
 /// `stderr_tail_len` bytes. Running all the time, it stops a chatty compiler
 /// from blocking on a full pipe.
 fn drainStderr(st: *State) void {
+    defer st.drain_done.store(true, .release);
     const file = st.child.inner.stderr.?;
     var buf: [1024]u8 = undefined;
     while (true) {
@@ -224,6 +246,8 @@ pub const Session = struct {
         } }).toDeadline(st.io);
         errdefer st.release();
 
+        // Only a digest sent during this update names its output.
+        st.clearOutput();
         try st.send(.update);
         const bundle: ErrorBundle = while (true) {
             const h = try st.receive(deadline);
@@ -359,10 +383,13 @@ test "dead server gives CompilerDied and its stderr tail" {
 }
 
 // The script reads the 8-byte `update` header, answers with `emit_digest`
-// (digest bytes 1..16) and an empty error bundle, then waits for stdin to close.
+// (digest bytes 1..16) and an empty error bundle. The second update gets an
+// empty bundle without a digest. Then it waits for stdin to close.
 const digest_script =
     \\head -c 8 >/dev/null
     \\printf '\002\000\000\000\021\000\000\000\000\001\002\003\004\005\006\007\010\011\012\013\014\015\016\017\020'
+    \\printf '\001\000\000\000\010\000\000\000\000\000\000\000\000\000\000\000'
+    \\head -c 8 >/dev/null
     \\printf '\001\000\000\000\010\000\000\000\000\000\000\000\000\000\000\000'
     \\cat >/dev/null
 ;
@@ -381,6 +408,11 @@ test "emit_digest gives the output path" {
     else
         "/nonexistent-ziggurat/cache/o/0102030405060708090a0b0c0d0e0f10/libzz.so";
     try testing.expectEqualStrings(want, r.output.?.bytes);
+    // An update without its own digest has no output, even after a digest.
+    var r2 = try s.update(10_000);
+    defer r2.deinit(a);
+    try testing.expectEqual(@as(u32, 0), r2.bundle.errorMessageCount());
+    try testing.expect(r2.output == null);
     s.exit();
     try testing.expect(!s.alive());
     s.exit();
@@ -397,6 +429,25 @@ test "a chatty stderr does not block the server" {
     try testing.expect(r.output != null);
     try testing.expectEqual(@as(usize, 4096), s.stderrTail().len);
     for (s.stderrTail()) |c| try testing.expectEqual(@as(u8, 'x'), c);
+}
+
+test "release does not wait for ever on a stderr held outside the group" {
+    if (is_windows) return error.SkipZigTest;
+    // `setsid` puts `sleep` in its own session, so the group kill misses it
+    // and it keeps the stderr pipe open for 5 s.
+    const argv = fakeArgv("if command -v setsid >/dev/null; then setsid sleep 5 </dev/null >/dev/null & else echo nosetsid >&2; fi; cat >/dev/null");
+    const io = testing.io;
+    var s = try Session.start(testing.allocator, io, &argv, .fromTrusted("."));
+    // Give the shell time to start `sleep` or to report it cannot.
+    try io.sleep(.fromMilliseconds(200), .awake);
+    const t0 = std.Io.Clock.awake.now(io);
+    s.exit();
+    const ms = t0.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+    const no_setsid = std.mem.indexOf(u8, s.stderrTail(), "nosetsid") != null;
+    s.deinit();
+    if (no_setsid) return error.SkipZigTest;
+    try testing.expect(ms >= drain_grace_ms - 100);
+    try testing.expect(ms < drain_grace_ms + 1500);
 }
 
 /// A temporary two-script project, prepared through the Task 6 workspace.
@@ -471,9 +522,21 @@ const b_source =
 
 const update_timeout_ms = 180_000;
 
-fn mtimeOf(path: []const u8) !i96 {
-    const st = try std.Io.Dir.cwd().statFile(testing.io, path, .{});
-    return st.mtime.nanoseconds;
+/// Copies `output` to `<tmp>/<copy_name>` (the compiler rewrites the output
+/// in place on the next update), loads the copy and calls `ziggurat_test_b`.
+fn callB(p: *Project, output: OsPath, copy_name: []const u8) !i32 {
+    const a = p.arena_state.allocator();
+    const base = try p.tmp.dir.realPathFileAlloc(testing.io, ".", a);
+    const copy = try platform.path.join(a, .fromTrusted(base), &.{copy_name});
+    try std.Io.Dir.cwd().copyFile(output.bytes, std.Io.Dir.cwd(), copy.bytes, testing.io, .{});
+    var diag: [256]u8 = undefined;
+    const lib = platform.loader.open(a, testing.io, copy, &diag) catch |err| {
+        std.debug.print("load failed: {s}\n", .{platform.elf.diagText(&diag)});
+        return err;
+    };
+    defer platform.loader.close(lib);
+    const f = platform.loader.lookup(lib, *const fn () callconv(.c) i32, "ziggurat_test_b") orelse return error.SymbolNotFound;
+    return f();
 }
 
 test "integration: session clean then edit" {
@@ -488,16 +551,14 @@ test "integration: session clean then edit" {
     var r1 = try s.update(update_timeout_ms);
     defer r1.deinit(a);
     try testing.expectEqual(@as(u32, 0), r1.bundle.errorMessageCount());
-    const out1 = try p.arena_state.allocator().dupe(u8, r1.output.?.bytes);
-    const m1 = try mtimeOf(out1);
+    try testing.expectEqual(@as(i32, 1), try callB(&p, r1.output.?, "load1.so"));
 
     const good = try std.mem.replaceOwned(u8, p.arena_state.allocator(), b_source, "return 1;", "return 22;");
     try p.write("b.zig", good);
     var r2 = try s.update(update_timeout_ms);
     defer r2.deinit(a);
     try testing.expectEqual(@as(u32, 0), r2.bundle.errorMessageCount());
-    const out2 = r2.output.?.bytes;
-    try testing.expect(!std.mem.eql(u8, out1, out2) or (try mtimeOf(out2)) != m1);
+    try testing.expectEqual(@as(i32, 22), try callB(&p, r2.output.?, "load2.so"));
 
     const broken_line: u32 = @intCast(std.mem.count(u8, good, "\n") + 1);
     try p.write("b.zig", try std.mem.concat(p.arena_state.allocator(), u8, &.{ good, "fn broken( {\n" }));
@@ -509,11 +570,12 @@ test "integration: session clean then edit" {
     try testing.expectEqualStrings("b.zig", ds[0].rel.?);
     try testing.expectEqual(broken_line, ds[0].line);
 
-    try p.write("b.zig", good);
+    // Fixed, with a new value, so the recovery build is checked as well.
+    try p.write("b.zig", try std.mem.replaceOwned(u8, p.arena_state.allocator(), b_source, "return 1;", "return 333;"));
     var r4 = try s.update(update_timeout_ms);
     defer r4.deinit(a);
     try testing.expectEqual(@as(u32, 0), r4.bundle.errorMessageCount());
-    try std.Io.Dir.cwd().access(testing.io, r4.output.?.bytes, .{});
+    try testing.expectEqual(@as(i32, 333), try callB(&p, r4.output.?, "load4.so"));
 }
 
 test "integration: non-incremental one-shot" {
