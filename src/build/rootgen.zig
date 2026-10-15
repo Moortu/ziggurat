@@ -153,8 +153,9 @@ test "integration: root compiles against stub sdk" {
     const text = try generateRoot(a, builtin.os.tag, res.scripts);
     try tmp.dir.writeFile(testing.io, .{ .sub_path = root_file_name, .data = text });
 
-    // The tests run with the package folder as the working directory.
-    const stub = try std.Io.Dir.cwd().realPathFileAlloc(testing.io, "test/stub_sdk/ziggurat.zig", a);
+    // The option may be relative to the caller's working directory (the same one
+    // the test runs in); make it absolute before the compiler runs elsewhere.
+    const stub = try std.Io.Dir.cwd().realPathFileAlloc(testing.io, build_options.stub_sdk_path, a);
     const so = try std.fmt.allocPrint(a, "{s}/libroot.so", .{project.bytes});
     const run = try platform.process.runCapture(a, testing.io, &.{
         build_options.zig_exe,

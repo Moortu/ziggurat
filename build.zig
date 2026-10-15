@@ -41,6 +41,7 @@ fn addTestSet(
     const options = b.addOptions();
     options.addOption([]const u8, "zig_exe", zig_exe);
     options.addOption(bool, "run_integration", run_integration);
+    options.addOptionPath("stub_sdk_path", b.path("test/stub_sdk/ziggurat.zig"));
 
     const platform = b.createModule(.{
         .root_source_file = b.path("src/platform/root.zig"),

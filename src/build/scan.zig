@@ -36,9 +36,12 @@ const Scanner = struct {
     scripts: std.ArrayList(Script) = .empty,
     problems: std.ArrayList(Problem) = .empty,
     seen: std.StringHashMapUnmanaged(void) = .empty,
+    walked: std.StringHashMapUnmanaged(void) = .empty,
     helpers: u32 = 0,
 
     fn walk(self: *Scanner, rel: []const u8) !void {
+        // Overlapping script folders: visit each folder once.
+        if ((try self.walked.getOrPut(self.a, rel)).found_existing) return;
         var dir = self.project.openDir(self.io, if (rel.len == 0) "." else rel, .{ .iterate = true }) catch |err| {
             try self.problem(rel, "Could not open script folder \"{s}\": {t}.", .{ rel, err });
             return;
@@ -94,8 +97,9 @@ const Scanner = struct {
 };
 
 /// Scans each folder of `script_dirs` (project-relative, `/`-separated, `""` is
-/// the project root). `error.InvalidScriptDir` when an entry is absolute or
-/// contains `..`.
+/// the project root). Entries are normalised first: `.` and empty parts are
+/// dropped, so `./a//b/` means `a/b`. `error.InvalidScriptDir` when an entry is
+/// absolute or contains `..`.
 pub fn scan(
     a: std.mem.Allocator,
     io: std.Io,
@@ -110,10 +114,7 @@ pub fn scan(
     var root = try std.Io.Dir.cwd().openDir(io, project.bytes, .{});
     defer root.close(io);
     var s: Scanner = .{ .a = a, .io = io, .project = root };
-    for (script_dirs) |d| {
-        const trimmed = std.mem.trimEnd(u8, d, "/");
-        try s.walk(trimmed);
-    }
+    for (script_dirs) |d| try s.walk(try normalizeDir(a, d));
     std.mem.sort(Script, s.scripts.items, {}, lessThan);
     try checkCase(&s);
     return .{
@@ -121,6 +122,17 @@ pub fn scan(
         .helpers = s.helpers,
         .problems = s.problems.items,
     };
+}
+
+fn normalizeDir(a: std.mem.Allocator, d: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var parts = std.mem.splitScalar(u8, d, '/');
+    while (parts.next()) |p| {
+        if (p.len == 0 or std.mem.eql(u8, p, ".")) continue;
+        if (out.items.len != 0) try out.append(a, '/');
+        try out.appendSlice(a, p);
+    }
+    return out.items;
 }
 
 fn lessThan(_: void, x: Script, y: Script) bool {
@@ -157,8 +169,12 @@ fn hasTopLevelExtends(a: std.mem.Allocator, src: [:0]const u8) !bool {
 
 fn textCheck(src: []const u8) bool {
     var lines = std.mem.splitScalar(u8, src, '\n');
+    const prefix = "pub const extends";
     while (lines.next()) |line| {
-        if (std.mem.startsWith(u8, line, "pub const extends")) return true;
+        if (!std.mem.startsWith(u8, line, prefix)) continue;
+        // Whole name only: spaces, then `=` or `:`.
+        const rest = std.mem.trimStart(u8, line[prefix.len..], " \t");
+        if (rest.len != 0 and (rest[0] == '=' or rest[0] == ':')) return true;
     }
     return false;
 }
@@ -191,12 +207,17 @@ test "scan rules" {
     try put(tmp, rootgen.root_file_name, "pub const extends = 1;\n");
     try put(tmp, "nested.zig", "const T = struct { pub const extends = 1; };\n");
     try put(tmp, "sub/addons/s.zig", "pub const extends = 1;\n");
+    try put(tmp, "var.zig", "pub var extends: i32 = 1;\n");
+    try put(tmp, "private.zig", "const extends = 1;\n");
+    try put(tmp, "typed.zig", "pub const extends: []const u8 = \"Node\";\n");
 
     const res = try scan(a, testing.io, try tmpProject(tmp, a), default_script_dirs);
-    try testing.expectEqual(@as(usize, 2), res.scripts.len);
+    // Typed `pub const extends: T = ...` counts; `pub var` and non-pub do not.
+    try testing.expectEqual(@as(usize, 3), res.scripts.len);
     try testing.expectEqualStrings("a.zig", res.scripts[0].rel);
     try testing.expectEqualStrings("sub/addons/s.zig", res.scripts[1].rel);
-    try testing.expectEqual(@as(u32, 2), res.helpers);
+    try testing.expectEqualStrings("typed.zig", res.scripts[2].rel);
+    try testing.expectEqual(@as(u32, 4), res.helpers);
     try testing.expectEqual(@as(usize, 0), res.problems.len);
 }
 
@@ -253,4 +274,57 @@ test "scan script dirs and symlinks" {
     try testing.expectEqualStrings("scripts/a.zig", res.scripts[0].rel);
     try testing.expectEqualStrings("scripts/link.zig", res.scripts[1].rel);
     try testing.expectError(error.InvalidScriptDir, scan(a, testing.io, try tmpProject(tmp, a), &.{"../x"}));
+}
+
+test "scan text fallback needs the whole name" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try put(tmp, "x.zig", "pub const extends_all = 1;\nfn broken( {{{\n");
+    try put(tmp, "y.zig", "pub const extends : type = 1;\nfn broken( {{{\n");
+    const res = try scan(a, testing.io, try tmpProject(tmp, a), default_script_dirs);
+    try testing.expectEqual(@as(usize, 1), res.scripts.len);
+    try testing.expectEqualStrings("y.zig", res.scripts[0].rel);
+    try testing.expectEqual(@as(u32, 1), res.helpers);
+}
+
+test "scan normalises and de-duplicates script dirs" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try put(tmp, "addons/x/s.zig", "pub const extends = 1;\n");
+    try put(tmp, "game/s.zig", "pub const extends = 1;\n");
+    const project = try tmpProject(tmp, a);
+    const res = try scan(a, testing.io, project, &.{ "./game//", "game", ".", "" });
+    try testing.expectEqual(@as(usize, 1), res.scripts.len);
+    try testing.expectEqualStrings("game/s.zig", res.scripts[0].rel);
+}
+
+test "scan reports a problem once for overlapping dirs" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try put(tmp, "game/ok.zig", "pub const extends = 1;\n");
+    try put(tmp, "game/locked/s.zig", "pub const extends = 1;\n");
+    const locked = try tmp.dir.realPathFileAlloc(testing.io, "game/locked", a);
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(locked, 0));
+    defer _ = std.c.chmod(locked, 0o755);
+    // Running as root can still open the folder; then there is nothing to count.
+    if (tmp.dir.openDir(testing.io, "game/locked", .{ .iterate = true })) |d| {
+        d.close(testing.io);
+        return error.SkipZigTest;
+    } else |_| {}
+
+    const res = try scan(a, testing.io, try tmpProject(tmp, a), &.{ "", "game", "game/locked" });
+    try testing.expectEqual(@as(usize, 1), res.problems.len);
 }
