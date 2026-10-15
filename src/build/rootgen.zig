@@ -5,11 +5,28 @@
 //! It imports the SDK as `@import("ziggurat")`. The Stage 2 SDK must provide
 //! exactly this surface:
 //!
-//!   - `ziggurat.Panic`: the root has `pub const panic = ziggurat.Panic;`.
-//!   - `ziggurat.describe(comptime S: type) ziggurat.ScriptDescriptor`, called
-//!     once per script as `pub const s<i> = ziggurat.describe(@import(<literal>));`.
+//!   - `ziggurat.Panic`: the root has `pub const panic = ziggurat.Panic;`. It
+//!     must be a panic namespace usable as a root `panic`, for example
+//!     `std.debug.FullPanic(handler)`. `std.debug.simple_panic` does not
+//!     compile in a `-lc` dynamic library with Zig 0.17.0.
+//!   - `ziggurat.describe(comptime S: type, comptime rel: []const u8) ziggurat.ScriptDescriptor`,
+//!     called once per script as
+//!     `pub const s<i> = ziggurat.describe(@import(<import literal>), <rel literal>);`.
+//!     `rel` is the script's project-relative path with `/` separators on
+//!     every OS (for example `"a/x.zig"`), written as a Zig string literal
+//!     escaped with `std.zig.fmtString`, so at comptime it holds the plain
+//!     path. It exists for the SDK marker below: `@typeName(S)` cannot give
+//!     the path back (`a b/q/x.y.zig` and `a b/q/x/y.zig` both give
+//!     `a b.q.x.y`).
 //!   - `ziggurat.Table`, built with `const table = ziggurat.makeTable(&.{ &s0, &s1, ... });`.
+//!     The argument is a pointer to a tuple of `*const ScriptDescriptor`,
+//!     which coerces to a slice `[]const *const ScriptDescriptor`. With no
+//!     scripts the call is `ziggurat.makeTable(&.{})`.
 //!   - `ziggurat.HostApi` and `ziggurat.moduleInit(api: *const ziggurat.HostApi, gen: u32) void`.
+//!   - `HostApi` and `Table` cross a `dlopen` boundary into a host that is
+//!     compiled separately, so their layout must be `extern` (or `packed`
+//!     with a fixed backing integer). A Zig slice, as in the stub SDK, is
+//!     fine for tests but has no stable layout.
 //!   - Two plain (non-generic) exports declared in the root itself, so they stay
 //!     bound to the current code under incremental compilation:
 //!       `export fn ziggurat_init(api: *const ziggurat.HostApi, gen: u32) callconv(.c) void`
@@ -17,6 +34,28 @@
 //!       `export fn ziggurat_describe() callconv(.c) *const ziggurat.Table`
 //!       returns `&table`.
 //!   - Scripts are sorted by `rel` (byte order), so the output is deterministic.
+//!
+//! The build around the root:
+//!
+//!   - The root module's only dependency is `ziggurat`, so a script can import
+//!     only `ziggurat`, `std`, `builtin` and files below the project root. A
+//!     script that needs another module (for example gdzig) gets it through a
+//!     re-export from the SDK.
+//!   - `BuildService.Config.sdk` must contain a module named `ziggurat`;
+//!     `BuildService.init` refuses the list otherwise (`error.MissingSdkModule`).
+//!     Further SDK modules are listed there too, each with its own deps.
+//!   - `@import("root")` from a script or from the SDK is this generated root.
+//!
+//! The SDK marker (decoded in `diagnostics.zig`): a compile error raised in
+//! SDK code has its source location in the SDK, outside the project. To map
+//! it to a script, the SDK puts `[ziggurat:<rel>#<name>]` in the message,
+//! where `<rel>` is the `rel` argument of `describe` copied unchanged and
+//! `<name>` is the declaration the error is about (an identifier). The
+//! decoder removes the marker and reports the error at `<rel>`, on the first
+//! top-level line that declares `<name>` (line 1 when none does). The marker
+//! has no escaping: a `rel` that contains `]`, `:` or `\` cannot be carried, and
+//! such an error shows without a file. The SDK should then leave the marker
+//! out.
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("ziggurat_platform");
@@ -42,7 +81,7 @@ pub fn generateRoot(a: std.mem.Allocator, os: std.Target.Os.Tag, scripts: []cons
     for (scripts, 0..) |s, i| {
         const lit = try platform.path.importLiteral(a, os, OsPath.fromTrusted(s.rel));
         defer a.free(lit);
-        try out.print(a, "pub const s{d} = ziggurat.describe(@import({s}));\n", .{ i, lit });
+        try out.print(a, "pub const s{d} = ziggurat.describe(@import({s}), \"{f}\");\n", .{ i, lit, std.zig.fmtString(s.rel) });
     }
     try out.appendSlice(a, "\nconst table = ziggurat.makeTable(&.{");
     for (scripts, 0..) |_, i| {
@@ -77,8 +116,8 @@ test "generateRoot golden" {
         \\
         \\pub const panic = ziggurat.Panic;
         \\
-        \\pub const s0 = ziggurat.describe(@import("a/x.zig"));
-        \\pub const s1 = ziggurat.describe(@import("b.zig"));
+        \\pub const s0 = ziggurat.describe(@import("a/x.zig"), "a/x.zig");
+        \\pub const s1 = ziggurat.describe(@import("b.zig"), "b.zig");
         \\
         \\const table = ziggurat.makeTable(&.{ &s0, &s1 });
         \\
@@ -98,7 +137,14 @@ test "generateRoot escapes quotes" {
     const scripts = [_]scan.Script{.{ .rel = "q\"uote/s.zig" }};
     const text = try generateRoot(testing.allocator, .linux, &scripts);
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.indexOf(u8, text, "@import(\"q\\\"uote/s.zig\")") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "ziggurat.describe(@import(\"q\\\"uote/s.zig\"), \"q\\\"uote/s.zig\");") != null);
+}
+
+test "generateRoot with no scripts" {
+    const text = try generateRoot(testing.allocator, .linux, &.{});
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "const table = ziggurat.makeTable(&.{});\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "ziggurat.describe(") == null);
 }
 
 /// True when the dynamic symbol table of the ELF64 little-endian file `bytes`

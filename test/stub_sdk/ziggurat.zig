@@ -6,12 +6,14 @@ pub const Panic = @import("std").debug.no_panic;
 
 pub const HostApi = extern struct {};
 
-pub const ScriptDescriptor = struct { name: []const u8 };
+pub const ScriptDescriptor = struct { name: []const u8, rel: []const u8 };
 
+/// A Zig slice keeps the stub short. The real SDK's `Table` crosses `dlopen`
+/// and must have an `extern` layout (see the root contract).
 pub const Table = []const *const ScriptDescriptor;
 
-pub fn describe(comptime S: type) ScriptDescriptor {
-    return .{ .name = @typeName(S) };
+pub fn describe(comptime S: type, comptime rel: []const u8) ScriptDescriptor {
+    return .{ .name = @typeName(S), .rel = rel };
 }
 
 pub fn makeTable(comptime descriptors: Table) Table {
