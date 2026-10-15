@@ -216,6 +216,17 @@ test "locator_rejects_bad_zig: 300 bytes" {
     try std.testing.expect(std.mem.indexOf(u8, p.msg, "did not print a version") != null);
 }
 
+test "locator_rejects_bad_zig: 300 bytes, exit 0" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const p = try probe(tmp, "#!/bin/sh\nhead -c 300 /dev/zero | tr '\\0' x\nexit 0\n");
+    defer a.free(p.msg);
+    try std.testing.expect(!p.ok);
+    try std.testing.expect(std.mem.indexOf(u8, p.msg, "did not print a version") != null);
+}
+
 test "locator_rejects_bad_zig: exit 3" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;

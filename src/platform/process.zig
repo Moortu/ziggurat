@@ -28,6 +28,21 @@ fn watchdog(io: std.Io, deadline: std.Io.Timeout, pid: std.posix.pid_t, timed_ou
     std.posix.kill(-pid, .KILL) catch {};
 }
 
+extern "c" fn waitid(idtype: c_uint, id: c_uint, infop: *anyopaque, options: c_int) c_int;
+
+/// Blocks until process `pid` has exited, without reaping it. Errors are
+/// ignored: `child.wait` follows and reports the real status.
+fn waitExitNoReap(pid: std.posix.pid_t) void {
+    const wexited = 4;
+    const wnowait: c_int = if (builtin.os.tag == .linux) 0x01000000 else 0x20;
+    var info: [128]u8 align(16) = undefined;
+    while (true) {
+        const rc = waitid(1, @intCast(pid), &info, wexited | wnowait);
+        if (rc == 0) return;
+        if (std.posix.errno(@as(isize, rc)) != .INTR) return;
+    }
+}
+
 /// Runs `argv` to completion and returns its exit status and output.
 /// The child gets no stdin and runs in its own process group (POSIX).
 /// If it does not finish within `timeout_ms` (reads and exit together), it is
@@ -85,13 +100,19 @@ pub fn runCapture(
     // The pipes are closed or full, but the child may still run. Bound the
     // wait with the same deadline: a watchdog kills the group when it expires.
     var timed_out = std.atomic.Value(bool).init(false);
-    var dog: ?std.Io.Future(std.Io.Cancelable!void) = null;
     if (comptime is_posix) {
-        if (!over_cap) dog = io.concurrent(watchdog, .{ io, deadline, child.id.?, &timed_out }) catch null;
+        if (!over_cap) {
+            // The watchdog may only kill while the child is unreaped. A zombie
+            // keeps its pid and group id reserved, so no other process can
+            // own them yet and a kill in this window is harmless. So: wait
+            // for exit without reaping (WNOWAIT), stop and join the
+            // watchdog, and only then reap with `child.wait`.
+            var dog = try io.concurrent(watchdog, .{ io, deadline, child.id.?, &timed_out });
+            waitExitNoReap(child.id.?);
+            dog.cancel(io) catch {};
+        }
     }
-    const waited = child.wait(io);
-    if (dog) |*d| d.cancel(io) catch {};
-    const term = try waited;
+    const term = try child.wait(io);
     if (timed_out.load(.acquire)) return error.Timeout;
 
     const out = try mr.toOwnedSlice(0);
@@ -213,4 +234,13 @@ test "Child: cat echoes a line" {
     c.inner.stdin = null;
     const term = try c.wait(io);
     try std.testing.expect(term.success());
+}
+
+test "runCapture: 300 bytes then exit 0 over cap 256 is cut and killed" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const r = try runCapture(a, std.testing.io, &.{ "/bin/sh", "-c", "head -c 300 /dev/zero | tr '\\0' x" }, null, 5000, 256);
+    defer a.free(r.stdout);
+    defer a.free(r.stderr);
+    try std.testing.expectEqual(@as(usize, 256), r.stdout.len);
 }
