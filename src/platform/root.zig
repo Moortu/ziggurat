@@ -8,6 +8,8 @@ pub const elf = @import("elf.zig");
 pub const loader = @import("loader.zig");
 pub const lock = @import("lock.zig");
 pub const generation_store = @import("generation_store.zig");
+pub const process = @import("process.zig");
+pub const zig_locator = @import("zig_locator.zig");
 pub const testing_support = @import("testing_support.zig");
 
 test {
@@ -16,6 +18,8 @@ test {
     std.testing.refAllDecls(loader);
     std.testing.refAllDecls(lock);
     std.testing.refAllDecls(generation_store);
+    std.testing.refAllDecls(process);
+    std.testing.refAllDecls(zig_locator);
 }
 
 test "pins" {
