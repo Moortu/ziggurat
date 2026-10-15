@@ -158,6 +158,38 @@ pub const Child = struct {
     pub fn wait(self: *Child, io: std.Io) !std.process.Child.Term {
         return self.inner.wait(io);
     }
+
+    /// Sends SIGKILL to the child's process group without reaping it, so its
+    /// pipes stay open until readers are done; `kill` or `wait` must follow.
+    /// POSIX only; elsewhere it does nothing.
+    pub fn signalKill(self: *Child) void {
+        killGroup(&self.inner);
+    }
+
+    /// Waits up to `timeout_ms` for the child to exit, without reaping it, so
+    /// `kill` or `wait` must follow. Returns true when the child exited by
+    /// itself. On timeout its group is killed and the wait goes on until the
+    /// child is gone, and the result is false. On Windows it returns false at
+    /// once (the caller then uses `kill`).
+    pub fn waitExit(self: *Child, io: std.Io, timeout_ms: u32) bool {
+        if (comptime !is_posix) return false;
+        const pid = self.inner.id orelse return true;
+        const deadline = (std.Io.Timeout{ .duration = .{
+            .raw = .fromMilliseconds(timeout_ms),
+            .clock = .awake,
+        } }).toDeadline(io);
+        var timed_out = std.atomic.Value(bool).init(false);
+        // Same order as in `runCapture`: the watchdog may only kill while the
+        // child is unreaped, so it is joined before anyone reaps.
+        var dog = io.concurrent(watchdog, .{ io, deadline, pid, &timed_out }) catch {
+            killGroup(&self.inner);
+            waitExitNoReap(pid);
+            return false;
+        };
+        waitExitNoReap(pid);
+        dog.cancel(io) catch {};
+        return !timed_out.load(.acquire);
+    }
 };
 
 test "runCapture: captures output and exit code" {
@@ -243,4 +275,26 @@ test "runCapture: 300 bytes then exit 0 over cap 256 is cut and killed" {
     defer a.free(r.stdout);
     defer a.free(r.stderr);
     try std.testing.expectEqual(@as(usize, 256), r.stdout.len);
+}
+
+test "Child.waitExit: a child that exits returns true" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var c = try Child.spawn(io, &.{ "/bin/sh", "-c", "exit 0" }, null);
+    defer c.deinit(io);
+    try std.testing.expect(c.waitExit(io, 5000));
+    const term = try c.wait(io);
+    try std.testing.expect(term.success());
+}
+
+test "Child.waitExit: a child that hangs is killed after the timeout" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    const start = std.Io.Clock.awake.now(io);
+    var c = try Child.spawn(io, &.{ "/bin/sh", "-c", "sleep 30" }, null);
+    defer c.deinit(io);
+    try std.testing.expect(!c.waitExit(io, 200));
+    const term = try c.wait(io);
+    try std.testing.expect(!term.success());
+    try std.testing.expect(start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 5000);
 }
