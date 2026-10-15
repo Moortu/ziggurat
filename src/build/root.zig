@@ -7,6 +7,8 @@ pub const rootgen = @import("rootgen.zig");
 pub const workspace = @import("workspace.zig");
 pub const compiler = @import("compiler.zig");
 pub const diagnostics = @import("diagnostics.zig");
+pub const backend = @import("backend.zig");
+pub const service = @import("service.zig");
 
 test {
     std.testing.refAllDecls(scan);
@@ -14,6 +16,8 @@ test {
     std.testing.refAllDecls(workspace);
     std.testing.refAllDecls(compiler);
     std.testing.refAllDecls(diagnostics);
+    std.testing.refAllDecls(backend);
+    std.testing.refAllDecls(service);
 }
 
 test "build module sees the platform module" {

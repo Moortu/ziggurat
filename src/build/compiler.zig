@@ -147,8 +147,13 @@ const State = struct {
     /// process and closes the pipes. Idempotent.
     fn release(st: *State) void {
         st.dead = true;
-        if (st.released) return;
-        st.released = true;
+        {
+            // Under the mutex, so `interrupt` never signals a reaped pid.
+            st.mutex.lockUncancelable(st.io);
+            defer st.mutex.unlock(st.io);
+            if (st.released) return;
+            st.released = true;
+        }
         // Kill first, without reaping: the pid stays reserved, so the kill
         // cannot hit another process, and the pipes stay open while the
         // readers finish.
@@ -297,6 +302,19 @@ pub const Session = struct {
         if (st.out_path) |p| a.free(p);
         a.destroy(st);
         self.* = undefined;
+    }
+
+    /// Kills the server's process group. Safe from any thread, also while
+    /// another thread is inside `update` (that update then ends with
+    /// `error.CompilerDied`); the session must not be freed meanwhile. Does
+    /// nothing once the session is released. POSIX only: on Windows it does
+    /// nothing and a running update ends only by itself or by its timeout.
+    pub fn interrupt(self: Session) void {
+        const st = self.st;
+        st.mutex.lockUncancelable(st.io);
+        defer st.mutex.unlock(st.io);
+        if (st.released) return;
+        st.child.signalKill();
     }
 
     /// False once the server died, timed out or was told to exit.
@@ -592,6 +610,27 @@ test "integration: non-incremental one-shot" {
     s.exit();
     try testing.expect(!s.alive());
     try std.Io.Dir.cwd().access(testing.io, r.output.?.bytes, .{});
+}
+
+test "interrupt from another thread ends a running update" {
+    if (is_windows) return error.SkipZigTest;
+    const argv = fakeArgv("cat >/dev/null");
+    var s = try Session.start(testing.allocator, testing.io, &argv, .fromTrusted("."));
+    defer s.deinit();
+    const Killer = struct {
+        fn run(sess: Session) void {
+            std.Io.sleep(testing.io, .fromMilliseconds(100), .awake) catch {};
+            sess.interrupt();
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Killer.run, .{s});
+    const t0 = std.Io.Clock.awake.now(testing.io);
+    try testing.expectError(error.CompilerDied, s.update(30_000));
+    t.join();
+    try testing.expect(t0.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() < 10_000);
+    try testing.expect(!s.alive());
+    // After release it is a no-op.
+    s.interrupt();
 }
 
 test "integration: compiler died" {

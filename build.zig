@@ -69,4 +69,19 @@ fn addTestSet(
             step.dependOn(&t.step);
         }
     }
+
+    // End-to-end tests (native only; all integration-gated, so `test-unit` skips them).
+    if (run) {
+        const e2e = b.createModule(.{
+            .root_source_file = b.path("test/e2e.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        e2e.addImport("build_options", options_mod);
+        e2e.addImport("ziggurat_platform", platform);
+        e2e.addImport("ziggurat_build", build_mod);
+        const t = b.addTest(.{ .root_module = e2e });
+        step.dependOn(&b.addRunArtifact(t).step);
+    }
 }
