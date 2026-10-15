@@ -587,3 +587,73 @@ test "integration: deinit while warming" {
     try testing.expectEqual(@as(u32, 1), counter.calls.load(.acquire));
     try expectThreadGone(counter.tid.load(.acquire));
 }
+
+fn incrementalLockPath(fx: *Fx) ![]const u8 {
+    const a = fx.arena();
+    const cache_root = try fx.paths().dir(.cache, a);
+    const id = fx.paths().projectId();
+    return std.fs.path.join(a, &.{ cache_root.bytes, "projects", &id, service.incremental_lock_name });
+}
+
+fn expectIncrementalLockFree(fx: *Fx) !void {
+    var l = try platform.lock.FileLock.acquire(io, .fromTrusted(try incrementalLockPath(fx)), .exclusive, 0);
+    l.release();
+}
+
+fn expectIncrementalLockBusy(fx: *Fx) !void {
+    try testing.expectError(error.Timeout, platform.lock.FileLock.acquire(io, .fromTrusted(try incrementalLockPath(fx)), .exclusive, 0));
+}
+
+test "integration: warm server restarts when the source root moves" {
+    try platform.testing_support.requireIntegration();
+    if (is_windows) return error.SkipZigTest;
+    // Root ignores file modes.
+    if (std.c.geteuid() == 0) return error.SkipZigTest;
+    var fx: Fx = undefined;
+    try fx.init("proj");
+    defer fx.deinit();
+    // The scripts sit in a sub folder that stays writable, so the test can edit them.
+    const rel = "game/s.zig";
+    try fx.write(rel, try scriptSource(fx.arena(), 1));
+    const proj_z = try fx.arena().dupeSentinel(u8, fx.project, 0);
+    defer _ = std.c.chmod(proj_z, 0o755);
+
+    var live = true;
+    const svc = try BuildService.init(testing.allocator, io, fx.config(build_options.zig_exe));
+    defer if (live) svc.deinit();
+    try expectOk(try build(svc, .open));
+    try svc.waitWarm(build_wait_ms);
+    try expectIncrementalLockBusy(&fx);
+
+    var value: i32 = 1;
+    for (0..4) |i| {
+        // Switch between read-only (mirror) and writable (project folder).
+        // A new script changes the generated root, so the read-only probe
+        // runs; the folder mode alone does not move the source root.
+        try testing.expectEqual(@as(c_int, 0), std.c.chmod(proj_z, if (i % 2 == 0) 0o555 else 0o755));
+        try fx.write(try std.fmt.allocPrint(fx.arena(), "game/extra{d}.zig", .{i}), "pub const extends = \"Node\";\n");
+        value += 1;
+        try fx.write(rel, try scriptSource(fx.arena(), value));
+        // The warm server compiles the old root: it is ended (not a death)
+        // and the save takes the full path.
+        const o1 = try build(svc, .save);
+        try expectOk(o1);
+        try testing.expectEqual(service.BuildPath.full, o1.path);
+        try testing.expectEqual(value, try callValue(o1));
+        // A new server warms for the new root, and the next saves use it.
+        try svc.waitWarm(build_wait_ms);
+        for (0..2) |_| {
+            value += 1;
+            try fx.write(rel, try scriptSource(fx.arena(), value));
+            const o2 = try build(svc, .save);
+            try expectOk(o2);
+            try testing.expectEqual(service.BuildPath.incremental, o2.path);
+            try testing.expectEqual(value, try callValue(o2));
+        }
+        try testing.expectEqual(@as(u32, 0), svc.stats().session_deaths);
+    }
+    try testing.expectEqual(@as(u32, 1 + 4 * 3), svc.stats().builds);
+    live = false;
+    svc.deinit();
+    try expectIncrementalLockFree(&fx);
+}

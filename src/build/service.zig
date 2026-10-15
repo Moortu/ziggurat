@@ -582,8 +582,11 @@ pub const BuildService = struct {
     /// Ends the incremental server (if any) and releases `incremental.lock`
     /// after it. `death` counts a session death (the second one disables
     /// incremental builds for good); otherwise the state goes back to `cold`.
+    /// The new state is published only after the server is reaped and the
+    /// lock released, so another editor that sees `cold` can take the lock.
     /// Called with `session_mu` held, or by the warm thread before the
-    /// server is ready.
+    /// server is ready. Until the state changes, `incrementalBuild` sees the
+    /// empty slot and takes the full path.
     fn dropWarm(self: *BuildService, death: bool) void {
         const io = self.io;
         var s: ?Session = null;
@@ -595,16 +598,18 @@ pub const BuildService = struct {
             l = self.warm_lock;
             self.warm_slot = null;
             self.warm_lock = null;
-            if (death) {
-                self.deaths += 1;
-                self.warm = if (self.deaths >= 2) .disabled else .cold;
-            } else if (self.warm != .disabled) {
-                self.warm = .cold;
-            }
-            self.cond.broadcast(io);
         }
         if (s) |*x| x.deinit();
         if (l) |*x| x.release();
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+        if (death) {
+            self.deaths += 1;
+            self.warm = if (self.deaths >= 2) .disabled else .cold;
+        } else if (self.warm != .disabled) {
+            self.warm = .cold;
+        }
+        self.cond.broadcast(io);
     }
 
     /// After a successful full build: starts warming when the policy has an
