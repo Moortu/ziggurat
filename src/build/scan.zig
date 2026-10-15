@@ -48,14 +48,19 @@ pub const Cache = struct {
     const Entry = struct {
         size: u64,
         mtime: i96,
+        /// Status-change time where the OS has one: it also changes when a
+        /// tool restores an old mtime, or a `chmod` makes the file unreadable.
+        ctime: i96,
         inode: std.Io.File.INode,
         script: bool,
         epoch: u32,
     };
 
-    /// A file modified less than this long before the scan is parsed again
-    /// on every scan: on file systems with coarse modification times, a
-    /// second edit within the same tick would otherwise go unseen.
+    /// A file modified less than this long before a scan is parsed but not
+    /// stored, so it is parsed again on every scan until it is older. On file
+    /// systems with coarse modification times, a second edit of the same size
+    /// within the same tick keeps the mtime; an entry stored inside this window
+    /// could then hide that edit for good ("racy git").
     pub const racy_ns: i96 = 2 * std.time.ns_per_s;
 
     pub fn init(gpa: std.mem.Allocator) Cache {
@@ -73,15 +78,23 @@ pub const Cache = struct {
         return self.map.count();
     }
 
-    fn lookup(self: *Cache, rel: []const u8, st: std.Io.File.Stat, now: i96) ?bool {
+    /// Entries are stored only outside the racy window (see `store`), so a
+    /// matching key is safe to trust.
+    fn lookup(self: *Cache, rel: []const u8, st: std.Io.File.Stat) ?bool {
         const e = self.map.getPtr(rel) orelse return null;
-        if (e.size != st.size or e.mtime != st.mtime.nanoseconds or e.inode != st.inode) return null;
-        if (now - st.mtime.nanoseconds < racy_ns) return null;
+        if (e.size != st.size or e.mtime != st.mtime.nanoseconds or
+            e.ctime != st.ctime.nanoseconds or e.inode != st.inode) return null;
         e.epoch = self.epoch;
         return e.script;
     }
 
-    fn store(self: *Cache, rel: []const u8, st: std.Io.File.Stat, script: bool) !void {
+    /// Stores the result for `rel` only when the file was last modified at
+    /// least `racy_ns` before this scan (`now`); otherwise drops any old entry.
+    fn store(self: *Cache, rel: []const u8, st: std.Io.File.Stat, script: bool, now: i96) !void {
+        if (now - st.mtime.nanoseconds < racy_ns) {
+            if (self.map.fetchRemove(rel)) |kv| self.gpa.free(kv.key);
+            return;
+        }
         const gop = try self.map.getOrPut(self.gpa, rel);
         if (!gop.found_existing) {
             gop.key_ptr.* = self.gpa.dupe(u8, rel) catch |err| {
@@ -92,6 +105,7 @@ pub const Cache = struct {
         gop.value_ptr.* = .{
             .size = st.size,
             .mtime = st.mtime.nanoseconds,
+            .ctime = st.ctime.nanoseconds,
             .inode = st.inode,
             .script = script,
             .epoch = self.epoch,
@@ -174,7 +188,7 @@ const Scanner = struct {
         if ((try self.seen.getOrPut(self.a, rel)).found_existing) return;
         // Without a usable stat the file is read and parsed, and not cached.
         const st: ?std.Io.File.Stat = if (self.cache != null) dir.statFile(self.io, name, .{}) catch null else null;
-        if (self.cache) |c| if (st) |x| if (c.lookup(rel, x, self.now)) |script| return self.classify(rel, script);
+        if (self.cache) |c| if (st) |x| if (c.lookup(rel, x)) |script| return self.classify(rel, script);
         const src = dir.readFileAllocOptions(self.io, name, self.a, .limited(max_file_bytes), .of(u8), 0) catch |err| {
             try self.problem(rel, "Could not read \"{s}\": {t}.", .{ rel, err });
             return;
@@ -183,7 +197,7 @@ const Scanner = struct {
         const script = try hasTopLevelExtends(self.a, src);
         // The stat was taken before the read: a write in between changes the
         // key, so the next scan reads the file again.
-        if (self.cache) |c| if (st) |x| try c.store(rel, x, script);
+        if (self.cache) |c| if (st) |x| try c.store(rel, x, script, self.now);
         try self.classify(rel, script);
     }
 
@@ -215,9 +229,9 @@ pub fn scan(
 
 /// Like `scan`, but with a `cache` it reads and parses only files that are
 /// new or changed since the last scan with the same cache (key: `rel`, size,
-/// modification time, inode), and files modified in the last
-/// `Cache.racy_ns`. The result is the same as `scan`'s. Entries for files
-/// that were not seen are removed.
+/// modification time, status-change time, inode), and files modified in the
+/// `Cache.racy_ns` before a scan (those are never stored). The result is
+/// the same as `scan`'s. Entries for files that were not seen are removed.
 pub fn scanCached(
     a: std.mem.Allocator,
     io: std.Io,
@@ -515,4 +529,34 @@ test "scan cache parses only changed files" {
     // Without a cache every file is parsed.
     const r6 = try scan(a, testing.io, project, default_script_dirs);
     try testing.expectEqual(@as(u32, 2), r6.parsed);
+}
+
+test "scan cache never trusts an entry stored inside the guard window" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Modified 1.5 s ago: inside the 2 s guard when the first scan reads it.
+    const now = std.Io.Clock.real.now(testing.io);
+    const mtime: std.Io.Timestamp = .{ .nanoseconds = now.nanoseconds - 1500 * std.time.ns_per_ms };
+    try put(tmp, "s.zig", "pub const extends = \"Node\";\n");
+    try tmp.dir.setTimestamps(testing.io, "s.zig", .{ .modify_timestamp = .{ .new = mtime } });
+    const project = try tmpProject(tmp, a);
+
+    var cache: Cache = .init(testing.allocator);
+    defer cache.deinit();
+    const r1 = try scanCached(a, testing.io, project, default_script_dirs, &cache);
+    try testing.expectEqual(@as(usize, 1), r1.scripts.len);
+    try testing.expectEqual(@as(usize, 0), cache.count());
+
+    // A same-size edit in the same mtime tick (the mtime is restored), then a
+    // scan after the guard has expired: the file must be parsed again.
+    try put(tmp, "s.zig", "pub const extendz = \"Node\";\n");
+    try tmp.dir.setTimestamps(testing.io, "s.zig", .{ .modify_timestamp = .{ .new = mtime } });
+    try testing.io.sleep(.fromMilliseconds(700), .awake);
+    const r2 = try scanCached(a, testing.io, project, default_script_dirs, &cache);
+    try testing.expectEqual(@as(u32, 1), r2.parsed);
+    try testing.expectEqual(@as(usize, 0), r2.scripts.len);
 }

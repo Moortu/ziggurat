@@ -27,7 +27,9 @@
 //! - When incremental builds are lost (the second death, or another editor
 //!   holds `incremental.lock`), the next full-path outcome without a message
 //!   of its own carries a one-time `message` that says why builds are slower.
-//!   Each reason is told at most once per service.
+//!   Each reason is told at most once per service. A build that fails with
+//!   an error (also OutOfMemory) reports that error and leaves the notice
+//!   pending.
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("ziggurat_platform");
@@ -439,10 +441,12 @@ pub const BuildService = struct {
         } else {
             o.path = .full;
             try self.fullBuild(arena, &ws, zig, o);
-            if (o.message == null) o.message = try self.takeNotice();
             if (o.ok) self.startWarm(&ws, zig);
         }
         try appendProblems(a, o, sc.problems);
+        // Last, after every step that can fail: a failed build reports its
+        // own error, and the notice stays pending for the next outcome.
+        if (o.path == .full and o.message == null) o.message = try self.takeNotice();
     }
 
     fn locateZig(self: *BuildService, o: *Outcome) !ZigInstall {
@@ -705,19 +709,26 @@ pub const BuildService = struct {
         self.notice = why;
     }
 
-    /// The pending one-time notice as an owned message, or null.
+    /// The pending one-time notice as an owned message, or null. The notice
+    /// is cleared only once the message exists, so an allocation failure
+    /// leaves it pending.
     fn takeNotice(self: *BuildService) !?[]const u8 {
         const why = blk: {
             self.mu.lockUncancelable(self.io);
             defer self.mu.unlock(self.io);
-            const w = self.notice orelse return null;
-            self.notice = null;
-            break :blk w;
+            break :blk self.notice orelse return null;
         };
-        return try std.fmt.allocPrint(self.a, "Fast rebuilds are off for this session: {s}. Builds still work but are slower.", .{switch (why) {
-            .server_died_twice => "the Zig compiler server stopped twice",
-            .lock_held => "another editor is using fast rebuilds for this project",
-        }});
+        const text = try self.a.dupe(u8, switch (why) {
+            .server_died_twice => "Fast rebuilds are off for this session: the Zig compiler server stopped twice. Builds still work but are slower.",
+            // Not for the session: warm-up is tried again after every
+            // successful full build, so fast rebuilds return when the other
+            // editor lets go.
+            .lock_held => "Fast rebuilds are paused: another editor is using them for this project. Builds still work but are slower.",
+        });
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        if (self.notice == why) self.notice = null;
+        return text;
     }
 
     fn warmState(self: *BuildService) WarmState {

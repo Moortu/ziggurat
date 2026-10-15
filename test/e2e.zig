@@ -658,7 +658,7 @@ test "integration: warm server restarts when the source root moves" {
     try expectIncrementalLockFree(&fx);
 }
 
-const lost_lock_message = "Fast rebuilds are off for this session: another editor is using fast rebuilds for this project. Builds still work but are slower.";
+const lost_lock_message = "Fast rebuilds are paused: another editor is using them for this project. Builds still work but are slower.";
 const lost_died_message = "Fast rebuilds are off for this session: the Zig compiler server stopped twice. Builds still work but are slower.";
 
 test "integration: lost fast path is reported once when another editor holds the server lock" {

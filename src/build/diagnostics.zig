@@ -51,7 +51,8 @@ const marker_open = "[ziggurat:";
 ///
 /// Source paths are mapped with `ws.mapPath`. An error whose source is outside
 /// the project (or that has no source) and whose message contains the SDK
-/// marker `[ziggurat:<rel>#<name>]` is mapped to `<rel>`, at the first
+/// marker `[ziggurat:<rel>#<name>]` (`<rel>` percent-encoded as the root
+/// contract in `rootgen.zig` says) is mapped to the decoded `<rel>`, at the first
 /// top-level line of `<source_root>/<rel>` that declares `<name>` (`<name>:`,
 /// `const <name>`, `fn <name>(`, each optionally after `pub `), or line 1.
 /// The marker is removed from every message that carries one.
@@ -78,7 +79,7 @@ pub fn decode(a: std.mem.Allocator, io: std.Io, bundle: ErrorBundle, ws: *const 
 fn decodeOne(a: std.mem.Allocator, io: std.Io, v: View, mi: u32, ws: *const Workspace) error{ MalformedBundle, OutOfMemory }!Diagnostic {
     const m = try v.message(mi);
     const raw = try v.string(m.msg);
-    const marker = findMarker(raw);
+    const marker = findMarker(raw, ws.os);
 
     var rel: ?[]const u8 = null;
     errdefer if (rel) |r| a.free(r);
@@ -95,8 +96,11 @@ fn decodeOne(a: std.mem.Allocator, io: std.Io, v: View, mi: u32, ws: *const Work
     }
     if (rel == null) {
         if (marker) |mk| {
-            rel = try a.dupe(u8, mk.rel);
-            line = markerLineInFile(a, io, ws.*, mk.rel, mk.name);
+            var buf: [max_marker_rel]u8 = undefined;
+            // `findMarker` already checked that the path decodes.
+            const plain = decodeMarkerRel(mk.rel, &buf).?;
+            rel = try a.dupe(u8, plain);
+            line = markerLineInFile(a, io, ws.*, plain, mk.name);
             column = 1;
         }
     }
@@ -126,13 +130,42 @@ const Marker = struct {
     /// Byte range of the whole `[ziggurat:...]` text in the message.
     start: usize,
     end: usize,
+    /// As written in the message (percent-encoded); see `decodeMarkerRel`.
     rel: []const u8,
     name: []const u8,
 };
 
-/// The first well-formed SDK marker in `msg`. A marker whose path could leave
-/// the project or whose name is not an identifier is ignored.
-fn findMarker(msg: []const u8) ?Marker {
+/// Longest decoded marker path.
+const max_marker_rel = 4096;
+
+/// Decodes the marker's percent-encoding into `buf`: `%25` is `%`, `%5D` is
+/// `]`, `%3A` is `:`, `%5C` is `\` (hex digits in either case). Any other
+/// `%` sequence, or a result longer than `buf`, gives null.
+fn decodeMarkerRel(enc: []const u8, buf: *[max_marker_rel]u8) ?[]const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < enc.len) : (n += 1) {
+        if (n == buf.len) return null;
+        if (enc[i] != '%') {
+            buf[n] = enc[i];
+            i += 1;
+            continue;
+        }
+        if (i + 3 > enc.len) return null;
+        const code = std.fmt.parseInt(u8, enc[i + 1 .. i + 3], 16) catch return null;
+        buf[n] = switch (code) {
+            '%', ']', ':', '\\' => code,
+            else => return null,
+        };
+        i += 3;
+    }
+    return buf[0..n];
+}
+
+/// The first well-formed SDK marker in `msg`. A marker whose path has a bad
+/// escape or could leave the project, or whose name is not an identifier, is
+/// ignored.
+fn findMarker(msg: []const u8, os: std.Target.Os.Tag) ?Marker {
     var from: usize = 0;
     while (std.mem.indexOfPos(u8, msg, from, marker_open)) |start| {
         from = start + 1;
@@ -142,15 +175,22 @@ fn findMarker(msg: []const u8) ?Marker {
         const hash = std.mem.lastIndexOfScalar(u8, body, '#') orelse continue;
         const rel = body[0..hash];
         const name = body[hash + 1 ..];
-        if (!validMarkerRel(rel) or !validIdentifier(name)) continue;
+        var buf: [max_marker_rel]u8 = undefined;
+        const plain = decodeMarkerRel(rel, &buf) orelse continue;
+        if (!validMarkerRel(plain, os) or !validIdentifier(name)) continue;
         return .{ .start = start, .end = close + 1, .rel = rel, .name = name };
     }
     return null;
 }
 
-fn validMarkerRel(rel: []const u8) bool {
+/// `rel` is the decoded path. `:` and `\\` are plain name bytes on POSIX; on
+/// Windows they could name a drive or a separator, so they are refused there.
+fn validMarkerRel(rel: []const u8, os: std.Target.Os.Tag) bool {
     if (rel.len == 0 or rel[0] == '/') return false;
-    for (rel) |c| if (c == '\\' or c == ':' or c == 0) return false;
+    for (rel) |c| {
+        if (c == 0) return false;
+        if (os == .windows and (c == '\\' or c == ':')) return false;
+    }
     var it = std.mem.splitScalar(u8, rel, '/');
     while (it.next()) |part| {
         if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
@@ -597,4 +637,34 @@ test "mutated bundles give MalformedBundle or a valid list" {
     }
     // Both outcomes must occur, or the mutations are not reaching the checks.
     try testing.expect(valid > 0 and malformed > 0);
+}
+
+test "sdk marker with a percent-encoded path" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "proj/[old]:x");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "proj/[old]:x/a%b.zig", .data = "const q = 1;\nspeed: u64 = 0,\n" });
+    const proj = try tmp.dir.realPathFileAlloc(testing.io, "proj", a);
+    const stub = try std.Io.Dir.cwd().realPathFileAlloc(testing.io, build_options.stub_sdk_path, a);
+    const ws = fakeWorkspace(proj, try std.fs.path.join(a, &.{ proj, "..", "build" }));
+    const eb = try buildBundle(a, &.{
+        .{ .msg = "bad field [ziggurat:[old%5d%3Ax/a%25b.zig#speed]", .src = .{ .path = stub, .line = 1, .column = 1 } },
+        // Bad escapes: no marker.
+        .{ .msg = "m1 [ziggurat:a%2.zig#speed]", .src = .{ .path = stub, .line = 1, .column = 1 } },
+        .{ .msg = "m2 [ziggurat:a%41.zig#speed]", .src = .{ .path = stub, .line = 1, .column = 1 } },
+        .{ .msg = "m3 [ziggurat:a%.zig#speed]", .src = .{ .path = stub, .line = 1, .column = 1 } },
+        // An encoded path that leaves the project is still refused.
+        .{ .msg = "m4 [ziggurat:a/../../x.zig#speed]", .src = .{ .path = stub, .line = 1, .column = 1 } },
+    });
+    const ds = try decode(a, testing.io, eb, &ws);
+    try testing.expectEqual(@as(usize, 5), ds.len);
+    try testing.expectEqualStrings("[old]:x/a%b.zig", ds[0].rel.?);
+    try testing.expectEqual(@as(u32, 2), ds[0].line);
+    try testing.expectEqualStrings("bad field", ds[0].message);
+    for (ds[1..]) |d| try testing.expect(d.rel == null);
+    try testing.expectEqualStrings("m1 [ziggurat:a%2.zig#speed]", ds[1].message);
 }

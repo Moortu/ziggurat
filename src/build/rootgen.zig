@@ -49,13 +49,15 @@
 //! The SDK marker (decoded in `diagnostics.zig`): a compile error raised in
 //! SDK code has its source location in the SDK, outside the project. To map
 //! it to a script, the SDK puts `[ziggurat:<rel>#<name>]` in the message,
-//! where `<rel>` is the `rel` argument of `describe` copied unchanged and
-//! `<name>` is the declaration the error is about (an identifier). The
-//! decoder removes the marker and reports the error at `<rel>`, on the first
-//! top-level line that declares `<name>` (line 1 when none does). The marker
-//! has no escaping: a `rel` that contains `]`, `:` or `\` cannot be carried, and
-//! such an error shows without a file. The SDK should then leave the marker
-//! out.
+//! where `<rel>` is the `rel` argument of `describe` (passed plain by the
+//! root) percent-encoded by the SDK: `%` as `%25`, `]` as `%5D`, `:` as `%3A`
+//! and `\` as `%5C`; every other byte is written as is. `<name>` is the
+//! declaration the error is about (an identifier). The decoder decodes
+//! `<rel>`, removes the marker and reports the error at `<rel>`, on the first
+//! top-level line that declares `<name>` (line 1 when none does). A marker
+//! with any other `%` sequence, or whose decoded path is absolute, has an
+//! empty, `.` or `..` part (or, on Windows, contains `:` or `\`), is not a
+//! marker: the error then shows without a file and keeps its text.
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("ziggurat_platform");
