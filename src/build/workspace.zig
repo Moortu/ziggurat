@@ -41,6 +41,9 @@ pub const Workspace = struct {
     /// Where the generated root and the scripts are read from: the project folder,
     /// or `<cache_dir>/mirror` when `mirrored`.
     source_root: OsPath,
+    /// Realpath of `source_root` when it differs (a symlinked project folder);
+    /// the compiler may report paths in either form.
+    source_real: ?OsPath = null,
     mirrored: bool,
     os: std.Target.Os.Tag,
     /// Borrowed from the caller of `prepare`; it must outlive the workspace.
@@ -52,6 +55,7 @@ pub const Workspace = struct {
         a.free(self.cache_dir.bytes);
         a.free(self.build_dir.bytes);
         a.free(self.source_root.bytes);
+        if (self.source_real) |r| a.free(r.bytes);
         self.* = undefined;
     }
 
@@ -104,20 +108,28 @@ pub const Workspace = struct {
     /// into a project-relative path with `/` separators. `error.OutsideProject`
     /// for anything not below `source_root` (the SDK, std, the root itself).
     pub fn mapPath(self: Workspace, a: std.mem.Allocator, reported: []const u8) ![]const u8 {
+        if (try self.mapUnder(a, self.source_root.bytes, reported)) |r| return r;
+        if (self.source_real) |real| {
+            if (try self.mapUnder(a, real.bytes, reported)) |r| return r;
+        }
+        return error.OutsideProject;
+    }
+
+    fn mapUnder(self: Workspace, a: std.mem.Allocator, root: []const u8, reported: []const u8) !?[]const u8 {
         var root_parts: std.ArrayList([]const u8) = .empty;
         defer root_parts.deinit(a);
-        try normalize(a, self.os, &root_parts, self.source_root.bytes);
+        try normalize(a, self.os, &root_parts, root);
 
         var parts: std.ArrayList([]const u8) = .empty;
         defer parts.deinit(a);
         if (!isAbsoluteFor(self.os, reported)) try normalize(a, self.os, &parts, self.build_dir.bytes);
         try normalize(a, self.os, &parts, reported);
 
-        if (parts.items.len <= root_parts.items.len) return error.OutsideProject;
+        if (parts.items.len <= root_parts.items.len) return null;
         for (root_parts.items, parts.items[0..root_parts.items.len]) |r, p| {
-            if (!partEql(self.os, r, p)) return error.OutsideProject;
+            if (!partEql(self.os, r, p)) return null;
         }
-        return std.mem.join(a, "/", parts.items[root_parts.items.len..]);
+        return try std.mem.join(a, "/", parts.items[root_parts.items.len..]);
     }
 };
 
@@ -176,8 +188,8 @@ fn writeIfChanged(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, sub: []cons
     }
     const tmp = try std.fmt.allocPrint(a, "{s}.tmp", .{sub});
     defer a.free(tmp);
-    try dir.writeFile(io, .{ .sub_path = tmp, .data = data });
     errdefer dir.deleteFile(io, tmp) catch {};
+    try dir.writeFile(io, .{ .sub_path = tmp, .data = data });
     try dir.rename(tmp, dir, sub, io);
     return true;
 }
@@ -234,10 +246,18 @@ pub fn prepare(
         .{ .bytes = try a.dupe(u8, ps.roots.project.bytes) };
     errdefer a.free(source_root.bytes);
     if (mirrored) try syncMirror(a, io, ps.roots.project, source_root, scan, root_text);
+    const source_real: ?OsPath = blk: {
+        const real = cwd.realPathFileAlloc(io, source_root.bytes, a) catch break :blk null;
+        defer a.free(real);
+        if (std.mem.eql(u8, real, source_root.bytes)) break :blk null;
+        break :blk .{ .bytes = try a.dupe(u8, real) };
+    };
+    errdefer if (source_real) |r| a.free(r.bytes);
     return .{
         .cache_dir = cache_dir,
         .build_dir = build_dir,
         .source_root = source_root,
+        .source_real = source_real,
         .mirrored = mirrored,
         .os = os,
         .sdk = sdk,
@@ -249,6 +269,9 @@ pub fn prepare(
 /// only files whose bytes differ.
 fn syncMirror(a: std.mem.Allocator, io: std.Io, project: OsPath, mirror: OsPath, scan: ScanResult, root_text: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
+    for ([_][]const scan_mod.Script{ scan.scripts, scan.helper_paths }) |list| {
+        for (list) |sc| try checkRel(sc.rel);
+    }
     try cwd.createDirPath(io, mirror.bytes);
     var mdir = try cwd.openDir(io, mirror.bytes, .{ .iterate = true });
     defer mdir.close(io);
@@ -304,6 +327,13 @@ fn syncMirror(a: std.mem.Allocator, io: std.Io, project: OsPath, mirror: OsPath,
         error.DirNotEmpty, error.FileNotFound => {},
         else => return err,
     };
+}
+
+/// A scanned path must stay inside the project and the mirror.
+fn checkRel(rel: []const u8) !void {
+    if (rel.len == 0 or rel[0] == '/' or rel[0] == '\\' or (builtin.os.tag == .windows and std.mem.indexOfScalar(u8, rel, ':') != null)) return error.InvalidPath;
+    var it = std.mem.tokenizeAny(u8, rel, "/\\");
+    while (it.next()) |part| if (std.mem.eql(u8, part, "..")) return error.InvalidPath;
 }
 
 fn deeperFirst(_: void, x: []const u8, y: []const u8) bool {
@@ -547,4 +577,69 @@ test "mapPath outside" {
     const ok = try ws.mapPath(a, "/proj/./a/../b/c.zig");
     defer a.free(ok);
     try testing.expectEqualStrings("b/c.zig", ok);
+}
+
+test "mapPath through a symlinked project" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fx = try Fixture.init(arena);
+    defer fx.tmp.cleanup();
+    try fx.put("a/x.zig", "pub const extends = \"Node\";\n");
+    try fx.tmp.dir.symLink(testing.io, "proj", "link", .{ .is_directory = true });
+    const link_real_parent = try fx.tmp.dir.realPathFileAlloc(testing.io, ".", arena);
+    const link_path = try std.fs.path.join(arena, &.{ link_real_parent, "link" });
+    const ps = PathService.init(.{ .project = .fromTrusted(link_path) }, fx.ps.env);
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(testing.allocator);
+    var ws = try prepare(testing.allocator, testing.io, ps, try fx.scan(arena), &.{}, .{}, &msg);
+    defer ws.deinit(testing.allocator);
+    try testing.expect(ws.source_real != null);
+    const m1 = try ws.mapPath(testing.allocator, try std.fs.path.join(arena, &.{ link_path, "a", "x.zig" }));
+    defer testing.allocator.free(m1);
+    try testing.expectEqualStrings("a/x.zig", m1);
+    const m2 = try ws.mapPath(testing.allocator, try std.fs.path.join(arena, &.{ fx.project.bytes, "a", "x.zig" }));
+    defer testing.allocator.free(m2);
+    try testing.expectEqualStrings("a/x.zig", m2);
+}
+
+test "mirror rejects paths that leave the project" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fx = try Fixture.init(arena);
+    defer fx.tmp.cleanup();
+    const mirror: OsPath = .fromTrusted(try std.fs.path.join(arena, &.{ fx.cache_base, "m" }));
+    for ([_][]const u8{ "../evil.zig", "a/../../evil.zig", "/etc/evil.zig" }) |bad| {
+        var scripts = [_]scan_mod.Script{.{ .rel = bad }};
+        const sc: ScanResult = .{ .scripts = &scripts, .helpers = 0, .helper_paths = &.{}, .problems = &.{} };
+        try testing.expectError(error.InvalidPath, syncMirror(testing.allocator, testing.io, fx.project, mirror, sc, "x"));
+    }
+    var helpers = [_]scan_mod.Script{.{ .rel = "../h.zig" }};
+    const sc2: ScanResult = .{ .scripts = &.{}, .helpers = 1, .helper_paths = &helpers, .problems = &.{} };
+    try testing.expectError(error.InvalidPath, syncMirror(testing.allocator, testing.io, fx.project, mirror, sc2, "x"));
+    // Nothing was created, in or beside the mirror.
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, mirror.bytes, .{}));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, try std.fs.path.join(arena, &.{ fx.cache_base, "evil.zig" }), .{}));
+}
+
+test "failed prepare releases the lock" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fx = try Fixture.init(arena);
+    defer fx.tmp.cleanup();
+    // A project folder that does not exist: prepare fails after taking the lock.
+    const missing = try std.fs.path.join(arena, &.{ fx.cache_base, "no_such_project" });
+    const ps = PathService.init(.{ .project = .fromTrusted(missing) }, fx.ps.env);
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(testing.allocator);
+    try testing.expectError(error.FileNotFound, prepare(testing.allocator, testing.io, ps, .{ .scripts = &.{}, .helpers = 0, .helper_paths = &.{}, .problems = &.{} }, &.{}, .{}, &msg));
+
+    const cache_root = try ps.dir(.cache, arena);
+    const id = ps.projectId();
+    const lock_path = try std.fs.path.join(arena, &.{ cache_root.bytes, "projects", &id, "build.lock" });
+    var l = try FileLock.acquire(testing.io, .fromTrusted(lock_path), .exclusive, 50);
+    l.release();
 }
