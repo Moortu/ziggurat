@@ -3,6 +3,8 @@
 #
 # Syntax is Forgejo Actions (Codeberg). `runs-on: docker` selects a generic
 # Docker runner; Codeberg also offers `codeberg-tiny`. We use `docker`.
+# Check at the first push that a runner with the label `docker` exists;
+# hosted runners may only advertise `codeberg-*` labels.
 name: ci
 
 on:
@@ -43,15 +45,41 @@ jobs:
             echo "minisign verification of $file failed" >&2
             exit 1
           }
-          mkdir -p "$HOME/zig"
-          tar -xJf "$file" -C "$HOME/zig" --strip-components=1
-          echo "$HOME/zig" >> "$GITHUB_PATH"
+          # Outside root's home, so the non-root test user can run it.
+          if [ "$(id -u)" -eq 0 ]; then zig_dir=/opt/zig; else zig_dir="$HOME/zig"; fi
+          mkdir -p "$zig_dir"
+          tar -xJf "$file" -C "$zig_dir" --strip-components=1
+          echo "$zig_dir" >> "$GITHUB_PATH"
 
       - name: Show Zig version
         run: zig version
 
+      - name: Check formatting
+        run: zig fmt --check src test build.zig
+
+      # Container jobs usually run as root, and the read-only project tests
+      # skip as root (root ignores file modes). Run the tests as a normal user
+      # so they run.
+      - name: Create a non-root test user
+        run: |
+          set -eu
+          if [ "$(id -u)" -eq 0 ]; then
+            if command -v useradd >/dev/null 2>&1; then
+              useradd -m ziguser
+            else
+              adduser -D ziguser
+            fi
+            chown -R ziguser "$PWD"
+          fi
+
       - name: Test
-        run: zig build test
+        run: |
+          set -eu
+          if [ "$(id -u)" -eq 0 ]; then
+            su -s /bin/sh ziguser -c "cd '$PWD' && PATH='$PATH' zig build test --summary all"
+          else
+            zig build test --summary all
+          fi
 
       - name: Cross-compile check
         run: zig build cross
