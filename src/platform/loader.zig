@@ -12,6 +12,6 @@ pub const lookup = impl.lookup;
 pub const close = impl.close;
 
 test {
-    _ = @import("loader_posix.zig");
+    if (builtin.os.tag != .windows) _ = @import("loader_posix.zig");
     _ = @import("loader_windows.zig");
 }

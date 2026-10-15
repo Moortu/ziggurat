@@ -12,11 +12,7 @@ pub const Library = struct {
     handle: *anyopaque,
 };
 
-fn setDiag(diag: *[256]u8, comptime fmt: []const u8, args: anytype) void {
-    @memset(diag, 0);
-    var w: std.Io.Writer = .fixed(diag[0..255]);
-    w.print(fmt, args) catch {};
-}
+const setDiag = elf.setDiag;
 
 /// Opens the shared library at `p` with `RTLD_NOW | RTLD_LOCAL`. On ELF targets
 /// the file is first checked with `elf.checkComplete`, so a truncated or
@@ -38,7 +34,7 @@ pub fn open(a: std.mem.Allocator, io: std.Io, p: path.OsPath, diag: *[256]u8) Lo
     if (@hasField(std.c.RTLD, "LOCAL")) flags.LOCAL = true;
     const handle = std.c.dlopen(z.ptr, flags) orelse {
         const msg: []const u8 = if (std.c.dlerror()) |m| std.mem.span(m) else "no dlerror message";
-        setDiag(diag, "Cannot load {s}: {s}", .{ p.bytes, msg });
+        setDiag(diag, "{s} (while loading {s})", .{ msg, p.bytes });
         return error.LoadFailed;
     };
     return .{ .handle = handle };

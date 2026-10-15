@@ -34,7 +34,7 @@ const Ehdr = struct {
 };
 
 /// Writes one sentence into `diag`, NUL-terminated, cut to fit if too long.
-fn setDiag(diag: *[256]u8, comptime fmt: []const u8, args: anytype) void {
+pub fn setDiag(diag: *[256]u8, comptime fmt: []const u8, args: anytype) void {
     @memset(diag, 0);
     var w: std.Io.Writer = .fixed(diag[0..255]);
     w.print(fmt, args) catch {};
@@ -64,8 +64,13 @@ fn readAt(io: std.Io, file: File, buf: []u8, off: u64) IoError!bool {
 pub fn checkComplete(io: std.Io, file: File, diag: *[256]u8) (ElfError || IoError)!void {
     const size = try file.length(io);
     var raw: [ehdr_size]u8 = undefined;
-    const ident_ok = try readAt(io, file, &raw, 0);
-    if (!ident_ok or !std.mem.eql(u8, raw[0..4], "\x7fELF") or raw[4] != 2 or raw[5] != 1) {
+    const n = try file.readPositionalAll(io, &raw, 0);
+    const magic_ok = n >= 4 and std.mem.eql(u8, raw[0..4], "\x7fELF");
+    if (magic_ok and n < ehdr_size) {
+        setDiag(diag, "The ELF header is cut short: the file has {d} bytes, the header needs {d}.", .{ size, ehdr_size });
+        return error.Truncated;
+    }
+    if (!magic_ok or raw[4] != 2 or raw[5] != 1) {
         setDiag(diag, "The file is not a 64-bit little-endian ELF file ({d} bytes).", .{size});
         return error.NotElf64;
     }
@@ -204,8 +209,9 @@ test "elf not elf" {
     const zeros = std.mem.zeroes([64]u8);
     try std.testing.expectError(error.NotElf64, checkBytes(&zeros, &diag));
     try std.testing.expect(diagText(&diag).len > 0);
-    // A file shorter than a header is not an ELF file either.
-    try std.testing.expectError(error.NotElf64, checkBytes("\x7fELF", &diag));
+    // Under 4 bytes there is no magic; with the magic but no full header the file is cut short.
+    try std.testing.expectError(error.NotElf64, checkBytes("\x7fEL", &diag));
+    try std.testing.expectError(error.Truncated, checkBytes("\x7fELF", &diag));
 }
 
 test "elf bad shoff" {
