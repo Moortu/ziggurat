@@ -15,6 +15,15 @@
 //!   of the service's life.
 //! - A requested build holds `build.lock` from `Workspace.prepare` until it
 //!   has staged its output, never for the life of the service.
+//! - An incremental server holds `<cache dir>/incremental.lock` (exclusive)
+//!   for its whole life: two servers on one cache rewrite the same output
+//!   file and crash each other. When another editor holds it, this service
+//!   stays on the full path (not a death) and tries again after its next
+//!   successful full build.
+//! - When a build's compiler command line (for example the source root, which
+//!   moves into the mirror when the project becomes read-only) differs from
+//!   the warm server's, the server is ended (not a death) and warming starts
+//!   again after the full build.
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("ziggurat_platform");
@@ -32,6 +41,7 @@ pub const Generation = platform.generation_store.Generation;
 pub const Diagnostic = diagnostics.Diagnostic;
 pub const BuildMode = workspace.BuildMode;
 const Session = compiler.Session;
+const FileLock = platform.lock.FileLock;
 
 pub const Trigger = enum { open, save, play, manual, watcher };
 
@@ -81,9 +91,14 @@ pub const Stats = struct {
 /// File stem of the staged library (`--name zmod` in `Workspace.argv`).
 pub const lib_stem = "zmod";
 
-/// Threads of any `BuildService` that are running now. `deinit` joins all of
-/// them, so this is 0 once every service is gone (tests check it).
-pub var live_threads: std.atomic.Value(u32) = .init(0);
+/// Threads of any `BuildService` that are running now.
+var live_threads: std.atomic.Value(u32) = .init(0);
+
+/// Number of service threads running in this process. `deinit` joins all
+/// of a service's threads, so this is 0 once every service is gone.
+pub fn liveThreads() u32 {
+    return live_threads.load(.acquire);
+}
 
 /// Everything is borrowed: the slices and paths must outlive the service.
 pub const Config = struct {
@@ -101,7 +116,11 @@ pub const Config = struct {
     /// Longest single compiler update before the compiler is killed.
     update_timeout_ms: u32 = 600000,
     /// Called on the build thread after each build (not for a build cut short
-    /// by `deinit`). The pointer is valid only during the call.
+    /// by `deinit`). The pointer is valid only during the call; copy what must
+    /// live longer. During the call the build still counts as running, so:
+    /// `last()` still returns the previous outcome, `waitIdle` returns
+    /// `error.CalledFromCallback`, and calling `deinit` is illegal (a debug
+    /// assertion catches it). `request` is fine.
     on_outcome: ?*const fn (ctx: ?*anyopaque, o: *const Outcome) void = null,
     on_outcome_ctx: ?*anyopaque = null,
 };
@@ -120,14 +139,16 @@ const Timer = struct {
     }
 };
 
-/// What the warm thread needs; owned by the thread.
+/// What the warm thread needs. `argv` is borrowed from
+/// `BuildService.warm_argv`; the paths are owned by the thread.
 const WarmJob = struct {
     argv: []const []const u8,
     cwd: OsPath,
+    lock_path: OsPath,
 
     fn deinit(job: WarmJob, a: std.mem.Allocator) void {
-        workspace.Workspace.freeArgv(a, job.argv);
         a.free(job.cwd.bytes);
+        a.free(job.lock_path.bytes);
     }
 };
 
@@ -158,14 +179,21 @@ pub const BuildService = struct {
     /// The incremental server, from the start of warm-up until it dies or
     /// the service ends.
     warm_slot: ?Session = null,
+    /// `incremental.lock`, held exactly while `warm_slot` is set.
+    warm_lock: ?FileLock = null,
 
     /// Held while a thread uses the incremental server, so the warm and the
     /// build thread never use it at once. Lock order: `session_mu`, then `mu`.
     session_mu: std.Io.Mutex = .init,
 
     build_thread: ?std.Thread = null,
+    /// Id of the build thread, set when it starts (0 before).
+    build_tid: std.atomic.Value(std.Thread.Id) = .init(0),
     /// Spawned by the build thread only; joined by it or by `deinit`.
     warm_thread: ?std.Thread = null,
+    /// Command line of the newest warm server. Written by the build thread
+    /// only, after joining the previous warm thread; freed by `deinit`.
+    warm_argv: ?[]const []const u8 = null,
 
     /// Starts the build thread. `a` must be thread-safe. Nothing is built
     /// until the first `request`.
@@ -191,8 +219,11 @@ pub const BuildService = struct {
         self.cond.broadcast(self.io);
     }
 
-    /// Waits until no build runs and none is pending. Warm-up is not waited for.
+    /// Waits until no build runs and none is pending. Warm-up is not waited
+    /// for. From inside `on_outcome` it returns `error.CalledFromCallback`
+    /// (the build that called it cannot end while it waits).
     pub fn waitIdle(self: *BuildService, timeout_ms: u32) !void {
+        if (self.onBuildThread()) return error.CalledFromCallback;
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         const timer = Timer.start(self.io);
@@ -222,12 +253,27 @@ pub const BuildService = struct {
         };
     }
 
-    /// A copy of the latest outcome. Its slices stay valid until the next
-    /// outcome is published or `deinit`; copy what must live longer.
+    fn onBuildThread(self: *BuildService) bool {
+        return std.Thread.getCurrentId() == self.build_tid.load(.acquire);
+    }
+
+    /// A shallow copy of the latest outcome. Its slices are freed when the
+    /// next outcome is published, so use it only from the thread that owns
+    /// the service and only between builds (after `waitIdle`, with no request
+    /// in flight). Other threads use `lastCopy`.
     pub fn last(self: *BuildService) ?Outcome {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         return self.last_outcome;
+    }
+
+    /// A deep copy of the latest outcome, made under the lock, so it is safe
+    /// from any thread at any time. Free it with `freeOutcome(a, o)`.
+    pub fn lastCopy(self: *BuildService, a: std.mem.Allocator) !?Outcome {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        const o = self.last_outcome orelse return null;
+        return try cloneOutcome(a, o);
     }
 
     pub fn stats(self: *BuildService) Stats {
@@ -245,7 +291,9 @@ pub const BuildService = struct {
     /// Stops both threads (a running compiler is killed, a build waiting for
     /// `build.lock` gives up within about 250 ms), joins them and frees
     /// everything. After it returns no thread of the service remains.
+    /// Illegal from inside `on_outcome` (a debug assertion catches it).
     pub fn deinit(self: *BuildService) void {
+        std.debug.assert(!self.onBuildThread());
         const io = self.io;
         {
             self.mu.lockUncancelable(io);
@@ -258,6 +306,8 @@ pub const BuildService = struct {
         if (self.build_thread) |t| t.join();
         if (self.warm_thread) |t| t.join();
         if (self.warm_slot) |*s| s.deinit();
+        if (self.warm_lock) |*l| l.release();
+        if (self.warm_argv) |v| workspace.Workspace.freeArgv(self.a, v);
         if (self.full_slot) |*s| s.deinit();
         if (self.zig) |z| z.deinit(self.a);
         if (self.last_outcome) |o| freeOutcome(self.a, o);
@@ -268,6 +318,7 @@ pub const BuildService = struct {
 
     fn buildMain(self: *BuildService) void {
         defer _ = live_threads.fetchSub(1, .release);
+        self.build_tid.store(std.Thread.getCurrentId(), .release);
         const io = self.io;
         while (true) {
             const t: Trigger = blk: {
@@ -344,7 +395,7 @@ pub const BuildService = struct {
         var ws = try self.prepareWorkspace(sc, o);
         defer ws.deinit(a);
 
-        if (try self.incrementalBuild(&ws, o)) {
+        if (try self.incrementalBuild(arena, &ws, zig, o)) {
             // TODO(Stage 2 and Stage 4): after an incremental update, compare each
             // script's layout hash in the output's tables with the sources (spec section 5).
         } else {
@@ -458,13 +509,20 @@ pub const BuildService = struct {
 
     /// Serves the request with the warm incremental server. False when there
     /// is none or it died (the caller then takes the full path).
-    fn incrementalBuild(self: *BuildService, ws: *const workspace.Workspace, o: *Outcome) !bool {
+    fn incrementalBuild(self: *BuildService, arena: std.mem.Allocator, ws: *const workspace.Workspace, zig: ZigInstall, o: *Outcome) !bool {
         const io = self.io;
         // Check before taking `session_mu`: the warm thread holds it for the
         // whole warm-up update, and a request must not wait for that.
         if (self.warmState() != .ready) return false;
         self.session_mu.lockUncancelable(io);
         defer self.session_mu.unlock(io);
+        // The server compiles what its command line named at warm-up time.
+        const mode = backend.policy(self.cfg.target, .warm, self.cfg.policy_override);
+        const now_argv = try ws.argv(arena, zig, mode);
+        if (self.warm_argv == null or !argvEql(self.warm_argv.?, now_argv)) {
+            self.dropWarm(false);
+            return false;
+        }
         const s0: Session = blk: {
             self.mu.lockUncancelable(io);
             defer self.mu.unlock(io);
@@ -478,7 +536,7 @@ pub const BuildService = struct {
         self.endUpdate();
         res catch |err| switch (err) {
             error.Timeout, error.CompilerDied => {
-                self.sessionDied();
+                self.dropWarm(true);
                 return false;
             },
             else => return err,
@@ -521,23 +579,32 @@ pub const BuildService = struct {
         return std.fmt.allocPrint(self.a, "The Zig compiler {s} stopped during the build; its last output was: {s}", .{ zig, tail });
     }
 
-    /// Called with `session_mu` held after the incremental server died.
-    fn sessionDied(self: *BuildService) void {
+    /// Ends the incremental server (if any) and releases `incremental.lock`
+    /// after it. `death` counts a session death (the second one disables
+    /// incremental builds for good); otherwise the state goes back to `cold`.
+    /// Called with `session_mu` held, or by the warm thread before the
+    /// server is ready.
+    fn dropWarm(self: *BuildService, death: bool) void {
         const io = self.io;
-        const dead: ?Session = blk: {
+        var s: ?Session = null;
+        var l: ?FileLock = null;
+        {
             self.mu.lockUncancelable(io);
             defer self.mu.unlock(io);
-            const s = self.warm_slot;
+            s = self.warm_slot;
+            l = self.warm_lock;
             self.warm_slot = null;
-            self.deaths += 1;
-            self.warm = if (self.deaths >= 2) .disabled else .cold;
+            self.warm_lock = null;
+            if (death) {
+                self.deaths += 1;
+                self.warm = if (self.deaths >= 2) .disabled else .cold;
+            } else if (self.warm != .disabled) {
+                self.warm = .cold;
+            }
             self.cond.broadcast(io);
-            break :blk s;
-        };
-        if (dead) |s0| {
-            var s = s0;
-            s.deinit();
         }
+        if (s) |*x| x.deinit();
+        if (l) |*x| x.release();
     }
 
     /// After a successful full build: starts warming when the policy has an
@@ -561,6 +628,9 @@ pub const BuildService = struct {
             t.join();
             self.warm_thread = null;
         }
+        // No thread reads `warm_argv` now.
+        if (self.warm_argv) |v| workspace.Workspace.freeArgv(self.a, v);
+        self.warm_argv = null;
         self.warm_thread = self.spawnWarm(ws, zig, mode) catch {
             self.setWarm(.cold);
             return;
@@ -570,10 +640,12 @@ pub const BuildService = struct {
     fn spawnWarm(self: *BuildService, ws: *const workspace.Workspace, zig: ZigInstall, mode: BuildMode) !std.Thread {
         const a = self.a;
         const argv = try ws.argv(a, zig, mode);
-        errdefer workspace.Workspace.freeArgv(a, argv);
+        self.warm_argv = argv;
         const cwd: OsPath = .{ .bytes = try a.dupe(u8, ws.build_dir.bytes) };
         errdefer a.free(cwd.bytes);
-        return spawn(warmMain, .{ self, WarmJob{ .argv = argv, .cwd = cwd } });
+        const lock_path = try platform.path.joinFor(ws.os, a, ws.cache_dir, &.{incremental_lock_name});
+        errdefer a.free(lock_path.bytes);
+        return spawn(warmMain, .{ self, WarmJob{ .argv = argv, .cwd = cwd, .lock_path = lock_path } });
     }
 
     fn warmState(self: *BuildService) WarmState {
@@ -595,21 +667,29 @@ pub const BuildService = struct {
         defer _ = live_threads.fetchSub(1, .release);
         defer job.deinit(self.a);
         const io = self.io;
-        var s = Session.start(self.a, io, job.argv, job.cwd) catch {
-            self.session_mu.lockUncancelable(io);
-            defer self.session_mu.unlock(io);
-            self.sessionDied();
+        // Never waited for: when another editor's server owns this cache,
+        // stay on the full path (not a death).
+        var lock = FileLock.acquire(io, job.lock_path, .exclusive, 0) catch {
+            self.setWarm(.cold);
             return;
         };
-        if (!self.register(&self.warm_slot, s)) {
+        var s = Session.start(self.a, io, job.argv, job.cwd) catch {
+            lock.release();
+            self.session_mu.lockUncancelable(io);
+            defer self.session_mu.unlock(io);
+            self.dropWarm(true);
+            return;
+        };
+        if (!self.registerWarm(s, lock)) {
             s.deinit();
+            lock.release();
             self.setWarm(.cold);
             return;
         }
         self.session_mu.lockUncancelable(io);
         defer self.session_mu.unlock(io);
         var r = s.update(self.cfg.update_timeout_ms) catch {
-            self.sessionDied();
+            self.dropWarm(true);
             return;
         };
         const clean = r.bundle.errorMessageCount() == 0;
@@ -620,9 +700,17 @@ pub const BuildService = struct {
         }
         // The sources have errors right now: drop this server without counting
         // a death; the next successful full build warms a new one.
-        self.unregister(&self.warm_slot);
-        s.deinit();
-        self.setWarm(.cold);
+        self.dropWarm(false);
+    }
+
+    /// Puts the warm server and its lock in place unless the service is stopping.
+    fn registerWarm(self: *BuildService, s: Session, lock: FileLock) bool {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        if (self.stopping) return false;
+        self.warm_slot = s;
+        self.warm_lock = lock;
+        return true;
     }
 };
 
@@ -632,10 +720,67 @@ fn spawn(comptime f: anytype, args: anytype) !std.Thread {
     return std.Thread.spawn(.{}, f, args);
 }
 
-fn freeOutcome(a: std.mem.Allocator, o: Outcome) void {
+/// Name of the lock file an incremental server holds in the cache folder.
+pub const incremental_lock_name = "incremental.lock";
+
+fn argvEql(x: []const []const u8, y: []const []const u8) bool {
+    if (x.len != y.len) return false;
+    for (x, y) |p, q| if (!std.mem.eql(u8, p, q)) return false;
+    return true;
+}
+
+/// Frees an outcome from `BuildService.lastCopy` (with the same allocator).
+pub fn freeOutcome(a: std.mem.Allocator, o: Outcome) void {
     if (o.generation) |g| g.deinit(a);
     diagnostics.free(a, o.diagnostics);
     if (o.message) |m| a.free(m);
+}
+
+fn freeDiag(a: std.mem.Allocator, d: Diagnostic) void {
+    if (d.rel) |r| a.free(r);
+    a.free(d.message);
+    for (d.notes) |n| a.free(n);
+    a.free(d.notes);
+}
+
+fn cloneDiag(a: std.mem.Allocator, d: Diagnostic) !Diagnostic {
+    const rel: ?[]const u8 = if (d.rel) |r| try a.dupe(u8, r) else null;
+    errdefer if (rel) |r| a.free(r);
+    const message = try a.dupe(u8, d.message);
+    errdefer a.free(message);
+    const notes = try a.alloc([]const u8, d.notes.len);
+    var n: usize = 0;
+    errdefer {
+        for (notes[0..n]) |x| a.free(x);
+        a.free(notes);
+    }
+    while (n < d.notes.len) : (n += 1) notes[n] = try a.dupe(u8, d.notes[n]);
+    return .{ .rel = rel, .line = d.line, .column = d.column, .message = message, .notes = notes };
+}
+
+/// A deep copy of `o`, allocated from `a`; free it with `freeOutcome`.
+fn cloneOutcome(a: std.mem.Allocator, o: Outcome) !Outcome {
+    var c = o;
+    c.generation = null;
+    c.diagnostics = &.{};
+    c.message = null;
+    errdefer freeOutcome(a, c);
+    if (o.message) |m| c.message = try a.dupe(u8, m);
+    if (o.generation) |g| {
+        const dir = try a.dupe(u8, g.dir.bytes);
+        errdefer a.free(dir);
+        const lib = try a.dupe(u8, g.lib.bytes);
+        c.generation = .{ .n = g.n, .dir = .{ .bytes = dir }, .lib = .{ .bytes = lib } };
+    }
+    const list = try a.alloc(Diagnostic, o.diagnostics.len);
+    var n: usize = 0;
+    errdefer {
+        for (list[0..n]) |d| freeDiag(a, d);
+        a.free(list);
+    }
+    while (n < o.diagnostics.len) : (n += 1) list[n] = try cloneDiag(a, o.diagnostics[n]);
+    c.diagnostics = list;
+    return c;
 }
 
 /// Adds scan problems to `o.diagnostics` as entries without a line.
@@ -698,5 +843,78 @@ test "request and deinit without a build" {
     try testing.expect(svc.last() == null);
     try testing.expectError(error.NotWarm, svc.waitWarm(10));
     svc.deinit();
-    try testing.expectEqual(@as(u32, 0), live_threads.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), liveThreads());
+}
+
+test "lastCopy deep copy is freed by freeOutcome" {
+    const a = testing.allocator;
+    var notes = [_][]const u8{ "note one", "note two" };
+    var diags = [_]Diagnostic{
+        .{ .rel = "a.zig", .line = 2, .column = 5, .message = "bad", .notes = &notes },
+        .{ .rel = null, .line = 0, .column = 0, .message = "outside", .notes = &.{} },
+    };
+    const o: Outcome = .{
+        .trigger = .play,
+        .ok = true,
+        .generation = .{ .n = 4, .dir = .fromTrusted("/s/gen/4"), .lib = .fromTrusted("/s/gen/4/libzmod.4.so") },
+        .diagnostics = &diags,
+        .message = "hello",
+        .path = .incremental,
+        .ms = 9,
+    };
+    const c = try cloneOutcome(a, o);
+    defer freeOutcome(a, c);
+    try testing.expectEqual(Trigger.play, c.trigger);
+    try testing.expectEqual(@as(u32, 4), c.generation.?.n);
+    try testing.expectEqualStrings("/s/gen/4/libzmod.4.so", c.generation.?.lib.bytes);
+    try testing.expect(c.generation.?.lib.bytes.ptr != o.generation.?.lib.bytes.ptr);
+    try testing.expectEqualStrings("hello", c.message.?);
+    try testing.expectEqual(@as(usize, 2), c.diagnostics.len);
+    try testing.expectEqualStrings("note two", c.diagnostics[0].notes[1]);
+    try testing.expect(c.diagnostics[1].rel == null);
+    // Every allocation failure point is cleaned up.
+    try testing.checkAllAllocationFailures(a, cloneAndFree, .{o});
+}
+
+fn cloneAndFree(a: std.mem.Allocator, o: Outcome) !void {
+    freeOutcome(a, try cloneOutcome(a, o));
+}
+
+const CallbackProbe = struct {
+    svc: std.atomic.Value(?*BuildService) = .init(null),
+    wait_result: std.atomic.Value(u8) = .init(0),
+
+    fn onOutcome(ctx: ?*anyopaque, o: *const Outcome) void {
+        _ = o;
+        const self: *CallbackProbe = @ptrCast(@alignCast(ctx.?));
+        const svc = self.svc.load(.acquire).?;
+        const r: u8 = if (svc.waitIdle(1000)) |_| 1 else |err| if (err == error.CalledFromCallback) 2 else 3;
+        self.wait_result.store(r, .release);
+    }
+};
+
+test "waitIdle from the callback is refused" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(testing.io, ".", a);
+    defer a.free(base);
+    const env: platform.path.HostEnv = .{ .os = builtin.os.tag, .home = base, .xdg_cache_home = base, .local_app_data = base };
+    var probe: CallbackProbe = .{};
+    // No Zig exists anywhere in this configuration, so the build fails fast
+    // in the locator without running a process.
+    const svc = try BuildService.init(a, testing.io, .{
+        .paths = .init(.{ .project = .fromTrusted(base) }, env),
+        .locate = .{ .configured = null, .toolchain_dir = .fromTrusted(base), .env = env },
+        .sdk = &.{},
+        .store_root = .fromTrusted(base),
+        .on_outcome = CallbackProbe.onOutcome,
+        .on_outcome_ctx = &probe,
+    });
+    defer svc.deinit();
+    probe.svc.store(svc, .release);
+    svc.request(.manual);
+    try svc.waitIdle(10_000);
+    try testing.expectEqual(@as(u8, 2), probe.wait_result.load(.acquire));
+    try testing.expect(!svc.last().?.ok);
 }

@@ -81,25 +81,53 @@ const Fx = struct {
     }
 
     /// Writes an executable shell script `name` in the temporary folder that
-    /// answers `version` with `version` and otherwise sleeps `delay` seconds
-    /// (`incremental_delay` for an `-fincremental` compiler) and then runs the
-    /// real compiler. Returns its absolute path.
-    fn wrapper(fx: *Fx, name: []const u8, version: []const u8, delay: []const u8, incremental_delay: []const u8) ![]const u8 {
+    /// answers `version` with `version` and otherwise runs the real compiler.
+    /// With a gate on, a non-incremental (`gate_full`) or `-fincremental`
+    /// (`gate_incremental`) start first creates `<name>.<kind>.waiting` and
+    /// then waits, at most 120 s, until the test creates `<name>.<kind>.go`
+    /// (`kind` is `full` or `incremental`). Returns the script's path.
+    fn wrapper(fx: *Fx, name: []const u8, version: []const u8, gate_full: bool, gate_incremental: bool) ![]const u8 {
         const a = fx.arena();
         const text = try std.fmt.allocPrint(a,
             \\#!/bin/sh
             \\if [ "$1" = version ]; then echo '{s}'; exit 0; fi
             \\case " $* " in
-            \\  *" -fincremental "*) sleep {s} ;;
-            \\  *) sleep {s} ;;
+            \\  *" -fincremental "*) kind=incremental; gate={} ;;
+            \\  *) kind=full; gate={} ;;
             \\esac
+            \\if [ "$gate" = 1 ]; then
+            \\  touch '{s}/{s}.'$kind.waiting
+            \\  n=0
+            \\  while [ ! -e '{s}/{s}.'$kind.go ] && [ $n -lt 6000 ]; do sleep 0.02; n=$((n+1)); done
+            \\fi
             \\exec '{s}' "$@"
             \\
-        , .{ version, incremental_delay, delay, build_options.zig_exe });
+        , .{
+            version, @intFromBool(gate_incremental), @intFromBool(gate_full),
+            fx.base, name,                           fx.base,
+            name,    build_options.zig_exe,
+        });
         try fx.tmp.dir.writeFile(io, .{ .sub_path = name, .data = text });
         const p = try std.fs.path.joinZ(a, &.{ fx.base, name });
         try testing.expectEqual(@as(c_int, 0), std.c.chmod(p, 0o755));
         return p;
+    }
+
+    /// Lets every gated start of `kind` for wrapper `name` go on.
+    fn openGate(fx: *Fx, name: []const u8, kind: []const u8) !void {
+        const sub = try std.fmt.allocPrint(fx.arena(), "{s}.{s}.go", .{ name, kind });
+        try fx.tmp.dir.writeFile(io, .{ .sub_path = sub, .data = "" });
+    }
+
+    /// Waits (bounded) until a gated start of `kind` for wrapper `name` waits at its gate.
+    fn waitAtGate(fx: *Fx, name: []const u8, kind: []const u8) !void {
+        const sub = try std.fmt.allocPrint(fx.arena(), "{s}.{s}.waiting", .{ name, kind });
+        const t0 = std.Io.Clock.awake.now(io);
+        while (true) {
+            if (fx.tmp.dir.access(io, sub, .{})) |_| return else |_| {}
+            if (t0.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() > build_wait_ms) return error.Timeout;
+            try io.sleep(.fromMilliseconds(5), .awake);
+        }
     }
 };
 
@@ -282,8 +310,8 @@ test "integration: triggers_merge" {
     try fx.init("proj");
     defer fx.deinit();
     try fx.write("a.zig", try scriptSource(fx.arena(), 1));
-    // The delay keeps the first build running while the requests arrive.
-    const zig = try fx.wrapper("slowzig", "0.17.0", "1", "1");
+    // The gate keeps the first build running while the requests arrive.
+    const zig = try fx.wrapper("gatezig", "0.17.0", true, false);
 
     var counter: Counter = .{};
     var cfg = fx.config(zig);
@@ -293,10 +321,14 @@ test "integration: triggers_merge" {
     defer svc.deinit();
 
     svc.request(.open);
-    try waitUpdating(svc);
+    try fx.waitAtGate("gatezig", "full");
     for (0..10) |_| svc.request(.save);
+    try fx.openGate("gatezig", "full");
     try svc.waitIdle(build_wait_ms);
 
+    // Ten requests during one build gave exactly one follow-up build. (The
+    // service has one build thread, so `updates_max == 1` holds by
+    // construction; it is checked as a guard against a future second path.)
     try testing.expectEqual(@as(u32, 2), counter.calls.load(.acquire));
     const st = svc.stats();
     try testing.expectEqual(@as(u32, 2), st.builds);
@@ -312,34 +344,47 @@ test "integration: save_during_warmup" {
     try fx.init("proj");
     defer fx.deinit();
     try fx.write("a.zig", try scriptSource(fx.arena(), 1));
-    // Only the incremental server is slow, so warm-up outlasts a full build.
-    const zig = try fx.wrapper("slowzig", "0.17.0", "0", "5");
+    // Only the incremental server waits at a gate, so warm-up lasts until the test says.
+    const zig = try fx.wrapper("gatezig", "0.17.0", false, true);
 
     const svc = try BuildService.init(testing.allocator, io, fx.config(zig));
     defer svc.deinit();
     const o1 = try build(svc, .open);
     try expectOk(o1);
-    try testing.expectEqual(service.WarmState.warming, svc.stats().warm);
 
-    // Let warm-up get well into its 5 s update, then save. The save does not
-    // wait for warm-up: it takes the full path at once.
-    try io.sleep(.fromMilliseconds(1000), .awake);
+    // Warm-up is inside its update (holding the server) when the save comes.
+    try fx.waitAtGate("gatezig", "incremental");
     try testing.expectEqual(service.WarmState.warming, svc.stats().warm);
     try fx.write("a.zig", try scriptSource(fx.arena(), 2));
     const o2 = try build(svc, .save);
     try expectOk(o2);
+    // The save did not wait for warm-up: warm-up cannot end before the gate opens.
     try testing.expectEqual(service.BuildPath.full, o2.path);
-    try testing.expect(o2.ms < 3000);
-    try testing.expectEqual(@as(i32, 2), try callValue(o2));
     try testing.expectEqual(service.WarmState.warming, svc.stats().warm);
+    try testing.expectEqual(@as(i32, 2), try callValue(o2));
 
     // Warm-up ends and the next save is incremental.
+    try fx.openGate("gatezig", "incremental");
     try svc.waitWarm(build_wait_ms);
     try fx.write("a.zig", try scriptSource(fx.arena(), 3));
     const o3 = try build(svc, .save);
     try expectOk(o3);
     try testing.expectEqual(service.BuildPath.incremental, o3.path);
     try testing.expectEqual(@as(i32, 3), try callValue(o3));
+}
+
+fn genEntries(fx: *Fx) ![]const []const u8 {
+    const a = fx.arena();
+    var names: std.ArrayList([]const u8) = .empty;
+    const gen_root = try std.fs.path.join(a, &.{ fx.store, "gen" });
+    var d = std.Io.Dir.cwd().openDir(io, gen_root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return names.items,
+        else => return err,
+    };
+    defer d.close(io);
+    var it = d.iterate();
+    while (try it.next(io)) |e| try names.append(a, try a.dupe(u8, e.name));
+    return names.items;
 }
 
 test "integration: two_services_one_project" {
@@ -349,9 +394,9 @@ test "integration: two_services_one_project" {
     try fx.init("proj");
     defer fx.deinit();
     try fx.write("a.zig", try scriptSource(fx.arena(), 1));
-    // The delay keeps the first service inside its build (holding build.lock)
-    // for longer than the second one waits.
-    const zig = try fx.wrapper("slowzig", "0.17.0", "3", "3");
+    // The gate keeps the first service inside its build (holding build.lock)
+    // until the second one has given up.
+    const zig = try fx.wrapper("gatezig", "0.17.0", true, false);
 
     const first = try BuildService.init(testing.allocator, io, fx.config(zig));
     defer first.deinit();
@@ -361,9 +406,8 @@ test "integration: two_services_one_project" {
     defer second.deinit();
 
     first.request(.open);
-    try waitUpdating(first);
+    try fx.waitAtGate("gatezig", "full");
     const o2 = try build(second, .open);
-    // The first service was still building the whole time.
     try testing.expectEqual(@as(u32, 1), first.stats().updates_active);
 
     try testing.expect(!o2.ok);
@@ -374,19 +418,70 @@ test "integration: two_services_one_project" {
     const lock_path = try std.fs.path.join(a, &.{ cache_root.bytes, "projects", &id, "build.lock" });
     const want = try std.fmt.allocPrint(a, "Another editor is building this project (lock: {s}).", .{lock_path});
     try testing.expectEqualStrings(want, o2.message.?);
-    // The second service staged nothing.
-    const gen_root = try std.fs.path.join(a, &.{ fx.store, "gen" });
-    if (std.Io.Dir.cwd().openDir(io, gen_root, .{ .iterate = true })) |d0| {
-        var d = d0;
-        defer d.close(io);
-        var it = d.iterate();
-        try testing.expect(try it.next(io) == null);
-    } else |err| try testing.expectEqual(error.FileNotFound, err);
 
+    try fx.openGate("gatezig", "full");
     try first.waitIdle(build_wait_ms);
     const o1 = first.last().?;
     try expectOk(o1);
     try testing.expectEqual(@as(u32, 1), o1.generation.?.n);
+    // Only the first service staged: exactly one generation, and the second
+    // service ran one build that kept no generation.
+    const gens = try genEntries(&fx);
+    try testing.expectEqual(@as(usize, 1), gens.len);
+    try testing.expectEqualStrings("1", gens[0]);
+    try testing.expectEqual(@as(u32, 1), second.stats().builds);
+    try testing.expect(second.last().?.generation == null);
+}
+
+test "integration: two_services_both_warm" {
+    try platform.testing_support.requireIntegration();
+    if (is_windows) return error.SkipZigTest;
+    var fx: Fx = undefined;
+    try fx.init("proj");
+    defer fx.deinit();
+    try fx.write("a.zig", try scriptSource(fx.arena(), 1));
+
+    const one = try BuildService.init(testing.allocator, io, fx.config(build_options.zig_exe));
+    defer one.deinit();
+    const two = try BuildService.init(testing.allocator, io, fx.config(build_options.zig_exe));
+    defer two.deinit();
+    const svcs = [_]*BuildService{ one, two };
+
+    one.request(.open);
+    two.request(.open);
+    for (svcs) |svc| {
+        try svc.waitIdle(build_wait_ms);
+        try expectOk(svc.last().?);
+    }
+    // Exactly one service gets incremental.lock and warms; the other stays on
+    // the full path without a crash or a counted death.
+    var warm_count: u32 = 0;
+    for (svcs) |svc| {
+        if (svc.waitWarm(build_wait_ms)) |_| {
+            warm_count += 1;
+        } else |err| try testing.expectEqual(error.NotWarm, err);
+    }
+    try testing.expectEqual(@as(u32, 1), warm_count);
+
+    var value: i32 = 1;
+    for (0..2) |_| {
+        for (svcs) |svc| {
+            value += 1;
+            try fx.write("a.zig", try scriptSource(fx.arena(), value));
+            const o = try build(svc, .save);
+            try expectOk(o);
+            try testing.expectEqual(value, try callValue(o));
+            const want_path: service.BuildPath = if (svc.stats().warm == .ready) .incremental else .full;
+            try testing.expectEqual(want_path, o.path);
+        }
+    }
+    var ready: u32 = 0;
+    for (svcs) |svc| {
+        const st = svc.stats();
+        try testing.expectEqual(@as(u32, 0), st.session_deaths);
+        if (st.warm == .ready) ready += 1;
+    }
+    try testing.expectEqual(@as(u32, 1), ready);
 }
 
 test "integration: e2e_bad_zig" {
@@ -396,7 +491,7 @@ test "integration: e2e_bad_zig" {
     try fx.init("proj");
     defer fx.deinit();
     try fx.write("a.zig", try scriptSource(fx.arena(), 1));
-    const zig = try fx.wrapper("oldzig", "0.16.0", "0", "0");
+    const zig = try fx.wrapper("oldzig", "0.16.0", false, false);
 
     var counter: Counter = .{};
     var cfg = fx.config(zig);
@@ -417,22 +512,25 @@ test "integration: e2e_bad_zig" {
     svc.deinit();
 
     // No thread of the service is left.
-    try testing.expectEqual(@as(u32, 0), service.live_threads.load(.acquire));
-    if (builtin.os.tag == .linux) {
-        const tid = counter.tid.load(.acquire);
-        try testing.expect(tid != 0);
-        var buf: [64]u8 = undefined;
-        const task = try std.fmt.bufPrint(&buf, "/proc/self/task/{d}", .{tid});
-        // The kernel removes the task entry right after the thread exits.
-        const t0 = std.Io.Clock.awake.now(io);
-        while (true) {
-            std.Io.Dir.cwd().access(io, task, .{}) catch |err| {
-                try testing.expectEqual(error.FileNotFound, err);
-                break;
-            };
-            if (t0.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() > 1000) return error.ThreadStillRunning;
-            try io.sleep(.fromMilliseconds(5), .awake);
-        }
+    try testing.expectEqual(@as(u32, 0), service.liveThreads());
+    try expectThreadGone(counter.tid.load(.acquire));
+}
+
+/// On Linux, checks that the thread `tid` no longer exists.
+fn expectThreadGone(tid: u64) !void {
+    if (builtin.os.tag != .linux) return;
+    try testing.expect(tid != 0);
+    var buf: [64]u8 = undefined;
+    const task = try std.fmt.bufPrint(&buf, "/proc/self/task/{d}", .{tid});
+    // The kernel removes the task entry right after the thread exits.
+    const t0 = std.Io.Clock.awake.now(io);
+    while (true) {
+        std.Io.Dir.cwd().access(io, task, .{}) catch |err| {
+            try testing.expectEqual(error.FileNotFound, err);
+            return;
+        };
+        if (t0.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() > 1000) return error.ThreadStillRunning;
+        try io.sleep(.fromMilliseconds(5), .awake);
     }
 }
 
@@ -443,7 +541,8 @@ test "integration: deinit stops a running build" {
     try fx.init("proj");
     defer fx.deinit();
     try fx.write("a.zig", try scriptSource(fx.arena(), 1));
-    const zig = try fx.wrapper("stuckzig", "0.17.0", "60", "60");
+    // The gate is never opened.
+    const zig = try fx.wrapper("gatezig", "0.17.0", true, true);
 
     var counter: Counter = .{};
     var cfg = fx.config(zig);
@@ -451,12 +550,40 @@ test "integration: deinit stops a running build" {
     cfg.on_outcome_ctx = &counter;
     const svc = try BuildService.init(testing.allocator, io, cfg);
     svc.request(.open);
-    try waitUpdating(svc);
+    try fx.waitAtGate("gatezig", "full");
     const t0 = std.Io.Clock.awake.now(io);
     svc.deinit();
     // The compiler group was killed instead of waited for.
     try testing.expect(t0.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 10_000);
-    try testing.expectEqual(@as(u32, 0), service.live_threads.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), service.liveThreads());
     // A build cut short by deinit reports nothing.
     try testing.expectEqual(@as(u32, 0), counter.calls.load(.acquire));
+}
+
+test "integration: deinit while warming" {
+    try platform.testing_support.requireIntegration();
+    if (is_windows) return error.SkipZigTest;
+    var fx: Fx = undefined;
+    try fx.init("proj");
+    defer fx.deinit();
+    try fx.write("a.zig", try scriptSource(fx.arena(), 1));
+    // Full builds run; the incremental server's gate is never opened.
+    const zig = try fx.wrapper("gatezig", "0.17.0", false, true);
+
+    var counter: Counter = .{};
+    var cfg = fx.config(zig);
+    cfg.on_outcome = Counter.onOutcome;
+    cfg.on_outcome_ctx = &counter;
+    const svc = try BuildService.init(testing.allocator, io, cfg);
+    const o = try build(svc, .open);
+    try expectOk(o);
+    try fx.waitAtGate("gatezig", "incremental");
+    try testing.expectEqual(service.WarmState.warming, svc.stats().warm);
+
+    const t0 = std.Io.Clock.awake.now(io);
+    svc.deinit();
+    try testing.expect(t0.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 10_000);
+    try testing.expectEqual(@as(u32, 0), service.liveThreads());
+    try testing.expectEqual(@as(u32, 1), counter.calls.load(.acquire));
+    try expectThreadGone(counter.tid.load(.acquire));
 }

@@ -20,7 +20,10 @@ pub const Phase = enum {
 /// - x86_64 Linux: session start is self-hosted and non-incremental, warm is
 ///   self-hosted and incremental, the debug build is LLVM and non-incremental
 ///   (incremental debug info is broken).
-/// - Every other target (Windows, macOS, ...): LLVM, non-incremental.
+/// - Every other target (Windows, macOS, and also aarch64 Linux and other
+///   Linux CPUs, which are unmeasured): LLVM, non-incremental, until the
+///   self-hosted backend and incremental mode are verified there. The
+///   override is available for trying them.
 pub fn policy(target: std.Target, phase: Phase, override: ?BuildMode) BuildMode {
     if (override) |o| return o;
     const self_hosted = target.cpu.arch == .x86_64 and target.os.tag == .linux;
@@ -54,7 +57,7 @@ test "policy table" {
     try expectMode(.{ .incremental = false, .use_llvm = true, .optimize = .Debug }, policy(linux, .debug_build, null));
 
     const llvm: BuildMode = .{ .incremental = false, .use_llvm = true, .optimize = .Debug };
-    for ([_][]const u8{ "x86_64-windows-gnu", "aarch64-macos", "x86_64-macos" }) |triple| {
+    for ([_][]const u8{ "x86_64-windows-gnu", "aarch64-macos", "x86_64-macos", "aarch64-linux-gnu" }) |triple| {
         const t = try resolve(triple);
         for ([_]Phase{ .session_start, .warm, .debug_build }) |phase| try expectMode(llvm, policy(t, phase, null));
     }

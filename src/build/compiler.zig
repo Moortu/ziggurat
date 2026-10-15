@@ -310,6 +310,8 @@ pub const Session = struct {
     /// nothing once the session is released. POSIX only: on Windows it does
     /// nothing and a running update ends only by itself or by its timeout.
     pub fn interrupt(self: Session) void {
+        // TODO(Stage 7): on Windows, end the server with TerminateProcess on the
+        // child handle (it does not reap, so the handle stays valid here).
         const st = self.st;
         st.mutex.lockUncancelable(st.io);
         defer st.mutex.unlock(st.io);
