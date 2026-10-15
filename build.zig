@@ -48,7 +48,8 @@ fn addTestSet(
         .optimize = optimize,
         .link_libc = true,
     });
-    platform.addOptions("build_options", options);
+    const options_mod = options.createModule();
+    platform.addImport("build_options", options_mod);
 
     const build_mod = b.createModule(.{
         .root_source_file = b.path("src/build/root.zig"),
@@ -56,7 +57,7 @@ fn addTestSet(
         .optimize = optimize,
         .link_libc = true,
     });
-    build_mod.addOptions("build_options", options);
+    build_mod.addImport("build_options", options_mod);
     build_mod.addImport("ziggurat_platform", platform);
 
     for ([_]*std.Build.Module{ platform, build_mod }) |mod| {
