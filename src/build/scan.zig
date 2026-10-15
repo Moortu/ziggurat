@@ -21,7 +21,10 @@ pub const Problem = struct { rel: []const u8, message: []const u8 };
 pub const ScanResult = struct {
     /// Sorted by `rel` (byte order).
     scripts: []Script,
+    /// Number of helper files; equals `helper_paths.len`.
     helpers: u32,
+    /// Helper `.zig` files (not scripts), sorted by `rel` (byte order).
+    helper_paths: []Script,
     problems: []Problem,
 };
 
@@ -37,7 +40,7 @@ const Scanner = struct {
     problems: std.ArrayList(Problem) = .empty,
     seen: std.StringHashMapUnmanaged(void) = .empty,
     walked: std.StringHashMapUnmanaged(void) = .empty,
-    helpers: u32 = 0,
+    helper_list: std.ArrayList(Script) = .empty,
 
     fn walk(self: *Scanner, rel: []const u8) !void {
         // Overlapping script folders: visit each folder once.
@@ -87,7 +90,7 @@ const Scanner = struct {
         if (try hasTopLevelExtends(self.a, src)) {
             try self.scripts.append(self.a, .{ .rel = rel });
         } else {
-            self.helpers += 1;
+            try self.helper_list.append(self.a, .{ .rel = rel });
         }
     }
 
@@ -116,10 +119,12 @@ pub fn scan(
     var s: Scanner = .{ .a = a, .io = io, .project = root };
     for (script_dirs) |d| try s.walk(try normalizeDir(a, d));
     std.mem.sort(Script, s.scripts.items, {}, lessThan);
+    std.mem.sort(Script, s.helper_list.items, {}, lessThan);
     try checkCase(&s);
     return .{
         .scripts = s.scripts.items,
-        .helpers = s.helpers,
+        .helpers = @intCast(s.helper_list.items.len),
+        .helper_paths = s.helper_list.items,
         .problems = s.problems.items,
     };
 }
@@ -218,6 +223,8 @@ test "scan rules" {
     try testing.expectEqualStrings("sub/addons/s.zig", res.scripts[1].rel);
     try testing.expectEqualStrings("typed.zig", res.scripts[2].rel);
     try testing.expectEqual(@as(u32, 4), res.helpers);
+    try testing.expectEqual(@as(usize, 4), res.helper_paths.len);
+    try testing.expectEqualStrings("lib/util.zig", res.helper_paths[0].rel);
     try testing.expectEqual(@as(usize, 0), res.problems.len);
 }
 

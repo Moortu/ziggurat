@@ -4,10 +4,12 @@ const platform = @import("ziggurat_platform");
 
 pub const scan = @import("scan.zig");
 pub const rootgen = @import("rootgen.zig");
+pub const workspace = @import("workspace.zig");
 
 test {
     std.testing.refAllDecls(scan);
     std.testing.refAllDecls(rootgen);
+    std.testing.refAllDecls(workspace);
 }
 
 test "build module sees the platform module" {

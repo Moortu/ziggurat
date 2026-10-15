@@ -1,0 +1,550 @@
+//! Build workspace (L2): the per-project cache folder, the build lock, the
+//! generated root file (in the project, or in a mirror copy when the project
+//! folder is read-only), the compiler command line, and the map from
+//! compiler-reported paths back to project-relative paths.
+//!
+//! Layout under `<cache>/projects/<projectId>/`:
+//!   build.lock   held exclusively by a `Workspace` until `deinit`
+//!   build/       the compiler's working folder
+//!   zig-cache/   the compiler's cache folder
+//!   mirror/      copy of the scanned `.zig` files and the root (read-only projects only)
+const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
+const platform = @import("ziggurat_platform");
+const scan_mod = @import("scan.zig");
+const rootgen = @import("rootgen.zig");
+const OsPath = platform.path.OsPath;
+const PathService = platform.path.PathService;
+const FileLock = platform.lock.FileLock;
+const ZigInstall = platform.zig_locator.ZigInstall;
+const ScanResult = scan_mod.ScanResult;
+
+pub const ModuleDep = struct {
+    name: []const u8,
+    root: OsPath,
+    /// Names of the modules this module imports (each needs its own entry in the SDK list).
+    deps: []const []const u8,
+};
+
+pub const BuildMode = struct {
+    incremental: bool,
+    use_llvm: bool,
+    optimize: std.builtin.OptimizeMode,
+};
+
+pub const PrepareOptions = struct { lock_timeout_ms: u32 = 30000 };
+
+pub const Workspace = struct {
+    cache_dir: OsPath,
+    build_dir: OsPath,
+    /// Where the generated root and the scripts are read from: the project folder,
+    /// or `<cache_dir>/mirror` when `mirrored`.
+    source_root: OsPath,
+    mirrored: bool,
+    os: std.Target.Os.Tag,
+    /// Borrowed from the caller of `prepare`; it must outlive the workspace.
+    sdk: []const ModuleDep,
+    lock: FileLock,
+
+    pub fn deinit(self: *Workspace, a: std.mem.Allocator) void {
+        self.lock.release();
+        a.free(self.cache_dir.bytes);
+        a.free(self.build_dir.bytes);
+        a.free(self.source_root.bytes);
+        self.* = undefined;
+    }
+
+    /// The compiler command line; run it with `build_dir` as the working folder.
+    /// Free with `freeArgv`, or use an arena.
+    pub fn argv(self: Workspace, a: std.mem.Allocator, zig: ZigInstall, mode: BuildMode) ![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        errdefer freeArgv(a, out.items);
+        const zig_cache = try platform.path.joinFor(self.os, a, self.cache_dir, &.{"zig-cache"});
+        defer a.free(zig_cache.bytes);
+        const root = try platform.path.joinFor(self.os, a, self.source_root, &.{rootgen.root_file_name});
+        defer a.free(root.bytes);
+
+        try push(a, &out, "{s}", .{zig.exe.bytes});
+        try push(a, &out, "build-lib", .{});
+        try push(a, &out, "-dynamic", .{});
+        try push(a, &out, "-lc", .{});
+        try push(a, &out, "-O{s}", .{switch (mode.optimize) {
+            .Debug => "Debug",
+            .ReleaseSafe => "ReleaseSafe",
+            .ReleaseFast => "ReleaseFast",
+            .ReleaseSmall => "ReleaseSmall",
+        }});
+        if (mode.use_llvm) try push(a, &out, "-fllvm", .{}) else try push(a, &out, "-fno-llvm", .{});
+        if (mode.incremental) try push(a, &out, "-fincremental", .{});
+        try push(a, &out, "--name", .{});
+        try push(a, &out, "zmod", .{});
+        try push(a, &out, "--cache-dir", .{});
+        try push(a, &out, "{s}", .{zig_cache.bytes});
+        try push(a, &out, "--listen=-", .{});
+        try push(a, &out, "--dep", .{});
+        try push(a, &out, "ziggurat", .{});
+        try push(a, &out, "-Mroot={s}", .{root.bytes});
+        for (self.sdk) |m| {
+            for (m.deps) |d| {
+                try push(a, &out, "--dep", .{});
+                try push(a, &out, "{s}", .{d});
+            }
+            try push(a, &out, "-M{s}={s}", .{ m.name, m.root.bytes });
+        }
+        return out.toOwnedSlice(a);
+    }
+
+    pub fn freeArgv(a: std.mem.Allocator, v: []const []const u8) void {
+        for (v) |item| a.free(item);
+        a.free(v);
+    }
+
+    /// Turns a compiler-reported path (absolute, or relative to `build_dir`)
+    /// into a project-relative path with `/` separators. `error.OutsideProject`
+    /// for anything not below `source_root` (the SDK, std, the root itself).
+    pub fn mapPath(self: Workspace, a: std.mem.Allocator, reported: []const u8) ![]const u8 {
+        var root_parts: std.ArrayList([]const u8) = .empty;
+        defer root_parts.deinit(a);
+        try normalize(a, self.os, &root_parts, self.source_root.bytes);
+
+        var parts: std.ArrayList([]const u8) = .empty;
+        defer parts.deinit(a);
+        if (!isAbsoluteFor(self.os, reported)) try normalize(a, self.os, &parts, self.build_dir.bytes);
+        try normalize(a, self.os, &parts, reported);
+
+        if (parts.items.len <= root_parts.items.len) return error.OutsideProject;
+        for (root_parts.items, parts.items[0..root_parts.items.len]) |r, p| {
+            if (!partEql(self.os, r, p)) return error.OutsideProject;
+        }
+        return std.mem.join(a, "/", parts.items[root_parts.items.len..]);
+    }
+};
+
+fn push(a: std.mem.Allocator, out: *std.ArrayList([]const u8), comptime fmt: []const u8, args: anytype) !void {
+    const item = try std.fmt.allocPrint(a, fmt, args);
+    errdefer a.free(item);
+    try out.append(a, item);
+}
+
+fn isSepFor(os: std.Target.Os.Tag, c: u8) bool {
+    return c == '/' or (os == .windows and c == '\\');
+}
+
+fn isAbsoluteFor(os: std.Target.Os.Tag, p: []const u8) bool {
+    if (p.len == 0) return false;
+    if (isSepFor(os, p[0])) return true;
+    return os == .windows and p.len >= 2 and p[1] == ':';
+}
+
+fn partEql(os: std.Target.Os.Tag, x: []const u8, y: []const u8) bool {
+    return if (os == .windows) std.ascii.eqlIgnoreCase(x, y) else std.mem.eql(u8, x, y);
+}
+
+/// Appends the components of `p` to `parts`, resolving `.` and `..` lexically.
+/// `..` at the top is dropped.
+fn normalize(a: std.mem.Allocator, os: std.Target.Os.Tag, parts: *std.ArrayList([]const u8), p: []const u8) !void {
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= p.len) : (i += 1) {
+        if (i < p.len and !isSepFor(os, p[i])) continue;
+        const part = p[start..i];
+        start = i + 1;
+        if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
+        if (std.mem.eql(u8, part, "..")) {
+            _ = parts.pop();
+            continue;
+        }
+        try parts.append(a, part);
+    }
+}
+
+fn isReadOnlyError(err: anyerror) bool {
+    return err == error.AccessDenied or err == error.PermissionDenied or err == error.ReadOnlyFileSystem;
+}
+
+/// Writes `data` to `sub` under `dir` only when the bytes differ from what is
+/// there, through `<sub>.tmp` and a rename so readers never see half a file.
+/// Returns true when it wrote.
+fn writeIfChanged(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, sub: []const u8, data: []const u8) !bool {
+    if (dir.readFileAlloc(io, sub, a, .limited(max_file_bytes))) |old| {
+        defer a.free(old);
+        if (std.mem.eql(u8, old, data)) return false;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    const tmp = try std.fmt.allocPrint(a, "{s}.tmp", .{sub});
+    defer a.free(tmp);
+    try dir.writeFile(io, .{ .sub_path = tmp, .data = data });
+    errdefer dir.deleteFile(io, tmp) catch {};
+    try dir.rename(tmp, dir, sub, io);
+    return true;
+}
+
+const max_file_bytes = 16 * 1024 * 1024;
+
+pub fn prepare(
+    a: std.mem.Allocator,
+    io: std.Io,
+    ps: PathService,
+    scan: ScanResult,
+    sdk: []const ModuleDep,
+    opts: PrepareOptions,
+    msg: *std.ArrayList(u8),
+) !Workspace {
+    const os = ps.env.os;
+    const cwd = std.Io.Dir.cwd();
+    const cache_root = try ps.dir(.cache, a);
+    defer a.free(cache_root.bytes);
+    const id = ps.projectId();
+    const cache_dir = try platform.path.joinFor(os, a, cache_root, &.{ "projects", &id });
+    errdefer a.free(cache_dir.bytes);
+    const build_dir = try platform.path.joinFor(os, a, cache_dir, &.{"build"});
+    errdefer a.free(build_dir.bytes);
+    try cwd.createDirPath(io, build_dir.bytes);
+
+    const lock_path = try platform.path.joinFor(os, a, cache_dir, &.{"build.lock"});
+    defer a.free(lock_path.bytes);
+    var lock = FileLock.acquire(io, lock_path, .exclusive, opts.lock_timeout_ms) catch |err| {
+        if (err == error.Timeout) {
+            msg.clearRetainingCapacity();
+            try msg.print(a, "Another editor is building this project (lock: {s}).", .{lock_path.bytes});
+        }
+        return err;
+    };
+    errdefer lock.release();
+
+    const root_text = try rootgen.generateRoot(a, os, scan.scripts);
+    defer a.free(root_text);
+
+    var mirrored = false;
+    {
+        var pdir = try cwd.openDir(io, ps.roots.project.bytes, .{});
+        defer pdir.close(io);
+        // The write is the read-only probe.
+        if (writeIfChanged(a, io, pdir, rootgen.root_file_name, root_text)) |_| {} else |err| {
+            if (!isReadOnlyError(err)) return err;
+            mirrored = true;
+        }
+    }
+    const source_root: OsPath = if (mirrored)
+        try platform.path.joinFor(os, a, cache_dir, &.{"mirror"})
+    else
+        .{ .bytes = try a.dupe(u8, ps.roots.project.bytes) };
+    errdefer a.free(source_root.bytes);
+    if (mirrored) try syncMirror(a, io, ps.roots.project, source_root, scan, root_text);
+    return .{
+        .cache_dir = cache_dir,
+        .build_dir = build_dir,
+        .source_root = source_root,
+        .mirrored = mirrored,
+        .os = os,
+        .sdk = sdk,
+        .lock = lock,
+    };
+}
+
+/// Makes `mirror` hold exactly the root and every scanned `.zig` file, copying
+/// only files whose bytes differ.
+fn syncMirror(a: std.mem.Allocator, io: std.Io, project: OsPath, mirror: OsPath, scan: ScanResult, root_text: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, mirror.bytes);
+    var mdir = try cwd.openDir(io, mirror.bytes, .{ .iterate = true });
+    defer mdir.close(io);
+    var pdir = try cwd.openDir(io, project.bytes, .{});
+    defer pdir.close(io);
+
+    var keep: std.StringHashMapUnmanaged(void) = .empty;
+    defer keep.deinit(a);
+    try keep.put(a, rootgen.root_file_name, {});
+    _ = try writeIfChanged(a, io, mdir, rootgen.root_file_name, root_text);
+
+    for ([_][]const scan_mod.Script{ scan.scripts, scan.helper_paths }) |list| {
+        for (list) |sc| {
+            try keep.put(a, sc.rel, {});
+            const data = try pdir.readFileAlloc(io, sc.rel, a, .limited(max_file_bytes));
+            defer a.free(data);
+            if (std.fs.path.dirname(sc.rel)) |d| try mdir.createDirPath(io, d);
+            _ = try writeIfChanged(a, io, mdir, sc.rel, data);
+        }
+    }
+
+    // Remove what the scan no longer lists, then folders that became empty.
+    var stale: std.ArrayList([]const u8) = .empty;
+    var dirs: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (stale.items) |x| a.free(x);
+        for (dirs.items) |x| a.free(x);
+        stale.deinit(a);
+        dirs.deinit(a);
+    }
+    var walker = try mdir.walk(a);
+    defer walker.deinit();
+    while (try walker.next(io)) |e| {
+        // Mirror paths are written with `/`; the walker reports the host separator.
+        const rel = try a.dupe(u8, e.path);
+        errdefer a.free(rel);
+        if (builtin.os.tag == .windows) std.mem.replaceScalar(u8, rel, '\\', '/');
+        if (e.kind == .directory) {
+            try dirs.append(a, rel);
+        } else if (keep.contains(rel)) {
+            a.free(rel);
+        } else {
+            try stale.append(a, rel);
+        }
+    }
+    for (stale.items) |rel| mdir.deleteFile(io, rel) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    // Deepest first, so a parent is empty by the time it is tried.
+    std.mem.sort([]const u8, dirs.items, {}, deeperFirst);
+    for (dirs.items) |rel| mdir.deleteDir(io, rel) catch |err| switch (err) {
+        error.DirNotEmpty, error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn deeperFirst(_: void, x: []const u8, y: []const u8) bool {
+    return std.mem.count(u8, x, "/") > std.mem.count(u8, y, "/");
+}
+
+// ---------------------------------------------------------------- tests
+
+const testing = std.testing;
+
+const Fixture = struct {
+    tmp: std.testing.TmpDir,
+    project: OsPath,
+    cache_base: []const u8,
+    ps: PathService,
+
+    fn init(a: std.mem.Allocator) !Fixture {
+        var tmp = testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        try tmp.dir.createDirPath(testing.io, "proj");
+        try tmp.dir.createDirPath(testing.io, "cache");
+        const project = try tmp.dir.realPathFileAlloc(testing.io, "proj", a);
+        const cache_base = try tmp.dir.realPathFileAlloc(testing.io, "cache", a);
+        const env: platform.path.HostEnv = .{
+            .os = builtin.os.tag,
+            .home = cache_base,
+            .xdg_cache_home = cache_base,
+            .local_app_data = cache_base,
+        };
+        return .{
+            .tmp = tmp,
+            .project = .fromTrusted(project),
+            .cache_base = cache_base,
+            .ps = PathService.init(.{ .project = .fromTrusted(project) }, env),
+        };
+    }
+
+    fn put(self: Fixture, sub: []const u8, data: []const u8) !void {
+        var proj = try self.tmp.dir.openDir(testing.io, "proj", .{});
+        defer proj.close(testing.io);
+        if (std.fs.path.dirname(sub)) |d| try proj.createDirPath(testing.io, d);
+        try proj.writeFile(testing.io, .{ .sub_path = sub, .data = data });
+    }
+
+    fn scan(self: Fixture, a: std.mem.Allocator) !ScanResult {
+        return scan_mod.scan(a, testing.io, self.project, scan_mod.default_script_dirs);
+    }
+};
+
+fn rootMtime(io: std.Io, ws: Workspace, a: std.mem.Allocator) !std.Io.Timestamp {
+    const p = try std.fs.path.join(a, &.{ ws.source_root.bytes, rootgen.root_file_name });
+    const st = try std.Io.Dir.cwd().statFile(io, p, .{});
+    return st.mtime;
+}
+
+test "prepare writes root once" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fx = try Fixture.init(arena);
+    defer fx.tmp.cleanup();
+    try fx.put("a/x.zig", "pub const extends = \"Node\";\n");
+    const sc = try fx.scan(arena);
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(testing.allocator);
+
+    var ws = try prepare(testing.allocator, testing.io, fx.ps, sc, &.{}, .{}, &msg);
+    try testing.expect(!ws.mirrored);
+    try testing.expectEqualStrings(fx.project.bytes, ws.source_root.bytes);
+    const m1 = try rootMtime(testing.io, ws, arena);
+    const want = try rootgen.generateRoot(arena, builtin.os.tag, sc.scripts);
+    const got = try std.Io.Dir.cwd().readFileAlloc(testing.io, try std.fs.path.join(arena, &.{ ws.source_root.bytes, rootgen.root_file_name }), arena, .limited(1 << 20));
+    try testing.expectEqualStrings(want, got);
+    ws.deinit(testing.allocator);
+
+    try testing.io.sleep(.fromMilliseconds(30), .awake);
+    var ws2 = try prepare(testing.allocator, testing.io, fx.ps, sc, &.{}, .{}, &msg);
+    defer ws2.deinit(testing.allocator);
+    const m2 = try rootMtime(testing.io, ws2, arena);
+    try testing.expectEqual(m1.nanoseconds, m2.nanoseconds);
+    // The build and cache folders exist.
+    try std.Io.Dir.cwd().access(testing.io, ws2.build_dir.bytes, .{});
+}
+
+test "prepare lock timeout" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fx = try Fixture.init(arena);
+    defer fx.tmp.cleanup();
+    try fx.put("a.zig", "pub const extends = \"Node\";\n");
+    const sc = try fx.scan(arena);
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(testing.allocator);
+
+    var ws = try prepare(testing.allocator, testing.io, fx.ps, sc, &.{}, .{}, &msg);
+    defer ws.deinit(testing.allocator);
+    try testing.expectError(error.Timeout, prepare(testing.allocator, testing.io, fx.ps, sc, &.{}, .{ .lock_timeout_ms = 50 }, &msg));
+    const want = try std.fmt.allocPrint(arena, "Another editor is building this project (lock: {s}{c}build.lock).", .{
+        ws.cache_dir.bytes, std.fs.path.sep,
+    });
+    try testing.expectEqualStrings(want, msg.items);
+}
+
+fn setMode(path: []const u8, a: std.mem.Allocator, mode: std.c.mode_t) !void {
+    const z = try std.mem.concatWithSentinel(a, u8, &.{path}, 0);
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(z, mode));
+}
+
+fn skipUnlessReadOnlyWorks() !void {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (std.c.geteuid() == 0) return error.SkipZigTest;
+}
+
+test "mirror_maps_paths_back" {
+    try skipUnlessReadOnlyWorks();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fx = try Fixture.init(arena);
+    defer fx.tmp.cleanup();
+    try fx.put("a/x.zig", "pub const extends = \"Node\";\n");
+    try fx.put("lib/h.zig", "pub fn f() void {}\n");
+    const sc = try fx.scan(arena);
+    try setMode(fx.project.bytes, arena, 0o555);
+    defer setMode(fx.project.bytes, arena, 0o755) catch {};
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(testing.allocator);
+
+    var ws = try prepare(testing.allocator, testing.io, fx.ps, sc, &.{}, .{}, &msg);
+    defer ws.deinit(testing.allocator);
+    try testing.expect(ws.mirrored);
+    const mirror = try std.fs.path.join(arena, &.{ ws.cache_dir.bytes, "mirror" });
+    try testing.expectEqualStrings(mirror, ws.source_root.bytes);
+    for ([_][]const u8{ "a/x.zig", "lib/h.zig", rootgen.root_file_name }) |f| {
+        try std.Io.Dir.cwd().access(testing.io, try std.fs.path.join(arena, &.{ mirror, f }), .{});
+    }
+
+    const abs = try std.fs.path.join(arena, &.{ mirror, "a", "x.zig" });
+    const m1 = try ws.mapPath(testing.allocator, abs);
+    defer testing.allocator.free(m1);
+    try testing.expectEqualStrings("a/x.zig", m1);
+    const m2 = try ws.mapPath(testing.allocator, "../mirror/a/x.zig");
+    defer testing.allocator.free(m2);
+    try testing.expectEqualStrings("a/x.zig", m2);
+}
+
+test "mirror resync" {
+    try skipUnlessReadOnlyWorks();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fx = try Fixture.init(arena);
+    defer fx.tmp.cleanup();
+    try fx.put("a/x.zig", "pub const extends = \"Node\";\n");
+    try fx.put("b/y.zig", "pub const extends = \"Node\";\n");
+    try setMode(fx.project.bytes, arena, 0o555);
+    defer setMode(fx.project.bytes, arena, 0o755) catch {};
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(testing.allocator);
+
+    var ws = try prepare(testing.allocator, testing.io, fx.ps, try fx.scan(arena), &.{}, .{}, &msg);
+    const mirror = try arena.dupe(u8, ws.source_root.bytes);
+    const y_path = try std.fs.path.join(arena, &.{ mirror, "b", "y.zig" });
+    const st1 = try std.Io.Dir.cwd().statFile(testing.io, y_path, .{});
+    ws.deinit(testing.allocator);
+
+    // The project root is read-only, but the sub folder `a` is not.
+    var proj = try fx.tmp.dir.openDir(testing.io, "proj", .{});
+    defer proj.close(testing.io);
+    try proj.deleteFile(testing.io, "a/x.zig");
+
+    try testing.io.sleep(.fromMilliseconds(30), .awake);
+    var ws2 = try prepare(testing.allocator, testing.io, fx.ps, try fx.scan(arena), &.{}, .{}, &msg);
+    defer ws2.deinit(testing.allocator);
+    try testing.expect(ws2.mirrored);
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, try std.fs.path.join(arena, &.{ mirror, "a", "x.zig" }), .{}));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, try std.fs.path.join(arena, &.{ mirror, "a" }), .{}));
+    // Unchanged files keep their mtime.
+    const st2 = try std.Io.Dir.cwd().statFile(testing.io, y_path, .{});
+    try testing.expectEqual(st1.mtime.nanoseconds, st2.mtime.nanoseconds);
+}
+
+fn dummyZig() ZigInstall {
+    return .{ .exe = .fromTrusted("/opt/zig/zig"), .version = "0.17.0" };
+}
+
+test "argv golden" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const deps = [_]ModuleDep{.{ .name = "ziggurat", .root = .fromTrusted("/sdk/ziggurat.zig"), .deps = &.{"gdzig"} }};
+    const ws: Workspace = .{
+        .cache_dir = .fromTrusted("/c/projects/p"),
+        .build_dir = .fromTrusted("/c/projects/p/build"),
+        .source_root = .fromTrusted("/proj"),
+        .mirrored = false,
+        .os = builtin.os.tag,
+        .sdk = &deps,
+        .lock = undefined,
+    };
+    const inc = try ws.argv(arena, dummyZig(), .{ .incremental = true, .use_llvm = false, .optimize = .Debug });
+    const want_inc: []const []const u8 = &.{
+        "/opt/zig/zig",            "build-lib",     "-dynamic",                     "-lc",      "-ODebug",
+        "-fno-llvm",               "-fincremental", "--name",                       "zmod",     "--cache-dir",
+        "/c/projects/p/zig-cache", "--listen=-",    "--dep",                        "ziggurat", "-Mroot=/proj/.ziggurat_root.zig",
+        "--dep",                   "gdzig",         "-Mziggurat=/sdk/ziggurat.zig",
+    };
+    try expectArgv(want_inc, inc);
+    const full = try ws.argv(arena, dummyZig(), .{ .incremental = false, .use_llvm = true, .optimize = .ReleaseFast });
+    const want_full: []const []const u8 = &.{
+        "/opt/zig/zig", "build-lib",                    "-dynamic", "-lc",                             "-OReleaseFast",
+        "-fllvm",       "--name",                       "zmod",     "--cache-dir",                     "/c/projects/p/zig-cache",
+        "--listen=-",   "--dep",                        "ziggurat", "-Mroot=/proj/.ziggurat_root.zig", "--dep",
+        "gdzig",        "-Mziggurat=/sdk/ziggurat.zig",
+    };
+    try expectArgv(want_full, full);
+}
+
+fn expectArgv(want: []const []const u8, got: []const []const u8) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try testing.expectEqualStrings(w, g);
+}
+
+test "mapPath outside" {
+    const ws: Workspace = .{
+        .cache_dir = .fromTrusted("/c/projects/p"),
+        .build_dir = .fromTrusted("/c/projects/p/build"),
+        .source_root = .fromTrusted("/proj"),
+        .mirrored = false,
+        .os = .linux,
+        .sdk = &.{},
+        .lock = undefined,
+    };
+    const a = testing.allocator;
+    try testing.expectError(error.OutsideProject, ws.mapPath(a, "/opt/zig/lib/std/mem.zig"));
+    try testing.expectError(error.OutsideProject, ws.mapPath(a, "../../../../x/y.zig"));
+    try testing.expectError(error.OutsideProject, ws.mapPath(a, "/project2/a.zig"));
+    try testing.expectError(error.OutsideProject, ws.mapPath(a, "/proj"));
+    const ok = try ws.mapPath(a, "/proj/./a/../b/c.zig");
+    defer a.free(ok);
+    try testing.expectEqualStrings("b/c.zig", ok);
+}
