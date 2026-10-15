@@ -24,6 +24,10 @@
 //!   moves into the mirror when the project becomes read-only) differs from
 //!   the warm server's, the server is ended (not a death) and warming starts
 //!   again after the full build.
+//! - When incremental builds are lost (the second death, or another editor
+//!   holds `incremental.lock`), the next full-path outcome without a message
+//!   of its own carries a one-time `message` that says why builds are slower.
+//!   Each reason is told at most once per service.
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("ziggurat_platform");
@@ -61,6 +65,9 @@ pub const Outcome = struct {
     /// One sentence for the user when the build failed for a reason other
     /// than compile errors: the Zig locator's message, the `build.lock`
     /// message, the compiler's last output when it died, a staging failure.
+    /// On a full-path outcome that has none of these it may instead hold the
+    /// one-time notice that fast (incremental) rebuilds were lost; then `ok`
+    /// can be true.
     message: ?[]const u8,
     path: BuildPath,
     /// Wall time of the whole build, from start to staged output.
@@ -76,6 +83,9 @@ pub const WarmState = enum {
     /// The server died twice, or the policy has no incremental mode.
     disabled,
 };
+
+/// Why incremental builds stopped; see `Outcome.message`.
+const LostReason = enum { server_died_twice, lock_held };
 
 pub const Stats = struct {
     /// Builds started.
@@ -105,9 +115,14 @@ pub const Config = struct {
     paths: PathService,
     locate: platform.zig_locator.LocateConfig,
     script_dirs: []const []const u8 = scan_mod.default_script_dirs,
+    /// The SDK modules. One must be named `ziggurat` (the root imports it);
+    /// `init` refuses the list otherwise.
     sdk: []const workspace.ModuleDep,
     store_root: OsPath,
     caps: platform.generation_store.Caps = .{},
+    /// Must be the host target (os tag and cpu arch; `init` checks both).
+    /// It exists so tests can check the backend policy; the compiler always
+    /// builds for the host, and the staged file name and checks follow it.
     target: std.Target = builtin.target,
     /// Replaces the backend policy table in every phase.
     policy_override: ?BuildMode = null,
@@ -170,6 +185,12 @@ pub const BuildService = struct {
     stopping: bool = false,
     warm: WarmState = .cold,
     deaths: u32 = 0,
+    /// Why incremental builds were lost, until a full-path outcome tells the
+    /// user (see `takeNotice`).
+    notice: ?LostReason = null,
+    /// Reasons already set once; each is told at most once per service.
+    told_died: bool = false,
+    told_lock: bool = false,
     builds: u32 = 0,
     updates_active: u32 = 0,
     updates_max: u32 = 0,
@@ -194,10 +215,24 @@ pub const BuildService = struct {
     /// Command line of the newest warm server. Written by the build thread
     /// only, after joining the previous warm thread; freed by `deinit`.
     warm_argv: ?[]const []const u8 = null,
+    /// Scan results from earlier builds. Used by the build thread only.
+    scan_cache: scan_mod.Cache,
+
+    pub const InitError = error{ MissingSdkModule, TargetNotHost, OutOfMemory } || std.Thread.SpawnError;
 
     /// Starts the build thread. `a` must be thread-safe. Nothing is built
-    /// until the first `request`.
-    pub fn init(a: std.mem.Allocator, io: std.Io, cfg: Config) !*BuildService {
+    /// until the first `request`. See `initDiag` for the errors.
+    pub fn init(a: std.mem.Allocator, io: std.Io, cfg: Config) InitError!*BuildService {
+        var diag: [256]u8 = undefined;
+        return initDiag(a, io, cfg, &diag);
+    }
+
+    /// Like `init`; on `error.MissingSdkModule` (no module in `cfg.sdk` is
+    /// named `ziggurat`) or `error.TargetNotHost` (`cfg.target` is not the
+    /// host), `diag` holds one sentence for the user (read it with
+    /// `platform.elf.diagText`), ready to show like `Outcome.message`.
+    pub fn initDiag(a: std.mem.Allocator, io: std.Io, cfg: Config, diag: *[256]u8) InitError!*BuildService {
+        try checkConfig(cfg, diag);
         const self = try a.create(BuildService);
         errdefer a.destroy(self);
         self.* = .{
@@ -205,7 +240,9 @@ pub const BuildService = struct {
             .io = io,
             .cfg = cfg,
             .store = GenerationStore.init(a, io, cfg.store_root, cfg.target.os.tag, lib_stem, cfg.caps),
+            .scan_cache = .init(a),
         };
+        errdefer self.scan_cache.deinit();
         self.build_thread = try spawn(buildMain, .{self});
         return self;
     }
@@ -311,6 +348,7 @@ pub const BuildService = struct {
         if (self.full_slot) |*s| s.deinit();
         if (self.zig) |z| z.deinit(self.a);
         if (self.last_outcome) |o| freeOutcome(self.a, o);
+        self.scan_cache.deinit();
         self.a.destroy(self);
     }
 
@@ -388,7 +426,7 @@ pub const BuildService = struct {
 
         const zig = try self.locateZig(o);
         const project = self.cfg.paths.roots.project;
-        const sc = scan_mod.scan(arena, self.io, project, self.cfg.script_dirs) catch |err| {
+        const sc = scan_mod.scanCached(arena, self.io, project, self.cfg.script_dirs, &self.scan_cache) catch |err| {
             o.message = try std.fmt.allocPrint(a, "Scanning the project folder {s} failed: {t}.", .{ project.bytes, err });
             return err;
         };
@@ -401,6 +439,7 @@ pub const BuildService = struct {
         } else {
             o.path = .full;
             try self.fullBuild(arena, &ws, zig, o);
+            if (o.message == null) o.message = try self.takeNotice();
             if (o.ok) self.startWarm(&ws, zig);
         }
         try appendProblems(a, o, sc.problems);
@@ -560,7 +599,7 @@ pub const BuildService = struct {
         };
         var diag: [256]u8 = undefined;
         const gen = self.store.stageDiag(out, &.{}, &diag) catch {
-            o.message = try a.dupe(u8, platform.elf.diagText(&diag));
+            o.message = try stagingMessage(a, out.bytes, platform.elf.diagText(&diag));
             return;
         };
         o.generation = gen;
@@ -606,6 +645,7 @@ pub const BuildService = struct {
         if (death) {
             self.deaths += 1;
             self.warm = if (self.deaths >= 2) .disabled else .cold;
+            if (self.warm == .disabled) self.noteLostLocked(.server_died_twice);
         } else if (self.warm != .disabled) {
             self.warm = .cold;
         }
@@ -653,6 +693,33 @@ pub const BuildService = struct {
         return spawn(warmMain, .{ self, WarmJob{ .argv = argv, .cwd = cwd, .lock_path = lock_path } });
     }
 
+    /// Records why incremental builds were lost, unless this reason was
+    /// already recorded once. Called with `mu` held.
+    fn noteLostLocked(self: *BuildService, why: LostReason) void {
+        const told = switch (why) {
+            .server_died_twice => &self.told_died,
+            .lock_held => &self.told_lock,
+        };
+        if (told.*) return;
+        told.* = true;
+        self.notice = why;
+    }
+
+    /// The pending one-time notice as an owned message, or null.
+    fn takeNotice(self: *BuildService) !?[]const u8 {
+        const why = blk: {
+            self.mu.lockUncancelable(self.io);
+            defer self.mu.unlock(self.io);
+            const w = self.notice orelse return null;
+            self.notice = null;
+            break :blk w;
+        };
+        return try std.fmt.allocPrint(self.a, "Fast rebuilds are off for this session: {s}. Builds still work but are slower.", .{switch (why) {
+            .server_died_twice => "the Zig compiler server stopped twice",
+            .lock_held => "another editor is using fast rebuilds for this project",
+        }});
+    }
+
     fn warmState(self: *BuildService) WarmState {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
@@ -674,8 +741,14 @@ pub const BuildService = struct {
         const io = self.io;
         // Never waited for: when another editor's server owns this cache,
         // stay on the full path (not a death).
-        var lock = FileLock.acquire(io, job.lock_path, .exclusive, 0) catch {
-            self.setWarm(.cold);
+        var lock = FileLock.acquire(io, job.lock_path, .exclusive, 0) catch |err| {
+            self.mu.lockUncancelable(io);
+            defer self.mu.unlock(io);
+            // Only a lock held elsewhere is another editor; other errors
+            // just leave the service on the full path.
+            if (err == error.Timeout) self.noteLostLocked(.lock_held);
+            self.warm = .cold;
+            self.cond.broadcast(io);
             return;
         };
         var s = Session.start(self.a, io, job.argv, job.cwd) catch {
@@ -718,6 +791,42 @@ pub const BuildService = struct {
         return true;
     }
 };
+
+/// Checks what `init` cannot work without; see `BuildService.initDiag`.
+fn checkConfig(cfg: Config, diag: *[256]u8) error{ MissingSdkModule, TargetNotHost }!void {
+    const t = cfg.target;
+    if (t.os.tag != builtin.os.tag or t.cpu.arch != builtin.cpu.arch) {
+        platform.elf.setDiag(diag, "The build target {t}-{t} is not this machine's target {t}-{t}; Ziggurat builds only for the machine it runs on.", .{
+            t.cpu.arch, t.os.tag, builtin.cpu.arch, builtin.os.tag,
+        });
+        return error.TargetNotHost;
+    }
+    for (cfg.sdk) |m| {
+        if (std.mem.eql(u8, m.name, "ziggurat")) return;
+    }
+    // Name the modules that are there, so a typo is easy to see.
+    var names: [160]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&names);
+    for (cfg.sdk, 0..) |m, i| {
+        w.print("{s}{s}", .{ if (i == 0) "" else ", ", m.name }) catch break;
+    }
+    const listed = w.buffered();
+    platform.elf.setDiag(diag, "The SDK module list ({s}) has no module named \"ziggurat\"; add the Ziggurat SDK to it.", .{
+        if (listed.len == 0) "empty" else listed,
+    });
+    return error.MissingSdkModule;
+}
+
+/// The user message for a staging failure: `detail` (one sentence) with the
+/// staged file named in front, unless `detail` already names it.
+fn stagingMessage(a: std.mem.Allocator, staged: []const u8, detail: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, detail, staged) != null) return a.dupe(u8, detail);
+    const m = try std.fmt.allocPrint(a, "Staging {s} failed: {s}", .{ staged, detail });
+    // "The file ..." reads as "the file ..." after the colon; "ELF ..." stays.
+    const at = m.len - detail.len;
+    if (detail.len >= 2 and std.ascii.isUpper(detail[0]) and std.ascii.isLower(detail[1])) m[at] = std.ascii.toLower(detail[0]);
+    return m;
+}
 
 fn spawn(comptime f: anytype, args: anytype) !std.Thread {
     _ = live_threads.fetchAdd(1, .acq_rel);
@@ -841,7 +950,7 @@ test "request and deinit without a build" {
     const svc = try BuildService.init(a, testing.io, .{
         .paths = .init(.{ .project = .fromTrusted(base) }, env),
         .locate = .{ .configured = null, .toolchain_dir = .fromTrusted(base), .env = env },
-        .sdk = &.{},
+        .sdk = &.{.{ .name = "ziggurat", .root = .fromTrusted(base), .deps = &.{} }},
         .store_root = .fromTrusted(base),
     });
     try svc.waitIdle(1000);
@@ -911,7 +1020,7 @@ test "waitIdle from the callback is refused" {
     const svc = try BuildService.init(a, testing.io, .{
         .paths = .init(.{ .project = .fromTrusted(base) }, env),
         .locate = .{ .configured = null, .toolchain_dir = .fromTrusted(base), .env = env },
-        .sdk = &.{},
+        .sdk = &.{.{ .name = "ziggurat", .root = .fromTrusted(base), .deps = &.{} }},
         .store_root = .fromTrusted(base),
         .on_outcome = CallbackProbe.onOutcome,
         .on_outcome_ctx = &probe,
@@ -922,4 +1031,58 @@ test "waitIdle from the callback is refused" {
     try svc.waitIdle(10_000);
     try testing.expectEqual(@as(u8, 2), probe.wait_result.load(.acquire));
     try testing.expect(!svc.last().?.ok);
+}
+
+fn testConfig(base: []const u8, sdk: []const workspace.ModuleDep) Config {
+    const env: platform.path.HostEnv = .{ .os = builtin.os.tag, .home = base, .xdg_cache_home = base, .local_app_data = base };
+    return .{
+        .paths = .init(.{ .project = .fromTrusted(base) }, env),
+        .locate = .{ .configured = null, .toolchain_dir = .fromTrusted(base), .env = env },
+        .sdk = sdk,
+        .store_root = .fromTrusted(base),
+    };
+}
+
+test "init refuses an sdk list without a ziggurat module" {
+    const a = testing.allocator;
+    var diag: [256]u8 = undefined;
+    const sdk = [_]workspace.ModuleDep{.{ .name = "gdzig", .root = .fromTrusted("/sdk/gdzig.zig"), .deps = &.{} }};
+    try testing.expectError(error.MissingSdkModule, BuildService.initDiag(a, testing.io, testConfig("/p", &sdk), &diag));
+    try testing.expectEqualStrings(
+        "The SDK module list (gdzig) has no module named \"ziggurat\"; add the Ziggurat SDK to it.",
+        platform.elf.diagText(&diag),
+    );
+    try testing.expectError(error.MissingSdkModule, BuildService.init(a, testing.io, testConfig("/p", &.{})));
+    try testing.expectEqual(@as(u32, 0), liveThreads());
+}
+
+test "init refuses a target that is not the host" {
+    const a = testing.allocator;
+    var diag: [256]u8 = undefined;
+    const sdk = [_]workspace.ModuleDep{.{ .name = "ziggurat", .root = .fromTrusted("/sdk/z.zig"), .deps = &.{} }};
+    var cfg = testConfig("/p", &sdk);
+    var t = builtin.target;
+    t.os.tag = if (builtin.os.tag == .windows) .linux else .windows;
+    cfg.target = t;
+    try testing.expectError(error.TargetNotHost, BuildService.initDiag(a, testing.io, cfg, &diag));
+    try testing.expect(std.mem.startsWith(u8, platform.elf.diagText(&diag), "The build target "));
+    t = builtin.target;
+    t.cpu.arch = if (builtin.cpu.arch == .aarch64) .x86_64 else .aarch64;
+    cfg.target = t;
+    try testing.expectError(error.TargetNotHost, BuildService.initDiag(a, testing.io, cfg, &diag));
+}
+
+test "stagingMessage names the staged file" {
+    const a = testing.allocator;
+    const m1 = try stagingMessage(a, "/c/build/libzmod.so", "The file is not a 64-bit little-endian ELF file (3 bytes).");
+    defer a.free(m1);
+    try testing.expectEqualStrings("Staging /c/build/libzmod.so failed: the file is not a 64-bit little-endian ELF file (3 bytes).", m1);
+    // An ELF word stays as written.
+    const m2 = try stagingMessage(a, "/c/x.so", "ELF data is short.");
+    defer a.free(m2);
+    try testing.expectEqualStrings("Staging /c/x.so failed: ELF data is short.", m2);
+    // A message that already names the file is kept.
+    const m3 = try stagingMessage(a, "/c/x.so", "Staging /c/x.so failed: AccessDenied.");
+    defer a.free(m3);
+    try testing.expectEqualStrings("Staging /c/x.so failed: AccessDenied.", m3);
 }

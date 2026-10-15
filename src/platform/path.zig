@@ -41,7 +41,8 @@ pub const HostEnv = struct {
 };
 
 pub const ProjectRoots = struct {
-    /// Absolute project folder, given by L4.
+    /// Absolute project folder, given by L4. It must be the realpath (no
+    /// symbolic links); see `PathService.projectId`.
     project: OsPath,
 };
 
@@ -107,6 +108,8 @@ pub fn importLiteral(a: Allocator, os: Os, rel: OsPath) ![]const u8 {
     return std.fmt.allocPrint(a, "\"{f}\"", .{std.zig.fmtString(src)});
 }
 
+/// Paths for one project and the host's per-user folders. The caller (L4)
+/// must pass the realpath of the project in `roots.project`; see `projectId`.
 pub const PathService = struct {
     roots: ProjectRoots,
     env: HostEnv,
@@ -143,6 +146,13 @@ pub const PathService = struct {
         return if (s.len == 0) null else s;
     }
 
+    /// An XDG base directory variable. The XDG spec says to ignore a relative
+    /// value, so it counts as unset (like an empty one).
+    fn presentXdg(v: ?[]const u8) ?[]const u8 {
+        const s = present(v) orelse return null;
+        return if (s[0] == '/') s else null;
+    }
+
     pub fn dir(self: PathService, kind: DirKind, a: Allocator) !OsPath {
         const e = self.env;
         const os = e.os;
@@ -175,17 +185,17 @@ pub const PathService = struct {
                 switch (kind) {
                     .cache, .temp => {
                         const tail: []const []const u8 = if (kind == .cache) &.{"ziggurat"} else &.{ "ziggurat", "tmp" };
-                        if (present(e.xdg_cache_home)) |x| return joinFor(os, a, .fromTrusted(x), tail);
+                        if (presentXdg(e.xdg_cache_home)) |x| return joinFor(os, a, .fromTrusted(x), tail);
                         const h = home orelse return error.NoHomeDirectory;
                         return joinFor(os, a, .fromTrusted(h), if (kind == .cache) &.{ ".cache", "ziggurat" } else &.{ ".cache", "ziggurat", "tmp" });
                     },
                     .config => {
-                        if (present(e.xdg_config_home)) |x| return joinFor(os, a, .fromTrusted(x), &.{"ziggurat"});
+                        if (presentXdg(e.xdg_config_home)) |x| return joinFor(os, a, .fromTrusted(x), &.{"ziggurat"});
                         const h = home orelse return error.NoHomeDirectory;
                         return joinFor(os, a, .fromTrusted(h), &.{ ".config", "ziggurat" });
                     },
                     .toolchain => {
-                        if (present(e.xdg_data_home)) |x| return joinFor(os, a, .fromTrusted(x), &.{ "ziggurat", "toolchains" });
+                        if (presentXdg(e.xdg_data_home)) |x| return joinFor(os, a, .fromTrusted(x), &.{ "ziggurat", "toolchains" });
                         const h = home orelse return error.NoHomeDirectory;
                         return joinFor(os, a, .fromTrusted(h), &.{ ".local", "share", "ziggurat", "toolchains" });
                     },
@@ -195,6 +205,10 @@ pub const PathService = struct {
     }
 
     /// First 16 lowercase hex characters of the sha256 of the project path.
+    /// The path is hashed as given, so the caller must pass the realpath of
+    /// the project (`roots.project`): the same project opened through a
+    /// symbolic link would otherwise get a second cache folder and a second
+    /// `build.lock`, and two editors would not exclude each other.
     pub fn projectId(self: PathService) [16]u8 {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(self.roots.project.bytes, &digest, .{});
@@ -364,4 +378,18 @@ test "importLiteral invalid utf8 and control bytes" {
 
 test "empty env value counts as unset" {
     try expectDir(.{ .os = .linux, .home = "/home/u", .xdg_cache_home = "" }, .cache, "/home/u/.cache/ziggurat");
+}
+
+test "relative xdg values count as unset" {
+    const env: HostEnv = .{
+        .os = .linux,
+        .home = "/home/u",
+        .xdg_cache_home = "rel/cache",
+        .xdg_config_home = "./cfg",
+        .xdg_data_home = "data",
+    };
+    try expectDir(env, .cache, "/home/u/.cache/ziggurat");
+    try expectDir(env, .temp, "/home/u/.cache/ziggurat/tmp");
+    try expectDir(env, .config, "/home/u/.config/ziggurat");
+    try expectDir(env, .toolchain, "/home/u/.local/share/ziggurat/toolchains");
 }

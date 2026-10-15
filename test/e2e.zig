@@ -657,3 +657,89 @@ test "integration: warm server restarts when the source root moves" {
     svc.deinit();
     try expectIncrementalLockFree(&fx);
 }
+
+const lost_lock_message = "Fast rebuilds are off for this session: another editor is using fast rebuilds for this project. Builds still work but are slower.";
+const lost_died_message = "Fast rebuilds are off for this session: the Zig compiler server stopped twice. Builds still work but are slower.";
+
+test "integration: lost fast path is reported once when another editor holds the server lock" {
+    try platform.testing_support.requireIntegration();
+    if (is_windows) return error.SkipZigTest;
+    var fx: Fx = undefined;
+    try fx.init("proj");
+    defer fx.deinit();
+    try fx.write("a.zig", try scriptSource(fx.arena(), 1));
+
+    // Another editor's incremental server owns this project's cache.
+    const lock_path = try incrementalLockPath(&fx);
+    try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(lock_path).?);
+    var other = try platform.lock.FileLock.acquire(io, .fromTrusted(lock_path), .exclusive, 0);
+    defer other.release();
+
+    const svc = try BuildService.init(testing.allocator, io, fx.config(build_options.zig_exe));
+    defer svc.deinit();
+    const o1 = try build(svc, .open);
+    try expectOk(o1);
+    try testing.expect(o1.message == null);
+    try testing.expectError(error.NotWarm, svc.waitWarm(build_wait_ms));
+
+    try fx.write("a.zig", try scriptSource(fx.arena(), 2));
+    const o2 = try build(svc, .save);
+    try expectOk(o2);
+    try testing.expectEqual(service.BuildPath.full, o2.path);
+    try testing.expectEqualStrings(lost_lock_message, o2.message.?);
+    try testing.expectEqual(@as(i32, 2), try callValue(o2));
+
+    // Told once: the next full build (the lock is still taken) says nothing.
+    try testing.expectError(error.NotWarm, svc.waitWarm(build_wait_ms));
+    try fx.write("a.zig", try scriptSource(fx.arena(), 3));
+    const o3 = try build(svc, .save);
+    try expectOk(o3);
+    try testing.expect(o3.message == null);
+    try testing.expectEqual(@as(u32, 0), svc.stats().session_deaths);
+}
+
+test "integration: lost fast path is reported once after the second server death" {
+    try platform.testing_support.requireIntegration();
+    if (is_windows) return error.SkipZigTest;
+    var fx: Fx = undefined;
+    try fx.init("proj");
+    defer fx.deinit();
+    try fx.write("a.zig", try scriptSource(fx.arena(), 1));
+
+    // A compiler whose incremental server always dies at once.
+    const a = fx.arena();
+    const text = try std.fmt.allocPrint(a,
+        \\#!/bin/sh
+        \\if [ "$1" = version ]; then echo '0.17.0'; exit 0; fi
+        \\case " $* " in *" -fincremental "*) exit 3 ;; esac
+        \\exec '{s}' "$@"
+        \\
+    , .{build_options.zig_exe});
+    try fx.tmp.dir.writeFile(io, .{ .sub_path = "diezig", .data = text });
+    const zig = try std.fs.path.joinZ(a, &.{ fx.base, "diezig" });
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(zig, 0o755));
+
+    const svc = try BuildService.init(testing.allocator, io, fx.config(zig));
+    defer svc.deinit();
+    const o1 = try build(svc, .open);
+    try expectOk(o1);
+    try testing.expectError(error.NotWarm, svc.waitWarm(build_wait_ms));
+    try testing.expectEqual(@as(u32, 1), svc.stats().session_deaths);
+
+    // The first death is not reported: the service warms again.
+    const o2 = try build(svc, .save);
+    try expectOk(o2);
+    try testing.expect(o2.message == null);
+    try testing.expectError(error.NotWarm, svc.waitWarm(build_wait_ms));
+    try testing.expectEqual(@as(u32, 2), svc.stats().session_deaths);
+    try testing.expectEqual(service.WarmState.disabled, svc.stats().warm);
+
+    const o3 = try build(svc, .save);
+    try expectOk(o3);
+    try testing.expectEqual(service.BuildPath.full, o3.path);
+    try testing.expectEqualStrings(lost_died_message, o3.message.?);
+
+    const o4 = try build(svc, .save);
+    try expectOk(o4);
+    try testing.expect(o4.message == null);
+}

@@ -8,6 +8,11 @@
 //! `.zig` file is read like a normal file.
 //!
 //! All results are allocated from `a`; pass an arena and free it as a whole.
+//!
+//! Finding `pub const extends` needs a full parse of the file, which is the
+//! largest part of a small build in a Debug build of the service. `scanCached`
+//! keeps each file's result in a `Cache` between scans and reads and parses
+//! only files whose size, modification time or inode changed.
 const std = @import("std");
 const platform = @import("ziggurat_platform");
 const OsPath = platform.path.OsPath;
@@ -26,6 +31,86 @@ pub const ScanResult = struct {
     /// Helper `.zig` files (not scripts), sorted by `rel` (byte order).
     helper_paths: []Script,
     problems: []Problem,
+    /// Number of files read and parsed by this scan (the others came from
+    /// the cache).
+    parsed: u32 = 0,
+};
+
+/// Each file's classification from earlier scans, so an unchanged file is
+/// neither read nor parsed again. Owned by one caller; not thread-safe.
+pub const Cache = struct {
+    gpa: std.mem.Allocator,
+    /// Keyed by `rel`; keys are owned by the cache.
+    map: std.StringHashMapUnmanaged(Entry) = .empty,
+    /// Incremented by every scan; entries not seen by a scan are removed.
+    epoch: u32 = 0,
+
+    const Entry = struct {
+        size: u64,
+        mtime: i96,
+        inode: std.Io.File.INode,
+        script: bool,
+        epoch: u32,
+    };
+
+    /// A file modified less than this long before the scan is parsed again
+    /// on every scan: on file systems with coarse modification times, a
+    /// second edit within the same tick would otherwise go unseen.
+    pub const racy_ns: i96 = 2 * std.time.ns_per_s;
+
+    pub fn init(gpa: std.mem.Allocator) Cache {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(self: *Cache) void {
+        var it = self.map.keyIterator();
+        while (it.next()) |k| self.gpa.free(k.*);
+        self.map.deinit(self.gpa);
+        self.* = undefined;
+    }
+
+    pub fn count(self: *const Cache) usize {
+        return self.map.count();
+    }
+
+    fn lookup(self: *Cache, rel: []const u8, st: std.Io.File.Stat, now: i96) ?bool {
+        const e = self.map.getPtr(rel) orelse return null;
+        if (e.size != st.size or e.mtime != st.mtime.nanoseconds or e.inode != st.inode) return null;
+        if (now - st.mtime.nanoseconds < racy_ns) return null;
+        e.epoch = self.epoch;
+        return e.script;
+    }
+
+    fn store(self: *Cache, rel: []const u8, st: std.Io.File.Stat, script: bool) !void {
+        const gop = try self.map.getOrPut(self.gpa, rel);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.gpa.dupe(u8, rel) catch |err| {
+                self.map.removeByPtr(gop.key_ptr);
+                return err;
+            };
+        }
+        gop.value_ptr.* = .{
+            .size = st.size,
+            .mtime = st.mtime.nanoseconds,
+            .inode = st.inode,
+            .script = script,
+            .epoch = self.epoch,
+        };
+    }
+
+    /// Removes entries that the scan with the current epoch did not see.
+    fn prune(self: *Cache) !void {
+        var stale: std.ArrayList([]const u8) = .empty;
+        defer stale.deinit(self.gpa);
+        var it = self.map.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.epoch != self.epoch) try stale.append(self.gpa, kv.key_ptr.*);
+        }
+        for (stale.items) |k| {
+            _ = self.map.remove(k);
+            self.gpa.free(k);
+        }
+    }
 };
 
 pub const default_script_dirs: []const []const u8 = &.{""};
@@ -41,6 +126,10 @@ const Scanner = struct {
     seen: std.StringHashMapUnmanaged(void) = .empty,
     walked: std.StringHashMapUnmanaged(void) = .empty,
     helper_list: std.ArrayList(Script) = .empty,
+    cache: ?*Cache = null,
+    /// Wall-clock time at the start of the scan, for `Cache.racy_ns`.
+    now: i96 = 0,
+    parsed: u32 = 0,
 
     fn walk(self: *Scanner, rel: []const u8) !void {
         // Overlapping script folders: visit each folder once.
@@ -83,11 +172,23 @@ const Scanner = struct {
 
     fn file(self: *Scanner, dir: std.Io.Dir, name: []const u8, rel: []const u8) !void {
         if ((try self.seen.getOrPut(self.a, rel)).found_existing) return;
+        // Without a usable stat the file is read and parsed, and not cached.
+        const st: ?std.Io.File.Stat = if (self.cache != null) dir.statFile(self.io, name, .{}) catch null else null;
+        if (self.cache) |c| if (st) |x| if (c.lookup(rel, x, self.now)) |script| return self.classify(rel, script);
         const src = dir.readFileAllocOptions(self.io, name, self.a, .limited(max_file_bytes), .of(u8), 0) catch |err| {
             try self.problem(rel, "Could not read \"{s}\": {t}.", .{ rel, err });
             return;
         };
-        if (try hasTopLevelExtends(self.a, src)) {
+        self.parsed += 1;
+        const script = try hasTopLevelExtends(self.a, src);
+        // The stat was taken before the read: a write in between changes the
+        // key, so the next scan reads the file again.
+        if (self.cache) |c| if (st) |x| try c.store(rel, x, script);
+        try self.classify(rel, script);
+    }
+
+    fn classify(self: *Scanner, rel: []const u8, script: bool) !void {
+        if (script) {
             try self.scripts.append(self.a, .{ .rel = rel });
         } else {
             try self.helper_list.append(self.a, .{ .rel = rel });
@@ -102,12 +203,27 @@ const Scanner = struct {
 /// Scans each folder of `script_dirs` (project-relative, `/`-separated, `""` is
 /// the project root). Entries are normalised first: `.` and empty parts are
 /// dropped, so `./a//b/` means `a/b`. `error.InvalidScriptDir` when an entry is
-/// absolute or contains `..`.
+/// absolute or contains `..`. Every file is read and parsed; see `scanCached`.
 pub fn scan(
     a: std.mem.Allocator,
     io: std.Io,
     project: OsPath,
     script_dirs: []const []const u8,
+) !ScanResult {
+    return scanCached(a, io, project, script_dirs, null);
+}
+
+/// Like `scan`, but with a `cache` it reads and parses only files that are
+/// new or changed since the last scan with the same cache (key: `rel`, size,
+/// modification time, inode), and files modified in the last
+/// `Cache.racy_ns`. The result is the same as `scan`'s. Entries for files
+/// that were not seen are removed.
+pub fn scanCached(
+    a: std.mem.Allocator,
+    io: std.Io,
+    project: OsPath,
+    script_dirs: []const []const u8,
+    cache: ?*Cache,
 ) !ScanResult {
     for (script_dirs) |d| {
         if (std.mem.startsWith(u8, d, "/") or std.mem.indexOfScalar(u8, d, '\\') != null) return error.InvalidScriptDir;
@@ -116,8 +232,13 @@ pub fn scan(
     }
     var root = try std.Io.Dir.cwd().openDir(io, project.bytes, .{});
     defer root.close(io);
-    var s: Scanner = .{ .a = a, .io = io, .project = root };
+    var s: Scanner = .{ .a = a, .io = io, .project = root, .cache = cache };
+    if (cache) |c| {
+        c.epoch +%= 1;
+        s.now = std.Io.Clock.real.now(io).nanoseconds;
+    }
     for (script_dirs) |d| try s.walk(try normalizeDir(a, d));
+    if (cache) |c| try c.prune();
     std.mem.sort(Script, s.scripts.items, {}, lessThan);
     std.mem.sort(Script, s.helper_list.items, {}, lessThan);
     try checkCase(&s);
@@ -126,6 +247,7 @@ pub fn scan(
         .helpers = @intCast(s.helper_list.items.len),
         .helper_paths = s.helper_list.items,
         .problems = s.problems.items,
+        .parsed = s.parsed,
     };
 }
 
@@ -334,4 +456,63 @@ test "scan reports a problem once for overlapping dirs" {
 
     const res = try scan(a, testing.io, try tmpProject(tmp, a), &.{ "", "game", "game/locked" });
     try testing.expectEqual(@as(usize, 1), res.problems.len);
+}
+
+/// Sets the modification time of `sub` to 10 s ago, outside the cache's
+/// coarse-mtime guard.
+fn age(tmp: std.testing.TmpDir, sub: []const u8) !void {
+    const now = std.Io.Clock.real.now(testing.io);
+    const old: std.Io.Timestamp = .{ .nanoseconds = now.nanoseconds - 10 * std.time.ns_per_s };
+    try tmp.dir.setTimestamps(testing.io, sub, .{ .modify_timestamp = .{ .new = old } });
+}
+
+test "scan cache parses only changed files" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try put(tmp, "a.zig", "pub const extends = \"Node\";\n");
+    try put(tmp, "b.zig", "pub const extends = \"Node\";\n");
+    try put(tmp, "lib/h.zig", "pub fn f() void {}\n");
+    for ([_][]const u8{ "a.zig", "b.zig", "lib/h.zig" }) |f| try age(tmp, f);
+    const project = try tmpProject(tmp, a);
+
+    var cache: Cache = .init(testing.allocator);
+    defer cache.deinit();
+
+    const r1 = try scanCached(a, testing.io, project, default_script_dirs, &cache);
+    try testing.expectEqual(@as(u32, 3), r1.parsed);
+    try testing.expectEqual(@as(usize, 2), r1.scripts.len);
+
+    // Nothing changed: nothing is read or parsed, and the result is the same.
+    const r2 = try scanCached(a, testing.io, project, default_script_dirs, &cache);
+    try testing.expectEqual(@as(u32, 0), r2.parsed);
+    try testing.expectEqual(@as(usize, 2), r2.scripts.len);
+    try testing.expectEqualStrings("a.zig", r2.scripts[0].rel);
+    try testing.expectEqualStrings("b.zig", r2.scripts[1].rel);
+    try testing.expectEqual(@as(u32, 1), r2.helpers);
+
+    // An edited file is parsed again; `b.zig` stops being a script.
+    try put(tmp, "b.zig", "pub fn g() void {}\n");
+    const r3 = try scanCached(a, testing.io, project, default_script_dirs, &cache);
+    try testing.expectEqual(@as(u32, 1), r3.parsed);
+    try testing.expectEqual(@as(usize, 1), r3.scripts.len);
+    try testing.expectEqual(@as(u32, 2), r3.helpers);
+
+    // A file changed in the last 2 s is parsed on every scan (coarse mtime).
+    const r4 = try scanCached(a, testing.io, project, default_script_dirs, &cache);
+    try testing.expectEqual(@as(u32, 1), r4.parsed);
+
+    // A deleted file leaves the cache.
+    try tmp.dir.deleteFile(testing.io, "a.zig");
+    try age(tmp, "b.zig");
+    const r5 = try scanCached(a, testing.io, project, default_script_dirs, &cache);
+    try testing.expectEqual(@as(usize, 0), r5.scripts.len);
+    try testing.expectEqual(@as(usize, 2), cache.count());
+
+    // Without a cache every file is parsed.
+    const r6 = try scan(a, testing.io, project, default_script_dirs);
+    try testing.expectEqual(@as(u32, 2), r6.parsed);
 }
