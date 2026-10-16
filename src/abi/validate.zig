@@ -3,6 +3,13 @@
 //! this order: the table header, then each count against its limit before any
 //! array is indexed, then each array element and the strings it points to.
 //!
+//! Work is bounded: every count has a limit, and the whole table has a budget
+//! of items (`Limits.max_total_items`) and string bytes
+//! (`Limits.max_total_string_bytes`), however much the module shares arrays
+//! or strings between scripts. Duplicate checks use a hash set, so they are
+//! linear. The set uses a fixed hash seed; a module that crafts colliding
+//! names can only slow a check by a factor bounded by the item budget.
+//!
 //! What it cannot prove: that a non-null, aligned pointer points to real
 //! memory. It relies on the module being loaded in this process (so the
 //! pointers the table holds refer to the module's own data) and on every
@@ -36,6 +43,11 @@ pub const Limits = struct {
     max_args: u32 = 64,
     max_string: u32 = 4096,
     max_instance_size: u32 = 1 << 24,
+    /// Scripts + fields + properties + methods + signals + arguments, summed
+    /// over the whole table.
+    max_total_items: u32 = 262144,
+    /// Sum of the length of every `Str` the validator looks at.
+    max_total_string_bytes: u32 = 16 << 20,
 };
 
 pub const ValidateError = error{
@@ -61,8 +73,14 @@ fn setDiag(diag: *[256]u8, comptime fmt: []const u8, args: anytype) void {
 
 /// Checks `t` and everything it points to. On failure returns the error for
 /// the first broken rule and puts one sentence in `diag`; on success `diag`
-/// is empty.
-pub fn validate(t: *const Table, expected_stamp: u64, limits: Limits, diag: *[256]u8) ValidateError!void {
+/// is empty. `a` is used for temporary hash sets, all freed before return.
+pub fn validate(
+    a: std.mem.Allocator,
+    t: *const Table,
+    expected_stamp: u64,
+    limits: Limits,
+    diag: *[256]u8,
+) (ValidateError || error{OutOfMemory})!void {
     @memset(diag, 0);
     if (t.magic != abi.magic) {
         setDiag(diag, "The table magic is 0x{x}, expected 0x{x}.", .{ t.magic, abi.magic });
@@ -81,12 +99,13 @@ pub fn validate(t: *const Table, expected_stamp: u64, limits: Limits, diag: *[25
         return error.BadStamp;
     }
 
-    var c: Ctx = .{ .diag = diag, .limits = limits };
-    _ = try c.str(&t.sdk_version, .{ .kind = "table", .what = "SDK version" });
-    _ = try c.str(&t.build_id, .{ .kind = "table", .what = "build id" });
+    var c: Ctx = .{ .a = a, .diag = diag, .limits = limits };
+    _ = try c.str(&t.sdk_version, .{ .what = "SDK version" });
+    _ = try c.str(&t.build_id, .{ .what = "build id" });
     if (t.script_count > limits.max_scripts) {
-        return c.fail(error.TooMany, "The table lists {d} scripts, above the maximum {d}.", .{ t.script_count, limits.max_scripts });
+        return c.fail(error.TooMany, "has {d} scripts, above the limit {d}.", .{ t.script_count, limits.max_scripts });
     }
+    try c.items(t.script_count);
     const scripts = try c.array(ScriptDesc, &t.scripts, t.script_count, "scripts");
 
     for (scripts, 0..) |*s, i| {
@@ -95,17 +114,22 @@ pub fn validate(t: *const Table, expected_stamp: u64, limits: Limits, diag: *[25
         try c.script(s);
     }
     c.script_index = null;
+    c.path = "";
 
     // Paths are unique. Each one was validated above.
-    for (scripts, 0..) |*a, i| {
-        const pa = slice(&a.path);
-        for (scripts[0..i], 0..) |*b, j| {
-            if (std.mem.eql(u8, pa, slice(&b.path))) {
-                return c.fail(error.Duplicate, "Scripts {d} and {d} share the path \"{f}\".", .{ j, i, Clip{ .s = pa } });
-            }
+    var seen: Set = .empty;
+    defer seen.deinit(a);
+    try seen.ensureTotalCapacity(a, @intCast(scripts.len));
+    for (scripts, 0..) |*sc, i| {
+        const gop = seen.getOrPutAssumeCapacity(slice(&sc.path));
+        if (gop.found_existing) {
+            return c.fail(error.Duplicate, "has two scripts with the path \"{f}\" (scripts {d} and {d}).", .{ Clip{ .s = slice(&sc.path) }, gop.value_ptr.*, i });
         }
+        gop.value_ptr.* = @intCast(i);
     }
 }
+
+const Set = std.StringHashMapUnmanaged(u32);
 
 /// The bytes of a `Str` already accepted by `Ctx.str`.
 fn slice(s: *const Str) []const u8 {
@@ -140,27 +164,43 @@ const Clip = struct {
     }
 };
 
-/// Names the item being checked, e.g. `property 3 name`.
+/// Names the item being checked, e.g. `property 3 name` or
+/// `method 1 argument 0 class name`. Empty `kind` names a script or table
+/// string directly (`class name`).
 const Where = struct {
-    kind: []const u8,
+    kind: []const u8 = "",
     index: ?u32 = null,
-    what: []const u8,
+    sub: []const u8 = "",
+    sub_index: ?u32 = null,
+    what: []const u8 = "",
 
     pub fn format(self: Where, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try w.writeAll(self.kind);
-        if (self.index) |i| try w.print(" {d}", .{i});
-        if (self.what.len > 0) try w.print(" {s}", .{self.what});
+        var first = true;
+        inline for (.{ self.kind, self.sub, self.what }, 0..) |word, k| {
+            if (word.len > 0) {
+                if (!first) try w.writeByte(' ');
+                try w.writeAll(word);
+                first = false;
+                const idx = if (k == 0) self.index else if (k == 1) self.sub_index else null;
+                if (idx) |i| try w.print(" {d}", .{i});
+            }
+        }
     }
 };
 
 const Ctx = struct {
+    a: std.mem.Allocator,
     diag: *[256]u8,
     limits: Limits,
+    total_items: u64 = 0,
+    total_bytes: u64 = 0,
     /// Set while a script is being checked.
     script_index: ?u32 = null,
     /// The script path once it has passed its checks, else empty.
     path: []const u8 = "",
 
+    /// Writes the subject ("The table ", `Script "p" ` or `Script 3 `) and then
+    /// the sentence in `fmt`, which continues it.
     fn fail(c: *Ctx, err: ValidateError, comptime fmt: []const u8, args: anytype) ValidateError {
         @memset(c.diag, 0);
         var w: std.Io.Writer = .fixed(c.diag[0..255]);
@@ -170,9 +210,19 @@ const Ctx = struct {
             } else {
                 w.print("Script {d} ", .{i}) catch {};
             }
+        } else {
+            w.writeAll("The table ") catch {};
         }
         w.print(fmt, args) catch {};
         return err;
+    }
+
+    /// Adds `k` to the whole-table item budget.
+    fn items(c: *Ctx, k: u64) ValidateError!void {
+        c.total_items += k;
+        if (c.total_items > c.limits.max_total_items) {
+            return c.fail(error.TooMany, "reaches {d} items in total, above the limit {d}.", .{ c.total_items, c.limits.max_total_items });
+        }
     }
 
     /// Reads a `Str`: a non-null pointer when `len > 0`, `len` within the
@@ -180,10 +230,14 @@ const Ctx = struct {
     fn str(c: *Ctx, s: *const Str, where: Where) ValidateError![]const u8 {
         if (s.len == 0) return "";
         if (s.len > c.limits.max_string) {
-            return c.fail(error.BadString, "{f} is {d} bytes long, above the maximum {d}.", .{ where, s.len, c.limits.max_string });
+            return c.fail(error.BadString, "{f} is {d} bytes long, above the limit {d}.", .{ where, s.len, c.limits.max_string });
         }
         if (isNull(&s.ptr)) {
             return c.fail(error.NullPointer, "{f} has length {d} but a null pointer.", .{ where, s.len });
+        }
+        c.total_bytes += s.len;
+        if (c.total_bytes > c.limits.max_total_string_bytes) {
+            return c.fail(error.TooMany, "reaches {d} string bytes in total, above the limit {d}.", .{ c.total_bytes, c.limits.max_total_string_bytes });
         }
         const bytes = s.ptr.?[0..s.len];
         if (std.mem.findScalar(u8, bytes, 0)) |pos| {
@@ -197,7 +251,10 @@ const Ctx = struct {
 
     fn identifier(c: *Ctx, s: *const Str, where: Where, allow_empty: bool) ValidateError![]const u8 {
         const bytes = try c.str(s, where);
-        if (bytes.len == 0 and allow_empty) return bytes;
+        if (bytes.len == 0) {
+            if (allow_empty) return bytes;
+            return c.fail(error.BadName, "has an empty {f}.", .{where});
+        }
         if (!isIdentifier(bytes)) {
             return c.fail(error.BadName, "{f} \"{f}\" is not a valid identifier.", .{ where, Clip{ .s = bytes } });
         }
@@ -209,24 +266,24 @@ const Ctx = struct {
     fn array(c: *Ctx, comptime T: type, field: anytype, count: u32, comptime what: []const u8) ValidateError![]const T {
         if (count == 0) return &.{};
         if (isNull(field)) {
-            return c.fail(error.NullPointer, "The {s} pointer is null but the count is {d}.", .{ what, count });
+            return c.fail(error.NullPointer, "has a null " ++ what ++ " pointer but a count of {d}.", .{count});
         }
-        const a = addr(field);
-        if (a % @alignOf(T) != 0) {
-            return c.fail(error.BadLayout, "The {s} pointer 0x{x} is not aligned to {d} bytes.", .{ what, a, @alignOf(T) });
+        const p_addr = addr(field);
+        if (p_addr % @alignOf(T) != 0) {
+            return c.fail(error.BadLayout, "has a misaligned " ++ what ++ " pointer 0x{x}, which needs {d}-byte alignment.", .{ p_addr, @alignOf(T) });
         }
-        const p: [*]const T = @ptrFromInt(a);
+        const p: [*]const T = @ptrFromInt(p_addr);
         return p[0..count];
     }
 
     fn limit(c: *Ctx, count: u32, max: u32, comptime what: []const u8) ValidateError!void {
         if (count > max) {
-            return c.fail(error.TooMany, "it has {d} " ++ what ++ ", above the maximum {d}.", .{ count, max });
+            return c.fail(error.TooMany, "has {d} " ++ what ++ ", above the limit {d}.", .{ count, max });
         }
     }
 
     fn fnPtr(c: *Ctx, field: anytype, comptime name: []const u8) ValidateError!void {
-        if (isNull(field)) return c.fail(error.NullPointer, "its {s} function pointer is null.", .{name});
+        if (isNull(field)) return c.fail(error.NullPointer, "has a null " ++ name ++ " function pointer.", .{});
     }
 
     fn variant(c: *Ctx, v: u32, where: Where) ValidateError!void {
@@ -235,32 +292,66 @@ const Ctx = struct {
         }
     }
 
-    fn script(c: *Ctx, s: *const ScriptDesc) ValidateError!void {
-        const idx = c.script_index.?;
-        const path = try c.str(&s.path, .{ .kind = "script", .index = idx, .what = "path" });
-        if (!isRelativePath(path)) {
-            return c.fail(error.BadName, "path \"{f}\" is not a relative path of non-empty parts without \".\" or \"..\".", .{Clip{ .s = path }});
+    /// Fails when two names in `list` (an array of structs with a `name: Str`)
+    /// are equal. The names were validated by the caller.
+    fn unique(c: *Ctx, comptime T: type, list: []const T, comptime plural: []const u8) (ValidateError || error{OutOfMemory})!void {
+        if (list.len < 2) return;
+        var seen: Set = .empty;
+        defer seen.deinit(c.a);
+        try seen.ensureTotalCapacity(c.a, @intCast(list.len));
+        for (list, 0..) |*e, i| {
+            const gop = seen.getOrPutAssumeCapacity(slice(&e.name));
+            if (gop.found_existing) {
+                return c.fail(error.Duplicate, "has two " ++ plural ++ " named \"{f}\" (numbers {d} and {d}).", .{ Clip{ .s = slice(&e.name) }, gop.value_ptr.*, i });
+            }
+            gop.value_ptr.* = @intCast(i);
         }
+    }
+
+    /// The arguments of method or signal `owner`.
+    fn checkArgs(c: *Ctx, kind: []const u8, owner: u32, name: []const u8, p: anytype, count: u32) ValidateError!void {
+        if (count > c.limits.max_args) {
+            return c.fail(error.TooMany, "has {s} {d} \"{f}\" with {d} arguments, above the limit {d}.", .{ kind, owner, Clip{ .s = name }, count, c.limits.max_args });
+        }
+        try c.items(count);
+        const list = try c.array(ArgDesc, p, count, "arguments");
+        for (list, 0..) |*a, k| {
+            const k32: u32 = @intCast(k);
+            _ = try c.identifier(&a.name, .{ .kind = kind, .index = owner, .sub = "argument", .sub_index = k32, .what = "name" }, false);
+            try c.variant(a.variant_type, .{ .kind = kind, .index = owner, .sub = "argument", .sub_index = k32 });
+            _ = try c.identifier(&a.class_name, .{ .kind = kind, .index = owner, .sub = "argument", .sub_index = k32, .what = "class name" }, true);
+        }
+    }
+
+    fn script(c: *Ctx, s: *const ScriptDesc) (ValidateError || error{OutOfMemory})!void {
+        const idx = c.script_index.?;
+        const path = try c.str(&s.path, .{ .what = "path" });
+        if (path.len == 0) return c.fail(error.BadName, "has an empty path.", .{});
+        if (!isRelativePath(path)) {
+            return c.fail(error.BadName, "has the path \"{f}\", which is not a relative path of non-empty parts without \".\" or \"..\".", .{Clip{ .s = path }});
+        }
+        _ = idx;
         c.path = path;
-        _ = try c.identifier(&s.class_name, .{ .kind = "script", .what = "class name" }, true);
-        const base = try c.identifier(&s.base_class, .{ .kind = "script", .what = "base class" }, false);
-        _ = base;
+        _ = try c.identifier(&s.class_name, .{ .what = "class name" }, true);
+        _ = try c.identifier(&s.base_class, .{ .what = "base class" }, false);
 
         if (s.instance_size > c.limits.max_instance_size) {
-            return c.fail(error.BadLayout, "instance size {d} is above the maximum {d}.", .{ s.instance_size, c.limits.max_instance_size });
+            return c.fail(error.BadLayout, "has instance size {d}, above the limit {d}.", .{ s.instance_size, c.limits.max_instance_size });
         }
         const al = s.instance_align;
         if (al == 0 or al > 4096 or !std.math.isPowerOfTwo(al)) {
-            return c.fail(error.BadLayout, "instance alignment {d} is not a power of two up to 4096.", .{al});
+            return c.fail(error.BadLayout, "has instance alignment {d}, which is not a power of two up to 4096.", .{al});
         }
 
-        // Every count against its limit before any array is indexed.
+        // Every count against its limit, and the item budget, before any
+        // array is indexed.
         try c.limit(s.field_count, c.limits.max_fields, "fields");
         try c.limit(s.property_count, c.limits.max_properties, "properties");
         try c.limit(s.method_count, c.limits.max_methods, "methods");
         try c.limit(s.signal_count, c.limits.max_signals, "signals");
+        try c.items(@as(u64, s.field_count) + s.property_count + s.method_count + s.signal_count);
 
-        if (isNull(&s.defaults)) return c.fail(error.NullPointer, "its defaults pointer is null.", .{});
+        if (isNull(&s.defaults)) return c.fail(error.NullPointer, "has a null defaults pointer.", .{});
         try c.fnPtr(&s.create, "create");
         try c.fnPtr(&s.destroy, "destroy");
         try c.fnPtr(&s.call, "call");
@@ -271,73 +362,44 @@ const Ctx = struct {
 
         const fields = try c.array(FieldDesc, &s.fields, s.field_count, "fields");
         for (fields, 0..) |*f, i| {
-            const w: Where = .{ .kind = "field", .index = @intCast(i), .what = "name" };
-            const name = try c.identifier(&f.name, w, false);
+            const name = try c.identifier(&f.name, .{ .kind = "field", .index = @intCast(i), .what = "name" }, false);
             const end = @as(u64, f.offset) + f.size;
             if (end > s.instance_size) {
-                return c.fail(error.BadLayout, "field {d} \"{f}\" ends at byte {d}, past the instance size {d}.", .{ i, Clip{ .s = name }, end, s.instance_size });
+                return c.fail(error.BadLayout, "has field {d} \"{f}\" ending at byte {d}, past the instance size {d}.", .{ i, Clip{ .s = name }, end, s.instance_size });
             }
         }
 
         const props = try c.array(PropertyDesc, &s.properties, s.property_count, "properties");
         for (props, 0..) |*p, i| {
-            const idx_u: u32 = @intCast(i);
-            const name = try c.identifier(&p.name, .{ .kind = "property", .index = idx_u, .what = "name" }, false);
-            try c.variant(p.variant_type, .{ .kind = "property", .index = idx_u, .what = "" });
-            _ = try c.identifier(&p.class_name, .{ .kind = "property", .index = idx_u, .what = "class name" }, true);
-            _ = try c.str(&p.hint_string, .{ .kind = "property", .index = idx_u, .what = "hint string" });
+            const i32_: u32 = @intCast(i);
+            const name = try c.identifier(&p.name, .{ .kind = "property", .index = i32_, .what = "name" }, false);
+            try c.variant(p.variant_type, .{ .kind = "property", .index = i32_ });
+            _ = try c.identifier(&p.class_name, .{ .kind = "property", .index = i32_, .what = "class name" }, true);
+            _ = try c.str(&p.hint_string, .{ .kind = "property", .index = i32_, .what = "hint string" });
             if (p.field_index != abi.no_field and p.field_index >= s.field_count) {
-                return c.fail(error.BadLayout, "property {d} \"{f}\" has field index {d}, but there are {d} fields.", .{ i, Clip{ .s = name }, p.field_index, s.field_count });
-            }
-            for (props[0..i], 0..) |*q, j| {
-                if (std.mem.eql(u8, name, slice(&q.name))) {
-                    return c.fail(error.Duplicate, "it has two properties named \"{f}\" (properties {d} and {d}).", .{ Clip{ .s = name }, j, i });
-                }
+                return c.fail(error.BadLayout, "has property {d} \"{f}\" with field index {d}, but only {d} fields.", .{ i, Clip{ .s = name }, p.field_index, s.field_count });
             }
         }
+        try c.unique(PropertyDesc, props, "properties");
 
         const methods = try c.array(MethodDesc, &s.methods, s.method_count, "methods");
         for (methods, 0..) |*m, i| {
-            const idx_u: u32 = @intCast(i);
-            const name = try c.identifier(&m.name, .{ .kind = "method", .index = idx_u, .what = "name" }, false);
-            try c.variant(m.ret.variant_type, .{ .kind = "method", .index = idx_u, .what = "return" });
-            _ = try c.identifier(&m.ret.class_name, .{ .kind = "method", .index = idx_u, .what = "return class name" }, true);
-            if (m.arg_count > c.limits.max_args) {
-                return c.fail(error.TooMany, "method {d} \"{f}\" has {d} arguments, above the maximum {d}.", .{ i, Clip{ .s = name }, m.arg_count, c.limits.max_args });
-            }
-            const args = try c.array(ArgDesc, &m.args, m.arg_count, "method arguments");
-            for (args, 0..) |*a, k| try c.argument(a, "method", idx_u, @intCast(k));
-            for (methods[0..i], 0..) |*q, j| {
-                if (std.mem.eql(u8, name, slice(&q.name))) {
-                    return c.fail(error.Duplicate, "it has two methods named \"{f}\" (methods {d} and {d}).", .{ Clip{ .s = name }, j, i });
-                }
-            }
+            const i32_: u32 = @intCast(i);
+            const name = try c.identifier(&m.name, .{ .kind = "method", .index = i32_, .what = "name" }, false);
+            try c.variant(m.ret.variant_type, .{ .kind = "method", .index = i32_, .what = "return" });
+            _ = try c.str(&m.ret.name, .{ .kind = "method", .index = i32_, .what = "return name" });
+            _ = try c.identifier(&m.ret.class_name, .{ .kind = "method", .index = i32_, .what = "return class name" }, true);
+            try c.checkArgs("method", i32_, name, &m.args, m.arg_count);
         }
+        try c.unique(MethodDesc, methods, "methods");
 
         const sigs = try c.array(SignalDesc, &s.signals, s.signal_count, "signals");
         for (sigs, 0..) |*g, i| {
-            const idx_u: u32 = @intCast(i);
-            const name = try c.identifier(&g.name, .{ .kind = "signal", .index = idx_u, .what = "name" }, false);
-            if (g.arg_count > c.limits.max_args) {
-                return c.fail(error.TooMany, "signal {d} \"{f}\" has {d} arguments, above the maximum {d}.", .{ i, Clip{ .s = name }, g.arg_count, c.limits.max_args });
-            }
-            const args = try c.array(ArgDesc, &g.args, g.arg_count, "signal arguments");
-            for (args, 0..) |*a, k| try c.argument(a, "signal", idx_u, @intCast(k));
-            for (sigs[0..i], 0..) |*q, j| {
-                if (std.mem.eql(u8, name, slice(&q.name))) {
-                    return c.fail(error.Duplicate, "it has two signals named \"{f}\" (signals {d} and {d}).", .{ Clip{ .s = name }, j, i });
-                }
-            }
+            const i32_: u32 = @intCast(i);
+            const name = try c.identifier(&g.name, .{ .kind = "signal", .index = i32_, .what = "name" }, false);
+            try c.checkArgs("signal", i32_, name, &g.args, g.arg_count);
         }
-    }
-
-    /// One argument of method or signal `owner`.
-    fn argument(c: *Ctx, a: *const ArgDesc, kind: []const u8, owner: u32, k: u32) ValidateError!void {
-        const name = try c.identifier(&a.name, .{ .kind = kind, .index = owner, .what = "argument name" }, false);
-        if (a.variant_type >= variant_max) {
-            return c.fail(error.BadType, "{s} {d} argument {d} \"{f}\" has variant type {d}, above the maximum {d}.", .{ kind, owner, k, Clip{ .s = name }, a.variant_type, variant_max - 1 });
-        }
-        _ = try c.identifier(&a.class_name, .{ .kind = kind, .index = owner, .what = "argument class name" }, true);
+        try c.unique(SignalDesc, sigs, "signals");
     }
 };
 
@@ -497,8 +559,8 @@ const Fixture = struct {
         }
     }
 
-    fn check(f: *const Fixture, limits: Limits, diag: *[256]u8) ValidateError!void {
-        return validate(&f.table, stamp, limits, diag);
+    fn check(f: *const Fixture, limits: Limits, diag: *[256]u8) (ValidateError || error{OutOfMemory})!void {
+        return validate(testing.allocator, &f.table, stamp, limits, diag);
     }
 };
 
@@ -572,12 +634,12 @@ test "validate count limits" {
         fn m(f: *Fixture) void {
             f.table.script_count = 70000;
         }
-    }.m, error.TooMany, "70000 scripts, above the maximum 65536");
+    }.m, error.TooMany, "has 70000 scripts, above the limit 65536");
     try expectRule(struct {
         fn m(f: *Fixture) void {
             f.scripts[0].field_count = 5000;
         }
-    }.m, error.TooMany, "Script \"a/x.zig\" it has 5000 fields");
+    }.m, error.TooMany, "Script \"a/x.zig\" has 5000 fields, above the limit 4096.");
     try expectRule(struct {
         fn m(f: *Fixture) void {
             f.scripts[0].property_count = 4097;
@@ -597,12 +659,12 @@ test "validate count limits" {
         fn m(f: *Fixture) void {
             f.methods[0][1].arg_count = 65;
         }
-    }.m, error.TooMany, "method 1 \"hit\" has 65 arguments");
+    }.m, error.TooMany, "has method 1 \"hit\" with 65 arguments");
     try expectRule(struct {
         fn m(f: *Fixture) void {
             f.signals[0][0].arg_count = 65;
         }
-    }.m, error.TooMany, "signal 0 \"died\" has 65 arguments");
+    }.m, error.TooMany, "has signal 0 \"died\" with 65 arguments");
 }
 
 test "validate strings" {
@@ -615,7 +677,7 @@ test "validate strings" {
         fn m(f: *Fixture) void {
             f.scripts[0].class_name.len = 5000;
         }
-    }.m, error.BadString, "5000 bytes long, above the maximum 4096");
+    }.m, error.BadString, "5000 bytes long, above the limit 4096");
     try expectRule(struct {
         fn m(f: *Fixture) void {
             setStr(&f.props[0][0].hint_string, "a\x00b");
@@ -638,12 +700,12 @@ test "validate names" {
         fn m(f: *Fixture) void {
             f.scripts[0].base_class = .{ .ptr = null, .len = 0 };
         }
-    }.m, error.BadName, "base class \"\" is not a valid identifier");
+    }.m, error.BadName, "has an empty base class");
     try expectRule(struct {
         fn m(f: *Fixture) void {
             f.scripts[1].path = .{ .ptr = null, .len = 0 };
         }
-    }.m, error.BadName, "Script 1 path");
+    }.m, error.BadName, "Script 1 has an empty path.");
     inline for (.{ "/abs.zig", "a//b.zig", "a/./b.zig", "a/../b.zig", "a\\b.zig", "a/" }) |bad| {
         try expectRule(struct {
             fn m(f: *Fixture) void {
@@ -665,7 +727,7 @@ test "validate names" {
         fn m(f: *Fixture) void {
             setStr(&f.method_args[0][1][0].class_name, "9");
         }
-    }.m, error.BadName, "argument class name \"9\"");
+    }.m, error.BadName, "method 1 argument 0 class name \"9\"");
 }
 
 test "validate variant types" {
@@ -683,12 +745,12 @@ test "validate variant types" {
         fn m(f: *Fixture) void {
             f.method_args[0][1][0].variant_type = 100;
         }
-    }.m, error.BadType, "method 1 argument 0 \"amount\" has variant type 100");
+    }.m, error.BadType, "method 1 argument 0 has variant type 100");
     try expectRule(struct {
         fn m(f: *Fixture) void {
             f.signal_args[0][0][0].variant_type = 0xFFFF_FFFF;
         }
-    }.m, error.BadType, "signal 0 argument 0 \"name\"");
+    }.m, error.BadType, "signal 0 argument 0 has variant type 4294967295");
 }
 
 test "validate layout" {
@@ -696,7 +758,7 @@ test "validate layout" {
         fn m(f: *Fixture) void {
             f.scripts[0].instance_size = 1 << 25;
         }
-    }.m, error.BadLayout, "instance size 33554432 is above the maximum 16777216");
+    }.m, error.BadLayout, "has instance size 33554432, above the limit 16777216");
     inline for (.{ 0, 3, 8192 }) |al| {
         try expectRule(struct {
             fn m(f: *Fixture) void {
@@ -708,7 +770,7 @@ test "validate layout" {
         fn m(f: *Fixture) void {
             f.fields[0][1].offset = 20;
         }
-    }.m, error.BadLayout, "field 1 \"name\" ends at byte 36, past the instance size 32");
+    }.m, error.BadLayout, "has field 1 \"name\" ending at byte 36, past the instance size 32");
     try expectRule(struct {
         fn m(f: *Fixture) void {
             f.fields[0][1].offset = 0xFFFF_FFF0;
@@ -719,13 +781,13 @@ test "validate layout" {
         fn m(f: *Fixture) void {
             f.props[0][0].field_index = 2;
         }
-    }.m, error.BadLayout, "property 0 \"hp\" has field index 2, but there are 2 fields");
+    }.m, error.BadLayout, "has property 0 \"hp\" with field index 2, but only 2 fields");
     try expectRule(struct {
         fn m(f: *Fixture) void {
             const misaligned: usize = @intFromPtr(&f.fields[0]) + 1;
             std.mem.asBytes(&f.scripts[0].fields)[0..@sizeOf(usize)].* = std.mem.toBytes(misaligned);
         }
-    }.m, error.BadLayout, "fields pointer");
+    }.m, error.BadLayout, "misaligned fields pointer");
 }
 
 test "validate null pointers" {
@@ -733,27 +795,27 @@ test "validate null pointers" {
         fn m(f: *Fixture) void {
             @memset(std.mem.asBytes(&f.table.scripts), 0);
         }
-    }.m, error.NullPointer, "scripts pointer is null");
+    }.m, error.NullPointer, "null scripts pointer");
     try expectRule(struct {
         fn m(f: *Fixture) void {
             @memset(std.mem.asBytes(&f.scripts[0].properties), 0);
         }
-    }.m, error.NullPointer, "properties pointer is null");
+    }.m, error.NullPointer, "null properties pointer");
     try expectRule(struct {
         fn m(f: *Fixture) void {
             @memset(std.mem.asBytes(&f.methods[0][1].args), 0);
         }
-    }.m, error.NullPointer, "method arguments pointer is null");
+    }.m, error.NullPointer, "null arguments pointer");
     try expectRule(struct {
         fn m(f: *Fixture) void {
             @memset(std.mem.asBytes(&f.scripts[0].defaults), 0);
         }
-    }.m, error.NullPointer, "defaults pointer is null");
+    }.m, error.NullPointer, "null defaults pointer");
     try expectRule(struct {
         fn m(f: *Fixture) void {
             @memset(std.mem.asBytes(&f.scripts[1].notification), 0);
         }
-    }.m, error.NullPointer, "Script \"b/y.zig\" its notification function pointer is null");
+    }.m, error.NullPointer, "Script \"b/y.zig\" has a null notification function pointer.");
     inline for (.{ "create", "destroy", "call", "get", "set", "get_default" }) |name| {
         try expectRule(struct {
             fn m(f: *Fixture) void {
@@ -768,7 +830,7 @@ test "validate duplicates" {
         fn m(f: *Fixture) void {
             setStr(&f.props[0][1].name, "hp");
         }
-    }.m, error.Duplicate, "two properties named \"hp\" (properties 0 and 1)");
+    }.m, error.Duplicate, "two properties named \"hp\" (numbers 0 and 1)");
     try expectRule(struct {
         fn m(f: *Fixture) void {
             setStr(&f.methods[0][1].name, "_ready");
@@ -778,7 +840,7 @@ test "validate duplicates" {
         fn m(f: *Fixture) void {
             f.scripts[1].path = f.scripts[0].path;
         }
-    }.m, error.Duplicate, "Scripts 0 and 1 share the path \"a/x.zig\"");
+    }.m, error.Duplicate, "has two scripts with the path \"a/x.zig\" (scripts 0 and 1)");
     try expectRule(struct {
         fn m(f: *Fixture) void {
             f.signals[0][0].arg_count = 0;
@@ -806,6 +868,192 @@ test "validate diag is clipped and printable" {
     try testing.expectError(error.BadName, f.check(.{}, &diag));
     try testing.expect(std.mem.indexOf(u8, diagText(&diag), "...") != null);
     for (diagText(&diag)) |ch| try testing.expect(ch >= 0x20 and ch < 0x7f);
+}
+
+test "validate table strings and return names" {
+    try expectRule(struct {
+        fn m(f: *Fixture) void {
+            f.table.sdk_version = .{ .ptr = null, .len = 4 };
+        }
+    }.m, error.NullPointer, "The table SDK version has length 4 but a null pointer.");
+    try expectRule(struct {
+        fn m(f: *Fixture) void {
+            setStr(&f.table.sdk_version, "a\xffb");
+        }
+    }.m, error.BadString, "The table SDK version is not valid UTF-8.");
+    try expectRule(struct {
+        fn m(f: *Fixture) void {
+            f.table.build_id = .{ .ptr = text.ptr, .len = 9999 };
+        }
+    }.m, error.BadString, "The table build id is 9999 bytes long, above the limit 4096.");
+    try expectRule(struct {
+        fn m(f: *Fixture) void {
+            setStr(&f.table.build_id, "x\x00y");
+        }
+    }.m, error.BadString, "The table build id contains a NUL byte at position 1.");
+    try expectRule(struct {
+        fn m(f: *Fixture) void {
+            f.methods[0][1].ret.name = .{ .ptr = null, .len = 5 };
+        }
+    }.m, error.NullPointer, "method 1 return name has length 5 but a null pointer");
+    try expectRule(struct {
+        fn m(f: *Fixture) void {
+            setStr(&f.methods[0][1].ret.name, "\xc0");
+        }
+    }.m, error.BadString, "method 1 return name is not valid UTF-8");
+}
+
+fn expectExact(comptime mutate: fn (*Fixture) void, err: ValidateError, exact: []const u8) !void {
+    var f = Fixture.init();
+    f.link();
+    mutate(&f);
+    var diag: [256]u8 = undefined;
+    try testing.expectError(err, f.check(.{}, &diag));
+    try testing.expectEqualStrings(exact, diagText(&diag));
+}
+
+test "validate diag text is exact" {
+    try expectExact(struct {
+        fn m(f: *Fixture) void {
+            f.scripts[0].field_count = 5000;
+        }
+    }.m, error.TooMany, "Script \"a/x.zig\" has 5000 fields, above the limit 4096.");
+    try expectExact(struct {
+        fn m(f: *Fixture) void {
+            f.scripts[0].path = .{ .ptr = null, .len = 0 };
+        }
+    }.m, error.BadName, "Script 0 has an empty path.");
+    try expectExact(struct {
+        fn m(f: *Fixture) void {
+            f.props[0][0].variant_type = 57;
+        }
+    }.m, error.BadType, "Script \"a/x.zig\" property 0 has variant type 57, above the maximum 38.");
+    try expectExact(struct {
+        fn m(f: *Fixture) void {
+            f.table.script_count = 70000;
+        }
+    }.m, error.TooMany, "The table has 70000 scripts, above the limit 65536.");
+    try expectExact(struct {
+        fn m(f: *Fixture) void {
+            @memset(std.mem.asBytes(&f.scripts[1].defaults), 0);
+        }
+    }.m, error.NullPointer, "Script \"b/y.zig\" has a null defaults pointer.");
+}
+
+fn validateGood(a: std.mem.Allocator) !void {
+    var f = Fixture.init();
+    f.link();
+    var diag: [256]u8 = undefined;
+    try validate(a, &f.table, stamp, .{}, &diag);
+}
+
+test "validate frees its sets and passes out of memory on" {
+    try testing.checkAllAllocationFailures(testing.allocator, validateGood, .{});
+}
+
+/// A table of `count` bare scripts with unique paths, owned by the test. When
+/// `props` is set, script 0 (or all scripts if `share`) uses an array of
+/// `props` properties.
+const Big = struct {
+    scripts: []ScriptDesc,
+    path_bytes: []u8,
+    prop_names: []u8,
+    props: []PropertyDesc,
+    table: Table,
+    fx: *Fixture,
+
+    fn init(a: std.mem.Allocator, count: u32, prop_count: u32, share: bool) !Big {
+        const fx = try a.create(Fixture);
+        errdefer a.destroy(fx);
+        fx.* = Fixture.init();
+        fx.link();
+        const scripts = try a.alloc(ScriptDesc, count);
+        errdefer a.free(scripts);
+        const path_bytes = try a.alloc(u8, @as(usize, count) * 16);
+        errdefer a.free(path_bytes);
+        const prop_names = try a.alloc(u8, @as(usize, prop_count) * 8);
+        errdefer a.free(prop_names);
+        const props = try a.alloc(PropertyDesc, prop_count);
+        errdefer a.free(props);
+        for (props, 0..) |*p, i| {
+            const nm = prop_names[i * 8 ..][0..8];
+            _ = std.fmt.bufPrint(nm, "p{d:0>6}", .{i}) catch unreachable;
+            p.* = std.mem.zeroes(PropertyDesc);
+            p.name = .{ .ptr = nm.ptr, .len = 7 };
+            p.field_index = abi.no_field;
+        }
+        for (scripts, 0..) |*sc, i| {
+            sc.* = fx.scripts[1];
+            const pb = path_bytes[i * 16 ..][0..16];
+            const used = std.fmt.bufPrint(pb, "d/{d}.zig", .{i}) catch unreachable;
+            sc.path = .{ .ptr = used.ptr, .len = @intCast(used.len) };
+            if (prop_count > 0 and (share or i == 0)) {
+                sc.properties = props.ptr;
+                sc.property_count = prop_count;
+            }
+        }
+        var table = fx.table;
+        table.scripts = scripts.ptr;
+        table.script_count = count;
+        return .{ .scripts = scripts, .path_bytes = path_bytes, .prop_names = prop_names, .props = props, .table = table, .fx = fx };
+    }
+
+    fn deinit(b: *Big, a: std.mem.Allocator) void {
+        a.free(b.scripts);
+        a.free(b.path_bytes);
+        a.free(b.prop_names);
+        a.free(b.props);
+        a.destroy(b.fx);
+    }
+
+    fn run(b: *const Big, limits: Limits, diag: *[256]u8) (ValidateError || error{OutOfMemory})!void {
+        return validate(testing.allocator, &b.table, stamp, limits, diag);
+    }
+};
+
+fn nowNs() i96 {
+    return std.Io.Clock.awake.now(testing.io).nanoseconds;
+}
+
+test "validate at the default limits is fast" {
+    var diag: [256]u8 = undefined;
+    // 65536 scripts with unique paths and one script with 4096 properties:
+    // 69632 items, inside the 262144 budget.
+    var big = try Big.init(testing.allocator, 65536, 4096, false);
+    defer big.deinit(testing.allocator);
+    var t0 = nowNs();
+    try big.run(.{}, &diag);
+    var ms = @divTrunc(nowNs() - t0, std.time.ns_per_ms);
+    std.debug.print("validate at limits: {d} ms\n", .{ms});
+    try testing.expect(ms < 1000);
+
+    // Every script shares the 4096-property array: 65536 * 4097 items, far
+    // over the budget. Rejected after the first few scripts.
+    var shared = try Big.init(testing.allocator, 65536, 4096, true);
+    defer shared.deinit(testing.allocator);
+    t0 = nowNs();
+    try testing.expectError(error.TooMany, shared.run(.{}, &diag));
+    ms = @divTrunc(nowNs() - t0, std.time.ns_per_ms);
+    std.debug.print("validate over budget: {d} ms\n", .{ms});
+    try testing.expect(ms < 1000);
+    try testing.expect(std.mem.indexOf(u8, diagText(&diag), "items in total, above the limit 262144.") != null);
+
+    // Two equal paths at the far ends of 65536 are found in linear time.
+    big.scripts[65535].path = big.scripts[0].path;
+    t0 = nowNs();
+    try testing.expectError(error.Duplicate, big.run(.{}, &diag));
+    ms = @divTrunc(nowNs() - t0, std.time.ns_per_ms);
+    std.debug.print("validate duplicate path: {d} ms\n", .{ms});
+    try testing.expect(ms < 1000);
+}
+
+test "validate string byte budget" {
+    var f = Fixture.init();
+    f.link();
+    var diag: [256]u8 = undefined;
+    try testing.expectError(error.TooMany, f.check(.{ .max_total_string_bytes = 10 }, &diag));
+    try testing.expect(std.mem.indexOf(u8, diagText(&diag), "string bytes in total, above the limit 10.") != null);
+    try testing.expectError(error.TooMany, f.check(.{ .max_total_items = 5 }, &diag));
 }
 
 // ---------------------------------------------------------------- fuzz
@@ -869,37 +1117,122 @@ fn mutateOnce(f: *Fixture, r: std.Random) void {
     }
 }
 
-/// Runs `rounds` rounds of 1 to 3 mutations on copies of the good table and
-/// checks `validate` returns. Returns how many were accepted.
-fn fuzzRun(r: std.Random, rounds: usize) usize {
+fn strBad(x: Str) bool {
+    if (x.len == 0) return false;
+    if (x.ptr == null or x.len > fuzz_limits.max_string) return true;
+    return @intFromPtr(x.ptr.?) == @intFromPtr(&scratch); // all zero bytes: a NUL
+}
+
+fn nameBad(x: Str) bool {
+    return x.len == 0 or strBad(x);
+}
+
+fn argsBad(list: *const [n]ArgDesc, own: *const [n]ArgDesc, ptr_field: anytype, count: u32) bool {
+    if (count > n) return true;
+    if (count == 0) return false;
+    if (addr(ptr_field) != @intFromPtr(own)) return true;
+    for (list[0..count]) |a| {
+        if (nameBad(a.name) or a.variant_type >= variant_max or strBad(a.class_name)) return true;
+    }
+    return false;
+}
+
+/// An independent, conservative check: true only when the table certainly
+/// breaks a rule. It reads the fixture's own arrays, and counts a pointer
+/// that no longer points at its original array as a violation whenever the
+/// count is above zero (a null pointer is refused, and the zero buffer holds
+/// elements with empty names).
+fn mustReject(f: *const Fixture) bool {
+    const t = &f.table;
+    if (t.magic != abi.magic or t.abi_version != abi.abi_version) return true;
+    if (t.size != @sizeOf(Table) or t.layout_stamp != stamp) return true;
+    if (strBad(t.sdk_version) or strBad(t.build_id)) return true;
+    if (t.script_count > n) return true;
+    if (t.script_count == 0) return false;
+    if (addr(&t.scripts) != @intFromPtr(&f.scripts)) return true;
+    for (f.scripts[0..t.script_count], 0..) |*sc, i| {
+        if (nameBad(sc.path) or strBad(sc.class_name) or nameBad(sc.base_class)) return true;
+        if (i >= 2) return true; // zero-filled spare script
+        if (sc.instance_size > fuzz_limits.max_instance_size) return true;
+        if (sc.instance_align == 0 or sc.instance_align > 4096 or !std.math.isPowerOfTwo(sc.instance_align)) return true;
+        if (sc.field_count > n or sc.property_count > n or sc.method_count > n or sc.signal_count > n) return true;
+        if (addr(&sc.defaults) == 0) return true;
+        inline for (.{ "create", "destroy", "call", "get", "set", "get_default", "notification" }) |name| {
+            if (addr(&@field(sc, name)) == 0) return true;
+        }
+        if (sc.field_count > 0) {
+            if (addr(&sc.fields) != @intFromPtr(&f.fields[i])) return true;
+            for (f.fields[i][0..sc.field_count]) |fd| {
+                if (nameBad(fd.name) or @as(u64, fd.offset) + fd.size > sc.instance_size) return true;
+            }
+        }
+        if (sc.property_count > 0) {
+            if (addr(&sc.properties) != @intFromPtr(&f.props[i])) return true;
+            for (f.props[i][0..sc.property_count]) |p| {
+                if (nameBad(p.name) or p.variant_type >= variant_max or strBad(p.class_name) or strBad(p.hint_string)) return true;
+                if (p.field_index != abi.no_field and p.field_index >= sc.field_count) return true;
+            }
+        }
+        if (sc.method_count > 0) {
+            if (addr(&sc.methods) != @intFromPtr(&f.methods[i])) return true;
+            for (f.methods[i][0..sc.method_count], 0..) |*m, j| {
+                if (nameBad(m.name) or m.ret.variant_type >= variant_max) return true;
+                if (strBad(m.ret.name) or strBad(m.ret.class_name)) return true;
+                if (argsBad(&f.method_args[i][j], &f.method_args[i][j], &m.args, m.arg_count)) return true;
+            }
+        }
+        if (sc.signal_count > 0) {
+            if (addr(&sc.signals) != @intFromPtr(&f.signals[i])) return true;
+            for (f.signals[i][0..sc.signal_count], 0..) |*g, j| {
+                if (nameBad(g.name)) return true;
+                if (argsBad(&f.signal_args[i][j], &f.signal_args[i][j], &g.args, g.arg_count)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+const FuzzStats = struct { accepted: usize = 0, oracle_rejects: usize = 0 };
+
+/// Runs `rounds` rounds of 1 to 3 mutations on copies of the good table.
+/// `validate` must return, and must reject whenever `mustReject` says so.
+fn fuzzRun(r: std.Random, rounds: usize) !FuzzStats {
     const pristine = Fixture.init();
-    var accepted: usize = 0;
+    var stats: FuzzStats = .{};
     var diag: [256]u8 = undefined;
     for (0..rounds) |_| {
         var work = pristine;
         work.link();
         for (0..1 + r.uintLessThan(usize, 3)) |_| mutateOnce(&work, r);
+        const must = mustReject(&work);
+        if (must) stats.oracle_rejects += 1;
         if (work.check(fuzz_limits, &diag)) |_| {
-            accepted += 1;
-        } else |_| {
+            stats.accepted += 1;
+            if (must) {
+                std.debug.print("validate accepted a table the oracle rejects\n", .{});
+                return error.OracleMismatch;
+            }
+        } else |err| {
             // The diag is always one terminated sentence.
-            std.debug.assert(std.mem.indexOfScalar(u8, &diag, 0) != null);
+            try testing.expect(err != error.OutOfMemory);
+            try testing.expect(diag[0] != 0 and std.mem.indexOfScalar(u8, &diag, 0) != null);
         }
     }
-    return accepted;
+    return stats;
 }
 
 test "fuzz validate" {
     var prng = std.Random.DefaultPrng.init(0x5A49_4747);
-    const accepted = fuzzRun(prng.random(), 20000);
+    const stats = try fuzzRun(prng.random(), 20000);
     // Many mutations are harmless (a changed `hint`, `usage`, `flags`), so
-    // some pass; most must be caught.
-    try testing.expect(accepted < 20000);
+    // some pass; most must be caught, and the oracle must have been busy.
+    try testing.expect(stats.accepted < 20000);
+    try testing.expect(stats.oracle_rejects > 5000);
 }
 
 fn fuzzOne(_: void, smith: *testing.Smith) anyerror!void {
     var prng = std.Random.DefaultPrng.init(smith.value(u64));
-    _ = fuzzRun(prng.random(), 64);
+    _ = try fuzzRun(prng.random(), 64);
 }
 
 test "fuzz validate with std.testing.fuzz" {
