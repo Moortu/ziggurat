@@ -24,6 +24,8 @@ pub const generation = runtime.generation;
 pub const log = runtime.log;
 pub const allocator = runtime.allocator;
 pub const StaticName = names.StaticName;
+/// Checked conversion between Godot Variants and Zig values.
+pub const convert = @import("convert.zig");
 
 pub const ScriptDescriptor = struct { name: []const u8, rel: []const u8 };
 

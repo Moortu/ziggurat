@@ -1,4 +1,5 @@
 const std = @import("std");
+const gdzig_build = @import("gdzig");
 
 const cross_targets = [_][]const u8{ "x86_64-windows-gnu", "aarch64-macos" };
 
@@ -13,15 +14,21 @@ pub fn build(b: *std.Build) void {
         "zig_exe",
         "Zig compiler used by integration tests [default: the one running this build]",
     ) orelse b.graph.zig_exe;
-    // Always passed to gdzig, so configuring never searches for Godot; only
-    // steps that run Godot need a real one.
-    const godot_path = b.option([]const u8, "godot-path", "Godot executable for steps that run Godot [default: godot]") orelse "godot";
+    // Always passed to gdzig, so configuring never fails for want of Godot;
+    // only steps that run Godot need a real one. gdzig's test coordinator
+    // hashes the executable, so the default is the absolute path of `godot`
+    // on PATH (a PATH search makes configuration uncacheable; pass
+    // -Dgodot-path to avoid it).
+    const godot_opt = b.option([]const u8, "godot-path", "Godot executable for steps that run Godot [default: godot on PATH]");
+    const godot_found = godot_opt orelse b.findProgram(.{ .names = &.{"godot"} });
+    const godot_path = godot_found orelse "godot";
     const manifest_out = b.option([]const u8, "manifest-out", "Absolute path the sdk-manifest step writes the SDK module manifest to");
 
     const test_step = b.step("test", "Run unit and integration tests");
     const unit_step = b.step("test-unit", "Run unit tests only (spawns no compiler)");
     const cross_step = b.step("cross", "Compile test binaries for Windows and macOS (not run)");
     const manifest_step = b.step("sdk-manifest", "Write the SDK module manifest to -Dmanifest-out=<absolute path>");
+    const godot_step = b.step("test-godot", "Run the SDK tests inside a headless Godot (needs Godot)");
 
     const sdk = addSdk(b, target, optimize, godot_path);
     const manifest_tool = b.addExecutable(.{
@@ -55,6 +62,13 @@ pub fn build(b: *std.Build) void {
         addManifestModules(b, run, sdk);
         break :blk out;
     };
+
+    if (godot_found == null) {
+        godot_step.dependOn(&b.addFail("test-godot needs Godot on PATH or -Dgodot-path=<absolute path>").step);
+    } else {
+        addGodotTests(b, godot_step, target, optimize, sdk, godot_found.?);
+    }
+    test_step.dependOn(godot_step);
 
     // Native: integration on for `test`, off for `test-unit`.
     addTestSet(b, test_step, target, optimize, zig_exe, true, true, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) });
@@ -113,6 +127,73 @@ fn addSdk(
             .{ .name = "ziggurat_abi", .module = addAbi(b, target, optimize) },
         },
     });
+}
+
+/// SDK tests that run inside Godot through gdzig's test harness.
+///
+/// The harness replaces the test module's `gdzig` import with the gdzig
+/// module of the first gdzig dependency this build created, and sets that
+/// module's `raw` table. The SDK must import the very same module, or it
+/// would see a second, unset `raw`; `sdk` is built from that dependency, and
+/// this function checks it.
+fn addGodotTests(
+    b: *std.Build,
+    step: *std.Build.Step,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    sdk: *std.Build.Module,
+    godot_exe: []const u8,
+) void {
+    if (harnessGdzig(b) != sdk.import_table.get("gdzig").?)
+        @panic("the SDK under test does not import the gdzig module the test harness uses");
+    const mod = b.createModule(.{
+        .root_source_file = b.path("test/godot/convert.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ziggurat", .module = sdk },
+            .{ .name = "ziggurat_abi", .module = sdk.import_table.get("ziggurat_abi").? },
+        },
+    });
+    const name = "sdk_godot";
+    const run = gdzig_build.addTest(b, .{ .name = name, .root_module = mod, .target = target, .optimize = optimize });
+    // The coordinator loads the library from the install directory, which
+    // is not an input of this step; without this an edited test would not rerun.
+    run.has_side_effects = true;
+    step.dependOn(&run.step);
+
+    // The harness ends Godot with SIGKILL, so Godot's exit-time leak reports
+    // never appear. Run every test once more through the library's
+    // clean-exit entry in a Godot that quits normally, and scan its output.
+    const runner = b.addExecutable(.{
+        .name = "clean_exit_runner",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/godot/clean_exit_runner.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const scan = b.addRunArtifact(runner);
+    scan.addArg(godot_exe);
+    // Where gdzig's harness installs the project and library.
+    scan.addDirectoryArg2(.{ .relative = .{ .base = .install_prefix, .sub_path = "test/" ++ name } }, .{ .make_absolute = true });
+    _ = scan.addOutputDirectoryArg("project");
+    // The library is read from the install directory, which the build
+    // cannot hash; always rerun.
+    scan.has_side_effects = true;
+    // After the harness run: it installs the project, and one Godot at a time.
+    scan.step.dependOn(&run.step);
+    step.dependOn(&scan.step);
+}
+
+/// The gdzig module `gdzig.addTest` links: that of the first gdzig
+/// dependency in the build graph's dependency cache, which keeps insertion
+/// order. No other package defines a module named `gdzig`.
+fn harnessGdzig(b: *std.Build) *std.Build.Module {
+    for (b.graph.dependency_cache.values()) |dep| {
+        if (dep.builder.modules.get("gdzig")) |m| return m;
+    }
+    @panic("no gdzig dependency");
 }
 
 /// The ABI module `ziggurat_abi`: imports only std and builtin, and is
