@@ -217,7 +217,14 @@ fn addTestSet(
 
     const abi = addAbi(b, target, optimize);
 
-    for ([_]*std.Build.Module{ platform, build_mod, abi }) |mod| {
+    // The SDK's name conversion imports only std, so it tests without gdzig.
+    const snake = b.createModule(.{
+        .root_source_file = b.path("sdk/snake.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    for ([_]*std.Build.Module{ platform, build_mod, abi, snake }) |mod| {
         const t = b.addTest(.{ .root_module = mod });
         if (run) {
             step.dependOn(&b.addRunArtifact(t).step);
