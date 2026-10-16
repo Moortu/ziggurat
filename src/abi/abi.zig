@@ -134,18 +134,16 @@ pub const StampInputs = struct {
 };
 
 /// Wyhash (seed 0) over, for each struct above in declaration order, its
-/// `@sizeOf`, then every field name and `@offsetOf`; then each input string
-/// preceded by its length as a little-endian u64.
+/// `@sizeOf`, then every field name, `@offsetOf` and `@typeName` of its type
+/// (so a changed function-pointer signature changes the stamp); then each
+/// input string preceded by its length as a little-endian u64. Enum values
+/// and constants are not hashed; `abi_version` covers those.
 pub fn layoutStamp(comptime in: StampInputs) u64 {
     return comptime blk: {
-        @setEvalBranchQuota(100_000);
+        @setEvalBranchQuota(1_000_000);
         var h = std.hash.Wyhash.init(0);
         for (.{ Str, HostApi, CallError, FieldDesc, ArgDesc, PropertyDesc, MethodDesc, SignalDesc, ScriptDesc, Table }) |T| {
-            hashInt(&h, @sizeOf(T));
-            for (@typeInfo(T).@"struct".field_names) |name| {
-                h.update(name);
-                hashInt(&h, @offsetOf(T, name));
-            }
+            hashStruct(&h, T);
         }
         for ([_][]const u8{ in.api_json_sha256, in.interface_h_sha256, in.zig_version, in.target, in.precision, in.sdk_version }) |s| {
             hashInt(&h, s.len);
@@ -153,6 +151,16 @@ pub fn layoutStamp(comptime in: StampInputs) u64 {
         }
         break :blk h.final();
     };
+}
+
+fn hashStruct(h: *std.hash.Wyhash, comptime T: type) void {
+    hashInt(h, @sizeOf(T));
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types) |name, FT| {
+        h.update(name);
+        hashInt(h, @offsetOf(T, name));
+        h.update(@typeName(FT));
+    }
 }
 
 fn hashInt(h: *std.hash.Wyhash, v: u64) void {
@@ -180,6 +188,29 @@ test "stamp changes" {
         @field(changed, name) = @field(sample, name) ++ "x";
         try std.testing.expect(layoutStamp(changed) != base);
     }
+}
+
+test "stamp changes when bytes move between inputs" {
+    comptime var a = sample;
+    comptime var b = sample;
+    a.target = "ab";
+    a.precision = "c";
+    b.target = "a";
+    b.precision = "bc";
+    try std.testing.expect(layoutStamp(a) != layoutStamp(b));
+}
+
+test "stamp changes with a function pointer signature" {
+    const A = extern struct { f: *const fn (x: u32) callconv(.c) void };
+    const B = extern struct { f: *const fn (x: u64) callconv(.c) void };
+    const differ = comptime blk: {
+        var ha = std.hash.Wyhash.init(0);
+        var hb = std.hash.Wyhash.init(0);
+        hashStruct(&ha, A);
+        hashStruct(&hb, B);
+        break :blk ha.final() != hb.final();
+    };
+    try std.testing.expect(differ);
 }
 
 test "layout pinned" {

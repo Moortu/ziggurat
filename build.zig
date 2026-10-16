@@ -130,7 +130,7 @@ fn addAbi(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
 fn addSourceInputs(b: *std.Build, run: *std.Build.Step.Run, dirs: []const []const u8) void {
     const io = b.graph.io;
     for (dirs) |sub| {
-        var dir = std.Io.Dir.cwd().openDir(io, sub, .{ .iterate = true }) catch |err|
+        var dir = b.root.root_dir.handle.openDir(io, sub, .{ .iterate = true }) catch |err|
             std.debug.panic("cannot open {s}: {t}", .{ sub, err });
         defer dir.close(io);
         // A new or removed file must repeat configuration, which is cached.
