@@ -146,6 +146,13 @@ fn addGodotTests(
 ) void {
     if (harnessGdzig(b) != sdk.import_table.get("gdzig").?)
         @panic("the SDK under test does not import the gdzig module the test harness uses");
+    // The descriptor tests read a fixture script, which imports the SDK.
+    const fixture_player = b.createModule(.{
+        .root_source_file = b.path("test/fixtures/sdk_project/player.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ziggurat", .module = sdk }},
+    });
     const mod = b.createModule(.{
         .root_source_file = b.path("test/godot/convert.zig"),
         .target = target,
@@ -153,6 +160,7 @@ fn addGodotTests(
         .imports = &.{
             .{ .name = "ziggurat", .module = sdk },
             .{ .name = "ziggurat_abi", .module = sdk.import_table.get("ziggurat_abi").? },
+            .{ .name = "fixture_player", .module = fixture_player },
         },
     });
     const name = "sdk_godot";
