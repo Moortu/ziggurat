@@ -8,7 +8,8 @@ const std = @import("std");
 pub const Error = error{ NotAscii, NoSpaceLeft };
 
 /// Runtime twin of `toSnakeCase`. `buf` must hold the result, which is at
-/// most `2 * name.len - 1` bytes. Both functions share `convert`.
+/// most `2 * name.len - 1` bytes; a smaller buffer returns `error.NoSpaceLeft`.
+/// A byte of 0x80 or more returns `error.NotAscii`. Both functions share `convert`.
 pub fn toSnakeCaseBuf(buf: []u8, name: []const u8) Error![]const u8 {
     const n = try convert(buf, name);
     return buf[0..n];
@@ -119,6 +120,11 @@ const task_cases = [_]Case{
     .{ .in = "getHealthHUD", .out = "get_health_hud" },
     .{ .in = "_physicsProcess", .out = "_physics_process" },
     .{ .in = "takeDamage", .out = "take_damage" },
+    // Differential run against Godot 4.7.2 (String.to_snake_case).
+    .{ .in = "ABC123def", .out = "abc_123_def" },
+    .{ .in = "a1B", .out = "a_1b" },
+    // Whitespace bytes 0x09 to 0x0d each become `_`.
+    .{ .in = "a\tb\x0bc\x0cd\re\nf", .out = "a_b_c_d_e_f" },
 };
 
 test "godot vectors, runtime" {
