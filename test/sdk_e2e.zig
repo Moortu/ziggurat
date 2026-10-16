@@ -80,20 +80,32 @@ test "integration: skeleton sdk builds with gdzig" {
     if (on) std.debug.print("sdk_e2e: full build {d} ms\n", .{o.ms});
 }
 
-test "integration: panic probe" {
-    try platform.testing_support.requireIntegration();
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
+/// Runs `argv`; it must print `Zig panic: probe` on stderr and die from a signal.
+fn expectPanicDeath(argv: []const []const u8) !void {
     const a = testing.allocator;
-    const r = try platform.process.runCapture(a, io, &.{build_options.panic_probe_path}, null, 60_000, 1 << 20);
+    const r = try platform.process.runCapture(a, io, argv, null, 60_000, 1 << 20);
     defer a.free(r.stdout);
     defer a.free(r.stderr);
     try testing.expect(std.mem.indexOf(u8, r.stderr, "Zig panic: probe") != null);
     switch (r.term) {
         .signal => {},
         else => {
-            std.debug.print("probe ended with {any}\nstderr: {s}\n", .{ r.term, r.stderr });
+            std.debug.print("probe {s} ended with {any}\nstderr: {s}\n", .{ argv[0], r.term, r.stderr });
             return error.NotKilledBySignal;
         },
     }
+}
+
+test "integration: panic probe executable, Debug and ReleaseSafe" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try expectPanicDeath(&.{build_options.panic_exe_debug});
+    try expectPanicDeath(&.{build_options.panic_exe_safe});
+}
+
+test "integration: panic probe in a -lc dynamic library, Debug and ReleaseSafe" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try expectPanicDeath(&.{ build_options.panic_loader, build_options.panic_lib_debug });
+    try expectPanicDeath(&.{ build_options.panic_loader, build_options.panic_lib_safe });
 }

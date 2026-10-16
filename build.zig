@@ -56,20 +56,8 @@ pub fn build(b: *std.Build) void {
         break :blk out;
     };
 
-    // The panic probe: an executable (Debug, libc) that panics through the SDK.
-    const probe_exe = b.addExecutable(.{
-        .name = "panic_probe",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("test/panic_probe.zig"),
-            .target = target,
-            .optimize = .Debug,
-            .link_libc = true,
-            .imports = &.{.{ .name = "ziggurat", .module = sdk }},
-        }),
-    });
-
     // Native: integration on for `test`, off for `test-unit`.
-    addTestSet(b, test_step, target, optimize, zig_exe, true, true, test_manifest, probe_exe.getEmittedBin());
+    addTestSet(b, test_step, target, optimize, zig_exe, true, true, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) });
     addTestSet(b, unit_step, target, optimize, zig_exe, false, true, null, null);
 
     // Cross: compile only.
@@ -188,6 +176,8 @@ fn addManifestModules(b: *std.Build, run: *std.Build.Step.Run, sdk: *std.Build.M
     }
 }
 
+const ProbeSdks = struct { debug: *std.Build.Module, safe: *std.Build.Module };
+
 fn addTestSet(
     b: *std.Build,
     step: *std.Build.Step,
@@ -198,8 +188,8 @@ fn addTestSet(
     run: bool,
     /// The SDK manifest for integration tests; null where none run.
     sdk_manifest: ?std.Build.LazyPath,
-    /// The built `test/panic_probe.zig` executable; null where none runs.
-    panic_probe: ?std.Build.LazyPath,
+    /// The SDK built in Debug and in ReleaseSafe, for the panic probes; null where none runs.
+    probe_sdks: ?ProbeSdks,
 ) void {
     const options = b.addOptions();
     options.addOption([]const u8, "zig_exe", zig_exe);
@@ -211,10 +201,69 @@ fn addTestSet(
         options.addOption([]const u8, "sdk_manifest_path", "");
     }
 
-    if (panic_probe) |p| {
-        options.addOptionPath("panic_probe_path", p);
+    const abi_for_probe = addAbi(b, target, optimize);
+    const probe_platform = b.createModule(.{
+        .root_source_file = b.path("src/platform/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    // Own options: the real ones hold the probe paths, which depend on the loader.
+    const probe_options = b.addOptions();
+    probe_options.addOption([]const u8, "zig_exe", zig_exe);
+    probe_options.addOption(bool, "run_integration", false);
+    probe_options.addOptionPath("stub_sdk_path", b.path("test/stub_sdk/ziggurat.zig"));
+    probe_options.addOption([]const u8, "sdk_manifest_path", "");
+    probe_platform.addImport("build_options", probe_options.createModule());
+    if (probe_sdks) |sdks| {
+        // Panic probes: an executable, and a dynamic library with a loader that
+        // dlopens it, each in Debug and ReleaseSafe.
+        for ([_]struct { mode: std.builtin.OptimizeMode, sdk: *std.Build.Module, tag: []const u8 }{
+            .{ .mode = .Debug, .sdk = sdks.debug, .tag = "debug" },
+            .{ .mode = .ReleaseSafe, .sdk = sdks.safe, .tag = "safe" },
+        }) |cfg| {
+            const exe = b.addExecutable(.{
+                .name = b.fmt("panic_probe_{s}", .{cfg.tag}),
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("test/panic_probe.zig"),
+                    .target = target,
+                    .optimize = cfg.mode,
+                    .link_libc = true,
+                    .imports = &.{.{ .name = "ziggurat", .module = cfg.sdk }},
+                }),
+            });
+            options.addOptionPath(b.fmt("panic_exe_{s}", .{cfg.tag}), exe.getEmittedBin());
+            const lib = b.addLibrary(.{
+                .name = b.fmt("panic_probe_lib_{s}", .{cfg.tag}),
+                .linkage = .dynamic,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("test/panic_probe_lib.zig"),
+                    .target = target,
+                    .optimize = cfg.mode,
+                    .link_libc = true,
+                    .imports = &.{.{ .name = "ziggurat", .module = cfg.sdk }},
+                }),
+            });
+            options.addOptionPath(b.fmt("panic_lib_{s}", .{cfg.tag}), lib.getEmittedBin());
+        }
+        const loader = b.addExecutable(.{
+            .name = "panic_probe_loader",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/panic_probe_loader.zig"),
+                .target = target,
+                .optimize = .Debug,
+                .link_libc = true,
+                .imports = &.{
+                    .{ .name = "ziggurat_platform", .module = probe_platform },
+                    .{ .name = "ziggurat_abi", .module = abi_for_probe },
+                },
+            }),
+        });
+        options.addOptionPath("panic_loader", loader.getEmittedBin());
     } else {
-        options.addOption([]const u8, "panic_probe_path", "");
+        for ([_][]const u8{ "panic_exe_debug", "panic_exe_safe", "panic_lib_debug", "panic_lib_safe", "panic_loader" }) |n| {
+            options.addOption([]const u8, n, "");
+        }
     }
 
     const platform = b.createModule(.{
