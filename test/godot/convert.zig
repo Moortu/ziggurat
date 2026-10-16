@@ -149,6 +149,7 @@ fn expectReject(comptime T: type, v: *const Variant, expected: u32) !void {
 const Three = enum { a, b, c };
 const ThreeU8 = enum(u8) { a, b, c };
 const Signed = enum(i16) { low = -300, high = 300 };
+const Open = enum(u8) { a, b, _ };
 
 test "harness runs" {
     var v = makeInt(7);
@@ -161,11 +162,11 @@ test "harness runs" {
 
 test "convert supported types" {
     inline for (.{
-        bool,       i8,         i16,       i32,           i64,           u8,                       u16,       u32,
-        f32,        f64,        Three,     ThreeU8,       Signed,        godot.global.MethodFlags, b.Vector2, b.Vector2i,
-        b.Vector3,  b.Vector3i, b.Vector4, b.Vector4i,    b.Color,       b.Rect2,                  b.Rect2i,  b.Quaternion,
-        b.Plane,    b.Aabb,     b.Basis,   b.Transform2d, b.Transform3d, b.Projection,             b.String,  b.StringName,
-        b.NodePath,
+        bool,         i8,         i16,        i32,       i64,           u8,            u16,                      u32,
+        f32,          f64,        Three,      ThreeU8,   Signed,        Open,          godot.global.MethodFlags, b.Vector2,
+        b.Vector2i,   b.Vector3,  b.Vector3i, b.Vector4, b.Vector4i,    b.Color,       b.Rect2,                  b.Rect2i,
+        b.Quaternion, b.Plane,    b.Aabb,     b.Basis,   b.Transform2d, b.Transform3d, b.Projection,             b.String,
+        b.StringName, b.NodePath,
     }) |T| try testing.expect(convert.supported(T));
     inline for (.{ u64, usize, i128, u63, f16, b.Array, b.Dictionary, []const u8, [3]i32, *i32, void, b.Rid }) |T|
         try testing.expect(!convert.supported(T));
@@ -286,6 +287,62 @@ test "convert rejects" {
     try expectReject(b.String, &flt, t_string);
 }
 
+test "convert rejects at width boundaries" {
+    inline for (.{ i8, i16, i32, u8, u16, u32 }) |T| {
+        var above = makeInt(@as(i64, std.math.maxInt(T)) + 1);
+        defer destroy(&above);
+        try expectReject(T, &above, t_int);
+        var below = makeInt(@as(i64, std.math.minInt(T)) - 1);
+        defer destroy(&below);
+        try expectReject(T, &below, t_int);
+        // The same values as FLOAT.
+        var above_f = makeFloat(@floatFromInt(@as(i64, std.math.maxInt(T)) + 1));
+        defer destroy(&above_f);
+        try expectReject(T, &above_f, t_int);
+        var below_f = makeFloat(@floatFromInt(@as(i64, std.math.minInt(T)) - 1));
+        defer destroy(&below_f);
+        try expectReject(T, &below_f, t_int);
+    }
+    // FLOAT 2^31 fits u32.
+    var f31 = makeFloat(0x1p31);
+    defer destroy(&f31);
+    var u: u32 = 0;
+    try testing.expectEqual(@as(?convert.ReadError, null), convert.read(u32, &f31, &u));
+    try testing.expectEqual(@as(u32, 1 << 31), u);
+}
+
+test "float into f32 range" {
+    // Finite but above f32's range: rejected.
+    for ([_]f64{ 1e300, -1e300, 0x1p128 }) |x| {
+        var v = makeFloat(x);
+        defer destroy(&v);
+        try expectReject(f32, &v, t_float);
+        // f64 takes it unchanged.
+        var d: f64 = 0;
+        try testing.expectEqual(@as(?convert.ReadError, null), convert.read(f64, &v, &d));
+        try testing.expectEqual(x, d);
+    }
+    // The largest f32 is accepted.
+    var max = makeFloat(std.math.floatMax(f32));
+    defer destroy(&max);
+    var m: f32 = 0;
+    try testing.expectEqual(@as(?convert.ReadError, null), convert.read(f32, &max, &m));
+    try testing.expectEqual(std.math.floatMax(f32), m);
+    // inf and NaN pass through as themselves.
+    for ([_]f64{ std.math.inf(f64), -std.math.inf(f64) }) |x| {
+        var v = makeFloat(x);
+        defer destroy(&v);
+        var f: f32 = 0;
+        try testing.expectEqual(@as(?convert.ReadError, null), convert.read(f32, &v, &f));
+        try testing.expectEqual(@as(f32, @floatCast(x)), f);
+    }
+    var nan = makeFloat(std.math.nan(f64));
+    defer destroy(&nan);
+    var n: f32 = 0;
+    try testing.expectEqual(@as(?convert.ReadError, null), convert.read(f32, &nan, &n));
+    try testing.expect(std.math.isNan(n));
+}
+
 test "enum out of range" {
     var v = makeInt(999);
     defer destroy(&v);
@@ -295,6 +352,12 @@ test "enum out of range" {
     var three = makeInt(3);
     defer destroy(&three);
     try expectReject(ThreeU8, &three, t_int);
+    // A non-exhaustive enum takes any value of its tag type.
+    var open: Open = .a;
+    try testing.expectEqual(@as(?convert.ReadError, null), convert.read(Open, &three, &open));
+    try testing.expectEqual(@as(u8, 3), @backingInt(open));
+    try expectReject(Open, &v, t_int);
+    try roundTrip(Open, @fromBackingInt(@intCast(200)));
     // A flag struct takes any value that fits its backing integer.
     var neg = makeInt(-1);
     defer destroy(&neg);

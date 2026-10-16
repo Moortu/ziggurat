@@ -7,11 +7,13 @@
 //! this entry and scans its output.
 //!
 //! Output lines: `ZTEST PASS <name>`, `ZTEST SKIP <name>`,
-//! `ZTEST FAIL <name>: <error>`, and last `ZTEST DONE pass=<n> skip=<n> fail=<n>`.
+//! `ZTEST FAIL <name>: <error>`, `ZTEST LEAK <name>: ...`, and last
+//! `ZTEST DONE pass=<n> skip=<n> fail=<n> leak=<n>`.
 const std = @import("std");
 const builtin = @import("builtin");
 const godot = @import("ziggurat").godot;
 const c = godot.c;
+const Os = godot.class.Os;
 
 pub const entry_symbol = "ziggurat_clean_exit_entry";
 
@@ -62,7 +64,20 @@ fn enter(_: ?*anyopaque, level: c.GDExtensionInitializationLevel) callconv(.c) v
             }
         }
     }
-    std.debug.print("ZTEST DONE pass={d} skip={d} fail={d}\n", .{ pass, skip, fail });
+    // Godot reports no leaked String (and a leaked StringName only with
+    // --verbose). Run each test a second time, once its lazy caches are
+    // warm, and require Godot's tracked heap to end where it started.
+    var leaks: usize = 0;
+    for (builtin.test_functions) |t| {
+        const before = Os.getStaticMemoryUsage();
+        _ = t.func() catch {};
+        const after = Os.getStaticMemoryUsage();
+        if (after != before) {
+            leaks += 1;
+            std.debug.print("ZTEST LEAK {s}: Godot heap {d} -> {d} bytes\n", .{ t.name, before, after });
+        }
+    }
+    std.debug.print("ZTEST DONE pass={d} skip={d} fail={d} leak={d}\n", .{ pass, skip, fail, leaks });
 }
 
 fn exit(_: ?*anyopaque, _: c.GDExtensionInitializationLevel) callconv(.c) void {}

@@ -5,10 +5,13 @@
 //!
 //! Copies the project gdzig's harness installed into <work dir>, points its
 //! `.gdextension` at the clean-exit entry, runs
-//! `godot --headless --path <work dir> --quit` with stdin closed, and fails
-//! when Godot exits non-zero, a test fails or is skipped, the moduleInit log
-//! line is missing, or the output has `ObjectDB instances leaked` or
-//! `Unreferenced static string`. Godot's output is printed only on failure.
+//! `godot --headless --verbose --path <work dir> --quit` with stdin closed
+//! and one 120 s deadline, and fails when Godot exits non-zero or times
+//! out, a test fails, is skipped or leaks Godot heap on its second run, the
+//! moduleInit log line is missing, or the output has one of Godot's leak
+//! reports: ObjectDB instances leaked, `Unreferenced static string`,
+//! `Orphan StringName:` (needs --verbose), RID allocations leaked, or
+//! resources still in use at exit. Godot's output is printed only on failure.
 const std = @import("std");
 const Io = std.Io;
 
@@ -51,10 +54,16 @@ pub fn main(init: std.process.Init) !u8 {
     try dst.createDirPath(io, ".godot");
     try dst.writeFile(io, .{ .sub_path = ".godot/extension_list.cfg", .data = "res://test_extension.gdextension\n" });
 
-    const result = try std.process.run(arena, io, .{
-        .argv = &.{ godot, "--headless", "--path", args[3], "--quit" },
-        .timeout = .{ .duration = .{ .raw = .fromSeconds(120), .clock = .awake } },
-    });
+    // One deadline for the whole run: a Godot that hangs while it keeps
+    // printing still times out.
+    const deadline: Io.Clock.Timestamp = .fromNow(io, .{ .raw = .fromSeconds(120), .clock = .awake });
+    const result = std.process.run(arena, io, .{
+        .argv = &.{ godot, "--headless", "--verbose", "--path", args[3], "--quit" },
+        .timeout = .{ .deadline = deadline },
+    }) catch |err| {
+        std.debug.print("clean_exit_runner: running Godot failed: {t}\n", .{err});
+        return 1;
+    };
     const out = try std.mem.concat(arena, u8, &.{ result.stdout, result.stderr });
 
     var problems: std.ArrayList([]const u8) = .empty;
@@ -66,7 +75,16 @@ pub fn main(init: std.process.Init) !u8 {
     if (std.mem.indexOf(u8, out, "ObjectDB instance was leaked") != null or
         std.mem.indexOf(u8, out, "ObjectDB instances were leaked") != null)
         try problems.append(arena, "ObjectDB instances leaked");
-    if (std.mem.indexOf(u8, out, "Unreferenced static string") != null) try problems.append(arena, "Unreferenced static string");
+    if (std.mem.indexOf(u8, out, "ZTEST LEAK") != null) try problems.append(arena, "a test leaked Godot heap memory");
+    // Godot's exit-time reports; the sources are in the report of this task.
+    for ([_][]const u8{
+        "Unreferenced static string", // core/string/string_name.cpp:118
+        "Orphan StringName:", // core/string/string_name.cpp:98, --verbose only
+        "RID allocations of type", // core/templates/rid_owner.h:430
+        "resources still in use at exit", // core/io/resource.cpp:817,822
+    }) |pattern| {
+        if (std.mem.indexOf(u8, out, pattern) != null) try problems.append(arena, pattern);
+    }
 
     if (problems.items.len == 0) return 0;
     std.debug.print("--- Godot output (stdout, then stderr) ---\n{s}\n---\n", .{out});

@@ -158,8 +158,12 @@ fn addGodotTests(
     const name = "sdk_godot";
     const run = gdzig_build.addTest(b, .{ .name = name, .root_module = mod, .target = target, .optimize = optimize });
     // The coordinator loads the library from the install directory, which
-    // is not an input of this step; without this an edited test would not rerun.
-    run.has_side_effects = true;
+    // gdzig does not make an input of this step, so an edited test would not
+    // rerun. Make the library itself (and Godot) inputs.
+    const lib = harnessLibrary(&run.step) orelse @panic("gdzig.addTest: no test library found under its run step");
+    const godot_file: std.Build.LazyPath = .{ .cwd_relative = godot_exe };
+    run.addFileInput(lib.getEmittedBin());
+    run.addFileInput(godot_file);
     step.dependOn(&run.step);
 
     // The harness ends Godot with SIGKILL, so Godot's exit-time leak reports
@@ -178,12 +182,24 @@ fn addGodotTests(
     // Where gdzig's harness installs the project and library.
     scan.addDirectoryArg2(.{ .relative = .{ .base = .install_prefix, .sub_path = "test/" ++ name } }, .{ .make_absolute = true });
     _ = scan.addOutputDirectoryArg("project");
-    // The library is read from the install directory, which the build
-    // cannot hash; always rerun.
-    scan.has_side_effects = true;
+    // The runner copies the library from the install directory; these
+    // inputs make it rerun exactly when the library or Godot changes.
+    scan.addFileInput(lib.getEmittedBin());
+    scan.addFileInput(godot_file);
     // After the harness run: it installs the project, and one Godot at a time.
     scan.step.dependOn(&run.step);
     step.dependOn(&scan.step);
+}
+
+/// The test library `gdzig.addTest` built: the artifact of the first
+/// `InstallArtifact` step found under the harness run step (run ->
+/// install project -> install library in gdzig's current layout).
+fn harnessLibrary(step: *std.Build.Step) ?*std.Build.Step.Compile {
+    for (step.dependencies.items) |dep| {
+        if (dep.cast(std.Build.Step.InstallArtifact)) |ia| return ia.artifact;
+        if (harnessLibrary(dep)) |found| return found;
+    }
+    return null;
 }
 
 /// The gdzig module `gdzig.addTest` links: that of the first gdzig

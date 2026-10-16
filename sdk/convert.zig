@@ -5,7 +5,11 @@
 //! is finite, integral and in range; STRING and STRING_NAME into each other.
 //! Integers are range-checked. An enum value with no Zig tag is rejected; a
 //! flag struct (a packed struct with a backing integer) takes any value that
-//! fits its backing integer, as Godot allows any bits in a bitfield.
+//! fits its backing integer, as Godot allows any bits in a bitfield. A
+//! non-exhaustive enum takes any value of its tag type, named or not.
+//! FLOAT into `f32`: a finite value whose magnitude is above the largest
+//! `f32` is rejected; inf and NaN pass through as themselves; other values
+//! round to the nearest `f32` (small ones may become subnormal or zero).
 //!
 //! v1 types: `bool`; `i8`..`i64`, `u8`..`u32`; `f32`, `f64`; Zig enums and
 //! flag structs whose integer fits in `i64`; the gdzig builtins Vector2,
@@ -177,6 +181,7 @@ pub fn read(comptime T: type, v: *const anyopaque, out: *T) ?ReadError {
                 t_float => {
                     var x: f64 = 0;
                     if (!extract(t_float, v, &x)) return fail;
+                    if (T == f32 and std.math.isFinite(x) and @abs(x) > std.math.floatMax(f32)) return fail;
                     out.* = @floatCast(x);
                 },
                 t_int => {
