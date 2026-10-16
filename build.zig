@@ -110,8 +110,42 @@ fn addSdk(
         .imports = &.{
             .{ .name = "gdzig", .module = gdzig.module("gdzig") },
             .{ .name = "sdk_options", .module = sdk_options },
+            .{ .name = "ziggurat_abi", .module = addAbi(b, target, optimize) },
         },
     });
+}
+
+/// The ABI module `ziggurat_abi`: imports only std and builtin, and is
+/// shared by the SDK and the future host.
+fn addAbi(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("src/abi/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+}
+
+/// Makes every file under `dirs` (relative to the build root) an input of
+/// `run`, so editing any of them reruns it. Found at configure time.
+fn addSourceInputs(b: *std.Build, run: *std.Build.Step.Run, dirs: []const []const u8) void {
+    const io = b.graph.io;
+    for (dirs) |sub| {
+        var dir = std.Io.Dir.cwd().openDir(io, sub, .{ .iterate = true }) catch |err|
+            std.debug.panic("cannot open {s}: {t}", .{ sub, err });
+        defer dir.close(io);
+        // A new or removed file must repeat configuration, which is cached.
+        b.dependOnDirectoryContents(b.path(sub));
+        var walker = dir.walk(b.allocator) catch @panic("OOM");
+        defer walker.deinit();
+        while (walker.next(io) catch |err| std.debug.panic("cannot walk {s}: {t}", .{ sub, err })) |entry| {
+            if (entry.kind == .directory) {
+                b.dependOnDirectoryContents(b.path(b.fmt("{s}/{s}", .{ sub, entry.path })));
+                continue;
+            }
+            if (entry.kind != .file) continue;
+            run.addFileInput(b.path(b.fmt("{s}/{s}", .{ sub, entry.path })));
+        }
+    }
 }
 
 /// Adds `<sdk_version>` and one `<name> <root> <deps>` triple per module
@@ -181,7 +215,9 @@ fn addTestSet(
     build_mod.addImport("build_options", options_mod);
     build_mod.addImport("ziggurat_platform", platform);
 
-    for ([_]*std.Build.Module{ platform, build_mod }) |mod| {
+    const abi = addAbi(b, target, optimize);
+
+    for ([_]*std.Build.Module{ platform, build_mod, abi }) |mod| {
         const t = b.addTest(.{ .root_module = mod });
         if (run) {
             step.dependOn(&b.addRunArtifact(t).step);
@@ -213,6 +249,10 @@ fn addTestSet(
         sdk_e2e.addImport("build_options", options_mod);
         sdk_e2e.addImport("ziggurat_platform", platform);
         sdk_e2e.addImport("ziggurat_build", build_mod);
-        step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = sdk_e2e })).step);
+        const sdk_run = b.addRunArtifact(b.addTest(.{ .root_module = sdk_e2e }));
+        // The test builds the SDK from source with a child compiler, which the
+        // build system cannot see; track the sources so an edit reruns it.
+        addSourceInputs(b, sdk_run, &.{ "sdk", "src/abi" });
+        step.dependOn(&sdk_run.step);
     }
 }
