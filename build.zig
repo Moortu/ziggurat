@@ -146,9 +146,21 @@ fn addGodotTests(
 ) void {
     if (harnessGdzig(b) != sdk.import_table.get("gdzig").?)
         @panic("the SDK under test does not import the gdzig module the test harness uses");
-    // The descriptor tests read a fixture script, which imports the SDK.
+    // The descriptor tests read the fixture scripts, which import the SDK.
     const fixture_player = b.createModule(.{
         .root_source_file = b.path("test/fixtures/sdk_project/player.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ziggurat", .module = sdk }},
+    });
+    const fixture_coin = b.createModule(.{
+        .root_source_file = b.path("test/fixtures/sdk_project/items/coin.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ziggurat", .module = sdk }},
+    });
+    const fixture_hud_label = b.createModule(.{
+        .root_source_file = b.path("test/fixtures/sdk_project/ui/hud_label.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "ziggurat", .module = sdk }},
@@ -161,6 +173,8 @@ fn addGodotTests(
             .{ .name = "ziggurat", .module = sdk },
             .{ .name = "ziggurat_abi", .module = sdk.import_table.get("ziggurat_abi").? },
             .{ .name = "fixture_player", .module = fixture_player },
+            .{ .name = "fixture_coin", .module = fixture_coin },
+            .{ .name = "fixture_hud_label", .module = fixture_hud_label },
         },
     });
     const name = "sdk_godot";

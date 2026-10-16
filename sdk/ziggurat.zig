@@ -44,16 +44,13 @@ pub const Table = abi.Table;
 /// reports at the script's line; see `describe.zig`.
 pub const describe = describe_mod.describe;
 
-/// The target part of the layout stamp: `<arch>-<os>-<abi>` as Zig names them.
-pub const stamp_target = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag) ++ "-" ++ @tagName(builtin.abi);
-
 /// The layout stamp this module's table carries. A host computes the same
 /// value from its own build facts with `ziggurat_abi.layoutStamp`.
 pub const layout_stamp: u64 = abi.layoutStamp(.{
     .api_json_sha256 = &sdk_options.api_json_sha256,
     .interface_h_sha256 = &sdk_options.interface_h_sha256,
     .zig_version = builtin.zig_version_string,
-    .target = stamp_target,
+    .target = abi.stampTarget(builtin.target),
     .precision = sdk_options.precision,
     .sdk_version = version,
 });

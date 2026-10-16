@@ -5,6 +5,8 @@ const testing = std.testing;
 const ziggurat = @import("ziggurat");
 const abi = @import("ziggurat_abi");
 const player = @import("fixture_player");
+const coin = @import("fixture_coin");
+const hud_label = @import("fixture_hud_label");
 const godot = ziggurat.godot;
 const Node = godot.class.Node;
 
@@ -19,6 +21,10 @@ const t_object: u32 = 24;
 const usage_script: u32 = 4102;
 const usage_group: u32 = 64;
 const hint_range: u32 = 1;
+const hint_enum: u32 = 2;
+const hint_resource_type: u32 = 17;
+const hint_node_type: u32 = 34;
+const group = "Movement/Fast motion";
 
 fn str(s: abi.Str) []const u8 {
     const p = s.ptr orelse return "";
@@ -63,18 +69,21 @@ test "describe player: fields" {
     try testing.expectEqual(d.fields[1].type_id, d.fields[9].type_id); // both f32
 }
 
-test "describe player: properties, group position, hints" {
+test "describe player: properties in source order, groups, hints" {
     const d = &player_desc;
     const want = [_]PropWant{
+        .{ .name = group, .field = abi.no_field, .vt = t_nil, .usage = usage_group },
+        .{ .name = "speed", .field = 1, .vt = t_float, .hint = hint_range, .hint_string = "0,1000,5" },
+        .{ .name = "", .field = abi.no_field, .vt = t_nil, .usage = usage_group },
         .{ .name = "health", .field = 2, .vt = t_int, .hint = hint_range, .hint_string = "0,100" },
         .{ .name = "alive", .field = 3, .vt = t_bool },
-        .{ .name = "mood", .field = 4, .vt = t_int },
+        .{ .name = "mood", .field = 4, .vt = t_int, .hint = hint_enum, .hint_string = "calm:0,angry:1" },
         .{ .name = "layers", .field = 5, .vt = t_int },
-        .{ .name = "title", .field = 7, .vt = t_string },
-        .{ .name = "target", .field = 8, .vt = t_object, .class = "Node" },
-        .{ .name = "Movement", .field = abi.no_field, .vt = t_nil, .usage = usage_group },
-        .{ .name = "speed", .field = 1, .vt = t_float, .hint = hint_range, .hint_string = "0,1000,5" },
+        .{ .name = group, .field = abi.no_field, .vt = t_nil, .usage = usage_group },
         .{ .name = "spawn_point", .field = 6, .vt = t_vector2 },
+        .{ .name = "", .field = abi.no_field, .vt = t_nil, .usage = usage_group },
+        .{ .name = "title", .field = 7, .vt = t_string },
+        .{ .name = "target", .field = 8, .vt = t_object, .class = "Node", .hint = hint_node_type, .hint_string = "Node" },
     };
     try testing.expectEqual(@as(u32, want.len), d.property_count);
     for (want, 0..) |w, i| {
@@ -191,6 +200,37 @@ const D = struct {
     }
 };
 
+const E1 = struct {
+    pub const extends = Node;
+    base: *Node,
+    x: i32 = 5,
+    pub fn f(self: *@This()) i32 {
+        return self.x;
+    }
+};
+const E2 = struct {
+    pub const extends = Node;
+    x: i32 = 0,
+    base: *Node,
+};
+
+test "describe: layout hash ignores defaults, follows field order" {
+    const ha = ziggurat.describe(A, "a.zig").layout_hash;
+    try testing.expectEqual(ha, ziggurat.describe(E1, "a.zig").layout_hash);
+    try testing.expect(ha != ziggurat.describe(E2, "a.zig").layout_hash);
+}
+
+test "describe coin: resource handle hint" {
+    const d = ziggurat.describe(coin, "items/coin.zig");
+    try testing.expectEqual(@as(u32, 2), d.property_count);
+    const tex = d.properties[1];
+    try testing.expectEqualStrings("texture", str(tex.name));
+    try testing.expectEqual(t_object, tex.variant_type);
+    try testing.expectEqualStrings("Texture2D", str(tex.class_name));
+    try testing.expectEqual(hint_resource_type, tex.hint);
+    try testing.expectEqualStrings("Texture2D", str(tex.hint_string));
+}
+
 test "describe: layout hash follows fields, not method bodies" {
     const ha = ziggurat.describe(A, "a.zig").layout_hash;
     try testing.expect(ha != ziggurat.describe(B, "a.zig").layout_hash);
@@ -214,18 +254,23 @@ test "describe: tool flag, no class name, no base field" {
 }
 
 const tool_desc = ziggurat.describe(Tool, "ui/tool.zig");
-const table = ziggurat.makeTable(&.{ &player_desc, &tool_desc });
+const coin_desc = ziggurat.describe(coin, "items/coin.zig");
+const hud_desc = ziggurat.describe(hud_label, "ui/hud_label.zig");
+const table = ziggurat.makeTable(&.{ &coin_desc, &player_desc, &hud_desc, &tool_desc });
 
-test "makeTable: header and scripts" {
+test "makeTable: header, every fixture script, validate" {
     const t = &table;
     try testing.expectEqual(abi.magic, t.magic);
     try testing.expectEqual(abi.abi_version, t.abi_version);
     try testing.expectEqual(@as(u32, @sizeOf(abi.Table)), t.size);
     try testing.expectEqual(ziggurat.layout_stamp, t.layout_stamp);
     try testing.expectEqualStrings(ziggurat.version, str(t.sdk_version));
-    try testing.expectEqual(@as(u32, 2), t.script_count);
-    try testing.expectEqualStrings("player.zig", str(t.scripts[0].path));
-    try testing.expectEqualStrings("ui/tool.zig", str(t.scripts[1].path));
+    try testing.expectEqual(@as(u32, 4), t.script_count);
+    try testing.expectEqualStrings("items/coin.zig", str(t.scripts[0].path));
+    try testing.expectEqualStrings("player.zig", str(t.scripts[1].path));
+    try testing.expectEqualStrings("ui/hud_label.zig", str(t.scripts[2].path));
+    try testing.expectEqualStrings("ui/tool.zig", str(t.scripts[3].path));
+    try testing.expectEqual(abi.script_flag_tool, t.scripts[2].flags);
 
     var diag: [256]u8 = undefined;
     // The harness test runner does not set up `testing.allocator`.

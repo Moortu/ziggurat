@@ -293,13 +293,17 @@ const Ctx = struct {
     }
 
     /// Fails when two names in `list` (an array of structs with a `name: Str`)
-    /// are equal. The names were validated by the caller.
-    fn unique(c: *Ctx, comptime T: type, list: []const T, comptime plural: []const u8) (ValidateError || error{OutOfMemory})!void {
+    /// are equal. The names were validated by the caller. When `counts` is
+    /// given, only the entries it accepts take part.
+    fn unique(c: *Ctx, comptime T: type, list: []const T, comptime plural: []const u8, comptime counts: ?fn (*const T) bool) (ValidateError || error{OutOfMemory})!void {
         if (list.len < 2) return;
         var seen: Set = .empty;
         defer seen.deinit(c.a);
         try seen.ensureTotalCapacity(c.a, @intCast(list.len));
         for (list, 0..) |*e, i| {
+            if (counts) |f| {
+                if (!f(e)) continue;
+            }
             const gop = seen.getOrPutAssumeCapacity(slice(&e.name));
             if (gop.found_existing) {
                 return c.fail(error.Duplicate, "has two " ++ plural ++ " named \"{f}\" (numbers {d} and {d}).", .{ Clip{ .s = slice(&e.name) }, gop.value_ptr.*, i });
@@ -372,7 +376,11 @@ const Ctx = struct {
         const props = try c.array(PropertyDesc, &s.properties, s.property_count, "properties");
         for (props, 0..) |*p, i| {
             const i32_: u32 = @intCast(i);
-            const name = try c.identifier(&p.name, .{ .kind = "property", .index = i32_, .what = "name" }, false);
+            // A group entry's name is a label (any text; empty ends a group).
+            const name = if (isGroupEntry(p))
+                try c.str(&p.name, .{ .kind = "property", .index = i32_, .what = "name" })
+            else
+                try c.identifier(&p.name, .{ .kind = "property", .index = i32_, .what = "name" }, false);
             try c.variant(p.variant_type, .{ .kind = "property", .index = i32_ });
             _ = try c.identifier(&p.class_name, .{ .kind = "property", .index = i32_, .what = "class name" }, true);
             _ = try c.str(&p.hint_string, .{ .kind = "property", .index = i32_, .what = "hint string" });
@@ -380,7 +388,7 @@ const Ctx = struct {
                 return c.fail(error.BadLayout, "has property {d} \"{f}\" with field index {d}, but only {d} fields.", .{ i, Clip{ .s = name }, p.field_index, s.field_count });
             }
         }
-        try c.unique(PropertyDesc, props, "properties");
+        try c.unique(PropertyDesc, props, "properties", notGroupEntry);
 
         const methods = try c.array(MethodDesc, &s.methods, s.method_count, "methods");
         for (methods, 0..) |*m, i| {
@@ -391,7 +399,7 @@ const Ctx = struct {
             _ = try c.identifier(&m.ret.class_name, .{ .kind = "method", .index = i32_, .what = "return class name" }, true);
             try c.checkArgs("method", i32_, name, &m.args, m.arg_count);
         }
-        try c.unique(MethodDesc, methods, "methods");
+        try c.unique(MethodDesc, methods, "methods", null);
 
         const sigs = try c.array(SignalDesc, &s.signals, s.signal_count, "signals");
         for (sigs, 0..) |*g, i| {
@@ -399,9 +407,20 @@ const Ctx = struct {
             const name = try c.identifier(&g.name, .{ .kind = "signal", .index = i32_, .what = "name" }, false);
             try c.checkArgs("signal", i32_, name, &g.args, g.arg_count);
         }
-        try c.unique(SignalDesc, sigs, "signals");
+        try c.unique(SignalDesc, sigs, "signals", null);
     }
 };
+
+/// A group entry: usage GROUP and no backing field. Godot shows its name as a
+/// section label and never looks it up, so any text is allowed, the empty
+/// name (which ends a group) included, and the name need not be unique.
+fn isGroupEntry(p: *const PropertyDesc) bool {
+    return p.usage & abi.usage_group != 0 and p.field_index == abi.no_field;
+}
+
+fn notGroupEntry(p: *const PropertyDesc) bool {
+    return !isGroupEntry(p);
+}
 
 fn isIdentifier(s: []const u8) bool {
     if (s.len == 0) return false;
@@ -850,6 +869,58 @@ test "validate duplicates" {
     }.m, error.Duplicate, "two signals named \"died\"");
 }
 
+test "validate group entries" {
+    var f = Fixture.init();
+    f.link();
+    // Script 0 has properties "hp" (field 0) and "name" (no field).
+    f.scripts[0].property_count = 4;
+    const label = "Stats and more/Sub";
+    const group: PropertyDesc = .{ .name = .{ .ptr = label.ptr, .len = label.len }, .field_index = abi.no_field, .variant_type = 0, .class_name = .{ .ptr = null, .len = 0 }, .hint = 0, .hint_string = .{ .ptr = null, .len = 0 }, .usage = abi.usage_group };
+    f.props[0][2] = group;
+    f.props[0][3] = group;
+    setStr(&f.props[0][3].name, "hp"); // same name as a property: allowed for a group
+    var diag: [256]u8 = undefined;
+    try f.check(.{}, &diag);
+    // The empty name ends a group.
+    f.props[0][3].name = .{ .ptr = null, .len = 0 };
+    try f.check(.{}, &diag);
+    // Two groups with one name.
+    f.props[0][3] = group;
+    try f.check(.{}, &diag);
+
+    try expectRule(struct {
+        fn m(g: *Fixture) void {
+            g.props[0][1].usage = abi.usage_group;
+            setStr(&g.props[0][1].name, "a\x00b");
+        }
+    }.m, error.BadString, "property 1 name contains a NUL byte");
+    try expectRule(struct {
+        fn m(g: *Fixture) void {
+            g.props[0][1].usage = abi.usage_group;
+            setStr(&g.props[0][1].name, "\xff");
+        }
+    }.m, error.BadString, "property 1 name is not valid UTF-8");
+    // A group usage on a property with a field is a plain property: identifier rules.
+    try expectRule(struct {
+        fn m(g: *Fixture) void {
+            g.props[0][0].usage = abi.usage_group;
+            setStr(&g.props[0][0].name, "h p");
+        }
+    }.m, error.BadName, "property 0 name \"h p\"");
+    // A non-group entry without a field still needs an identifier and a unique name.
+    try expectRule(struct {
+        fn m(g: *Fixture) void {
+            setStr(&g.props[0][1].name, "");
+        }
+    }.m, error.BadName, "has an empty property 1 name");
+    try expectRule(struct {
+        fn m(g: *Fixture) void {
+            g.props[0][1].usage = 6;
+            setStr(&g.props[0][1].name, "hp");
+        }
+    }.m, error.Duplicate, "two properties named \"hp\"");
+}
+
 test "validate allows a null migrate and an empty class name" {
     var f = Fixture.init();
     f.link();
@@ -1169,7 +1240,8 @@ fn mustReject(f: *const Fixture) bool {
         if (sc.property_count > 0) {
             if (addr(&sc.properties) != @intFromPtr(&f.props[i])) return true;
             for (f.props[i][0..sc.property_count]) |p| {
-                if (nameBad(p.name) or p.variant_type >= variant_max or strBad(p.class_name) or strBad(p.hint_string)) return true;
+                const name_bad = if (isGroupEntry(&p)) strBad(p.name) else nameBad(p.name);
+                if (name_bad or p.variant_type >= variant_max or strBad(p.class_name) or strBad(p.hint_string)) return true;
                 if (p.field_index != abi.no_field and p.field_index >= sc.field_count) return true;
             }
         }

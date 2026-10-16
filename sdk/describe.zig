@@ -12,34 +12,45 @@
 //!
 //! Godot names: a property is named after its field, a method after
 //! `toSnakeCase` of its name, a signal after its declaration; `meta` can
-//! override the first two with `.name`. All of them, and group names, must be
-//! distinct, because the host looks them up by name.
+//! override the first two with `.name`. All of them must be distinct, because
+//! the host looks them up by name. Group names are labels: any non-empty
+//! UTF-8 text (`/` nests sections), and they may repeat.
 //!
-//! Property order: exported fields without a group first, in field order;
-//! then each group (in the order its first field appears), as a group entry
-//! followed by its fields. Godot puts every property after a group entry into
-//! that group, and an entry with an empty name to close a group is not a
-//! valid descriptor name, so grouped properties go last.
+//! Property order: exported fields in source order. A group entry starts each
+//! run of fields with the same `meta` group, and an entry with an empty name
+//! ends the group before the next field without one.
 //!
-//! Limit: a field that defaults to `undefined` is caught only for integer,
-//! float, bool and enum fields, and only through Zig's own "use of undefined
-//! value" error, which has no marker. Zig 0.17 cannot test a comptime value
-//! for `undefined` without raising that error, and structs (whose padding
-//! bytes are undefined) cannot be checked byte by byte.
+//! Hints (as GDScript exports): `.range` gives RANGE; an enum gives ENUM with
+//! `"tag:value,..."`; `z.Obj(T)` of a Node class gives NODE_TYPE and
+//! `z.Ref(T)` of a Resource class RESOURCE_TYPE, each with the engine class
+//! name. Other object handles cannot be exported. `meta` `.hint` and
+//! `.hint_string` override all of these.
+//!
+//! Limit: a field that defaults to `undefined` fails the build, but with Zig's
+//! own "use of undefined value" error at this file, not at the script line.
+//! Zig 0.17 has no comptime test for `undefined` that does not raise that
+//! error. Every scalar, pointer and optional inside the default is compared
+//! with itself (arrays and struct fields recursively, padding never read), so
+//! all v1 field types are covered; unions and vectors are not looked into.
 const std = @import("std");
 const abi = @import("ziggurat_abi");
 const snake = @import("snake.zig");
 const convert = @import("convert.zig");
 const object = @import("object.zig");
+const godot = @import("gdzig");
 
 /// Usage of an exported field: STORAGE | EDITOR | SCRIPT_VARIABLE, as
 /// GDScript sets for script variables.
 pub const usage_script_variable: u32 = 2 | 4 | 4096;
-/// Usage of a group entry (PROPERTY_USAGE_GROUP).
-pub const usage_group: u32 = 64;
 pub const hint_none: u32 = 0;
 /// PROPERTY_HINT_RANGE; the hint string is `"min,max"` or `"min,max,step"`.
 pub const hint_range: u32 = 1;
+/// PROPERTY_HINT_ENUM; the hint string is `"Tag:value,..."`.
+pub const hint_enum: u32 = 2;
+/// PROPERTY_HINT_RESOURCE_TYPE; the hint string is the engine class name.
+pub const hint_resource_type: u32 = 17;
+/// PROPERTY_HINT_NODE_TYPE; the hint string is the engine class name.
+pub const hint_node_type: u32 = 34;
 
 const t_nil: u32 = 0;
 
@@ -157,6 +168,17 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             break :blk &final;
         };
 
+        /// A `pub fn` that takes the script by value would work on a copy.
+        fn checkByValue() void {
+            for (info.decl_names) |d| {
+                const T = @TypeOf(@field(S, d));
+                if (@typeInfo(T) != .@"fn") continue;
+                const f = @typeInfo(T).@"fn";
+                if (f.param_types.len > 0 and f.param_types[0] == S)
+                    fail(d, "Method '" ++ d ++ "' takes the script by value; take self as *@This() or *const @This().");
+            }
+        }
+
         fn isMethodName(comptime name: []const u8) bool {
             for (method_decls) |d| {
                 if (eql(d, name)) return true;
@@ -224,12 +246,30 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                         fail(name, "Field '" ++ name ++ "' has type ?*" ++ shortName(C) ++ ", which Godot cannot hold; use z.Obj(" ++ shortName(C) ++ ").");
                     if (!convert.supported(FT))
                         fail(name, "Field '" ++ name ++ "' has type " ++ @typeName(FT) ++ ", which Godot cannot hold; not supported in v1.");
+                    checkExportable(name, FT);
                 }
                 const d = attrs.defaultValue(FT) orelse fail(name, "Field '" ++ name ++ "' needs a default value.");
-                // Comparing an undefined scalar is a compile error (see the file header).
-                switch (@typeInfo(FT)) {
-                    .int, .float, .bool, .@"enum" => if (d != d) {},
-                    else => {},
+                requireDefined(FT, d);
+            }
+        }
+
+        /// Object handles Godot's Inspector can edit, and enum tags its enum
+        /// hint can show.
+        fn checkExportable(comptime name: []const u8, comptime FT: type) void {
+            if (handleKind(FT)) |k| {
+                const C = FT.Class;
+                const spelled = (if (k == .obj) "z.Obj(" else "z.Ref(") ++ shortName(C) ++ ")";
+                const is_node = godot.class.isA(godot.class.Node, C);
+                const is_resource = godot.class.isA(godot.class.Resource, C);
+                if (k == .obj and is_resource)
+                    fail(name, "Field '" ++ name ++ "' holds " ++ spelled ++ ", a Resource that the field would not keep alive; use z.Ref(" ++ shortName(C) ++ ").");
+                if (!(k == .obj and is_node) and !(k == .ref and is_resource))
+                    fail(name, "Field '" ++ name ++ "' holds " ++ spelled ++ ", which is neither a Node nor a Resource; Godot cannot export it.");
+            }
+            if (@typeInfo(FT) == .@"enum") {
+                for (@typeInfo(FT).@"enum".field_names) |tag| {
+                    if (std.mem.indexOfAny(u8, tag, ",:") != null)
+                        fail(name, "Field '" ++ name ++ "' has the enum tag '" ++ tag ++ "', which Godot's enum hint cannot show because it contains ',' or ':'.");
                 }
             }
         }
@@ -240,27 +280,20 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
 
         fn groupOf(comptime name: []const u8) ?[]const u8 {
             const g = metaString(name, "group") orelse return null;
-            if (!isIdentifier(g))
-                fail(name, "meta group '" ++ g ++ "' for '" ++ name ++ "' must be an identifier.");
+            if (g.len == 0 or std.mem.indexOfScalar(u8, g, 0) != null or !std.unicode.utf8ValidateSlice(g))
+                fail(name, "meta group for '" ++ name ++ "' must be non-empty UTF-8 text without NUL bytes.");
             return g;
         }
-
-        /// Distinct group names in order of first use.
-        const groups: []const []const u8 = blk: {
-            @setEvalBranchQuota(quota);
-            var list: []const []const u8 = &.{};
-            for (info.field_names) |name| {
-                if (!exported(name)) continue;
-                const g = groupOf(name) orelse continue;
-                if (!inList(g, list)) list = list ++ [_][]const u8{g};
-            }
-            break :blk list;
-        };
 
         fn rangeHint(comptime name: []const u8) ?[]const u8 {
             if (!@hasField(Meta, name)) return null;
             const e = @field(meta, name);
             if (!@hasField(@TypeOf(e), "range")) return null;
+            const FT = @FieldType(S, name);
+            switch (@typeInfo(FT)) {
+                .int, .float => {},
+                else => fail(name, "meta range for '" ++ name ++ "' needs a number field, but '" ++ name ++ "' has type " ++ @typeName(FT) ++ "."),
+            }
             const r = @field(e, "range");
             const bad = "meta range for '" ++ name ++ "' must be .{ min, max } or .{ min, max, step } with numbers.";
             const R = @TypeOf(r);
@@ -279,10 +312,31 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             return out;
         }
 
+        const Hint = struct { hint: u32, string: []const u8 };
+
+        /// The hint a field gets from its type: an enum dropdown, a node
+        /// picker or a resource picker (as GDScript exports them).
+        fn typeHint(comptime FT: type) Hint {
+            if (handleKind(FT)) |k| {
+                const class = object.engineClassName(FT.Class);
+                return .{ .hint = if (k == .obj) hint_node_type else hint_resource_type, .string = class };
+            }
+            if (@typeInfo(FT) == .@"enum") {
+                const e = @typeInfo(FT).@"enum";
+                var out: []const u8 = "";
+                for (e.field_names, e.field_values, 0..) |tag, value, i| {
+                    out = out ++ (if (i == 0) "" else ",") ++ tag ++ ":" ++ std.fmt.comptimePrint("{d}", .{value});
+                }
+                return .{ .hint = hint_enum, .string = out };
+            }
+            return .{ .hint = hint_none, .string = "" };
+        }
+
         fn property(comptime name: []const u8) abi.PropertyDesc {
             const FT = @FieldType(S, name);
-            var hint: u32 = hint_none;
-            var hint_string: []const u8 = "";
+            const th = typeHint(FT);
+            var hint: u32 = th.hint;
+            var hint_string: []const u8 = th.string;
             if (rangeHint(name)) |h| {
                 hint = hint_range;
                 hint_string = h;
@@ -309,27 +363,37 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             };
         }
 
+        fn groupEntry(comptime name: []const u8) abi.PropertyDesc {
+            return .{
+                .name = str(name),
+                .field_index = abi.no_field,
+                .variant_type = t_nil,
+                .class_name = str(""),
+                .hint = hint_none,
+                .hint_string = str(""),
+                .usage = abi.usage_group,
+            };
+        }
+
+        /// Exported fields in source order. A group entry starts each run of
+        /// fields with the same group; an empty-name entry ends a group
+        /// before the next field without one.
         const properties: []const abi.PropertyDesc = blk: {
             @setEvalBranchQuota(quota);
             var list: []const abi.PropertyDesc = &.{};
+            var current: ?[]const u8 = null;
             for (info.field_names) |name| {
-                if (exported(name) and groupOf(name) == null) list = list ++ [_]abi.PropertyDesc{property(name)};
-            }
-            for (groups) |g| {
-                list = list ++ [_]abi.PropertyDesc{.{
-                    .name = str(g),
-                    .field_index = abi.no_field,
-                    .variant_type = t_nil,
-                    .class_name = str(""),
-                    .hint = hint_none,
-                    .hint_string = str(""),
-                    .usage = usage_group,
-                }};
-                for (info.field_names) |name| {
-                    if (!exported(name)) continue;
-                    const fg = groupOf(name) orelse continue;
-                    if (eql(fg, g)) list = list ++ [_]abi.PropertyDesc{property(name)};
+                if (!exported(name)) continue;
+                if (groupOf(name)) |g| {
+                    if (current == null or !eql(current.?, g)) {
+                        list = list ++ [_]abi.PropertyDesc{groupEntry(g)};
+                        current = g;
+                    }
+                } else if (current != null) {
+                    list = list ++ [_]abi.PropertyDesc{groupEntry("")};
+                    current = null;
                 }
+                list = list ++ [_]abi.PropertyDesc{property(name)};
             }
             const final = list[0..list.len].*;
             break :blk &final;
@@ -503,12 +567,6 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             for (info.field_names) |name| {
                 if (exported(name)) list = list ++ [_]Named{.{ .zig = name, .godot = godotFieldName(name), .marker = name }};
             }
-            for (groups) |g| {
-                const first = for (info.field_names) |name| {
-                    if (exported(name) and eql(groupOf(name) orelse "", g)) break name;
-                } else unreachable;
-                list = list ++ [_]Named{.{ .zig = g, .godot = g, .marker = first }};
-            }
             for (method_decls) |d| list = list ++ [_]Named{.{ .zig = d, .godot = godotMethodName(d), .marker = d }};
             for (@typeInfo(Signals).@"struct".decl_names) |sname| {
                 list = list ++ [_]Named{.{ .zig = sname, .godot = sname, .marker = "signals" }};
@@ -526,8 +584,10 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             _ = Extends;
             _ = class_name;
             _ = tool;
+            checkByValue();
             checkFields();
             checkMeta();
+            _ = properties;
             checkMethods();
             checkSignals();
             checkCollisions();
@@ -612,6 +672,38 @@ const placeholder = struct {
         _ = reversed;
     }
 };
+
+/// Reads every scalar in `v`, so an `undefined` one is a compile error
+/// (see the file header). Padding is never read.
+fn requireDefined(comptime T: type, comptime v: T) void {
+    @setEvalBranchQuota(100_000);
+    switch (@typeInfo(T)) {
+        .int, .float, .bool, .@"enum" => if (v != v) {},
+        .pointer => |p| switch (p.size) {
+            .slice => if (v.ptr != v.ptr or v.len != v.len) {},
+            else => if (v != v) {},
+        },
+        .optional => |o| if (v != null) requireDefined(o.child, v.?),
+        .array => |a| for (v) |e| requireDefined(a.child, e),
+        .@"struct" => |s| {
+            if (s.backing_integer) |I| {
+                const bits: I = @bitCast(v);
+                if (bits != bits) {}
+                return;
+            }
+            inline for (s.field_names, s.field_types, s.field_attrs) |name, FT, attrs| {
+                if (!attrs.@"comptime") requireDefined(FT, @field(v, name));
+            }
+        },
+        else => {},
+    }
+}
+
+/// `.obj` or `.ref` when `T` is a `z.Obj` or `z.Ref` handle.
+fn handleKind(comptime T: type) ?@TypeOf(.obj) {
+    if (@typeInfo(T) != .@"struct" or !@hasDecl(T, object.handle_decl)) return null;
+    return T.ziggurat_handle;
+}
 
 /// An argument or return value of type `T` named `name`; `void` is NIL.
 fn argDesc(comptime name: []const u8, comptime T: type) abi.ArgDesc {

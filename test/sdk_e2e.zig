@@ -146,8 +146,8 @@ test "integration: fixture project builds" {
     if (timingOn()) std.debug.print("sdk_e2e: fixture project (3 fixtures + 30-field, 30-method script) full build {d} ms\n", .{o.ms});
 }
 
-/// One script that must fail with `sentence`, reported at `rel` on the first
-/// line that starts with `decl`.
+/// One script that must fail with exactly `sentence`, reported at `rel` on
+/// the first line that starts with `decl`.
 const BadScript = struct { rel: []const u8, data: []const u8, sentence: []const u8, decl: []const u8 };
 
 const prelude =
@@ -158,7 +158,7 @@ const prelude =
 
 const bad_scripts = [_]BadScript{
     .{
-        .rel = "odd%d]i:r/bad_type.zig",
+        .rel = "h#a%25x[b]:c/bad_type.zig",
         .data = prelude ++
             \\pub const extends = class.Node;
             \\base: *class.Node,
@@ -292,6 +292,79 @@ const bad_scripts = [_]BadScript{
         .decl = "pub fn takeDamage",
     },
     .{
+        .rel = "collide_reverse.zig",
+        .data = prelude ++
+            \\pub const extends = class.Node;
+            \\height: f32 = 0,
+            \\pub const meta = .{ .height = .{ .name = "jump" } };
+            \\
+            \\pub fn jump(self: *@This()) void {
+            \\    _ = self;
+            \\}
+            \\
+        ,
+        .sentence = "'height' and 'jump' both map to the Godot name 'jump'; give one a name override in meta.",
+        .decl = "pub fn jump",
+    },
+    .{
+        .rel = "by_value.zig",
+        .data = prelude ++
+            \\pub const extends = class.Node;
+            \\speed: f32 = 1,
+            \\
+            \\pub fn boost(self: @This()) f32 {
+            \\    return self.speed;
+            \\}
+            \\
+        ,
+        .sentence = "Method 'boost' takes the script by value; take self as *@This() or *const @This().",
+        .decl = "pub fn boost",
+    },
+    .{
+        .rel = "range_on_bool.zig",
+        .data = prelude ++
+            \\pub const extends = class.Node;
+            \\speed: f32 = 1,
+            \\alive: bool = true,
+            \\pub const meta = .{ .alive = .{ .range = .{ 0, 1 } } };
+            \\
+        ,
+        .sentence = "meta range for 'alive' needs a number field, but 'alive' has type bool.",
+        .decl = "alive:",
+    },
+    .{
+        .rel = "neither.zig",
+        .data = prelude ++
+            \\pub const extends = class.Node;
+            \\speed: f32 = 1,
+            \\thing: z.Obj(class.Object) = .{},
+            \\
+        ,
+        .sentence = "Field 'thing' holds z.Obj(Object), which is neither a Node nor a Resource; Godot cannot export it.",
+        .decl = "thing:",
+    },
+    .{
+        .rel = "weak_resource.zig",
+        .data = prelude ++
+            \\pub const extends = class.Node;
+            \\speed: f32 = 1,
+            \\tex: z.Obj(class.Texture2d) = .{},
+            \\
+        ,
+        .sentence = "Field 'tex' holds z.Obj(Texture2d), a Resource that the field would not keep alive; use z.Ref(Texture2d).",
+        .decl = "tex:",
+    },
+    .{
+        .rel = "enum_tag.zig",
+        .data = prelude ++
+            \\pub const extends = class.Node;
+            \\mode: enum { plain, @"a:b" } = .plain,
+            \\
+        ,
+        .sentence = "Field 'mode' has the enum tag 'a:b', which Godot's enum hint cannot show because it contains ',' or ':'.",
+        .decl = "mode:",
+    },
+    .{
         .rel = "bad_param.zig",
         .data = prelude ++
             \\pub const extends = class.Node;
@@ -377,31 +450,47 @@ test "integration: compile errors map to the script" {
         const d = for (o.diagnostics) |d| {
             if (d.rel != null and std.mem.eql(u8, d.rel.?, c.rel)) break d;
         } else return error.NoDiagnosticForScript;
-        if (!std.mem.startsWith(u8, d.message, c.sentence)) {
+        if (!std.mem.eql(u8, d.message, c.sentence)) {
             std.debug.print("want: {s}\ngot:  {s}\n", .{ c.sentence, d.message });
             return error.WrongMessage;
         }
         try testing.expectEqual(want_line, d.line);
     }
 
-    // A scalar field defaulting to `undefined` fails through Zig's own error
-    // (no marker); see sdk/describe.zig.
-    try h.tmp.dir.writeFile(io, .{ .sub_path = "proj/undef.zig", .data = prelude ++
-        \\pub const extends = class.Node;
-        \\speed: f32 = undefined,
-        \\
-    });
-    const o = try h.build(.save);
-    total_ms += o.ms;
-    errdefer printDiagnostics(o);
-    try testing.expect(!o.ok);
-    const undef = for (o.diagnostics) |d| {
-        if (std.mem.indexOf(u8, d.message, "undefined") != null) break d;
-    } else return error.NoUndefinedError;
-    if (timingOn()) {
-        std.debug.print("sdk_e2e: {d} failing builds took {d} ms in total\n", .{ bad_scripts.len + 1, total_ms });
-        std.debug.print("sdk_e2e: undefined default reported as {?s}:{d}: {s}\n", .{ undef.rel, undef.line, undef.message });
+    // A field defaulting to `undefined` fails through Zig's own error (no
+    // marker), for scalars and for struct types alike; see sdk/describe.zig.
+    const undef_cases = [_]File{
+        .{ .rel = "undef_f32.zig", .data = prelude ++
+            \\pub const extends = class.Node;
+            \\speed: f32 = undefined,
+            \\
+        },
+        .{ .rel = "undef_vector.zig", .data = prelude ++
+            \\pub const extends = class.Node;
+            \\spawn: z.godot.builtin.Vector2 = undefined,
+            \\
+        },
+        .{ .rel = "undef_string.zig", .data = prelude ++
+            \\pub const extends = class.Node;
+            \\_name: z.godot.builtin.String = undefined,
+            \\
+        },
+    };
+    for (undef_cases) |c| {
+        errdefer std.debug.print("case {s}\n", .{c.rel});
+        const sub = try std.fmt.allocPrint(a, "proj/{s}", .{c.rel});
+        try h.tmp.dir.writeFile(io, .{ .sub_path = sub, .data = c.data });
+        defer h.tmp.dir.deleteFile(io, sub) catch {};
+        const o = try h.build(.save);
+        total_ms += o.ms;
+        errdefer printDiagnostics(o);
+        try testing.expect(!o.ok);
+        const undef = for (o.diagnostics) |d| {
+            if (std.mem.indexOf(u8, d.message, "undefined") != null) break d;
+        } else return error.NoUndefinedError;
+        if (timingOn()) std.debug.print("sdk_e2e: {s}: undefined default reported as {?s}:{d}: {s}\n", .{ c.rel, undef.rel, undef.line, undef.message });
     }
+    if (timingOn()) std.debug.print("sdk_e2e: {d} failing builds took {d} ms in total\n", .{ bad_scripts.len + undef_cases.len, total_ms });
 }
 
 /// Runs `argv`; it must print `Zig panic: probe` on stderr and die from a signal.

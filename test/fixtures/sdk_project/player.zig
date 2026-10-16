@@ -22,9 +22,9 @@ pub const Mood = enum(u8) { calm, angry };
 pub const Layers = packed struct(u8) { ground: bool = true, water: bool = false, _pad: u6 = 0 };
 
 pub const meta = .{
-    .speed = .{ .range = .{ 0, 1000, 5 }, .group = "Movement" },
+    .speed = .{ .range = .{ 0, 1000, 5 }, .group = "Movement/Fast motion" },
     .health = .{ .range = .{ 0, 100 } },
-    .spawn = .{ .group = "Movement", .name = "spawn_point" },
+    .spawn = .{ .group = "Movement/Fast motion", .name = "spawn_point" },
     .takeDamage = .{ .args = .{ "amount", "critical" } },
     .jump = .{ .name = "leap" },
 };

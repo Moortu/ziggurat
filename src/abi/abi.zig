@@ -55,6 +55,11 @@ pub const ArgDesc = extern struct {
 /// `field_index` of group entries, which have no backing field.
 pub const no_field: u32 = 0xFFFF_FFFF;
 
+/// `PropertyDesc.usage` bit of a group entry (PROPERTY_USAGE_GROUP). A group
+/// entry has `field_index = no_field`; its name is the section label (any
+/// UTF-8 text, `/` nests sections) and the empty name ends the group.
+pub const usage_group: u32 = 64;
+
 pub const PropertyDesc = extern struct {
     name: Str,
     field_index: u32,
@@ -92,6 +97,9 @@ pub const ScriptDesc = extern struct {
     layout_hash: u64,
     instance_size: u32,
     instance_align: u32,
+    /// An instance with every field at its default value. `base` in it is
+    /// undefined (a `*E` cannot be zero at compile time): the host must not
+    /// read `base` from it and sets `base` on every instance it makes.
     defaults: *const anyopaque,
     fields: [*]const FieldDesc,
     field_count: u32,
@@ -132,6 +140,12 @@ pub const StampInputs = struct {
     precision: []const u8,
     sdk_version: []const u8,
 };
+
+/// The `target` stamp input for `t`: `<arch>-<os>-<abi>` as Zig names them,
+/// for example `x86_64-linux-gnu`. The SDK and the host both use this.
+pub fn stampTarget(comptime t: std.Target) []const u8 {
+    return @tagName(t.cpu.arch) ++ "-" ++ @tagName(t.os.tag) ++ "-" ++ @tagName(t.abi);
+}
 
 /// Wyhash (seed 0) over, for each struct above in declaration order, its
 /// `@sizeOf`, then every field name, `@offsetOf` and `@typeName` of its type
@@ -176,6 +190,12 @@ const sample: StampInputs = .{
     .precision = "single",
     .sdk_version = "0.1.0",
 };
+
+test "stampTarget" {
+    const t = comptime stampTarget(builtin.target);
+    const want = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag) ++ "-" ++ @tagName(builtin.abi);
+    try std.testing.expectEqualStrings(want, t);
+}
 
 test "stamp is stable" {
     try std.testing.expectEqual(layoutStamp(sample), layoutStamp(sample));
