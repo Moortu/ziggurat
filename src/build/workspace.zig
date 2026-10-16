@@ -73,12 +73,12 @@ pub const Workspace = struct {
         try push(a, &out, "build-lib", .{});
         try push(a, &out, "-dynamic", .{});
         try push(a, &out, "-lc", .{});
-        try push(a, &out, "-O{s}", .{switch (mode.optimize) {
-            .Debug => "Debug",
-            .ReleaseSafe => "ReleaseSafe",
-            .ReleaseFast => "ReleaseFast",
-            .ReleaseSmall => "ReleaseSmall",
-        }});
+        const opt = switch (mode.optimize) {
+            .Debug => "-ODebug",
+            .ReleaseSafe => "-OReleaseSafe",
+            .ReleaseFast => "-OReleaseFast",
+            .ReleaseSmall => "-OReleaseSmall",
+        };
         if (mode.use_llvm) try push(a, &out, "-fllvm", .{}) else try push(a, &out, "-fno-llvm", .{});
         if (mode.incremental) try push(a, &out, "-fincremental", .{});
         try push(a, &out, "--name", .{});
@@ -86,10 +86,14 @@ pub const Workspace = struct {
         try push(a, &out, "--cache-dir", .{});
         try push(a, &out, "{s}", .{zig_cache.bytes});
         try push(a, &out, "--listen=-", .{});
+        // `-O` is a per-module option: each `-M` gets its own, so no module
+        // depends on how the compiler fills in a missing one.
+        try push(a, &out, "{s}", .{opt});
         try push(a, &out, "--dep", .{});
         try push(a, &out, "ziggurat", .{});
         try push(a, &out, "-Mroot={s}", .{root.bytes});
         for (self.sdk) |m| {
+            try push(a, &out, "{s}", .{opt});
             for (m.deps) |d| {
                 try push(a, &out, "--dep", .{});
                 try push(a, &out, "{s}", .{d});
@@ -538,20 +542,64 @@ test "argv golden" {
     };
     const inc = try ws.argv(arena, dummyZig(), .{ .incremental = true, .use_llvm = false, .optimize = .Debug });
     const want_inc: []const []const u8 = &.{
-        "/opt/zig/zig",            "build-lib",     "-dynamic",                     "-lc",      "-ODebug",
-        "-fno-llvm",               "-fincremental", "--name",                       "zmod",     "--cache-dir",
-        "/c/projects/p/zig-cache", "--listen=-",    "--dep",                        "ziggurat", "-Mroot=/proj/.ziggurat_root.zig",
-        "--dep",                   "gdzig",         "-Mziggurat=/sdk/ziggurat.zig",
+        "/opt/zig/zig", "build-lib",               "-dynamic",                     "-lc",     "-fno-llvm", "-fincremental", "--name",                          "zmod",
+        "--cache-dir",  "/c/projects/p/zig-cache", "--listen=-",                   "-ODebug", "--dep",     "ziggurat",      "-Mroot=/proj/.ziggurat_root.zig", "-ODebug",
+        "--dep",        "gdzig",                   "-Mziggurat=/sdk/ziggurat.zig",
     };
     try expectArgv(want_inc, inc);
     const full = try ws.argv(arena, dummyZig(), .{ .incremental = false, .use_llvm = true, .optimize = .ReleaseFast });
     const want_full: []const []const u8 = &.{
-        "/opt/zig/zig", "build-lib",                    "-dynamic", "-lc",                             "-OReleaseFast",
-        "-fllvm",       "--name",                       "zmod",     "--cache-dir",                     "/c/projects/p/zig-cache",
-        "--listen=-",   "--dep",                        "ziggurat", "-Mroot=/proj/.ziggurat_root.zig", "--dep",
-        "gdzig",        "-Mziggurat=/sdk/ziggurat.zig",
+        "/opt/zig/zig",            "build-lib",                    "-dynamic",      "-lc",   "-fllvm",   "--name",                          "zmod",          "--cache-dir",
+        "/c/projects/p/zig-cache", "--listen=-",                   "-OReleaseFast", "--dep", "ziggurat", "-Mroot=/proj/.ziggurat_root.zig", "-OReleaseFast", "--dep",
+        "gdzig",                   "-Mziggurat=/sdk/ziggurat.zig",
     };
     try expectArgv(want_full, full);
+}
+
+test "argv repeats optimize" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const deps = [_]ModuleDep{
+        .{ .name = "ziggurat", .root = .fromTrusted("/sdk/ziggurat.zig"), .deps = &.{ "gdzig", "sdk_options" } },
+        .{ .name = "gdzig", .root = .fromTrusted("/g/gdzig.zig"), .deps = &.{"gdzig"} },
+        .{ .name = "sdk_options", .root = .fromTrusted("/o/options.zig"), .deps = &.{} },
+    };
+    const ws: Workspace = .{
+        .cache_dir = .fromTrusted("/c/projects/p"),
+        .build_dir = .fromTrusted("/c/projects/p/build"),
+        .source_root = .fromTrusted("/proj"),
+        .mirrored = false,
+        .os = builtin.os.tag,
+        .sdk = &deps,
+        .lock = undefined,
+    };
+    const got = try ws.argv(arena, dummyZig(), .{ .incremental = false, .use_llvm = false, .optimize = .Debug });
+    const want: []const []const u8 = &.{
+        "/opt/zig/zig",            "build-lib",                    "-dynamic",    "-lc",                          "-fno-llvm", "--name",                          "zmod",    "--cache-dir",
+        "/c/projects/p/zig-cache", "--listen=-",                   "-ODebug",     "--dep",                        "ziggurat",  "-Mroot=/proj/.ziggurat_root.zig", "-ODebug", "--dep",
+        "gdzig",                   "--dep",                        "sdk_options", "-Mziggurat=/sdk/ziggurat.zig", "-ODebug",   "--dep",                           "gdzig",   "-Mgdzig=/g/gdzig.zig",
+        "-ODebug",                 "-Msdk_options=/o/options.zig",
+    };
+    try expectArgv(want, got);
+    // Exactly one -O per module, each before that module's -M.
+    var o_count: usize = 0;
+    var m_count: usize = 0;
+    for (got, 0..) |arg, i| {
+        if (std.mem.startsWith(u8, arg, "-O")) o_count += 1;
+        if (std.mem.startsWith(u8, arg, "-M")) {
+            m_count += 1;
+            var j = i;
+            while (j > 0) : (j -= 1) {
+                if (std.mem.startsWith(u8, got[j - 1], "-O")) break;
+                try testing.expect(!std.mem.startsWith(u8, got[j - 1], "-M"));
+            }
+            try testing.expect(j > 0);
+        }
+    }
+    try testing.expectEqual(@as(usize, 4), m_count);
+    try testing.expectEqual(m_count, o_count);
 }
 
 fn expectArgv(want: []const []const u8, got: []const []const u8) !void {

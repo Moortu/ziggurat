@@ -9,6 +9,7 @@ pub const compiler = @import("compiler.zig");
 pub const diagnostics = @import("diagnostics.zig");
 pub const backend = @import("backend.zig");
 pub const service = @import("service.zig");
+pub const sdk_manifest = @import("sdk_manifest.zig");
 
 test {
     std.testing.refAllDecls(scan);
@@ -18,6 +19,7 @@ test {
     std.testing.refAllDecls(diagnostics);
     std.testing.refAllDecls(backend);
     std.testing.refAllDecls(service);
+    std.testing.refAllDecls(sdk_manifest);
 }
 
 test "build module sees the platform module" {

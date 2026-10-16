@@ -55,7 +55,7 @@ jobs:
         run: zig version
 
       - name: Check formatting
-        run: zig fmt --check src test build.zig
+        run: zig fmt --check src test sdk tools build.zig
 
       # Container jobs usually run as root, and the read-only project tests
       # skip as root (root ignores file modes). Run the tests as a normal user

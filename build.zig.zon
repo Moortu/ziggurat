@@ -3,12 +3,19 @@
     .fingerprint = 0x5865cceb5ca2acbe,
     .version = "0.0.0",
     .minimum_zig_version = "0.17.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .gdzig = .{
+            .url = "git+https://github.com/gdzig/gdzig#c8e0768c9eb768827163f0ac893a5038bda799cb",
+            .hash = "godot-0.0.0-dev-q0GYjsfPwgCDsHpBgBeKR6ph6EbtJLqaMCY7waAmKGty",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "sdk",
         "src",
         "test",
+        "tools",
         "LICENSE",
     },
 }
