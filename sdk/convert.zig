@@ -16,7 +16,8 @@
 //! Vector2i, Vector3, Vector3i, Vector4, Vector4i, Color, Rect2, Rect2i,
 //! Quaternion, Plane, Aabb, Basis, Transform2d, Transform3d, Projection,
 //! String, StringName and NodePath. Not in v1: `u64`, `usize`, arrays,
-//! dictionaries, slices. Objects (and NIL into a null object) come later.
+//! dictionaries, slices. Object types: `?*Class` (engine class), `object.Obj(Class)` and
+//! `object.Ref(Class)`; see `object.zig`.
 //!
 //! Only Godot's raw variant-from-type and type-from-variant constructors are
 //! used, with locals at Godot's widths (int64, double, one-byte bool), and no
@@ -24,19 +25,22 @@
 const std = @import("std");
 const godot = @import("gdzig");
 const b = godot.builtin;
+const object = @import("object.zig");
 
 /// A failed read. `expected` is the Variant type the Zig type needs, for
 /// `CallError.expected`.
 pub const ReadError = struct { expected: u32 };
 
 // GDExtensionVariantType values.
+const t_nil: u32 = 0;
 const t_bool: u32 = 1;
 const t_int: u32 = 2;
 const t_float: u32 = 3;
 const t_string: u32 = 4;
 const t_string_name: u32 = 21;
+const t_object: u32 = 24;
 
-const Kind = enum { bool, int, float, enum_int, flags, builtin, unsupported };
+const Kind = enum { bool, int, float, enum_int, flags, builtin, obj_ptr, obj, ref, unsupported };
 
 const builtins = .{
     .{ b.String, 4 },   .{ b.Vector2, 5 },     .{ b.Vector2i, 6 },     .{ b.Rect2, 7 },
@@ -62,6 +66,13 @@ fn fitsI64(comptime I: type) bool {
     };
 }
 
+/// The engine class `P` points to, when `P` is `*Class`.
+fn objectPtrClass(comptime P: type) ?type {
+    const info = @typeInfo(P);
+    if (info != .pointer or info.pointer.size != .one or info.pointer.attrs.@"const") return null;
+    return if (object.isEngineClass(info.pointer.child)) info.pointer.child else null;
+}
+
 fn kind(comptime T: type) Kind {
     if (T == bool) return .bool;
     if (builtinType(T) != null) return .builtin;
@@ -70,7 +81,13 @@ fn kind(comptime T: type) Kind {
         f32, f64 => .float,
         else => switch (@typeInfo(T)) {
             .@"enum" => |e| if (fitsI64(e.tag_type)) .enum_int else .unsupported,
-            .@"struct" => |s| if (s.backing_integer) |I| (if (fitsI64(I)) .flags else .unsupported) else .unsupported,
+            .@"struct" => |s| if (s.backing_integer) |I|
+                (if (fitsI64(I)) .flags else .unsupported)
+            else if (@hasDecl(T, object.handle_decl))
+                (if (T.ziggurat_handle == .obj) .obj else .ref)
+            else
+                .unsupported,
+            .optional => |o| if (objectPtrClass(o.child) != null) .obj_ptr else .unsupported,
             else => .unsupported,
         },
     };
@@ -88,6 +105,7 @@ pub fn variantType(comptime T: type) u32 {
         .int, .enum_int, .flags => t_int,
         .float => t_float,
         .builtin => builtinType(T).?,
+        .obj_ptr, .obj, .ref => t_object,
         .unsupported => @compileError("ziggurat: no Variant conversion for type " ++ @typeName(T)),
     };
 }
@@ -119,6 +137,12 @@ fn extract(t: u32, v: *const anyopaque, out: *anyopaque) bool {
     return true;
 }
 
+/// Writes OBJECT Variant for `o` into `ret`, or NIL for null.
+fn writeObject(ret: *anyopaque, o: ?*anyopaque) void {
+    var p = o orelse return godot.raw.variantNewNil(ret);
+    construct(t_object, ret, @ptrCast(&p));
+}
+
 /// Writes `value.*` into `ret`, which must be uninitialised Variant storage.
 /// The new Variant is owned by the caller, who destroys it. String-like
 /// values are copied (Godot adds a reference); `value` stays the caller's.
@@ -146,6 +170,12 @@ pub fn write(comptime T: type, value: *const T, ret: *anyopaque) void {
             construct(t_float, ret, &x);
         },
         .builtin => construct(builtinType(T).?, ret, @ptrCast(@constCast(value))),
+        // Godot's from-type constructor for OBJECT adds the Variant's own
+        // reference to a RefCounted. No reference is taken by hand here, and
+        // the caller's own reference (a `Ref`, a creation reference) stays.
+        .obj_ptr => writeObject(ret, if (value.*) |p| @ptrCast(p) else null),
+        .obj => writeObject(ret, if (value.get()) |p| @ptrCast(p) else null),
+        .ref => writeObject(ret, if (value.get()) |p| @ptrCast(p) else null),
         .unsupported => @compileError("ziggurat: no Variant conversion for type " ++ @typeName(T)),
     }
 }
@@ -201,9 +231,43 @@ pub fn read(comptime T: type, v: *const anyopaque, out: *T) ?ReadError {
             if (!extract(expected, v, &x)) return fail;
             out.* = x;
         },
+        .obj_ptr => {
+            const Class = comptime objectPtrClass(@typeInfo(T).optional.child).?;
+            const id = readObjectId(t, v) orelse return fail;
+            out.* = if (id == 0) null else object.resolve(Class, id) orelse return fail;
+        },
+        .obj => {
+            const id = readObjectId(t, v) orelse return fail;
+            // A live id of the wrong class is a mismatch; 0 is the null handle.
+            if (id != 0 and object.resolve(T.Class, id) == null) return fail;
+            out.* = .{ .id = id };
+        },
+        .ref => {
+            const id = readObjectId(t, v) orelse return fail;
+            var h: T = .{};
+            if (id != 0) {
+                const p = object.resolve(T.Class, id) orelse return fail;
+                h.set(p);
+                // Godot refused the reference: the object is going away.
+                if (h.ptr == null) return fail;
+            }
+            // `out` is overwritten, not released, like the String-like reads.
+            out.* = h;
+        },
         .unsupported => @compileError("ziggurat: no Variant conversion for type " ++ @typeName(T)),
     }
     return null;
+}
+
+/// The ObjectID of an OBJECT Variant; 0 for NIL and for a null object. Null
+/// for any other Variant type. Read with Godot's `variant_get_object_instance_id`,
+/// which returns the id stored in the Variant and never touches the stored
+/// object pointer, so a freed object cannot be dereferenced here. Godot never
+/// reuses an ObjectID, so the id of a freed object resolves to null later.
+fn readObjectId(t: u32, v: *const anyopaque) ?u64 {
+    if (t == t_nil) return 0;
+    if (t != t_object) return null;
+    return godot.raw.variantGetObjectInstanceId.?(v);
 }
 
 /// An INT, or a FLOAT that is finite, integral and inside `i64`.

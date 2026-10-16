@@ -26,6 +26,10 @@ pub const allocator = runtime.allocator;
 pub const StaticName = names.StaticName;
 /// Checked conversion between Godot Variants and Zig values.
 pub const convert = @import("convert.zig");
+/// Object handles: `Obj(T)`, `Ref(T)` and the engine class check.
+pub const object = @import("object.zig");
+pub const Obj = object.Obj;
+pub const Ref = object.Ref;
 
 pub const ScriptDescriptor = struct { name: []const u8, rel: []const u8 };
 

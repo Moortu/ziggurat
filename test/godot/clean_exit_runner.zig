@@ -7,7 +7,8 @@
 //! `.gdextension` at the clean-exit entry, runs
 //! `godot --headless --verbose --path <work dir> --quit` with stdin closed
 //! and one 120 s deadline, and fails when Godot exits non-zero or times
-//! out, a test fails, is skipped or leaks Godot heap on its second run, the
+//! out, a test fails, is skipped or leaks Godot heap on its second run, Godot's
+//! tracked memory usage reads 0 (a release Godot), the
 //! moduleInit log line is missing, or the output has one of Godot's leak
 //! reports: ObjectDB instances leaked, `Unreferenced static string`,
 //! `Orphan StringName:` (needs --verbose), RID allocations leaked, or
@@ -75,6 +76,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (std.mem.indexOf(u8, out, "ObjectDB instance was leaked") != null or
         std.mem.indexOf(u8, out, "ObjectDB instances were leaked") != null)
         try problems.append(arena, "ObjectDB instances leaked");
+    if (std.mem.indexOf(u8, out, "ZTEST NOMEM") != null) try problems.append(arena, "Godot's tracked memory usage reads 0 (a release Godot?), so the heap check measured nothing");
     if (std.mem.indexOf(u8, out, "ZTEST LEAK") != null) try problems.append(arena, "a test leaked Godot heap memory");
     // Godot's exit-time reports; the sources are in the report of this task.
     for ([_][]const u8{

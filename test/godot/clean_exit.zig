@@ -7,8 +7,9 @@
 //! this entry and scans its output.
 //!
 //! Output lines: `ZTEST PASS <name>`, `ZTEST SKIP <name>`,
-//! `ZTEST FAIL <name>: <error>`, `ZTEST LEAK <name>: ...`, and last
-//! `ZTEST DONE pass=<n> skip=<n> fail=<n> leak=<n>`.
+//! `ZTEST FAIL <name>: <error>`, `ZTEST LEAK <name>: ...`, `ZTEST NOMEM ...`
+//! when Godot's tracked memory reads 0, and last
+//! `ZTEST DONE pass=<n> skip=<n> fail=<n> leak=<n> tracked=<bool>`.
 const std = @import("std");
 const builtin = @import("builtin");
 const godot = @import("ziggurat").godot;
@@ -68,6 +69,13 @@ fn enter(_: ?*anyopaque, level: c.GDExtensionInitializationLevel) callconv(.c) v
     // --verbose). Run each test a second time, once its lazy caches are
     // warm, and require Godot's tracked heap to end where it started.
     var leaks: usize = 0;
+    // A release Godot reports 0 for every call, which would make the check
+    // below pass without measuring anything.
+    var tracked = true;
+    if (Os.getStaticMemoryUsage() == 0) {
+        tracked = false;
+        std.debug.print("ZTEST NOMEM Godot reports 0 bytes of tracked memory; the heap check cannot run\n", .{});
+    }
     for (builtin.test_functions) |t| {
         const before = Os.getStaticMemoryUsage();
         _ = t.func() catch {};
@@ -77,7 +85,7 @@ fn enter(_: ?*anyopaque, level: c.GDExtensionInitializationLevel) callconv(.c) v
             std.debug.print("ZTEST LEAK {s}: Godot heap {d} -> {d} bytes\n", .{ t.name, before, after });
         }
     }
-    std.debug.print("ZTEST DONE pass={d} skip={d} fail={d} leak={d}\n", .{ pass, skip, fail, leaks });
+    std.debug.print("ZTEST DONE pass={d} skip={d} fail={d} leak={d} tracked={}\n", .{ pass, skip, fail, leaks, tracked });
 }
 
 fn exit(_: ?*anyopaque, _: c.GDExtensionInitializationLevel) callconv(.c) void {}

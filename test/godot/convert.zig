@@ -14,6 +14,7 @@ const Variant = b.Variant;
 
 comptime {
     _ = clean_exit;
+    _ = @import("object.zig");
 }
 
 // Variant types (GDExtensionVariantType).
