@@ -24,6 +24,11 @@ pub const Table = []const *const ScriptDescriptor;
 pub fn describe(comptime S: type, comptime rel: []const u8) ScriptDescriptor {
     // Resolve `extends`, so a script whose base type does not exist fails to build.
     if (@hasDecl(S, "extends")) _ = S.extends;
+    // Analyse the generated options module, so a broken one fails every build.
+    _ = version;
+    _ = sdk_options.api_json_sha256;
+    _ = sdk_options.interface_h_sha256;
+    _ = sdk_options.precision;
     return .{ .name = @typeName(S), .rel = rel };
 }
 

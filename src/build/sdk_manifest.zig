@@ -60,7 +60,10 @@ pub fn load(a: std.mem.Allocator, io: std.Io, path: OsPath, msg: *std.ArrayList(
     };
     defer a.free(bytes);
 
-    const parsed = std.json.parseFromSlice(Raw, a, bytes, .{}) catch |err| switch (err) {
+    const parsed = std.json.parseFromSlice(Raw, a, bytes, .{
+        // A later SDK may add fields; this loader reads the ones it knows.
+        .ignore_unknown_fields = true,
+    }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             try msg.print(a, "The SDK manifest {s} is not valid manifest JSON ({t}).", .{ path.bytes, err });
@@ -76,8 +79,8 @@ pub fn load(a: std.mem.Allocator, io: std.Io, path: OsPath, msg: *std.ArrayList(
     }
     var has_ziggurat = false;
     for (raw.modules, 0..) |m, i| {
-        if (m.name.len == 0 or std.mem.indexOfAny(u8, m.name, "=") != null) {
-            try msg.print(a, "The SDK manifest has the module name \"{s}\", which is not a valid module name.", .{m.name});
+        if (!validName(m.name)) {
+            try msg.print(a, "The SDK manifest has the module name \"{f}\"; module names use only A-Z, a-z, 0-9, _ and . and are not empty.", .{std.zig.fmtString(m.name)});
             return error.InvalidManifest;
         }
         for (reserved_names) |r| if (std.mem.eql(u8, m.name, r)) {
@@ -126,6 +129,17 @@ pub fn load(a: std.mem.Allocator, io: std.Io, path: OsPath, msg: *std.ArrayList(
         done += 1;
     }
     return .{ .zig_version = zig_version, .sdk_version = sdk_version, .modules = modules };
+}
+
+/// Module names reach the compiler command line (`-M<name>=`, `--dep <name>`),
+/// so they are limited to `[A-Za-z0-9_.]`.
+fn validName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |ch| switch (ch) {
+        'A'...'Z', 'a'...'z', '0'...'9', '_', '.' => {},
+        else => return false,
+    };
+    return true;
 }
 
 fn dupeModule(a: std.mem.Allocator, name: []const u8, root: []const u8, deps: []const []const u8) !ModuleDep {
@@ -219,10 +233,81 @@ test "manifest rejects" {
     ++ abs ++
         \\z.zig","deps":[]}]}
     , "0.16.0");
+    // Module names outside [A-Za-z0-9_.].
+    for ([_][]const u8{ "a b", "a,b", "a=b", "a\\u0001b", "" }) |bad| {
+        const json = try std.fmt.allocPrint(testing.allocator,
+            \\{{"zig_version":"0.17.0","sdk_version":"0.1.0","modules":[
+            \\{{"name":"ziggurat","root":"{s}z.zig","deps":[]}},
+            \\{{"name":"{s}","root":"{s}y.zig","deps":[]}}]}}
+        , .{ abs, bad, abs });
+        defer testing.allocator.free(json);
+        try expectRejected(json, "module names use only");
+    }
     // Not JSON of the expected shape.
     try expectRejected("{\"zig_version\":", "m.json");
     // An empty file.
     try expectRejected("", "m.json");
+}
+
+test "manifest rejects hostile input" {
+    const a = testing.allocator;
+    const valid_module = "{\"name\":\"ziggurat\",\"root\":\"" ++ abs ++ "z.zig\",\"deps\":[]}";
+    // Larger than the 1 MiB read limit: valid JSON padded with spaces.
+    const oversized = try a.alloc(u8, max_bytes + 16);
+    defer a.free(oversized);
+    @memset(oversized, ' ');
+    const head = "{\"zig_version\":\"0.17.0\",\"sdk_version\":\"0.1.0\",\"modules\":[" ++ valid_module ++ "]}";
+    @memcpy(oversized[0..head.len], head);
+    // Deeply nested arrays where a string belongs.
+    const depth = 100_000;
+    const nested = try a.alloc(u8, 2 * depth + 64);
+    defer a.free(nested);
+    const prefix = "{\"zig_version\":";
+    @memcpy(nested[0..prefix.len], prefix);
+    @memset(nested[prefix.len..][0..depth], '[');
+    @memset(nested[prefix.len + depth ..][0..depth], ']');
+    const tail = nested[prefix.len + 2 * depth ..];
+    @memset(tail, ' ');
+    tail[0] = '}';
+
+    const Case = struct { name: []const u8, json: []const u8 };
+    const cases = [_]Case{
+        .{ .name = "oversized", .json = oversized },
+        .{ .name = "deeply nested", .json = nested },
+        .{ .name = "number for a string", .json = "{\"zig_version\":17,\"sdk_version\":\"0.1.0\",\"modules\":[" ++ valid_module ++ "]}" },
+        .{ .name = "string for deps", .json = "{\"zig_version\":\"0.17.0\",\"sdk_version\":\"0.1.0\",\"modules\":[{\"name\":\"ziggurat\",\"root\":\"" ++ abs ++ "z.zig\",\"deps\":\"gdzig\"}]}" },
+        .{ .name = "null modules", .json = "{\"zig_version\":\"0.17.0\",\"sdk_version\":\"0.1.0\",\"modules\":null}" },
+        .{ .name = "object for modules", .json = "{\"zig_version\":\"0.17.0\",\"sdk_version\":\"0.1.0\",\"modules\":{}}" },
+    };
+    for (cases) |c| {
+        expectRejected(c.json, "m.json") catch |err| {
+            std.debug.print("case \"{s}\" was not rejected cleanly\n", .{c.name});
+            return err;
+        };
+    }
+}
+
+test "manifest ignores unknown fields" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const json =
+        \\{"zig_version":"0.17.0","sdk_version":"0.1.0","future":{"x":[1,2]},"modules":[
+    ++
+        \\{"name":"ziggurat","root":"
+    ++ abs ++
+        \\z.zig","deps":[],"flags":["-fno-x"]}]}
+    ;
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "m.json", .data = json });
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const p = try std.fs.path.join(testing.allocator, &.{ dir, "m.json" });
+    defer testing.allocator.free(p);
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(testing.allocator);
+    var m = try load(testing.allocator, testing.io, .fromTrusted(p), &msg);
+    defer m.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), m.modules.len);
+    try testing.expectEqualStrings("ziggurat", m.modules[0].name);
 }
 
 test "manifest loads a self-dependency" {
