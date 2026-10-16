@@ -2,6 +2,7 @@
 //! layout stamp both sides compare. Imports only `std` and `builtin`.
 
 const abi = @import("abi.zig");
+const validator = @import("validate.zig");
 
 pub const magic = abi.magic;
 pub const abi_version = abi.abi_version;
@@ -27,7 +28,11 @@ pub const script_flag_tool = abi.script_flag_tool;
 pub const Table = abi.Table;
 pub const StampInputs = abi.StampInputs;
 pub const layoutStamp = abi.layoutStamp;
+pub const validate = validator.validate;
+pub const Limits = validator.Limits;
+pub const ValidateError = validator.ValidateError;
 
 test {
     _ = abi;
+    _ = validator;
 }
