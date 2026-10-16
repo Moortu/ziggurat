@@ -56,16 +56,28 @@ pub fn build(b: *std.Build) void {
         break :blk out;
     };
 
+    // The panic probe: an executable (Debug, libc) that panics through the SDK.
+    const probe_exe = b.addExecutable(.{
+        .name = "panic_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/panic_probe.zig"),
+            .target = target,
+            .optimize = .Debug,
+            .link_libc = true,
+            .imports = &.{.{ .name = "ziggurat", .module = sdk }},
+        }),
+    });
+
     // Native: integration on for `test`, off for `test-unit`.
-    addTestSet(b, test_step, target, optimize, zig_exe, true, true, test_manifest);
-    addTestSet(b, unit_step, target, optimize, zig_exe, false, true, null);
+    addTestSet(b, test_step, target, optimize, zig_exe, true, true, test_manifest, probe_exe.getEmittedBin());
+    addTestSet(b, unit_step, target, optimize, zig_exe, false, true, null, null);
 
     // Cross: compile only.
     for (cross_targets) |triple| {
         const query = std.Target.Query.parse(.{ .arch_os_abi = triple }) catch
             @panic("bad cross target triple");
         const resolved = b.resolveTargetQuery(query);
-        addTestSet(b, cross_step, resolved, optimize, zig_exe, false, false, null);
+        addTestSet(b, cross_step, resolved, optimize, zig_exe, false, false, null, null);
     }
 }
 
@@ -186,6 +198,8 @@ fn addTestSet(
     run: bool,
     /// The SDK manifest for integration tests; null where none run.
     sdk_manifest: ?std.Build.LazyPath,
+    /// The built `test/panic_probe.zig` executable; null where none runs.
+    panic_probe: ?std.Build.LazyPath,
 ) void {
     const options = b.addOptions();
     options.addOption([]const u8, "zig_exe", zig_exe);
@@ -195,6 +209,12 @@ fn addTestSet(
         options.addOptionPath("sdk_manifest_path", m);
     } else {
         options.addOption([]const u8, "sdk_manifest_path", "");
+    }
+
+    if (panic_probe) |p| {
+        options.addOptionPath("panic_probe_path", p);
+    } else {
+        options.addOption([]const u8, "panic_probe_path", "");
     }
 
     const platform = b.createModule(.{
@@ -224,7 +244,14 @@ fn addTestSet(
         .optimize = optimize,
     });
 
-    for ([_]*std.Build.Module{ platform, build_mod, abi, snake }) |mod| {
+    // Likewise the SDK's message formatter.
+    const fmtlog = b.createModule(.{
+        .root_source_file = b.path("sdk/fmtlog.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    for ([_]*std.Build.Module{ platform, build_mod, abi, snake, fmtlog }) |mod| {
         const t = b.addTest(.{ .root_module = mod });
         if (run) {
             step.dependOn(&b.addRunArtifact(t).step);

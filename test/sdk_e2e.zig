@@ -79,3 +79,21 @@ test "integration: skeleton sdk builds with gdzig" {
     const on = testing.environ.containsUnempty(testing.allocator, "ZIGGURAT_E2E_TIMING") catch false;
     if (on) std.debug.print("sdk_e2e: full build {d} ms\n", .{o.ms});
 }
+
+test "integration: panic probe" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const a = testing.allocator;
+    const r = try platform.process.runCapture(a, io, &.{build_options.panic_probe_path}, null, 60_000, 1 << 20);
+    defer a.free(r.stdout);
+    defer a.free(r.stderr);
+    try testing.expect(std.mem.indexOf(u8, r.stderr, "Zig panic: probe") != null);
+    switch (r.term) {
+        .signal => {},
+        else => {
+            std.debug.print("probe ended with {any}\nstderr: {s}\n", .{ r.term, r.stderr });
+            return error.NotKilledBySignal;
+        },
+    }
+}

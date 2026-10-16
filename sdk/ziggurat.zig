@@ -5,15 +5,25 @@
 //! re-exports gdzig as `godot`. Later work replaces the stub parts.
 const std = @import("std");
 const sdk_options = @import("sdk_options");
+const abi = @import("ziggurat_abi");
+const runtime = @import("runtime.zig");
+const names = @import("names.zig");
 
 /// gdzig. Scripts reach Godot types through this, for example `ziggurat.godot.class.Node`.
 pub const godot = @import("gdzig");
 
 pub const version = sdk_options.sdk_version;
 
-pub const Panic = std.debug.no_panic;
+/// The SDK's panic handler: logs `Zig panic: <msg>` through the host, then traps.
+pub const Panic = runtime.Panic;
 
-pub const HostApi = extern struct {};
+pub const HostApi = abi.HostApi;
+pub const LogLevel = abi.LogLevel;
+pub const moduleInit = runtime.moduleInit;
+pub const generation = runtime.generation;
+pub const log = runtime.log;
+pub const allocator = runtime.allocator;
+pub const StaticName = names.StaticName;
 
 pub const ScriptDescriptor = struct { name: []const u8, rel: []const u8 };
 
@@ -34,9 +44,4 @@ pub fn describe(comptime S: type, comptime rel: []const u8) ScriptDescriptor {
 
 pub fn makeTable(comptime descriptors: Table) Table {
     return descriptors;
-}
-
-pub fn moduleInit(api: *const HostApi, gen: u32) void {
-    _ = api;
-    _ = gen;
 }
