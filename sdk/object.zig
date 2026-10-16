@@ -20,6 +20,11 @@ const Object = godot.class.Object;
 const RefCounted = godot.class.RefCounted;
 const StringName = godot.builtin.StringName;
 
+// Thread note: the `StaticName` behind the class check and gdzig's lazy
+// method-bind cache for `is_class` are plain variables written without
+// atomics. Their first use must happen on the main thread (warm them in
+// `moduleInit`) before any other thread resolves a handle.
+
 /// Marks a struct as an object handle for `convert`. Value: `.obj` or `.ref`.
 pub const handle_decl = "ziggurat_handle";
 

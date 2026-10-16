@@ -353,3 +353,44 @@ test "ref release frees the last reference" {
     h.set(null);
     try testing.expect(!alive(e_id));
 }
+
+test "typed null object Variant" {
+    // An OBJECT Variant built from a null pointer: type OBJECT, id 0.
+    var v = makeObject(@as(?*anyopaque, null));
+    defer destroyVariant(&v);
+    var p: ?*Node = null;
+    const keep = Node.init();
+    defer free(keep);
+    p = keep;
+    try testing.expect(convert.read(?*Node, &v, &p) == null);
+    try testing.expect(p == null);
+    var h: Obj(Node) = .{ .id = 9 };
+    try testing.expect(convert.read(Obj(Node), &v, &h) == null);
+    try testing.expectEqual(@as(u64, 0), h.id);
+    var r: Ref(Resource) = .{};
+    try testing.expect(convert.read(Ref(Resource), &v, &r) == null);
+    try testing.expect(r.ptr == null);
+}
+
+test "ref read of a freed id" {
+    const res = Resource.init();
+    const id = idOf(res);
+    var v = makeObject(res);
+    // Free the object by hand while the Variant still holds its id (and a
+    // reference). The Variant is never destroyed: its destructor would
+    // unreference freed memory. An OBJECT Variant owns no other heap memory.
+    godot.raw.objectDestroy(@ptrCast(res));
+    try testing.expect(!alive(id));
+    try expectRejected(Ref(Resource), &v);
+    var r: Ref(Resource) = .{};
+    _ = convert.read(Ref(Resource), &v, &r);
+    try testing.expect(r.ptr == null);
+}
+
+test "write a null Ref" {
+    const r: Ref(Resource) = .{};
+    var v: Variant = undefined;
+    convert.write(Ref(Resource), &r, &v);
+    defer destroyVariant(&v);
+    try testing.expectEqual(t_nil, typeOf(&v));
+}
