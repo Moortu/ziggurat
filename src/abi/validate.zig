@@ -1086,6 +1086,14 @@ fn nowNs() i96 {
     return std.Io.Clock.awake.now(testing.io).nanoseconds;
 }
 
+/// Fails when `ms` is 1000 or more. Prints only then: any output on stderr
+/// makes the build runner print the test command as if it had failed.
+fn expectFast(what: []const u8, ms: i96) !void {
+    if (ms < 1000) return;
+    std.debug.print("{s}: {d} ms, above the 1000 ms budget\n", .{ what, ms });
+    return error.TooSlow;
+}
+
 test "validate at the default limits is fast" {
     var diag: [256]u8 = undefined;
     // 65536 scripts with unique paths and one script with 4096 properties:
@@ -1095,8 +1103,7 @@ test "validate at the default limits is fast" {
     var t0 = nowNs();
     try big.run(.{}, &diag);
     var ms = @divTrunc(nowNs() - t0, std.time.ns_per_ms);
-    std.debug.print("validate at limits: {d} ms\n", .{ms});
-    try testing.expect(ms < 1000);
+    try expectFast("validate at limits", ms);
 
     // Every script shares the 4096-property array: 65536 * 4097 items, far
     // over the budget. Rejected after the first few scripts.
@@ -1105,8 +1112,7 @@ test "validate at the default limits is fast" {
     t0 = nowNs();
     try testing.expectError(error.TooMany, shared.run(.{}, &diag));
     ms = @divTrunc(nowNs() - t0, std.time.ns_per_ms);
-    std.debug.print("validate over budget: {d} ms\n", .{ms});
-    try testing.expect(ms < 1000);
+    try expectFast("validate over budget", ms);
     try testing.expect(std.mem.indexOf(u8, diagText(&diag), "items in total, above the limit 262144.") != null);
 
     // Two equal paths at the far ends of 65536 are found in linear time.
@@ -1114,8 +1120,7 @@ test "validate at the default limits is fast" {
     t0 = nowNs();
     try testing.expectError(error.Duplicate, big.run(.{}, &diag));
     ms = @divTrunc(nowNs() - t0, std.time.ns_per_ms);
-    std.debug.print("validate duplicate path: {d} ms\n", .{ms});
-    try testing.expect(ms < 1000);
+    try expectFast("validate duplicate path", ms);
 }
 
 test "validate string byte budget" {

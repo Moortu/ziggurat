@@ -12,7 +12,7 @@
 //! `ZTEST DONE pass=<n> skip=<n> fail=<n> leak=<n> tracked=<bool>`.
 const std = @import("std");
 const builtin = @import("builtin");
-const godot = @import("ziggurat").godot;
+const godot = @import("gdzig");
 const c = godot.c;
 const Os = godot.class.Os;
 

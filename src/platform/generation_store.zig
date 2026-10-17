@@ -60,6 +60,10 @@ pub const GenerationStore = struct {
     os: std.Target.Os.Tag,
     stem: []const u8,
     caps: Caps,
+    /// Lowest number the next `stage` may use; raised by `remove`, so a
+    /// removed generation's number (and its library path, which a process
+    /// may have loaded once) is never reused by this store.
+    min_next: u32 = 1,
 
     /// Borrows `root` and `stem`; both must outlive the store. Creates nothing
     /// on disk until the first `stage`.
@@ -101,10 +105,11 @@ pub const GenerationStore = struct {
 
         const gens = try self.listGens(gen_root);
         defer a.free(gens);
-        const n: u32 = if (gens.len == 0) 1 else std.math.add(u32, gens[gens.len - 1], 1) catch {
+        const after_last: u32 = if (gens.len == 0) 1 else std.math.add(u32, gens[gens.len - 1], 1) catch {
             elf.setDiag(diag, "The generation numbers under {s} are used up.", .{gen_root.bytes});
             return error.GenerationOverflow;
         };
+        const n = @max(after_last, self.min_next);
 
         var nb: [16]u8 = undefined;
         const n_name = try std.fmt.bufPrint(&nb, "{d}", .{n});
@@ -137,6 +142,17 @@ pub const GenerationStore = struct {
         lf.close(io);
 
         return .{ .n = n, .dir = dir, .lib = lib };
+    }
+
+    /// Deletes generation `n`, which nothing may have pinned (the build
+    /// service removes a generation it staged but never handed out), and
+    /// keeps later `stage` calls from reusing its number. `error.Pinned`
+    /// when it is pinned after all; it then stays on disk.
+    pub fn remove(self: *GenerationStore, n: u32) !void {
+        var store_lock = try self.lockStore(.exclusive);
+        defer store_lock.release();
+        self.min_next = @max(self.min_next, n +| 1);
+        if (!try self.deleteIfUnpinned(n)) return error.Pinned;
     }
 
     /// Takes a shared lock on `gen/<n>/.lock`. Hold it while the generation is
@@ -426,6 +442,26 @@ test "stage numbers" {
     try std.testing.expectEqual(@as(u32, 2), try stageOne(a, &s, built));
     try rmGen(a, &f, 1);
     try std.testing.expectEqual(@as(u32, 3), try stageOne(a, &s, built));
+}
+
+test "remove deletes and never reuses the number" {
+    const a = std.testing.allocator;
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    try f.writeElf("built.so", "hello");
+    const built = try f.p(a, &.{"built.so"});
+    defer a.free(built.bytes);
+    var s = f.store(a, .{});
+    try std.testing.expectEqual(@as(u32, 1), try stageOne(a, &s, built));
+    try std.testing.expectEqual(@as(u32, 2), try stageOne(a, &s, built));
+    try s.remove(2);
+    try std.testing.expect(!try genExists(a, &f, 2));
+    try std.testing.expectEqual(@as(u32, 3), try stageOne(a, &s, built));
+    // A pinned generation is kept.
+    var l = try s.pin(3);
+    try std.testing.expectError(error.Pinned, s.remove(3));
+    l.release();
+    try std.testing.expect(try genExists(a, &f, 3));
 }
 
 test "stage copies, never moves" {

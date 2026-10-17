@@ -231,7 +231,7 @@ pub fn prepare(
     };
     errdefer lock.release();
 
-    const root_text = try rootgen.generateRoot(a, os, scan.scripts);
+    const root_text = try rootgen.generateRoot(a, os, scan.scripts, &scan.build_id);
     defer a.free(root_text);
 
     var mirrored = false;
@@ -408,7 +408,7 @@ test "prepare writes root once" {
     try testing.expect(!ws.mirrored);
     try testing.expectEqualStrings(fx.project.bytes, ws.source_root.bytes);
     const m1 = try rootMtime(testing.io, ws, arena);
-    const want = try rootgen.generateRoot(arena, builtin.os.tag, sc.scripts);
+    const want = try rootgen.generateRoot(arena, builtin.os.tag, sc.scripts, &sc.build_id);
     const got = try std.Io.Dir.cwd().readFileAlloc(testing.io, try std.fs.path.join(arena, &.{ ws.source_root.bytes, rootgen.root_file_name }), arena, .limited(1 << 20));
     try testing.expectEqualStrings(want, got);
     ws.deinit(testing.allocator);

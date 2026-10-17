@@ -30,6 +30,15 @@
 //!   Each reason is told at most once per service. A build that fails with
 //!   an error (also OutOfMemory) reports that error and leaves the notice
 //!   pending.
+//! - With `Config.check_tables`, every incremental update is checked before
+//!   it is handed out: the staged library is loaded (`RTLD_LOCAL`), its
+//!   `ziggurat_describe` table is validated (`ziggurat_abi.validate`, with
+//!   `Config.expected_stamp`) and its build id must be the one this build
+//!   wrote into the root (Stage 0 found that the incremental compiler can
+//!   keep a stale export). `ziggurat_init` is never called. When the check
+//!   fails, the generation is deleted, the server counts a death and the
+//!   same request is built on the full path; that outcome carries
+//!   `stale_note`.
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("ziggurat_platform");
@@ -38,6 +47,7 @@ const workspace = @import("workspace.zig");
 const compiler = @import("compiler.zig");
 const diagnostics = @import("diagnostics.zig");
 const backend = @import("backend.zig");
+const abi = @import("ziggurat_abi");
 
 const OsPath = platform.path.OsPath;
 const PathService = platform.path.PathService;
@@ -98,7 +108,14 @@ pub const Stats = struct {
     updates_max: u32,
     warm: WarmState,
     session_deaths: u32,
+    /// Microseconds the last table check took (load, validate, compare,
+    /// close); 0 before the first one. See `Config.check_tables`.
+    table_check_us: u64,
 };
+
+/// The note an outcome carries when an incremental update failed the table
+/// check and the request was built on the full path instead.
+pub const stale_note = "The fast rebuild returned stale or invalid code, so this build ran in full.";
 
 /// File stem of the staged library (`--name zmod` in `Workspace.argv`).
 pub const lib_stem = "zmod";
@@ -140,6 +157,18 @@ pub const Config = struct {
     /// assertion catches it). `request` is fine.
     on_outcome: ?*const fn (ctx: ?*anyopaque, o: *const Outcome) void = null,
     on_outcome_ctx: ?*anyopaque = null,
+    /// Check the table of every incremental update before handing it out
+    /// (see the file comment). Needs the real SDK: the stub SDK's table has
+    /// no `Table` layout.
+    check_tables: bool = false,
+    /// The layout stamp the host expects in the table: `ziggurat_abi.layoutStamp`
+    /// over the SDK's facts with `ziggurat_abi.stampTarget(builtin.target)`.
+    /// Null: the stamp is not checked.
+    expected_stamp: ?u64 = null,
+    /// TEST ONLY. The table check sees the build id of the previous build
+    /// instead of the table's own, as it would when the compiler kept stale
+    /// code. Never set this outside tests.
+    test_stale_build_id: bool = false,
 };
 
 const Timer = struct {
@@ -219,6 +248,10 @@ pub const BuildService = struct {
     warm_argv: ?[]const []const u8 = null,
     /// Scan results from earlier builds. Used by the build thread only.
     scan_cache: scan_mod.Cache,
+    /// Build id of the last build that staged a generation. Build thread only.
+    last_build_id: ?[16]u8 = null,
+    /// See `Stats.table_check_us`. Guarded by `mu`.
+    table_check_us: u64 = 0,
 
     pub const InitError = error{ MissingSdkModule, TargetNotHost, OutOfMemory } || std.Thread.SpawnError;
 
@@ -324,6 +357,7 @@ pub const BuildService = struct {
             .updates_max = self.updates_max,
             .warm = self.warm,
             .session_deaths = self.deaths,
+            .table_check_us = self.table_check_us,
         };
     }
 
@@ -435,15 +469,18 @@ pub const BuildService = struct {
         var ws = try self.prepareWorkspace(sc, o);
         defer ws.deinit(a);
 
-        if (try self.incrementalBuild(arena, &ws, zig, o)) {
-            // TODO(Stage 2 and Stage 4): after an incremental update, compare each
-            // script's layout hash in the output's tables with the sources (spec section 5).
+        var stale = false;
+        if (try self.incrementalBuild(arena, &ws, zig, &sc.build_id, o, &stale)) {
+            // TODO(Stage 4): compare each script's layout hash in the table
+            // with the previous generation's (spec section 5).
         } else {
             o.path = .full;
             try self.fullBuild(arena, &ws, zig, o);
             if (o.ok) self.startWarm(&ws, zig);
         }
+        if (o.ok) self.last_build_id = sc.build_id;
         try appendProblems(a, o, sc.problems);
+        if (stale) try addStaleNote(a, o);
         // Last, after every step that can fail: a failed build reports its
         // own error, and the notice stays pending for the next outcome.
         if (o.path == .full and o.message == null) o.message = try self.takeNotice();
@@ -551,8 +588,17 @@ pub const BuildService = struct {
     }
 
     /// Serves the request with the warm incremental server. False when there
-    /// is none or it died (the caller then takes the full path).
-    fn incrementalBuild(self: *BuildService, arena: std.mem.Allocator, ws: *const workspace.Workspace, zig: ZigInstall, o: *Outcome) !bool {
+    /// is none, it died, or its output failed the table check (then `stale`
+    /// is set); the caller then takes the full path.
+    fn incrementalBuild(
+        self: *BuildService,
+        arena: std.mem.Allocator,
+        ws: *const workspace.Workspace,
+        zig: ZigInstall,
+        build_id: []const u8,
+        o: *Outcome,
+        stale: *bool,
+    ) !bool {
         const io = self.io;
         // Check before taking `session_mu`: the warm thread holds it for the
         // whole warm-up update, and a request must not wait for that.
@@ -584,7 +630,44 @@ pub const BuildService = struct {
             },
             else => return err,
         };
+        if (o.ok and self.cfg.check_tables) {
+            const gen = o.generation.?;
+            if (!self.checkTable(arena, gen, build_id)) {
+                // Never handed out: delete it, and treat the server as dead.
+                self.store.remove(gen.n) catch {};
+                gen.deinit(self.a);
+                o.generation = null;
+                o.ok = false;
+                stale.* = true;
+                self.dropWarm(true);
+                return false;
+            }
+        }
         return true;
+    }
+
+    /// Loads the staged library of `gen`, validates the table that
+    /// `ziggurat_describe` returns and compares its build id with
+    /// `build_id`. True when all of it passes. Never calls `ziggurat_init`.
+    fn checkTable(self: *BuildService, arena: std.mem.Allocator, gen: Generation, build_id: []const u8) bool {
+        const t0 = std.Io.Clock.awake.now(self.io);
+        defer {
+            const us = t0.durationTo(std.Io.Clock.awake.now(self.io)).toMicroseconds();
+            self.mu.lockUncancelable(self.io);
+            defer self.mu.unlock(self.io);
+            self.table_check_us = @intCast(@max(us, 0));
+        }
+        var diag: [256]u8 = undefined;
+        const lib = platform.loader.open(arena, self.io, gen.lib, &diag) catch return false;
+        defer platform.loader.close(lib);
+        const describe = platform.loader.lookup(lib, *const fn () callconv(.c) *const abi.Table, "ziggurat_describe") orelse return false;
+        const table = describe();
+        const stamp = self.cfg.expected_stamp orelse table.layout_stamp;
+        abi.validate(arena, table, stamp, .{}, &diag) catch return false;
+        const own = (table.build_id.ptr orelse return false)[0..table.build_id.len];
+        const previous = self.last_build_id orelse @as([16]u8, @splat(0));
+        const seen: []const u8 = if (self.cfg.test_stale_build_id) &previous else own;
+        return std.mem.eql(u8, seen, build_id);
     }
 
     /// One update on `s`: decodes errors into `o.diagnostics`, or stages the
@@ -906,6 +989,16 @@ fn cloneOutcome(a: std.mem.Allocator, o: Outcome) !Outcome {
     while (n < o.diagnostics.len) : (n += 1) list[n] = try cloneDiag(a, o.diagnostics[n]);
     c.diagnostics = list;
     return c;
+}
+
+/// Puts `stale_note` in front of `o.message` (alone when there is none).
+fn addStaleNote(a: std.mem.Allocator, o: *Outcome) !void {
+    const old = o.message orelse {
+        o.message = try a.dupe(u8, stale_note);
+        return;
+    };
+    o.message = try std.mem.concat(a, u8, &.{ stale_note, " ", old });
+    a.free(old);
 }
 
 /// Adds scan problems to `o.diagnostics` as entries without a line.

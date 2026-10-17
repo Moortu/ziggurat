@@ -6,6 +6,8 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("ziggurat_platform");
 const zbuild = @import("ziggurat_build");
+const abi = @import("ziggurat_abi");
+const sdk_options = @import("sdk_options");
 const service = zbuild.service;
 const BuildService = service.BuildService;
 const Outcome = service.Outcome;
@@ -29,6 +31,23 @@ fn timingOn() bool {
 
 const File = struct { rel: []const u8, data: []const u8 };
 
+/// The layout stamp a host built with this compiler for this machine
+/// expects, computed as the host computes it.
+const host_stamp: u64 = abi.layoutStamp(.{
+    .api_json_sha256 = &sdk_options.api_json_sha256,
+    .interface_h_sha256 = &sdk_options.interface_h_sha256,
+    .zig_version = builtin.zig_version_string,
+    .target = abi.stampTarget(builtin.target),
+    .precision = sdk_options.precision,
+    .sdk_version = sdk_options.sdk_version,
+});
+
+/// Service options the tests set beyond the defaults.
+const Opts = struct {
+    check_tables: bool = false,
+    test_stale_build_id: bool = false,
+};
+
 /// A temp project with `files`, the SDK manifest and a `BuildService` on it.
 const Harness = struct {
     arena: std.heap.ArenaAllocator,
@@ -39,6 +58,10 @@ const Harness = struct {
 
     /// `h` must not move while the service runs; the config borrows from it.
     fn init(h: *Harness, files: []const File) !void {
+        return h.initOpts(files, .{});
+    }
+
+    fn initOpts(h: *Harness, files: []const File, opts: Opts) !void {
         h.arena = .init(testing.allocator);
         errdefer h.arena.deinit();
         const a = h.arena.allocator();
@@ -76,6 +99,9 @@ const Harness = struct {
             },
             .sdk = h.manifest.modules,
             .store_root = .fromTrusted(store),
+            .check_tables = opts.check_tables,
+            .expected_stamp = host_stamp,
+            .test_stale_build_id = opts.test_stale_build_id,
         });
     }
 
@@ -84,6 +110,12 @@ const Harness = struct {
         h.tmp.cleanup();
         h.manifest.deinit(testing.allocator);
         h.arena.deinit();
+    }
+
+    fn write(h: *Harness, rel: []const u8, data: []const u8) !void {
+        var buf: [256]u8 = undefined;
+        const sub = try std.fmt.bufPrint(&buf, "proj/{s}", .{rel});
+        try h.tmp.dir.writeFile(io, .{ .sub_path = sub, .data = data });
     }
 
     fn build(h: *Harness, t: service.Trigger) !Outcome {
@@ -97,9 +129,8 @@ test "integration: skeleton sdk builds with gdzig" {
     try platform.testing_support.requireIntegration();
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    // gdzig keeps engine classes in `class`; the SDK's `godot` is gdzig as is for now.
     var h: Harness = undefined;
-    try h.init(&.{.{ .rel = "a.zig", .data = "pub const extends = @import(\"ziggurat\").godot.class.Node;\n" }});
+    try h.init(&.{.{ .rel = "a.zig", .data = "pub const extends = @import(\"ziggurat\").godot.Node;\n" }});
     defer h.deinit();
 
     const o = try h.build(.open);
@@ -116,7 +147,7 @@ test "integration: skeleton sdk builds with gdzig" {
 /// methods, to check that `describe` stays within its branch quota.
 fn bigScript(a: std.mem.Allocator) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(a, "const z = @import(\"ziggurat\");\npub const extends = z.godot.class.Node;\nbase: *z.godot.class.Node,\n");
+    try out.appendSlice(a, "const z = @import(\"ziggurat\");\npub const extends = z.godot.Node;\nbase: *z.godot.Node,\n");
     for (0..30) |i| try out.print(a, "field{d}: i32 = {d},\n", .{ i, i });
     try out.appendSlice(a, "pub const meta = .{\n");
     for (0..30) |i| try out.print(a, "    .field{d} = .{{ .range = .{{ 0, {d} }}, .group = \"Group{d}\" }},\n", .{ i, 100 + i, i % 3 });
@@ -152,7 +183,7 @@ const BadScript = struct { rel: []const u8, data: []const u8, sentence: []const 
 
 const prelude =
     \\const z = @import("ziggurat");
-    \\const class = z.godot.class;
+    \\const g = z.godot;
     \\
 ;
 
@@ -160,7 +191,7 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "bad_getter.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\speed: f32 = 1,
             \\pub fn get_speed(self: *const @This()) f64 {
             \\    return self.speed;
@@ -173,7 +204,7 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "bad_init.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\pub fn init(self: *@This()) bool {
             \\    _ = self;
             \\    return true;
@@ -186,7 +217,7 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "bad_deinit.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\pub fn deinit(self: *const @This()) void {
             \\    _ = self;
             \\}
@@ -198,8 +229,8 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "full_default.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
-            \\title: z.godot.builtin.String = .{ .@"_" = .{ 1, 0, 0, 0, 0, 0, 0, 0 } },
+            \\pub const extends = g.Node;
+            \\title: z.godot.String = .{ .@"_" = .{ 1, 0, 0, 0, 0, 0, 0, 0 } },
             \\
         ,
         .sentence = "Field 'title' must default to an empty value (.empty or .{}), because every instance starts as a copy of the defaults.",
@@ -208,7 +239,7 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "bad_setter.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\speed: f32 = 1,
             \\pub fn set_speed(self: *@This(), value: f64) void {
             \\    self.speed = @floatCast(value);
@@ -221,7 +252,7 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "bad_notification.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\pub fn _notification(self: *@This(), what: i64) void {
             \\    _ = self;
             \\    _ = what;
@@ -234,8 +265,8 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "h#a%25x[b]:c/bad_type.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
-            \\base: *class.Node,
+            \\pub const extends = g.Node;
+            \\base: *g.Node,
             \\count: u64 = 0,
             \\
         ,
@@ -245,18 +276,18 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "obj_ptr.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\speed: f32 = 1,
-            \\target: ?*class.Node2d = null,
+            \\target: ?*g.Node2D = null,
             \\
         ,
-        .sentence = "Field 'target' has type ?*Node2d, which Godot cannot hold; use z.Obj(Node2d).",
+        .sentence = "Field 'target' has type ?*Node2D, which Godot cannot hold; use z.Obj(Node2D).",
         .decl = "target:",
     },
     .{
         .rel = "no_default.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\
             \\health: i32 = 1,
             \\speed: f32,
@@ -268,8 +299,8 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "bad_base.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
-            \\base: *class.Node2d,
+            \\pub const extends = g.Node;
+            \\base: *g.Node2D,
             \\
         ,
         .sentence = "Field 'base' must have type *Node.",
@@ -288,7 +319,7 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "bad_class_name.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\pub const class_name = "my class";
             \\
         ,
@@ -298,7 +329,7 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "meta_unknown.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\speed: f32 = 1,
             \\
             \\pub const meta = .{ .speed = .{ .range = .{ 0, 10 } }, .sped = .{ .range = .{ 0, 10 } } };
@@ -310,7 +341,7 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "meta_key.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\health: i32 = 1,
             \\speed: f32 = 1,
             \\
@@ -323,7 +354,7 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "meta_method_key.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\pub const meta = .{ .jump = .{ .nmae = "leap" } };
             \\
             \\pub fn jump(self: *@This()) void {
@@ -337,7 +368,7 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "collide.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\
             \\pub fn getHUD(self: *@This()) void {
             \\    _ = self;
@@ -354,7 +385,7 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "collide_kinds.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\take_damage: i32 = 0,
             \\
             \\pub fn takeDamage(self: *@This()) void {
@@ -368,7 +399,7 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "collide_reverse.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\height: f32 = 0,
             \\pub const meta = .{ .height = .{ .name = "jump" } };
             \\
@@ -383,7 +414,7 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "by_value.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\speed: f32 = 1,
             \\
             \\pub fn boost(self: @This()) f32 {
@@ -397,7 +428,7 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "range_on_bool.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\speed: f32 = 1,
             \\alive: bool = true,
             \\pub const meta = .{ .alive = .{ .range = .{ 0, 1 } } };
@@ -409,9 +440,9 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "neither.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\speed: f32 = 1,
-            \\thing: z.Obj(class.Object) = .{},
+            \\thing: z.Obj(g.Object) = .{},
             \\
         ,
         .sentence = "Field 'thing' holds z.Obj(Object), which is neither a Node nor a Resource; Godot cannot export it.",
@@ -420,18 +451,18 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "weak_resource.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\speed: f32 = 1,
-            \\tex: z.Obj(class.Texture2d) = .{},
+            \\tex: z.Obj(g.Texture2D) = .{},
             \\
         ,
-        .sentence = "Field 'tex' holds z.Obj(Texture2d), a Resource that the field would not keep alive; use z.Ref(Texture2d).",
+        .sentence = "Field 'tex' holds z.Obj(Texture2D), a Resource that the field would not keep alive; use z.Ref(Texture2D).",
         .decl = "tex:",
     },
     .{
         .rel = "enum_tag.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\mode: enum { plain, @"a:b" } = .plain,
             \\
         ,
@@ -441,7 +472,7 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "bad_param.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\
             \\pub fn hit(self: *@This(), amount: u64) void {
             \\    _ = self;
@@ -455,7 +486,7 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "bad_return.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\
             \\pub fn name(self: *@This()) []const u8 {
             \\    _ = self;
@@ -469,7 +500,7 @@ const bad_scripts = [_]BadScript{
     .{
         .rel = "bad_signal.zig",
         .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\
             \\pub const signals = struct {
             \\    pub const hit = struct { amount: u64 };
@@ -535,18 +566,18 @@ test "integration: compile errors map to the script" {
     // marker), for scalars and for struct types alike; see sdk/describe.zig.
     const undef_cases = [_]File{
         .{ .rel = "undef_f32.zig", .data = prelude ++
-            \\pub const extends = class.Node;
+            \\pub const extends = g.Node;
             \\speed: f32 = undefined,
             \\
         },
         .{ .rel = "undef_vector.zig", .data = prelude ++
-            \\pub const extends = class.Node;
-            \\spawn: z.godot.builtin.Vector2 = undefined,
+            \\pub const extends = g.Node;
+            \\spawn: z.godot.Vector2 = undefined,
             \\
         },
         .{ .rel = "undef_string.zig", .data = prelude ++
-            \\pub const extends = class.Node;
-            \\_name: z.godot.builtin.String = undefined,
+            \\pub const extends = g.Node;
+            \\_name: z.godot.String = undefined,
             \\
         },
     };
@@ -565,6 +596,149 @@ test "integration: compile errors map to the script" {
         if (timingOn()) std.debug.print("sdk_e2e: {s}: undefined default reported as {?s}:{d}: {s}\n", .{ c.rel, undef.rel, undef.line, undef.message });
     }
     if (timingOn()) std.debug.print("sdk_e2e: {d} failing builds took {d} ms in total\n", .{ bad_scripts.len + undef_cases.len, total_ms });
+}
+
+/// A script with two signals and a method that emits one. `{s}` is the
+/// argument struct of the emit and `{d}` a number in the method body.
+fn heroScript(a: std.mem.Allocator, emit_args: []const u8, n: i32) ![]const u8 {
+    return std.fmt.allocPrint(a,
+        \\const z = @import("ziggurat");
+        \\const g = z.godot;
+        \\pub const extends = g.CharacterBody2D;
+        \\base: *g.CharacterBody2D,
+        \\health: i32 = 100,
+        \\
+        \\pub const signals = struct {{
+        \\    pub const died = struct {{}};
+        \\    pub const hit = struct {{ damage: i32, source: ?*g.Node }};
+        \\}};
+        \\
+        \\pub fn takeDamage(self: *@This(), amount: i32) void {{
+        \\    self.health -= amount + {d};
+        \\    z.emit(self, {s});
+        \\    if (self.health <= 0) z.emit(self, .died, .{{}});
+        \\}}
+        \\
+    , .{ n, emit_args });
+}
+
+test "integration: emit compile errors" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A correct emit (number literal, null for an optional object) builds.
+    var h: Harness = undefined;
+    try h.init(&.{.{ .rel = "hero.zig", .data = try heroScript(a, ".hit, .{ .damage = 1, .source = null }", 0) }});
+    defer h.deinit();
+    try expectOk(try h.build(.open));
+
+    const cases = [_]struct { args: []const u8, sentence: []const u8 }{
+        .{
+            .args = ".hti, .{ .damage = amount, .source = null }",
+            .sentence = "'hti' is not a signal of this script; its signals are died, hit.",
+        },
+        .{
+            .args = ".hit, .{ .damage = \"x\", .source = null }",
+            .sentence = "emit of 'hit' passes 'damage' as *const [1:0]u8, but the signal declares i32.",
+        },
+        .{
+            .args = ".hit, .{ .damage = amount }",
+            .sentence = "emit of 'hit' is missing the argument 'source'.",
+        },
+        .{
+            .args = ".hit, .{ .damage = amount, .source = null, .extra = 1 }",
+            .sentence = "emit of 'hit' passes 'extra', which is not an argument of the signal.",
+        },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("case {s}\n", .{c.args});
+        const data = try heroScript(a, c.args, 0);
+        try h.write("hero.zig", data);
+        const o = try h.build(.save);
+        errdefer printDiagnostics(o);
+        try testing.expect(!o.ok);
+        const d = for (o.diagnostics) |d| {
+            if (d.rel != null and std.mem.eql(u8, d.rel.?, "hero.zig")) break d;
+        } else return error.NoDiagnosticForScript;
+        if (!std.mem.eql(u8, d.message, c.sentence)) {
+            std.debug.print("want: {s}\ngot:  {s}\n", .{ c.sentence, d.message });
+            return error.WrongMessage;
+        }
+        try testing.expectEqual(lineOf(data, "pub const signals"), d.line);
+    }
+}
+
+fn expectGenGone(o_store: []const u8, n: u32) !void {
+    var buf: [512]u8 = undefined;
+    const p = try std.fmt.bufPrint(&buf, "{s}/gen/{d}", .{ o_store, n });
+    if (std.Io.Dir.cwd().access(io, p, .{})) |_| return error.GenerationStillThere else |_| {}
+}
+
+test "integration: incremental check passes" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const emit_args = ".hit, .{ .damage = amount, .source = null }";
+
+    var h: Harness = undefined;
+    try h.initOpts(&.{.{ .rel = "hero.zig", .data = try heroScript(a, emit_args, 0) }}, .{ .check_tables = true });
+    defer h.deinit();
+    const o1 = try h.build(.open);
+    try expectOk(o1);
+    try testing.expectEqual(service.BuildPath.full, o1.path);
+    try h.svc.waitWarm(build_wait_ms);
+
+    // Two body edits, each checked.
+    var check_us: [2]u64 = undefined;
+    for (1..3) |i| {
+        try h.write("hero.zig", try heroScript(a, emit_args, @intCast(i)));
+        const o = try h.build(.save);
+        try expectOk(o);
+        try testing.expectEqual(service.BuildPath.incremental, o.path);
+        try testing.expect(o.message == null);
+        try testing.expectEqual(@as(u32, @intCast(1 + i)), o.generation.?.n);
+        check_us[i - 1] = h.svc.stats().table_check_us;
+        try testing.expect(check_us[i - 1] > 0);
+        if (timingOn()) std.debug.print("sdk_e2e: incremental edit {d} ms, of which the table check {d} us\n", .{ o.ms, check_us[i - 1] });
+    }
+    try testing.expectEqual(@as(u32, 0), h.svc.stats().session_deaths);
+}
+
+test "integration: stale table is caught" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const emit_args = ".hit, .{ .damage = amount, .source = null }";
+
+    var h: Harness = undefined;
+    try h.initOpts(&.{.{ .rel = "hero.zig", .data = try heroScript(a, emit_args, 0) }}, .{
+        .check_tables = true,
+        .test_stale_build_id = true,
+    });
+    defer h.deinit();
+    const o1 = try h.build(.open);
+    try expectOk(o1);
+    try h.svc.waitWarm(build_wait_ms);
+
+    try h.write("hero.zig", try heroScript(a, emit_args, 1));
+    const o2 = try h.build(.save);
+    try expectOk(o2);
+    try testing.expectEqual(service.BuildPath.full, o2.path);
+    try testing.expectEqualStrings(service.stale_note, o2.message.?);
+    // The incremental output was staged as 2, checked, and deleted; the full
+    // build that replaced it never reuses that number.
+    try testing.expectEqual(@as(u32, 3), o2.generation.?.n);
+    const store = try std.fs.path.join(a, &.{ try h.tmp.dir.realPathFileAlloc(io, ".", a), "store" });
+    try expectGenGone(store, 2);
+    try std.Io.Dir.cwd().access(io, o2.generation.?.lib.bytes, .{});
+    try testing.expectEqual(@as(u32, 1), h.svc.stats().session_deaths);
 }
 
 /// Runs `argv`; it must print `Zig panic: probe` on stderr and die from a signal.

@@ -751,8 +751,11 @@ fn engineOptionalPtr(comptime T: type) ?type {
     return if (object.isEngineClass(C)) C else null;
 }
 
-/// The last part of a type's name: `Node2d` for `gdzig.class.node2d.Node2d`.
+/// The name a script spells the type with: the Godot name of an engine
+/// class (`Node2D`, as `ziggurat.godot` declares it), otherwise the last part
+/// of the type's name.
 fn shortName(comptime T: type) []const u8 {
+    if (comptime object.isEngineClass(T)) return object.engineClassName(T);
     const full = @typeName(T);
     return if (std.mem.lastIndexOfScalar(u8, full, '.')) |i| full[i + 1 ..] else full;
 }
@@ -802,7 +805,7 @@ fn isIdentifier(s: []const u8) bool {
 }
 
 /// `rel` for the SDK marker: `%`, `]`, `:` and `\` percent-encoded.
-fn encodeRel(comptime rel: []const u8) []const u8 {
+pub fn encodeRel(comptime rel: []const u8) []const u8 {
     comptime {
         @setEvalBranchQuota(1000 + 100 * rel.len);
         var out: []const u8 = "";

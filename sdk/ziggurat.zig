@@ -1,8 +1,7 @@
 //! The Ziggurat SDK: the module user scripts import as `@import("ziggurat")`.
 //!
-//! This is the skeleton. It satisfies the root contract documented in
-//! `src/build/rootgen.zig` with the smallest code that compiles, and
-//! re-exports gdzig as `godot`. Later work replaces the stub parts.
+//! It satisfies the root contract documented in `src/build/rootgen.zig`,
+//! and gives scripts the curated Godot surface as `godot`.
 const std = @import("std");
 const sdk_options = @import("sdk_options");
 const abi = @import("ziggurat_abi");
@@ -11,8 +10,10 @@ const names = @import("names.zig");
 const describe_mod = @import("describe.zig");
 const builtin = @import("builtin");
 
-/// gdzig. Scripts reach Godot types through this, for example `ziggurat.godot.class.Node`.
-pub const godot = @import("gdzig");
+/// The curated Godot surface: engine classes, builtin value types and
+/// global enums under their Godot names, for example `ziggurat.godot.Node2D`.
+/// See `sdk/godot.zig` for exactly what it holds.
+pub const godot = @import("ziggurat_godot");
 
 pub const version = sdk_options.sdk_version;
 
@@ -40,6 +41,10 @@ pub const Owned = @import("own.zig").Owned;
 /// length of the call, so a method that keeps one stores it with `assign`.
 pub const assign = @import("own.zig").assign;
 
+/// Emits a signal the script declares, checked at compile time:
+/// `z.emit(self, .hit, .{ .damage = 3 })`. See `signal.zig`.
+pub const emit = @import("signal.zig").emit;
+
 /// One script's descriptor (C ABI), built at compile time by `describe`.
 pub const ScriptDescriptor = abi.ScriptDesc;
 
@@ -62,9 +67,11 @@ pub const layout_stamp: u64 = abi.layoutStamp(.{
     .sdk_version = version,
 });
 
-/// The table over `descs`, which the generated root passes sorted by path.
-/// The build id stays empty for now.
-pub fn makeTable(comptime descs: []const *const ScriptDescriptor) Table {
+/// The table over `descs`, which the generated root passes sorted by path,
+/// with the build id the build service wrote into the root. After a fast
+/// (incremental) rebuild the service reads the id back from the staged
+/// library: a different id means the compiler kept stale code.
+pub fn makeTable(comptime descs: []const *const ScriptDescriptor, comptime build_id: []const u8) Table {
     const scripts = &Scripts(descs).list;
     return .{
         .magic = abi.magic,
@@ -72,7 +79,7 @@ pub fn makeTable(comptime descs: []const *const ScriptDescriptor) Table {
         .size = @sizeOf(Table),
         .layout_stamp = layout_stamp,
         .sdk_version = .{ .ptr = version.ptr, .len = version.len },
-        .build_id = .{ .ptr = null, .len = 0 },
+        .build_id = .{ .ptr = build_id.ptr, .len = build_id.len },
         .scripts = scripts,
         .script_count = descs.len,
     };

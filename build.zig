@@ -71,15 +71,16 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(godot_step);
 
     // Native: integration on for `test`, off for `test-unit`.
-    addTestSet(b, test_step, target, optimize, zig_exe, true, true, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) });
-    addTestSet(b, unit_step, target, optimize, zig_exe, false, true, null, null);
+    const sdk_options = sdk.import_table.get("sdk_options").?;
+    addTestSet(b, test_step, target, optimize, zig_exe, true, true, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) }, sdk_options);
+    addTestSet(b, unit_step, target, optimize, zig_exe, false, true, null, null, sdk_options);
 
     // Cross: compile only.
     for (cross_targets) |triple| {
         const query = std.Target.Query.parse(.{ .arch_os_abi = triple }) catch
             @panic("bad cross target triple");
         const resolved = b.resolveTargetQuery(query);
-        addTestSet(b, cross_step, resolved, optimize, zig_exe, false, false, null, null);
+        addTestSet(b, cross_step, resolved, optimize, zig_exe, false, false, null, null, sdk_options);
     }
 }
 
@@ -117,12 +118,38 @@ fn addSdk(
         .target = target,
         .optimize = optimize,
     });
+
+    // `ziggurat.godot`: sdk/godot.zig plus one declaration per engine class,
+    // matched against gdzig's generated class.zig (next to its root file).
+    const gdzig_mod = gdzig.module("gdzig");
+    const surface_tool = b.addExecutable(.{
+        .name = "godot_surface",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/godot_surface.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const surface_run = b.addRunArtifact(surface_tool);
+    const surface_file = surface_run.addOutputFileArg("ziggurat_godot.zig");
+    surface_run.addFileArg(b.path("sdk/godot.zig"));
+    surface_run.addFileArg(gdzig.path("vendor/extension_api.json"));
+    const gdzig_root = gdzig_mod.root_source_file orelse @panic("the gdzig module has no root source file");
+    surface_run.addFileArg(gdzig_root.dirname().path(b, "class.zig"));
+    const surface = b.createModule(.{
+        .root_source_file = surface_file,
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "gdzig", .module = gdzig_mod }},
+    });
+
     return b.createModule(.{
         .root_source_file = b.path("sdk/ziggurat.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "gdzig", .module = gdzig.module("gdzig") },
+            .{ .name = "gdzig", .module = gdzig_mod },
+            .{ .name = "ziggurat_godot", .module = surface },
             .{ .name = "sdk_options", .module = sdk_options },
             .{ .name = "ziggurat_abi", .module = addAbi(b, target, optimize) },
         },
@@ -309,6 +336,9 @@ fn addTestSet(
     sdk_manifest: ?std.Build.LazyPath,
     /// The SDK built in Debug and in ReleaseSafe, for the panic probes; null where none runs.
     probe_sdks: ?ProbeSdks,
+    /// The SDK's `sdk_options`, from which the SDK e2e tests compute the
+    /// layout stamp a host expects (native sets only).
+    sdk_options: *std.Build.Module,
 ) void {
     const options = b.addOptions();
     options.addOption([]const u8, "zig_exe", zig_exe);
@@ -394,6 +424,8 @@ fn addTestSet(
     const options_mod = options.createModule();
     platform.addImport("build_options", options_mod);
 
+    const abi = addAbi(b, target, optimize);
+
     const build_mod = b.createModule(.{
         .root_source_file = b.path("src/build/root.zig"),
         .target = target,
@@ -402,8 +434,7 @@ fn addTestSet(
     });
     build_mod.addImport("build_options", options_mod);
     build_mod.addImport("ziggurat_platform", platform);
-
-    const abi = addAbi(b, target, optimize);
+    build_mod.addImport("ziggurat_abi", abi);
 
     // The SDK's name conversion imports only std, so it tests without gdzig.
     const snake = b.createModule(.{
@@ -451,6 +482,8 @@ fn addTestSet(
         sdk_e2e.addImport("build_options", options_mod);
         sdk_e2e.addImport("ziggurat_platform", platform);
         sdk_e2e.addImport("ziggurat_build", build_mod);
+        sdk_e2e.addImport("ziggurat_abi", abi);
+        sdk_e2e.addImport("sdk_options", sdk_options);
         const sdk_run = b.addRunArtifact(b.addTest(.{ .root_module = sdk_e2e }));
         // The test builds the SDK from source with a child compiler, which the
         // build system cannot see; track the sources so an edit reruns it.

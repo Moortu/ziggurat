@@ -34,6 +34,12 @@ pub const ScanResult = struct {
     /// Number of files read and parsed by this scan (the others came from
     /// the cache).
     parsed: u32 = 0,
+    /// 16 lowercase hex characters: the first 8 bytes of a sha256 over every
+    /// scanned `.zig` file's `rel`, size, modification time, status-change
+    /// time and inode, sorted by `rel`. Editing, adding, removing or
+    /// renaming a file changes it; a scan with no change keeps it. The
+    /// generated root writes it into the table (see `rootgen.zig`).
+    build_id: [16]u8 = @splat('0'),
 };
 
 /// Each file's classification from earlier scans, so an unchanged file is
@@ -131,6 +137,46 @@ pub const default_script_dirs: []const []const u8 = &.{""};
 
 const max_file_bytes = 16 * 1024 * 1024;
 
+/// What `ScanResult.build_id` hashes for one file. A file that cannot be
+/// stat'ed counts with zeros, so it still changes the id when it appears.
+const Stamp = struct {
+    rel: []const u8,
+    size: u64 = 0,
+    mtime: i96 = 0,
+    ctime: i96 = 0,
+    inode: u128 = 0,
+
+    fn fromStat(rel: []const u8, st: ?std.Io.File.Stat) Stamp {
+        const x = st orelse return .{ .rel = rel };
+        return .{ .rel = rel, .size = x.size, .mtime = x.mtime.nanoseconds, .ctime = x.ctime.nanoseconds, .inode = @intCast(x.inode) };
+    }
+
+    fn lessThan(_: void, x: Stamp, y: Stamp) bool {
+        return std.mem.lessThan(u8, x.rel, y.rel);
+    }
+};
+
+/// See `ScanResult.build_id`. Sorts `stamps`.
+fn buildId(stamps: []Stamp) [16]u8 {
+    std.mem.sort(Stamp, stamps, {}, Stamp.lessThan);
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    for (stamps) |st| {
+        var len: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len, st.rel.len, .little);
+        h.update(&len);
+        h.update(st.rel);
+        var buf: [8 + 16 + 16 + 16]u8 = undefined;
+        std.mem.writeInt(u64, buf[0..8], st.size, .little);
+        std.mem.writeInt(i128, buf[8..24], st.mtime, .little);
+        std.mem.writeInt(i128, buf[24..40], st.ctime, .little);
+        std.mem.writeInt(u128, buf[40..56], st.inode, .little);
+        h.update(&buf);
+    }
+    var digest: [32]u8 = undefined;
+    h.final(&digest);
+    return std.fmt.bytesToHex(digest[0..8].*, .lower);
+}
+
 const Scanner = struct {
     a: std.mem.Allocator,
     io: std.Io,
@@ -141,6 +187,8 @@ const Scanner = struct {
     walked: std.StringHashMapUnmanaged(void) = .empty,
     helper_list: std.ArrayList(Script) = .empty,
     cache: ?*Cache = null,
+    /// One entry per scanned `.zig` file, for `ScanResult.build_id`.
+    stamps: std.ArrayList(Stamp) = .empty,
     /// Wall-clock time at the start of the scan, for `Cache.racy_ns`.
     now: i96 = 0,
     parsed: u32 = 0,
@@ -187,7 +235,8 @@ const Scanner = struct {
     fn file(self: *Scanner, dir: std.Io.Dir, name: []const u8, rel: []const u8) !void {
         if ((try self.seen.getOrPut(self.a, rel)).found_existing) return;
         // Without a usable stat the file is read and parsed, and not cached.
-        const st: ?std.Io.File.Stat = if (self.cache != null) dir.statFile(self.io, name, .{}) catch null else null;
+        const st: ?std.Io.File.Stat = dir.statFile(self.io, name, .{}) catch null;
+        try self.stamps.append(self.a, .fromStat(rel, st));
         if (self.cache) |c| if (st) |x| if (c.lookup(rel, x)) |script| return self.classify(rel, script);
         const src = dir.readFileAllocOptions(self.io, name, self.a, .limited(max_file_bytes), .of(u8), 0) catch |err| {
             try self.problem(rel, "Could not read \"{s}\": {t}.", .{ rel, err });
@@ -262,6 +311,7 @@ pub fn scanCached(
         .helper_paths = s.helper_list.items,
         .problems = s.problems.items,
         .parsed = s.parsed,
+        .build_id = buildId(s.stamps.items),
     };
 }
 
@@ -478,6 +528,42 @@ fn age(tmp: std.testing.TmpDir, sub: []const u8) !void {
     const now = std.Io.Clock.real.now(testing.io);
     const old: std.Io.Timestamp = .{ .nanoseconds = now.nanoseconds - 10 * std.time.ns_per_s };
     try tmp.dir.setTimestamps(testing.io, sub, .{ .modify_timestamp = .{ .new = old } });
+}
+
+test "build id changes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try put(tmp, "a.zig", "pub const extends = \"Node\";\n");
+    try put(tmp, "lib/h.zig", "pub fn f() void {}\n");
+    const project = try tmpProject(tmp, a);
+    var cache: Cache = .init(testing.allocator);
+    defer cache.deinit();
+
+    const r1 = try scanCached(a, testing.io, project, default_script_dirs, &cache);
+    for (r1.build_id) |c| try testing.expect(std.ascii.isDigit(c) or (c >= 'a' and c <= 'f'));
+
+    // Touching nothing keeps it, with or without the cache.
+    const r2 = try scanCached(a, testing.io, project, default_script_dirs, &cache);
+    try testing.expectEqualStrings(&r1.build_id, &r2.build_id);
+    const r2b = try scan(a, testing.io, project, default_script_dirs);
+    try testing.expectEqualStrings(&r1.build_id, &r2b.build_id);
+
+    // Editing one file (here a helper, with the same size) changes it.
+    try put(tmp, "lib/h.zig", "pub fn g() void {}\n");
+    const r3 = try scanCached(a, testing.io, project, default_script_dirs, &cache);
+    try testing.expect(!std.mem.eql(u8, &r2.build_id, &r3.build_id));
+
+    // So do a new file and a removed one.
+    try put(tmp, "b.zig", "pub const extends = \"Node\";\n");
+    const r4 = try scanCached(a, testing.io, project, default_script_dirs, &cache);
+    try testing.expect(!std.mem.eql(u8, &r3.build_id, &r4.build_id));
+    try tmp.dir.deleteFile(testing.io, "b.zig");
+    const r5 = try scanCached(a, testing.io, project, default_script_dirs, &cache);
+    try testing.expect(!std.mem.eql(u8, &r4.build_id, &r5.build_id));
 }
 
 test "scan cache parses only changed files" {

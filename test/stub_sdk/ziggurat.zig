@@ -16,7 +16,9 @@ pub fn describe(comptime S: type, comptime rel: []const u8) ScriptDescriptor {
     return .{ .name = @typeName(S), .rel = rel };
 }
 
-pub fn makeTable(comptime descriptors: Table) Table {
+/// The build id is not kept: the stub table has no field for it.
+pub fn makeTable(comptime descriptors: Table, comptime build_id: []const u8) Table {
+    _ = build_id;
     return descriptors;
 }
 

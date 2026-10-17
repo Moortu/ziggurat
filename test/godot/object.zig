@@ -4,7 +4,7 @@
 const std = @import("std");
 const testing = std.testing;
 const ziggurat = @import("ziggurat");
-const godot = ziggurat.godot;
+const godot = @import("gdzig");
 const convert = ziggurat.convert;
 const object = ziggurat.object;
 const Obj = ziggurat.Obj;
@@ -149,6 +149,40 @@ test "engine class names exist in Godot" {
     try testing.expect(checked > 800);
     if (bad != 0) std.debug.print("{d} of {d} engine class names are not known to Godot\n", .{ bad, checked });
     try testing.expectEqual(@as(usize, 0), bad);
+}
+
+// `ziggurat.godot`: every engine class under its Godot name (and nothing
+// under a gdzig spelling), the builtin value types and global enums, and
+// none of the withheld gdzig parts.
+test "curated godot surface" {
+    const g = ziggurat.godot;
+    comptime {
+        @setEvalBranchQuota(50_000_000);
+        var classes: usize = 0;
+        var others: usize = 0;
+        for (@typeInfo(g).@"struct".decl_names) |name| {
+            const T = @field(g, name);
+            if (@TypeOf(T) != type) @compileError("ziggurat.godot." ++ name ++ " is not a type");
+            if (object.isEngineClass(T)) {
+                if (!std.mem.eql(u8, object.engineClassName(T), name))
+                    @compileError("ziggurat.godot." ++ name ++ " is not named as Godot names it");
+                classes += 1;
+            } else others += 1;
+        }
+        // 1036 engine classes in 4.7.2, minus ClassDB, GDExtension and GDExtensionManager.
+        if (classes != 1033) @compileError(std.fmt.comptimePrint("ziggurat.godot has {d} engine classes", .{classes}));
+        // 34 builtin value types and 20 global enums.
+        if (others != 54) @compileError(std.fmt.comptimePrint("ziggurat.godot has {d} other types", .{others}));
+        for ([_][]const u8{ "ClassDB", "ClassDb", "GDExtension", "GDExtensionManager", "Variant", "Registry", "class", "builtin", "global", "extension", "raw", "c", "heap", "testing" }) |name| {
+            if (@hasDecl(g, name)) @compileError("ziggurat.godot must not declare " ++ name);
+        }
+    }
+    try testing.expect(g.CharacterBody2D == godot.class.CharacterBody2d);
+    try testing.expect(g.AESContext == godot.class.AesContext);
+    try testing.expect(g.Node == Node);
+    try testing.expect(g.Transform2D == godot.builtin.Transform2d);
+    try testing.expect(g.RID == godot.builtin.Rid);
+    try testing.expect(g.MIDIMessage == godot.global.MidiMessage);
 }
 
 test "object round trips" {

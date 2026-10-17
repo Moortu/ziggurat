@@ -2,20 +2,19 @@
 //! arguments, a virtual method and signals with arguments.
 const z = @import("ziggurat");
 const g = z.godot;
-const class = g.class;
 
-pub const extends = class.CharacterBody2d;
+pub const extends = g.CharacterBody2D;
 pub const class_name = "Player";
 
-base: *class.CharacterBody2d,
+base: *g.CharacterBody2D,
 speed: f32 = 300,
 health: i32 = 100,
 alive: bool = true,
 mood: Mood = .calm,
 layers: Layers = .{},
-spawn: g.builtin.Vector2 = .{ .x = 1, .y = 2 },
-title: g.builtin.String = .empty,
-target: z.Obj(class.Node) = .{},
+spawn: g.Vector2 = .{ .x = 1, .y = 2 },
+title: g.String = .empty,
+target: z.Obj(g.Node) = .{},
 _dash_timer: f32 = 0,
 
 pub const Mood = enum(u8) { calm, angry };
@@ -31,7 +30,7 @@ pub const meta = .{
 
 pub const signals = struct {
     pub const died = struct {};
-    pub const hit = struct { damage: i32, source: ?*class.Node };
+    pub const hit = struct { damage: i32, source: ?*g.Node };
 };
 
 pub fn init(self: *@This()) void {

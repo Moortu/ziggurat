@@ -7,7 +7,7 @@ const abi = @import("ziggurat_abi");
 const player = @import("fixture_player");
 const coin = @import("fixture_coin");
 const hud_label = @import("fixture_hud_label");
-const godot = ziggurat.godot;
+const godot = @import("gdzig");
 const Node = godot.class.Node;
 
 const t_nil: u32 = 0;
@@ -244,7 +244,7 @@ test "describe: tool flag, no class name, no base field" {
 const tool_desc = ziggurat.describe(Tool, "ui/tool.zig");
 const coin_desc = ziggurat.describe(coin, "items/coin.zig");
 const hud_desc = ziggurat.describe(hud_label, "ui/hud_label.zig");
-const table = ziggurat.makeTable(&.{ &coin_desc, &player_desc, &hud_desc, &tool_desc });
+const table = ziggurat.makeTable(&.{ &coin_desc, &player_desc, &hud_desc, &tool_desc }, "0123456789abcdef");
 
 test "makeTable: header, every fixture script, validate" {
     const t = &table;

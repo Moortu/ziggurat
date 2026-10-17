@@ -2,11 +2,11 @@
 const z = @import("ziggurat");
 const g = z.godot;
 
-pub const extends = g.class.Label;
+pub const extends = g.Label;
 pub const class_name = "HudLabel";
 pub const tool = true;
 
-prefix: g.builtin.String = .empty,
+prefix: g.String = .empty,
 blink: f64 = 0.5,
 
 pub fn _process(self: *@This(), delta: f64) void {
