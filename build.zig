@@ -72,15 +72,15 @@ pub fn build(b: *std.Build) void {
 
     // Native: integration on for `test`, off for `test-unit`.
     const sdk_options = sdk.import_table.get("sdk_options").?;
-    addTestSet(b, test_step, target, optimize, zig_exe, true, true, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) }, sdk_options);
-    addTestSet(b, unit_step, target, optimize, zig_exe, false, true, null, null, sdk_options);
+    addTestSet(b, test_step, target, optimize, zig_exe, true, true, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) }, sdk_options, sdk);
+    addTestSet(b, unit_step, target, optimize, zig_exe, false, true, null, null, sdk_options, sdk);
 
     // Cross: compile only.
     for (cross_targets) |triple| {
         const query = std.Target.Query.parse(.{ .arch_os_abi = triple }) catch
             @panic("bad cross target triple");
         const resolved = b.resolveTargetQuery(query);
-        addTestSet(b, cross_step, resolved, optimize, zig_exe, false, false, null, null, sdk_options);
+        addTestSet(b, cross_step, resolved, optimize, zig_exe, false, false, null, null, sdk_options, sdk);
     }
 }
 
@@ -156,6 +156,22 @@ fn addSdk(
     });
 }
 
+/// A fixture script as a module that imports the SDK.
+fn fixtureModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    sdk: *std.Build.Module,
+    path: []const u8,
+) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path(path),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ziggurat", .module = sdk }},
+    });
+}
+
 /// SDK tests that run inside Godot through gdzig's test harness.
 ///
 /// The harness replaces the test module's `gdzig` import with the gdzig
@@ -174,24 +190,9 @@ fn addGodotTests(
     if (harnessGdzig(b) != sdk.import_table.get("gdzig").?)
         @panic("the SDK under test does not import the gdzig module the test harness uses");
     // The descriptor tests read the fixture scripts, which import the SDK.
-    const fixture_player = b.createModule(.{
-        .root_source_file = b.path("test/fixtures/sdk_project/player.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "ziggurat", .module = sdk }},
-    });
-    const fixture_coin = b.createModule(.{
-        .root_source_file = b.path("test/fixtures/sdk_project/items/coin.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "ziggurat", .module = sdk }},
-    });
-    const fixture_hud_label = b.createModule(.{
-        .root_source_file = b.path("test/fixtures/sdk_project/ui/hud_label.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "ziggurat", .module = sdk }},
-    });
+    const fixture_player = fixtureModule(b, target, optimize, sdk, "test/fixtures/sdk_project/player.zig");
+    const fixture_coin = fixtureModule(b, target, optimize, sdk, "test/fixtures/sdk_project/items/coin.zig");
+    const fixture_hud_label = fixtureModule(b, target, optimize, sdk, "test/fixtures/sdk_project/ui/hud_label.zig");
     const mod = b.createModule(.{
         .root_source_file = b.path("test/godot/convert.zig"),
         .target = target,
@@ -339,6 +340,9 @@ fn addTestSet(
     /// The SDK's `sdk_options`, from which the SDK e2e tests compute the
     /// layout stamp a host expects (native sets only).
     sdk_options: *std.Build.Module,
+    /// The SDK the fixture scripts are compiled against in the SDK e2e tests
+    /// (they read `@sizeOf` of the fixture types).
+    fixture_sdk: *std.Build.Module,
 ) void {
     const options = b.addOptions();
     options.addOption([]const u8, "zig_exe", zig_exe);
@@ -424,7 +428,9 @@ fn addTestSet(
     const options_mod = options.createModule();
     platform.addImport("build_options", options_mod);
 
-    const abi = addAbi(b, target, optimize);
+    // The SDK e2e tests compile the SDK (through the fixtures) and the build
+    // service together, so both must use one `ziggurat_abi` module.
+    const abi = if (run) fixture_sdk.import_table.get("ziggurat_abi").? else addAbi(b, target, optimize);
 
     const build_mod = b.createModule(.{
         .root_source_file = b.path("src/build/root.zig"),
@@ -484,6 +490,9 @@ fn addTestSet(
         sdk_e2e.addImport("ziggurat_build", build_mod);
         sdk_e2e.addImport("ziggurat_abi", abi);
         sdk_e2e.addImport("sdk_options", sdk_options);
+        sdk_e2e.addImport("fixture_player", fixtureModule(b, target, optimize, fixture_sdk, "test/fixtures/sdk_project/player.zig"));
+        sdk_e2e.addImport("fixture_coin", fixtureModule(b, target, optimize, fixture_sdk, "test/fixtures/sdk_project/items/coin.zig"));
+        sdk_e2e.addImport("fixture_hud_label", fixtureModule(b, target, optimize, fixture_sdk, "test/fixtures/sdk_project/ui/hud_label.zig"));
         const sdk_run = b.addRunArtifact(b.addTest(.{ .root_module = sdk_e2e }));
         // The test builds the SDK from source with a child compiler, which the
         // build system cannot see; track the sources so an edit reruns it.

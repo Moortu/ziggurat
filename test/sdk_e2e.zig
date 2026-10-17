@@ -177,6 +177,260 @@ test "integration: fixture project builds" {
     if (timingOn()) std.debug.print("sdk_e2e: fixture project (3 fixtures + 30-field, 30-method script) full build {d} ms\n", .{o.ms});
 }
 
+const fixture_player = @import("fixture_player");
+const fixture_coin = @import("fixture_coin");
+const fixture_hud_label = @import("fixture_hud_label");
+
+fn str(s: abi.Str) []const u8 {
+    const p = s.ptr orelse return "";
+    return p[0..s.len];
+}
+
+/// A staged library opened the way the host will open it, with its table
+/// read through the `ziggurat_describe` export (the module is never
+/// initialised, so no Godot is needed).
+const Loaded = struct {
+    lib: platform.loader.Library,
+    table: *const abi.Table,
+
+    fn open(gen: service.Generation) !Loaded {
+        var diag: [256]u8 = undefined;
+        const lib = platform.loader.open(testing.allocator, io, gen.lib, &diag) catch |err| {
+            std.debug.print("load failed: {s}\n", .{std.mem.sliceTo(&diag, 0)});
+            return err;
+        };
+        errdefer platform.loader.close(lib);
+        const describe = platform.loader.lookup(lib, *const fn () callconv(.c) *const abi.Table, "ziggurat_describe") orelse
+            return error.SymbolNotFound;
+        return .{ .lib = lib, .table = describe() };
+    }
+
+    fn close(l: Loaded) void {
+        platform.loader.close(l.lib);
+    }
+
+    /// The host's own check, with the stamp the host computes.
+    fn validate(l: Loaded) !void {
+        var diag: [256]u8 = undefined;
+        abi.validate(testing.allocator, l.table, host_stamp, .{}, &diag) catch |err| {
+            std.debug.print("validate: {s}\n", .{std.mem.sliceTo(&diag, 0)});
+            return err;
+        };
+    }
+
+    fn scripts(l: Loaded) []const abi.ScriptDesc {
+        return l.table.scripts[0..l.table.script_count];
+    }
+};
+
+const t_nil: u32 = 0;
+const t_bool: u32 = 1;
+const t_int: u32 = 2;
+const t_float: u32 = 3;
+const t_string: u32 = 4;
+const t_vector2: u32 = 5;
+const t_object: u32 = 24;
+const usage_script: u32 = 4102;
+const usage_group: u32 = 64;
+const hint_range: u32 = 1;
+const hint_enum: u32 = 2;
+const hint_resource_type: u32 = 17;
+const hint_node_type: u32 = 34;
+const group = "Movement/Fast motion";
+
+const PropWant = struct {
+    name: []const u8,
+    field: u32,
+    vt: u32,
+    class: []const u8 = "",
+    hint: u32 = 0,
+    hint_string: []const u8 = "",
+    usage: u32 = usage_script,
+};
+
+fn expectProps(d: *const abi.ScriptDesc, want: []const PropWant) !void {
+    try testing.expectEqual(@as(u32, @intCast(want.len)), d.property_count);
+    for (want, 0..) |w, i| {
+        const p = d.properties[i];
+        errdefer std.debug.print("property {d} ({s})\n", .{ i, w.name });
+        try testing.expectEqualStrings(w.name, str(p.name));
+        try testing.expectEqual(w.field, p.field_index);
+        try testing.expectEqual(w.vt, p.variant_type);
+        try testing.expectEqualStrings(w.class, str(p.class_name));
+        try testing.expectEqual(w.hint, p.hint);
+        try testing.expectEqualStrings(w.hint_string, str(p.hint_string));
+        try testing.expectEqual(w.usage, p.usage);
+    }
+}
+
+fn expectFixtureTable(l: Loaded) !void {
+    try l.validate();
+    const t = l.table;
+    try testing.expectEqual(host_stamp, t.layout_stamp);
+    try testing.expectEqualStrings(sdk_options.sdk_version, str(t.sdk_version));
+    try testing.expectEqual(@as(usize, 16), str(t.build_id).len);
+
+    // Three scripts, sorted by path in byte order.
+    const s = l.scripts();
+    try testing.expectEqual(@as(usize, 3), s.len);
+    try testing.expectEqualStrings("items/coin.zig", str(s[0].path));
+    try testing.expectEqualStrings("player.zig", str(s[1].path));
+    try testing.expectEqualStrings("ui/hud_label.zig", str(s[2].path));
+
+    // class_name, base class, flags and instance layout.
+    const coin = &s[0];
+    try testing.expectEqualStrings("Coin", str(coin.class_name));
+    try testing.expectEqualStrings("Area2D", str(coin.base_class));
+    try testing.expectEqual(@as(u32, 0), coin.flags);
+    try testing.expectEqual(@as(u32, @sizeOf(fixture_coin)), coin.instance_size);
+    try testing.expectEqual(@as(u32, @alignOf(fixture_coin)), coin.instance_align);
+
+    const p = &s[1];
+    try testing.expectEqualStrings("Player", str(p.class_name));
+    try testing.expectEqualStrings("CharacterBody2D", str(p.base_class));
+    try testing.expectEqual(@as(u32, 0), p.flags);
+    try testing.expectEqual(@as(u32, @sizeOf(fixture_player)), p.instance_size);
+    try testing.expectEqual(@as(u32, @alignOf(fixture_player)), p.instance_align);
+    try testing.expectEqual(@as(u32, 10), p.field_count);
+
+    const hud = &s[2];
+    try testing.expectEqualStrings("HudLabel", str(hud.class_name));
+    try testing.expectEqualStrings("Label", str(hud.base_class));
+    try testing.expectEqual(abi.script_flag_tool, hud.flags);
+    try testing.expectEqual(@as(u32, @sizeOf(fixture_hud_label)), hud.instance_size);
+    try testing.expectEqual(@as(u32, @alignOf(fixture_hud_label)), hud.instance_align);
+
+    // Player: properties in source order with groups and hints.
+    try expectProps(p, &.{
+        .{ .name = group, .field = abi.no_field, .vt = t_nil, .usage = usage_group },
+        .{ .name = "speed", .field = 1, .vt = t_float, .hint = hint_range, .hint_string = "0,1000,5" },
+        .{ .name = "", .field = abi.no_field, .vt = t_nil, .usage = usage_group },
+        .{ .name = "health", .field = 2, .vt = t_int, .hint = hint_range, .hint_string = "0,100" },
+        .{ .name = "alive", .field = 3, .vt = t_bool },
+        .{ .name = "mood", .field = 4, .vt = t_int, .hint = hint_enum, .hint_string = "calm:0,angry:1" },
+        .{ .name = "layers", .field = 5, .vt = t_int },
+        .{ .name = group, .field = abi.no_field, .vt = t_nil, .usage = usage_group },
+        .{ .name = "spawn_point", .field = 6, .vt = t_vector2 },
+        .{ .name = "", .field = abi.no_field, .vt = t_nil, .usage = usage_group },
+        .{ .name = "title", .field = 7, .vt = t_string },
+        .{ .name = "target", .field = 8, .vt = t_object, .class = "Node", .hint = hint_node_type, .hint_string = "Node" },
+    });
+    try expectProps(coin, &.{
+        .{ .name = "value", .field = 1, .vt = t_int },
+        .{ .name = "texture", .field = 2, .vt = t_object, .class = "Texture2D", .hint = hint_resource_type, .hint_string = "Texture2D" },
+    });
+    try expectProps(hud, &.{
+        .{ .name = "prefix", .field = 0, .vt = t_string },
+        .{ .name = "blink", .field = 1, .vt = t_float },
+    });
+
+    // Player: methods, in source order, with the Godot names.
+    try testing.expectEqual(@as(u32, 3), p.method_count);
+    const m0 = p.methods[0];
+    try testing.expectEqualStrings("_physics_process", str(m0.name));
+    try testing.expectEqual(abi.method_flag_virtual, m0.flags);
+    try testing.expectEqual(@as(u32, 1), m0.arg_count);
+    try testing.expectEqual(t_float, m0.args[0].variant_type);
+    try testing.expectEqual(t_nil, m0.ret.variant_type);
+    const m1 = p.methods[1];
+    try testing.expectEqualStrings("take_damage", str(m1.name));
+    try testing.expectEqual(@as(u32, 0), m1.flags);
+    try testing.expectEqual(@as(u32, 2), m1.arg_count);
+    try testing.expectEqualStrings("amount", str(m1.args[0].name));
+    try testing.expectEqual(t_int, m1.args[0].variant_type);
+    try testing.expectEqualStrings("critical", str(m1.args[1].name));
+    try testing.expectEqual(t_bool, m1.args[1].variant_type);
+    const m2 = p.methods[2];
+    try testing.expectEqualStrings("leap", str(m2.name));
+    try testing.expectEqual(@as(u32, 1), m2.arg_count);
+    try testing.expectEqual(t_float, m2.args[0].variant_type);
+    try testing.expectEqual(t_float, m2.ret.variant_type);
+    try testing.expectEqual(@as(u32, 1), coin.method_count);
+    try testing.expectEqualStrings("collect", str(coin.methods[0].name));
+    try testing.expectEqual(@as(u32, 1), hud.method_count);
+    try testing.expectEqualStrings("_process", str(hud.methods[0].name));
+
+    // Player: signals.
+    try testing.expectEqual(@as(u32, 2), p.signal_count);
+    try testing.expectEqualStrings("died", str(p.signals[0].name));
+    try testing.expectEqual(@as(u32, 0), p.signals[0].arg_count);
+    const hit = p.signals[1];
+    try testing.expectEqualStrings("hit", str(hit.name));
+    try testing.expectEqual(@as(u32, 2), hit.arg_count);
+    try testing.expectEqualStrings("damage", str(hit.args[0].name));
+    try testing.expectEqual(t_int, hit.args[0].variant_type);
+    try testing.expectEqualStrings("source", str(hit.args[1].name));
+    try testing.expectEqual(t_object, hit.args[1].variant_type);
+    try testing.expectEqualStrings("Node", str(hit.args[1].class_name));
+    try testing.expectEqual(@as(u32, 1), coin.signal_count);
+    try testing.expectEqualStrings("collected", str(coin.signals[0].name));
+    try testing.expectEqual(@as(u32, 0), hud.signal_count);
+}
+
+test "integration: fixture project end to end" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const player_src = @embedFile("fixtures/sdk_project/player.zig");
+
+    var h: Harness = undefined;
+    try h.initOpts(&.{
+        .{ .rel = "player.zig", .data = player_src },
+        .{ .rel = "items/coin.zig", .data = @embedFile("fixtures/sdk_project/items/coin.zig") },
+        .{ .rel = "ui/hud_label.zig", .data = @embedFile("fixtures/sdk_project/ui/hud_label.zig") },
+    }, .{ .check_tables = true });
+    defer h.deinit();
+
+    // Full build, then the staged library: load, validate, compare.
+    const o1 = try h.build(.open);
+    try expectOk(o1);
+    try testing.expectEqual(service.BuildPath.full, o1.path);
+    const gen1 = o1.generation orelse return error.NoGeneration;
+    var first_id: [16]u8 = undefined;
+    var first_hash: u64 = 0;
+    {
+        const l = try Loaded.open(gen1);
+        defer l.close();
+        try expectFixtureTable(l);
+        @memcpy(&first_id, str(l.table.build_id));
+        first_hash = l.scripts()[1].layout_hash;
+    }
+
+    // Warm up, then one body edit on the incremental path with the table check.
+    const t_warm = std.Io.Clock.awake.now(io);
+    try h.svc.waitWarm(build_wait_ms);
+    const warm_ms = t_warm.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+
+    const needle = "return height * self.speed;";
+    try testing.expect(std.mem.indexOf(u8, player_src, needle) != null);
+    try h.write("player.zig", try std.mem.replaceOwned(u8, a, player_src, needle, "return height * self.speed + 1;"));
+    const o2 = try h.build(.save);
+    try expectOk(o2);
+    try testing.expectEqual(service.BuildPath.incremental, o2.path);
+    try testing.expect(o2.message == null);
+    const gen2 = o2.generation orelse return error.NoGeneration;
+    try testing.expectEqual(gen1.n + 1, gen2.n);
+    const check_us = h.svc.stats().table_check_us;
+    try testing.expect(check_us > 0);
+    try testing.expectEqual(@as(u32, 0), h.svc.stats().session_deaths);
+    {
+        const l = try Loaded.open(gen2);
+        defer l.close();
+        try expectFixtureTable(l);
+        // The edit changed the build id and not the layout.
+        try testing.expect(!std.mem.eql(u8, &first_id, str(l.table.build_id)));
+        try testing.expectEqual(first_hash, l.scripts()[1].layout_hash);
+    }
+
+    if (timingOn()) std.debug.print(
+        "sdk_e2e: fixture project: session-start build {d} ms, warm-up {d} ms, incremental body edit {d} ms (table check {d} us)\n",
+        .{ o1.ms, warm_ms, o2.ms, check_us },
+    );
+}
+
 /// One script that must fail with exactly `sentence`, reported at `rel` on
 /// the first line that starts with `decl`.
 const BadScript = struct { rel: []const u8, data: []const u8, sentence: []const u8, decl: []const u8 };
