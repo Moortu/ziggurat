@@ -38,7 +38,10 @@ pub const ScanResult = struct {
     /// scanned `.zig` file's `rel`, size, modification time, status-change
     /// time and inode, sorted by `rel`. Editing, adding, removing or
     /// renaming a file changes it; a scan with no change keeps it. The
-    /// generated root writes it into the table (see `rootgen.zig`).
+    /// generated root writes it into the table (see `rootgen.zig`). It does
+    /// not cover `@embedFile` data, `.zig` helpers outside `script_dirs`,
+    /// or SDK edits, so a stale export after only such an edit is not caught
+    /// by the id comparison.
     build_id: [16]u8 = @splat('0'),
 };
 

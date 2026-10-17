@@ -669,6 +669,71 @@ test "integration: emit compile errors" {
         }
         try testing.expectEqual(lineOf(data, "pub const signals"), d.line);
     }
+
+    // Compile probe: scripts cannot build a Callable from a function pointer.
+    const probe =
+        \\const z = @import("ziggurat");
+        \\pub const extends = z.godot.Node;
+        \\base: *z.godot.Node,
+        \\fn cb() void {}
+        \\pub fn hook(self: *@This()) void {
+        \\    _ = z.godot.Callable.fromClosure(self, cb);
+        \\}
+        \\
+    ;
+    try h.write("hero.zig", probe);
+    const o = try h.build(.save);
+    errdefer printDiagnostics(o);
+    try testing.expect(!o.ok);
+    for (o.diagnostics) |d| {
+        if (d.rel != null and std.mem.eql(u8, d.rel.?, "hero.zig") and d.line == 6 and
+            std.mem.indexOf(u8, d.message, "fromClosure") != null) break;
+    } else return error.FromClosureNotRefused;
+}
+
+/// Number of scripts in the large-project emit test.
+const many_scripts = 1500;
+
+test "integration: emit error in a large project" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Many small scripts with paths of the same length, so the marker lookup
+    // compares bytes for each one; the last one emits an unknown signal.
+    const files = try a.alloc(File, many_scripts);
+    for (files, 0..) |*f, i| {
+        f.rel = try std.fmt.allocPrint(a, "scripts/enemy_{d:0>4}.zig", .{i});
+        f.data = "const z = @import(\"ziggurat\");\npub const extends = z.godot.Node;\nbase: *z.godot.Node,\n";
+    }
+    const bad =
+        \\const z = @import("ziggurat");
+        \\pub const extends = z.godot.Node;
+        \\base: *z.godot.Node,
+        \\pub const signals = struct {
+        \\    pub const hit = struct {};
+        \\};
+        \\pub fn go(self: *@This()) void {
+        \\    z.emit(self, .miss, .{});
+        \\}
+        \\
+    ;
+    files[many_scripts - 1].data = bad;
+    var h: Harness = undefined;
+    try h.init(files);
+    defer h.deinit();
+    const o = try h.build(.open);
+    errdefer printDiagnostics(o);
+    if (timingOn()) std.debug.print("sdk_e2e: {d}-script project with an emit error built in {d} ms\n", .{ many_scripts, o.ms });
+    try testing.expect(!o.ok);
+    const want_rel = files[many_scripts - 1].rel;
+    const d = for (o.diagnostics) |d| {
+        if (d.rel != null and std.mem.eql(u8, d.rel.?, want_rel)) break d;
+    } else return error.NoDiagnosticForScript;
+    try testing.expectEqualStrings("'miss' is not a signal of this script; its signals are hit.", d.message);
+    try testing.expectEqual(@as(u32, 4), d.line);
 }
 
 fn expectGenGone(o_store: []const u8, n: u32) !void {

@@ -38,7 +38,17 @@
 //!   keep a stale export). `ziggurat_init` is never called. When the check
 //!   fails, the generation is deleted, the server counts a death and the
 //!   same request is built on the full path; that outcome carries
-//!   `stale_note`.
+//!   `stale_note` (also when that full build fails). `init` refuses
+//!   `check_tables` without `expected_stamp`.
+//!   Loading each checked build into the editor process has side effects:
+//!   the library's `.init_array` constructors run on every check (Zig code
+//!   has none, but C code a project links in would run its constructors in
+//!   the editor on every edit); the self-hosted backend emits an empty
+//!   PT_TLS segment, so every load takes and every close frees a glibc
+//!   dynamic TLS module id (measured bounded: about 20 kB once, flat over 50
+//!   cycles, and `dlclose` unloads fully); and each check holds the dynamic
+//!   loader lock for about 0.7 ms, which other threads loading libraries
+//!   wait for.
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("ziggurat_platform");
@@ -163,11 +173,12 @@ pub const Config = struct {
     check_tables: bool = false,
     /// The layout stamp the host expects in the table: `ziggurat_abi.layoutStamp`
     /// over the SDK's facts with `ziggurat_abi.stampTarget(builtin.target)`.
-    /// Null: the stamp is not checked.
+    /// Required when `check_tables` is set (`init` refuses the config
+    /// otherwise with `error.MissingExpectedStamp`).
     expected_stamp: ?u64 = null,
-    /// TEST ONLY. The table check sees the build id of the previous build
-    /// instead of the table's own, as it would when the compiler kept stale
-    /// code. Never set this outside tests.
+    /// TEST ONLY, and read only in test builds (`builtin.is_test`). The
+    /// table check sees the build id of the previous build instead of the
+    /// table's own, as it would when the compiler kept stale code.
     test_stale_build_id: bool = false,
 };
 
@@ -253,7 +264,7 @@ pub const BuildService = struct {
     /// See `Stats.table_check_us`. Guarded by `mu`.
     table_check_us: u64 = 0,
 
-    pub const InitError = error{ MissingSdkModule, TargetNotHost, OutOfMemory } || std.Thread.SpawnError;
+    pub const InitError = error{ MissingSdkModule, TargetNotHost, MissingExpectedStamp, OutOfMemory } || std.Thread.SpawnError;
 
     /// Starts the build thread. `a` must be thread-safe. Nothing is built
     /// until the first `request`. See `initDiag` for the errors.
@@ -263,8 +274,9 @@ pub const BuildService = struct {
     }
 
     /// Like `init`; on `error.MissingSdkModule` (no module in `cfg.sdk` is
-    /// named `ziggurat`) or `error.TargetNotHost` (`cfg.target` is not the
-    /// host), `diag` holds one sentence for the user (read it with
+    /// named `ziggurat`), `error.TargetNotHost` (`cfg.target` is not the
+    /// host) or `error.MissingExpectedStamp` (`check_tables` without
+    /// `expected_stamp`), `diag` holds one sentence for the user (read it with
     /// `platform.elf.diagText`), ready to show like `Outcome.message`.
     pub fn initDiag(a: std.mem.Allocator, io: std.Io, cfg: Config, diag: *[256]u8) InitError!*BuildService {
         try checkConfig(cfg, diag);
@@ -444,17 +456,24 @@ pub const BuildService = struct {
             .path = .full,
             .ms = 0,
         };
-        self.buildInner(&o) catch |err| {
+        var stale: Stale = .{};
+        self.buildInner(&o, &stale) catch |err| {
             o.ok = false;
             if (o.message == null) o.message = std.fmt.allocPrint(self.a, "The build of {s} failed: {t}.", .{
                 self.cfg.paths.roots.project.bytes, err,
             }) catch null;
+            // The fast path was dropped even though the full build failed.
+            if (stale.found and !stale.noted) addStaleNote(self.a, &o) catch {};
         };
         o.ms = timer.ms();
         return o;
     }
 
-    fn buildInner(self: *BuildService, o: *Outcome) !void {
+    /// Whether this build's incremental output failed the table check, and
+    /// whether `stale_note` is already in the outcome.
+    const Stale = struct { found: bool = false, noted: bool = false };
+
+    fn buildInner(self: *BuildService, o: *Outcome, stale: *Stale) !void {
         const a = self.a;
         var arena_state = std.heap.ArenaAllocator.init(a);
         defer arena_state.deinit();
@@ -469,8 +488,7 @@ pub const BuildService = struct {
         var ws = try self.prepareWorkspace(sc, o);
         defer ws.deinit(a);
 
-        var stale = false;
-        if (try self.incrementalBuild(arena, &ws, zig, &sc.build_id, o, &stale)) {
+        if (try self.incrementalBuild(arena, &ws, zig, &sc.build_id, o, &stale.found)) {
             // TODO(Stage 4): compare each script's layout hash in the table
             // with the previous generation's (spec section 5).
         } else {
@@ -480,7 +498,10 @@ pub const BuildService = struct {
         }
         if (o.ok) self.last_build_id = sc.build_id;
         try appendProblems(a, o, sc.problems);
-        if (stale) try addStaleNote(a, o);
+        if (stale.found) {
+            try addStaleNote(a, o);
+            stale.noted = true;
+        }
         // Last, after every step that can fail: a failed build reports its
         // own error, and the notice stays pending for the next outcome.
         if (o.path == .full and o.message == null) o.message = try self.takeNotice();
@@ -662,11 +683,11 @@ pub const BuildService = struct {
         defer platform.loader.close(lib);
         const describe = platform.loader.lookup(lib, *const fn () callconv(.c) *const abi.Table, "ziggurat_describe") orelse return false;
         const table = describe();
-        const stamp = self.cfg.expected_stamp orelse table.layout_stamp;
+        const stamp = self.cfg.expected_stamp orelse return false;
         abi.validate(arena, table, stamp, .{}, &diag) catch return false;
         const own = (table.build_id.ptr orelse return false)[0..table.build_id.len];
         const previous = self.last_build_id orelse @as([16]u8, @splat(0));
-        const seen: []const u8 = if (self.cfg.test_stale_build_id) &previous else own;
+        const seen: []const u8 = if (builtin.is_test and self.cfg.test_stale_build_id) &previous else own;
         return std.mem.eql(u8, seen, build_id);
     }
 
@@ -887,13 +908,17 @@ pub const BuildService = struct {
 };
 
 /// Checks what `init` cannot work without; see `BuildService.initDiag`.
-fn checkConfig(cfg: Config, diag: *[256]u8) error{ MissingSdkModule, TargetNotHost }!void {
+fn checkConfig(cfg: Config, diag: *[256]u8) error{ MissingSdkModule, TargetNotHost, MissingExpectedStamp }!void {
     const t = cfg.target;
     if (t.os.tag != builtin.os.tag or t.cpu.arch != builtin.cpu.arch) {
         platform.elf.setDiag(diag, "The build target {t}-{t} is not this machine's target {t}-{t}; Ziggurat builds only for the machine it runs on.", .{
             t.cpu.arch, t.os.tag, builtin.cpu.arch, builtin.os.tag,
         });
         return error.TargetNotHost;
+    }
+    if (cfg.check_tables and cfg.expected_stamp == null) {
+        platform.elf.setDiag(diag, "The table check is on but no expected layout stamp is set; set Config.expected_stamp.", .{});
+        return error.MissingExpectedStamp;
     }
     for (cfg.sdk) |m| {
         if (std.mem.eql(u8, m.name, "ziggurat")) return;
@@ -1157,6 +1182,20 @@ test "init refuses an sdk list without a ziggurat module" {
         platform.elf.diagText(&diag),
     );
     try testing.expectError(error.MissingSdkModule, BuildService.init(a, testing.io, testConfig("/p", &.{})));
+    try testing.expectEqual(@as(u32, 0), liveThreads());
+}
+
+test "init refuses the table check without an expected stamp" {
+    const a = testing.allocator;
+    var diag: [256]u8 = undefined;
+    const sdk = [_]workspace.ModuleDep{.{ .name = "ziggurat", .root = .fromTrusted("/sdk/z.zig"), .deps = &.{} }};
+    var cfg = testConfig("/p", &sdk);
+    cfg.check_tables = true;
+    try testing.expectError(error.MissingExpectedStamp, BuildService.initDiag(a, testing.io, cfg, &diag));
+    try testing.expectEqualStrings(
+        "The table check is on but no expected layout stamp is set; set Config.expected_stamp.",
+        platform.elf.diagText(&diag),
+    );
     try testing.expectEqual(@as(u32, 0), liveThreads());
 }
 

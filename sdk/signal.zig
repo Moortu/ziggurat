@@ -167,23 +167,35 @@ fn fail(comptime S: type, comptime sentence: []const u8) noreturn {
 }
 
 /// The project-relative path of `S`: the one descriptor in the generated
-/// root (`pub const s<i>`) whose path gives `@typeName(S)`, or null.
+/// root (`pub const s<i>`) whose path gives `@typeName(S)`, or null. The
+/// branch quota grows with the number of root declarations; a path whose
+/// length cannot match is skipped before any per-byte work.
 fn scriptRel(comptime S: type) ?[]const u8 {
-    @setEvalBranchQuota(100_000);
     const root = @import("root");
     if (@typeInfo(root) != .@"struct") return null;
+    const decls = @typeInfo(root).@"struct".decl_names;
     const want = @typeName(S);
+    @setEvalBranchQuota(10_000 + decls.len * (100 + 4 * want.len));
     var found: ?[]const u8 = null;
-    for (@typeInfo(root).@"struct".decl_names) |d| {
+    for (decls) |d| {
         if (!isScriptDecl(d)) continue;
         const v = @field(root, d);
         if (@TypeOf(v) != abi.ScriptDesc) continue;
         const rel = (v.path.ptr orelse continue)[0..v.path.len];
-        if (!std.mem.eql(u8, typeNameOf(rel), want)) continue;
+        if (rel.len != want.len + ".zig".len or !std.mem.endsWith(u8, rel, ".zig")) continue;
+        if (!sameTypeName(rel[0..want.len], want)) continue;
         if (found != null) return null;
         found = rel;
     }
     return found;
+}
+
+/// True when the path stem `stem` gives the type name `want` (`/` as `.`).
+fn sameTypeName(comptime stem: []const u8, comptime want: []const u8) bool {
+    for (stem, want) |c, w| {
+        if ((if (c == '/') '.' else c) != w) return false;
+    }
+    return true;
 }
 
 /// True for `s` followed by digits, the generated root's descriptor names.
@@ -191,13 +203,4 @@ fn isScriptDecl(comptime d: []const u8) bool {
     if (d.len < 2 or d[0] != 's') return false;
     for (d[1..]) |c| if (!std.ascii.isDigit(c)) return false;
     return true;
-}
-
-/// `@typeName` of the file at `rel` in the root module: `a/b.zig` gives `a.b`.
-fn typeNameOf(comptime rel: []const u8) []const u8 {
-    const stem = if (std.mem.endsWith(u8, rel, ".zig")) rel[0 .. rel.len - 4] else rel;
-    var out: [stem.len]u8 = undefined;
-    for (stem, 0..) |c, i| out[i] = if (c == '/') '.' else c;
-    const final = out;
-    return &final;
 }

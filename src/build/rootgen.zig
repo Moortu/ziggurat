@@ -27,7 +27,9 @@
 //!     path, size, times and inode of every scanned file) that the SDK
 //!     stores in `Table.build_id`. After an incremental update the build
 //!     service reads the id back from the staged library to catch a compiler
-//!     that kept stale code.
+//!     that kept stale code. Limit: the id covers only the scanned `.zig`
+//!     files, not `@embedFile` data, helpers outside the script folders or
+//!     SDK edits, so a stale export after only such an edit goes unnoticed.
 //!   - `ziggurat.HostApi` and `ziggurat.moduleInit(api: *const ziggurat.HostApi, gen: u32) void`.
 //!   - `HostApi` and `Table` cross a `dlopen` boundary into a host that is
 //!     compiled separately, so their layout must be `extern` (or `packed`

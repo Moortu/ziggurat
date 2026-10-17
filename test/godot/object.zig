@@ -171,9 +171,14 @@ test "curated godot surface" {
         }
         // 1036 engine classes in 4.7.2, minus ClassDB, GDExtension and GDExtensionManager.
         if (classes != 1033) @compileError(std.fmt.comptimePrint("ziggurat.godot has {d} engine classes", .{classes}));
-        // 34 builtin value types and 20 global enums.
-        if (others != 54) @compileError(std.fmt.comptimePrint("ziggurat.godot has {d} other types", .{others}));
-        for ([_][]const u8{ "ClassDB", "ClassDb", "GDExtension", "GDExtensionManager", "Variant", "Registry", "class", "builtin", "global", "extension", "raw", "c", "heap", "testing" }) |name| {
+        // 33 builtin value types, 20 global enums, the SDK's Callable and ClassDB.
+        if (others != 55) @compileError(std.fmt.comptimePrint("ziggurat.godot has {d} other types", .{others}));
+        // No raw-function Callables, no registration.
+        if (@hasDecl(g.Callable, "fromClosure")) @compileError("ziggurat.godot.Callable must not have fromClosure");
+        for ([_][]const u8{ "registerClass", "registerMethod", "unregisterClass" }) |name| {
+            if (@hasDecl(g.ClassDB, name)) @compileError("ziggurat.godot.ClassDB must not have " ++ name);
+        }
+        for ([_][]const u8{ "ClassDb", "GDExtension", "GDExtensionManager", "Variant", "Registry", "class", "builtin", "global", "extension", "raw", "c", "heap", "testing" }) |name| {
             if (@hasDecl(g, name)) @compileError("ziggurat.godot must not declare " ++ name);
         }
     }
@@ -183,6 +188,39 @@ test "curated godot surface" {
     try testing.expect(g.Transform2D == godot.builtin.Transform2d);
     try testing.expect(g.RID == godot.builtin.Rid);
     try testing.expect(g.MIDIMessage == godot.global.MidiMessage);
+}
+
+test "sdk Callable calls a method on a Node" {
+    const g = ziggurat.godot;
+    const node = Node.init();
+    defer free(node); // frees the child too
+    node.addChild(Node.init(), .{});
+    var c = g.Callable.init(node, "get_child_count");
+    defer c.deinit();
+    try testing.expect(c.engine().isValid());
+    var args = godot.builtin.Array.init();
+    defer args.deinit();
+    var r = c.engine().callv(args);
+    defer destroyVariant(&r);
+    var count: i64 = -1;
+    try testing.expect(convert.read(i64, &r, &count) == null);
+    try testing.expectEqual(@as(i64, 1), count);
+}
+
+test "sdk ClassDB: classExists, isParentClass, instantiate" {
+    const g = ziggurat.godot;
+    const SN = godot.builtin.StringName;
+    try testing.expect(g.ClassDB.classExists(SN.fromComptimeLatin1("Node2D")));
+    try testing.expect(!g.ClassDB.classExists(SN.fromComptimeLatin1("NoSuchClassAtAll")));
+    try testing.expect(g.ClassDB.isParentClass(SN.fromComptimeLatin1("Node2D"), SN.fromComptimeLatin1("Node")));
+    try testing.expect(g.ClassDB.classHasMethod(SN.fromComptimeLatin1("Node"), SN.fromComptimeLatin1("get_child_count"), false));
+
+    const o = g.ClassDB.instantiate(SN.fromComptimeLatin1("Node2D")) orelse return error.NoInstance;
+    defer free(o);
+    try testing.expect(o.isClass(SN.fromComptimeLatin1("Node2D")));
+    // RefCounted classes are refused (their only reference would be a temporary).
+    try testing.expect(g.ClassDB.instantiate(SN.fromComptimeLatin1("RefCounted")) == null);
+    try testing.expect(g.ClassDB.instantiate(SN.fromComptimeLatin1("Resource")) == null);
 }
 
 test "object round trips" {

@@ -63,7 +63,7 @@ pub const GenerationStore = struct {
     /// Lowest number the next `stage` may use; raised by `remove`, so a
     /// removed generation's number (and its library path, which a process
     /// may have loaded once) is never reused by this store.
-    min_next: u32 = 1,
+    min_next: u64 = 1,
 
     /// Borrows `root` and `stem`; both must outlive the store. Creates nothing
     /// on disk until the first `stage`.
@@ -109,7 +109,10 @@ pub const GenerationStore = struct {
             elf.setDiag(diag, "The generation numbers under {s} are used up.", .{gen_root.bytes});
             return error.GenerationOverflow;
         };
-        const n = @max(after_last, self.min_next);
+        const n = std.math.cast(u32, @max(after_last, self.min_next)) orelse {
+            elf.setDiag(diag, "The generation numbers under {s} are used up.", .{gen_root.bytes});
+            return error.GenerationOverflow;
+        };
 
         var nb: [16]u8 = undefined;
         const n_name = try std.fmt.bufPrint(&nb, "{d}", .{n});
@@ -151,7 +154,7 @@ pub const GenerationStore = struct {
     pub fn remove(self: *GenerationStore, n: u32) !void {
         var store_lock = try self.lockStore(.exclusive);
         defer store_lock.release();
-        self.min_next = @max(self.min_next, n +| 1);
+        self.min_next = @max(self.min_next, @as(u64, n) + 1);
         if (!try self.deleteIfUnpinned(n)) return error.Pinned;
     }
 
@@ -457,6 +460,11 @@ test "remove deletes and never reuses the number" {
     try s.remove(2);
     try std.testing.expect(!try genExists(a, &f, 2));
     try std.testing.expectEqual(@as(u32, 3), try stageOne(a, &s, built));
+    // Past the last number, stage refuses instead of reusing one.
+    const keep = s.min_next;
+    s.min_next = @as(u64, std.math.maxInt(u32)) + 1;
+    try std.testing.expectError(error.GenerationOverflow, s.stage(built, &.{}));
+    s.min_next = keep;
     // A pinned generation is kept.
     var l = try s.pin(3);
     try std.testing.expectError(error.Pinned, s.remove(3));
