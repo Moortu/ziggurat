@@ -33,14 +33,7 @@ const File = struct { rel: []const u8, data: []const u8 };
 
 /// The layout stamp a host built with this compiler for this machine
 /// expects, computed as the host computes it.
-const host_stamp: u64 = abi.layoutStamp(.{
-    .api_json_sha256 = &sdk_options.api_json_sha256,
-    .interface_h_sha256 = &sdk_options.interface_h_sha256,
-    .zig_version = builtin.zig_version_string,
-    .target = abi.stampTarget(builtin.target),
-    .precision = sdk_options.precision,
-    .sdk_version = sdk_options.sdk_version,
-});
+const host_stamp: u64 = abi.expectedStamp(sdk_options);
 
 /// Service options the tests set beyond the defaults.
 const Opts = struct {
@@ -764,6 +757,55 @@ const bad_scripts = [_]BadScript{
         .sentence = "Signal 'hit' argument 'amount' has type u64, which Godot cannot hold.",
         .decl = "pub const signals",
     },
+    // Names, strings and counts the host's validator would refuse. A name
+    // that is not an identifier has no line to point at: line 1.
+    .{
+        .rel = "spaced_field.zig",
+        .data = prelude ++
+            \\pub const extends = g.Node;
+            \\@"max hp": i32 = 0,
+            \\
+        ,
+        .sentence = "Field 'max hp' needs an identifier name (letters, digits and '_', not starting with a digit).",
+        .decl = "const z",
+    },
+    .{
+        .rel = "spaced_signal_arg.zig",
+        .data = prelude ++
+            \\pub const extends = g.Node;
+            \\
+            \\pub const signals = struct {
+            \\    pub const hit = struct { @"a b": i32 };
+            \\};
+            \\
+        ,
+        .sentence = "Signal 'hit' argument 'a b' needs an identifier name (letters, digits and '_', not starting with a digit).",
+        .decl = "pub const signals",
+    },
+    .{
+        .rel = "many_args.zig",
+        .data = many_args_script,
+        .sentence = "Method 'many' takes 65 arguments; Godot allows at most 64.",
+        .decl = "pub fn many",
+    },
+    .{
+        .rel = "long_hint.zig",
+        .data = prelude ++
+            \\pub const extends = g.Node;
+            \\speed: f32 = 1,
+            \\pub const meta = .{ .speed = .{ .hint_string = &@as([4097]u8, @splat('x')) } };
+            \\
+        ,
+        .sentence = "The hint string of 'speed' is 4097 bytes long; the limit is 4096.",
+        .decl = "speed:",
+    },
+};
+
+/// A method with 65 parameters, one above the validator's limit.
+const many_args_script = blk: {
+    var s: []const u8 = prelude ++ "pub const extends = g.Node;\npub fn many(self: *@This()";
+    for (0..65) |_| s = s ++ ", _: i32";
+    break :blk s ++ ") void {\n    _ = self;\n}\n";
 };
 
 fn lineOf(text: []const u8, prefix: []const u8) u32 {
@@ -1058,6 +1100,87 @@ test "integration: stale table is caught" {
     try expectGenGone(store, 2);
     try std.Io.Dir.cwd().access(io, o2.generation.?.lib.bytes, .{});
     try testing.expectEqual(@as(u32, 1), h.svc.stats().session_deaths);
+}
+
+/// A script named `class` whose body changes with `n`.
+fn namedScript(a: std.mem.Allocator, class: []const u8, n: i32) ![]const u8 {
+    return std.fmt.allocPrint(a,
+        \\const z = @import("ziggurat");
+        \\pub const extends = z.godot.Node;
+        \\pub const class_name = "{s}";
+        \\base: *z.godot.Node,
+        \\hp: i32 = {d},
+        \\
+    , .{ class, n });
+}
+
+const duplicate_sentence = "The table has two scripts with the class name \"Hero\": \"a_hero.zig\" and \"b_hero.zig\".";
+
+test "integration: invalid table fails the full build" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Two scripts with one class name: the SDK compiles it, the validator
+    // refuses it, and a rebuild would not change that.
+    var h: Harness = undefined;
+    try h.initOpts(&.{
+        .{ .rel = "a_hero.zig", .data = try namedScript(a, "Hero", 0) },
+        .{ .rel = "b_hero.zig", .data = try namedScript(a, "Hero", 0) },
+    }, .{ .check_tables = true });
+    defer h.deinit();
+    const o = try h.build(.open);
+    try testing.expect(!o.ok);
+    try testing.expectEqual(service.BuildPath.full, o.path);
+    try testing.expect(o.generation == null);
+    try testing.expectEqualStrings(duplicate_sentence, o.message.?);
+    try testing.expect(h.svc.stats().table_check_us > 0);
+    try testing.expectEqual(@as(u32, 0), h.svc.stats().session_deaths);
+    const store = try std.fs.path.join(a, &.{ try h.tmp.dir.realPathFileAlloc(io, ".", a), "store" });
+    try expectGenGone(store, 1);
+}
+
+test "integration: invalid table fails the incremental build" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var h: Harness = undefined;
+    try h.initOpts(&.{
+        .{ .rel = "a_hero.zig", .data = try namedScript(a, "Hero", 0) },
+        .{ .rel = "b_hero.zig", .data = try namedScript(a, "Villain", 0) },
+    }, .{ .check_tables = true });
+    defer h.deinit();
+    const o1 = try h.build(.open);
+    try expectOk(o1);
+    // Full builds are checked too.
+    try testing.expect(h.svc.stats().table_check_us > 0);
+    try h.svc.waitWarm(build_wait_ms);
+
+    // The edit makes the table invalid: the build fails with the
+    // validator's sentence, on the incremental path, with no full rebuild.
+    try h.write("b_hero.zig", try namedScript(a, "Hero", 1));
+    const o2 = try h.build(.save);
+    try testing.expect(!o2.ok);
+    try testing.expectEqual(service.BuildPath.incremental, o2.path);
+    try testing.expect(o2.generation == null);
+    try testing.expectEqualStrings(duplicate_sentence, o2.message.?);
+    try testing.expectEqual(@as(u32, 0), h.svc.stats().session_deaths);
+    const store = try std.fs.path.join(a, &.{ try h.tmp.dir.realPathFileAlloc(io, ".", a), "store" });
+    try expectGenGone(store, 2);
+
+    // The server is still warm: the fix builds incrementally.
+    try h.write("b_hero.zig", try namedScript(a, "Villain", 2));
+    const o3 = try h.build(.save);
+    try expectOk(o3);
+    try testing.expectEqual(service.BuildPath.incremental, o3.path);
+    try testing.expect(o3.message == null);
+    try testing.expectEqual(@as(u32, 3), o3.generation.?.n);
+    try testing.expectEqual(@as(u32, 0), h.svc.stats().session_deaths);
 }
 
 /// Runs `argv`; it must print `Zig panic: probe` on stderr and die from a signal.

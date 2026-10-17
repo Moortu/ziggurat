@@ -30,16 +30,25 @@
 //!   Each reason is told at most once per service. A build that fails with
 //!   an error (also OutOfMemory) reports that error and leaves the notice
 //!   pending.
-//! - With `Config.check_tables`, every incremental update is checked before
-//!   it is handed out: the staged library is loaded (`RTLD_LOCAL`), its
-//!   `ziggurat_describe` table is validated (`ziggurat_abi.validate`, with
-//!   `Config.expected_stamp`) and its build id must be the one this build
-//!   wrote into the root (Stage 0 found that the incremental compiler can
-//!   keep a stale export). `ziggurat_init` is never called. When the check
-//!   fails, the generation is deleted, the server counts a death and the
-//!   same request is built on the full path; that outcome carries
-//!   `stale_note` (also when that full build fails). `init` refuses
-//!   `check_tables` without `expected_stamp`.
+//! - With `Config.check_tables`, every update (incremental and full) is
+//!   checked before it is handed out: the staged library is loaded
+//!   (`RTLD_LOCAL`), its `ziggurat_describe` table is validated
+//!   (`ziggurat_abi.validate`, with `Config.expected_stamp`) and its build id
+//!   must be the one this build wrote into the root (Stage 0 found that the
+//!   incremental compiler can keep a stale export). `ziggurat_init` is never
+//!   called. The check tells two faults apart:
+//!   - invalid: the library does not load, has no table, or the table fails
+//!     validation (for example two scripts with one class name, or a stamp
+//!     mismatch). Rebuilding would give the same table, so the build fails
+//!     with the validator's sentence as `message`, the generation is
+//!     deleted, and nothing else happens: no death is counted and the warm
+//!     server stays.
+//!   - stale: the table validates, but after an incremental update its build
+//!     id is not this build's. The generation is deleted, the server counts
+//!     a death and the same request is built on the full path; that outcome
+//!     carries `stale_note` (also when that full build fails). A full build
+//!     whose build id does not match fails as invalid.
+//!   `init` refuses `check_tables` without `expected_stamp`.
 //!   Loading each checked build into the editor process has side effects:
 //!   the library's `.init_array` constructors run on every check (Zig code
 //!   has none, but C code a project links in would run its constructors in
@@ -125,7 +134,7 @@ pub const Stats = struct {
 
 /// The note an outcome carries when an incremental update failed the table
 /// check and the request was built on the full path instead.
-pub const stale_note = "The fast rebuild returned stale or invalid code, so this build ran in full.";
+pub const stale_note = "The fast rebuild returned stale code, so this build ran in full.";
 
 /// File stem of the staged library (`--name zmod` in `Workspace.argv`).
 pub const lib_stem = "zmod";
@@ -167,18 +176,19 @@ pub const Config = struct {
     /// assertion catches it). `request` is fine.
     on_outcome: ?*const fn (ctx: ?*anyopaque, o: *const Outcome) void = null,
     on_outcome_ctx: ?*anyopaque = null,
-    /// Check the table of every incremental update before handing it out
-    /// (see the file comment). Needs the real SDK: the stub SDK's table has
+    /// Check the table of every update before handing it out (see the file
+    /// comment). Needs the real SDK: the stub SDK's table has
     /// no `Table` layout.
     check_tables: bool = false,
-    /// The layout stamp the host expects in the table: `ziggurat_abi.layoutStamp`
-    /// over the SDK's facts with `ziggurat_abi.stampTarget(builtin.target)`.
+    /// The layout stamp the host expects in the table:
+    /// `ziggurat_abi.expectedStamp(sdk_options)` of the SDK being built against.
     /// Required when `check_tables` is set (`init` refuses the config
     /// otherwise with `error.MissingExpectedStamp`).
     expected_stamp: ?u64 = null,
     /// TEST ONLY, and read only in test builds (`builtin.is_test`). The
-    /// table check sees the build id of the previous build instead of the
-    /// table's own, as it would when the compiler kept stale code.
+    /// table check of an incremental update sees the build id of the
+    /// previous build instead of the table's own, as it would when the
+    /// compiler kept stale code.
     test_stale_build_id: bool = false,
 };
 
@@ -493,7 +503,7 @@ pub const BuildService = struct {
             // with the previous generation's (spec section 5).
         } else {
             o.path = .full;
-            try self.fullBuild(arena, &ws, zig, o);
+            try self.fullBuild(arena, &ws, zig, &sc.build_id, o);
             if (o.ok) self.startWarm(&ws, zig);
         }
         if (o.ok) self.last_build_id = sc.build_id;
@@ -581,7 +591,7 @@ pub const BuildService = struct {
     }
 
     /// A fresh non-incremental compiler for one update; it exits afterwards.
-    fn fullBuild(self: *BuildService, arena: std.mem.Allocator, ws: *const workspace.Workspace, zig: ZigInstall, o: *Outcome) !void {
+    fn fullBuild(self: *BuildService, arena: std.mem.Allocator, ws: *const workspace.Workspace, zig: ZigInstall, build_id: []const u8, o: *Outcome) !void {
         const a = self.a;
         const mode = backend.policy(self.cfg.target, .session_start, self.cfg.policy_override);
         const argv = try ws.argv(arena, zig, mode);
@@ -606,11 +616,22 @@ pub const BuildService = struct {
             },
             else => return err,
         };
+        if (o.ok and self.cfg.check_tables) {
+            switch (self.checkTable(arena, o.generation.?, build_id, false)) {
+                .ok => {},
+                .stale => unreachable,
+                .invalid => |sentence| {
+                    self.discardGeneration(o);
+                    o.message = try self.a.dupe(u8, sentence.text());
+                },
+            }
+        }
     }
 
     /// Serves the request with the warm incremental server. False when there
-    /// is none, it died, or its output failed the table check (then `stale`
-    /// is set); the caller then takes the full path.
+    /// is none, it died, or its output was stale (then `stale` is set); the
+    /// caller then takes the full path. An invalid table is served: the
+    /// build fails with the validator's sentence.
     fn incrementalBuild(
         self: *BuildService,
         arena: std.mem.Allocator,
@@ -652,25 +673,58 @@ pub const BuildService = struct {
             else => return err,
         };
         if (o.ok and self.cfg.check_tables) {
-            const gen = o.generation.?;
-            if (!self.checkTable(arena, gen, build_id)) {
-                // Never handed out: delete it, and treat the server as dead.
-                self.store.remove(gen.n) catch {};
-                gen.deinit(self.a);
-                o.generation = null;
-                o.ok = false;
-                stale.* = true;
-                self.dropWarm(true);
-                return false;
+            switch (self.checkTable(arena, o.generation.?, build_id, true)) {
+                .ok => {},
+                .stale => {
+                    // Never handed out: delete it, and treat the server as dead.
+                    self.discardGeneration(o);
+                    stale.* = true;
+                    self.dropWarm(true);
+                    return false;
+                },
+                .invalid => |sentence| {
+                    // A fault in the module, not in the server: fail the
+                    // build and keep the server.
+                    self.discardGeneration(o);
+                    o.message = try self.a.dupe(u8, sentence.text());
+                },
             }
         }
         return true;
     }
 
+    /// Deletes the staged generation of a build that must not be handed out
+    /// and marks the build failed.
+    fn discardGeneration(self: *BuildService, o: *Outcome) void {
+        const gen = o.generation.?;
+        self.store.remove(gen.n) catch {};
+        gen.deinit(self.a);
+        o.generation = null;
+        o.ok = false;
+    }
+
+    /// One sentence for the user, NUL-padded.
+    const Sentence = struct {
+        buf: [256]u8,
+
+        fn text(s: *const Sentence) []const u8 {
+            return std.mem.sliceTo(&s.buf, 0);
+        }
+    };
+
+    const TableCheck = union(enum) {
+        ok,
+        /// The table validates but carries another build's id.
+        stale,
+        /// The library or its table would be refused by the host.
+        invalid: Sentence,
+    };
+
     /// Loads the staged library of `gen`, validates the table that
     /// `ziggurat_describe` returns and compares its build id with
-    /// `build_id`. True when all of it passes. Never calls `ziggurat_init`.
-    fn checkTable(self: *BuildService, arena: std.mem.Allocator, gen: Generation, build_id: []const u8) bool {
+    /// `build_id`. Never calls `ziggurat_init`. `incremental` says which
+    /// path built it: only an incremental build id mismatch is `stale`.
+    fn checkTable(self: *BuildService, arena: std.mem.Allocator, gen: Generation, build_id: []const u8, incremental: bool) TableCheck {
         const t0 = std.Io.Clock.awake.now(self.io);
         defer {
             const us = t0.durationTo(std.Io.Clock.awake.now(self.io)).toMicroseconds();
@@ -678,17 +732,32 @@ pub const BuildService = struct {
             defer self.mu.unlock(self.io);
             self.table_check_us = @intCast(@max(us, 0));
         }
+        var s: Sentence = undefined;
         var diag: [256]u8 = undefined;
-        const lib = platform.loader.open(arena, self.io, gen.lib, &diag) catch return false;
+        const lib = platform.loader.open(arena, self.io, gen.lib, &diag) catch {
+            platform.elf.setDiag(&s.buf, "The built library {s} could not be loaded for its table check: {s}", .{ gen.lib.bytes, platform.elf.diagText(&diag) });
+            return .{ .invalid = s };
+        };
         defer platform.loader.close(lib);
-        const describe = platform.loader.lookup(lib, *const fn () callconv(.c) *const abi.Table, "ziggurat_describe") orelse return false;
+        const describe = platform.loader.lookup(lib, *const fn () callconv(.c) *const abi.Table, "ziggurat_describe") orelse {
+            platform.elf.setDiag(&s.buf, "The built library {s} has no ziggurat_describe export.", .{gen.lib.bytes});
+            return .{ .invalid = s };
+        };
         const table = describe();
-        const stamp = self.cfg.expected_stamp orelse return false;
-        abi.validate(arena, table, stamp, .{}, &diag) catch return false;
-        const own = (table.build_id.ptr orelse return false)[0..table.build_id.len];
+        // `init` refuses `check_tables` without a stamp.
+        const stamp = self.cfg.expected_stamp.?;
+        abi.validate(arena, table, stamp, .{}, &s.buf) catch |err| {
+            if (err == error.OutOfMemory) platform.elf.setDiag(&s.buf, "The table check ran out of memory.", .{});
+            return .{ .invalid = s };
+        };
+        // Validated: the build id is a readable string.
+        const own = if (table.build_id.len == 0) "" else table.build_id.ptr.?[0..table.build_id.len];
         const previous = self.last_build_id orelse @as([16]u8, @splat(0));
-        const seen: []const u8 = if (builtin.is_test and self.cfg.test_stale_build_id) &previous else own;
-        return std.mem.eql(u8, seen, build_id);
+        const seen: []const u8 = if (builtin.is_test and incremental and self.cfg.test_stale_build_id) &previous else own;
+        if (std.mem.eql(u8, seen, build_id)) return .ok;
+        if (incremental) return .stale;
+        platform.elf.setDiag(&s.buf, "The full build's table has build id \"{f}\", but this build wrote \"{s}\" into the root.", .{ std.zig.fmtString(seen[0..@min(seen.len, 32)]), build_id });
+        return .{ .invalid = s };
     }
 
     /// One update on `s`: decodes errors into `o.diagnostics`, or stages the

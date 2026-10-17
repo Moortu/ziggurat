@@ -267,3 +267,130 @@ test "makeTable: header, every fixture script, validate" {
         return err;
     };
 }
+
+// ---- the SDK writes, the validator reads ----
+
+/// A script at or near every limit the validator checks: a 4096-byte hint
+/// string, a 64-argument method and signal, a large enum hint, groups,
+/// name overrides, every handle hint.
+const Stress = struct {
+    pub const extends = godot.class.Node2d;
+    pub const class_name = "Stress";
+    pub const signals = struct {
+        pub const wide = struct {
+            s0: i32,
+            s1: i32,
+            s2: i32,
+            s3: i32,
+            s4: i32,
+            s5: i32,
+            s6: i32,
+            s7: i32,
+            s8: i32,
+            s9: i32,
+            s10: i32,
+            s11: i32,
+            s12: i32,
+            s13: i32,
+            s14: i32,
+            s15: i32,
+            s16: i32,
+            s17: i32,
+            s18: i32,
+            s19: i32,
+            s20: i32,
+            s21: i32,
+            s22: i32,
+            s23: i32,
+            s24: i32,
+            s25: i32,
+            s26: i32,
+            s27: i32,
+            s28: i32,
+            s29: i32,
+            s30: i32,
+            s31: i32,
+            s32: i32,
+            s33: i32,
+            s34: i32,
+            s35: i32,
+            s36: i32,
+            s37: i32,
+            s38: i32,
+            s39: i32,
+            s40: i32,
+            s41: i32,
+            s42: i32,
+            s43: i32,
+            s44: i32,
+            s45: i32,
+            s46: i32,
+            s47: i32,
+            s48: i32,
+            s49: i32,
+            s50: i32,
+            s51: i32,
+            s52: i32,
+            s53: i32,
+            s54: i32,
+            s55: i32,
+            s56: i32,
+            s57: i32,
+            s58: i32,
+            s59: i32,
+            s60: i32,
+            s61: i32,
+            s62: i32,
+            s63: i32,
+        };
+        pub const target_lost = struct { who: ?*Node, why: godot.builtin.String };
+    };
+    pub const meta = .{
+        .speed = .{ .range = .{ 0, 10, 0.5 }, .group = "Motion/Fast" },
+        .accel = .{ .group = "Motion/Fast", .name = "acceleration" },
+        .note = .{ .hint = 18, .hint_string = &@as([4096]u8, @splat('h')) },
+        .wideMethod = .{ .name = "wide_method" },
+        .aimAt = .{ .args = .{ "where", "how_fast" } },
+    };
+
+    base: *godot.class.Node2d,
+    speed: f32 = 1,
+    accel: f64 = 2,
+    note: godot.builtin.String = .empty,
+    mode: enum { tag_0, tag_1, tag_2, tag_3, tag_4, tag_5, tag_6, tag_7, tag_8, tag_9, tag_10, tag_11, tag_12, tag_13, tag_14, tag_15, tag_16, tag_17, tag_18, tag_19, tag_20, tag_21, tag_22, tag_23, tag_24, tag_25, tag_26, tag_27, tag_28, tag_29, tag_30, tag_31, tag_32, tag_33, tag_34, tag_35, tag_36, tag_37, tag_38, tag_39, tag_40, tag_41, tag_42, tag_43, tag_44, tag_45, tag_46, tag_47, tag_48, tag_49, tag_50, tag_51, tag_52, tag_53, tag_54, tag_55, tag_56, tag_57, tag_58, tag_59, tag_60, tag_61, tag_62, tag_63, tag_64, tag_65, tag_66, tag_67, tag_68, tag_69, tag_70, tag_71, tag_72, tag_73, tag_74, tag_75, tag_76, tag_77, tag_78, tag_79, tag_80, tag_81, tag_82, tag_83, tag_84, tag_85, tag_86, tag_87, tag_88, tag_89, tag_90, tag_91, tag_92, tag_93, tag_94, tag_95, tag_96, tag_97, tag_98, tag_99, tag_100, tag_101, tag_102, tag_103, tag_104, tag_105, tag_106, tag_107, tag_108, tag_109, tag_110, tag_111, tag_112, tag_113, tag_114, tag_115, tag_116, tag_117, tag_118, tag_119, tag_120, tag_121, tag_122, tag_123, tag_124, tag_125, tag_126, tag_127, tag_128, tag_129, tag_130, tag_131, tag_132, tag_133, tag_134, tag_135, tag_136, tag_137, tag_138, tag_139, tag_140, tag_141, tag_142, tag_143, tag_144, tag_145, tag_146, tag_147, tag_148, tag_149, tag_150, tag_151, tag_152, tag_153, tag_154, tag_155, tag_156, tag_157, tag_158, tag_159, tag_160, tag_161, tag_162, tag_163, tag_164, tag_165, tag_166, tag_167, tag_168, tag_169, tag_170, tag_171, tag_172, tag_173, tag_174, tag_175, tag_176, tag_177, tag_178, tag_179, tag_180, tag_181, tag_182, tag_183, tag_184, tag_185, tag_186, tag_187, tag_188, tag_189, tag_190, tag_191, tag_192, tag_193, tag_194, tag_195, tag_196, tag_197, tag_198, tag_199, tag_200, tag_201, tag_202, tag_203, tag_204, tag_205, tag_206, tag_207, tag_208, tag_209, tag_210, tag_211, tag_212, tag_213, tag_214, tag_215, tag_216, tag_217, tag_218, tag_219, tag_220, tag_221, tag_222, tag_223, tag_224, tag_225, tag_226, tag_227, tag_228, tag_229, tag_230, tag_231, tag_232, tag_233, tag_234, tag_235, tag_236, tag_237, tag_238, tag_239, tag_240, tag_241, tag_242, tag_243, tag_244, tag_245, tag_246, tag_247, tag_248, tag_249, tag_250, tag_251, tag_252, tag_253, tag_254, tag_255, tag_256, tag_257, tag_258, tag_259, tag_260, tag_261, tag_262, tag_263, tag_264, tag_265, tag_266, tag_267, tag_268, tag_269, tag_270, tag_271, tag_272, tag_273, tag_274, tag_275, tag_276, tag_277, tag_278, tag_279, tag_280, tag_281, tag_282, tag_283, tag_284, tag_285, tag_286, tag_287, tag_288, tag_289, tag_290, tag_291, tag_292, tag_293, tag_294, tag_295, tag_296, tag_297, tag_298, tag_299 } = .tag_0,
+    target: ziggurat.Obj(Node) = .{},
+    skin: ziggurat.Ref(godot.class.Texture2d) = .{},
+    spot: godot.builtin.Vector2 = .{ .x = 0, .y = 0 },
+    _hidden: i64 = 0,
+
+    pub fn wideMethod(self: *Stress, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32) i64 {
+        return self._hidden;
+    }
+
+    pub fn aimAt(self: *Stress, where: godot.builtin.Vector2, how_fast: f32) void {
+        self.spot = where;
+        self.speed = how_fast;
+    }
+
+    pub fn _ready(self: *Stress) void {
+        self._hidden = 1;
+    }
+};
+
+const stress_desc = ziggurat.describe(Stress, "deep/er/stress test.zig");
+const stress_table = ziggurat.makeTable(&.{ &coin_desc, &stress_desc, &player_desc, &hud_desc, &tool_desc }, "fedcba9876543210");
+
+test "makeTable: a script at the limits validates" {
+    const d = &stress_desc;
+    try testing.expectEqual(@as(u32, 64), d.signals[0].arg_count);
+    var wide: ?abi.MethodDesc = null;
+    for (d.methods[0..d.method_count]) |m| {
+        if (std.mem.eql(u8, str(m.name), "wide_method")) wide = m;
+    }
+    try testing.expectEqual(@as(u32, 64), wide.?.arg_count);
+    var diag: [256]u8 = undefined;
+    abi.validate(std.heap.page_allocator, &stress_table, ziggurat.layout_stamp, .{}, &diag) catch |err| {
+        std.debug.print("validate: {s}\n", .{std.mem.sliceTo(&diag, 0)});
+        return err;
+    };
+}

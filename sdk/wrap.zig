@@ -2,6 +2,9 @@
 //! host calls to create and destroy instances, call methods, read and write
 //! properties and pass notifications.
 //!
+//! The host's side of these rules is the host contract in `src/abi/abi.zig`
+//! (what a host imports); keep the two in step.
+//!
 //! Host guarantees: `inst` is always a pointer that this descriptor's
 //! `create` returned and `destroy` has not freed; `create` gets the
 //! generation number the host gave `moduleInit`; calls on one instance do
@@ -149,6 +152,8 @@ pub fn Wrappers(
             ret: *anyopaque,
             err: *abi.CallError,
         ) void {
+            // Up to 64 arguments (the validator's limit) unrolled below.
+            @setEvalBranchQuota(100_000);
             const func = @field(S, d);
             const F = @TypeOf(func);
             const params = @typeInfo(F).@"fn".param_types[1..];

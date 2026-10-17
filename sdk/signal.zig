@@ -50,6 +50,8 @@ pub const EmitSignal = names.MethodBind("Object", "emit_signal", emit_signal_has
 /// `emit` through the method bind `Bind` (a `names.MethodBind`); `emit`
 /// passes `EmitSignal`. Public so tests can pass a bind Godot lacks.
 pub fn emitWith(comptime Bind: type, self: anytype, comptime signal: @EnumLiteral(), args: anytype) void {
+    // Up to 64 arguments (the validator's limit) unrolled below.
+    @setEvalBranchQuota(100_000);
     const S = comptime ScriptOf(@TypeOf(self));
     const sname = @tagName(signal);
     const Sig = comptime SignalArgs(S, sname);

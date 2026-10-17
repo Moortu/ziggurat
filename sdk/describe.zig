@@ -67,6 +67,14 @@ const not_methods = [_][]const u8{ "init", "deinit", "migrate" };
 /// the decoder then reports the error on line 1.
 const unnamed = "ziggurat_unnamed";
 
+/// The host's validator limits. `describe` and `makeTable` refuse at compile
+/// time every table the validator would refuse at load time, except two
+/// scripts with one path (the generated root never makes that) or one
+/// non-empty class name (the build service reports that from the validator).
+pub const limits: abi.Limits = .{};
+
+const identifier_rule = "letters, digits and '_', not starting with a digit";
+
 /// The descriptor of the script `S` at the project-relative path `rel`.
 pub fn describe(comptime S: type, comptime rel: []const u8) abi.ScriptDesc {
     return Script(S, rel).desc;
@@ -124,9 +132,44 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             if (!isString(@TypeOf(S.class_name)))
                 fail("class_name", "class_name must be a string.");
             const v: []const u8 = S.class_name;
+            checkLength("class_name", "class_name", v);
             if (!isIdentifier(v)) fail("class_name", "class_name '" ++ v ++ "' must be an identifier.");
             break :blk v;
         };
+
+        /// A string the descriptor holds must fit the validator's limit.
+        fn checkLength(comptime owner: []const u8, comptime what: []const u8, comptime v: []const u8) void {
+            if (v.len > limits.max_string)
+                fail(owner, std.fmt.comptimePrint("{s} is {d} bytes long; the limit is {d}.", .{ what, v.len, limits.max_string }));
+        }
+
+        /// A name the descriptor holds must be an identifier within the limit.
+        fn checkName(comptime owner: []const u8, comptime what: []const u8, comptime v: []const u8) void {
+            if (!isIdentifier(v))
+                fail(owner, what ++ " needs an identifier name (" ++ identifier_rule ++ ").");
+            checkLength(owner, what ++ " name", v);
+        }
+
+        fn checkCount(comptime n: usize, comptime max: u32, comptime what: []const u8) void {
+            if (n > max)
+                fail(unnamed, std.fmt.comptimePrint("The script has {d} {s}; Godot allows at most {d}.", .{ n, what, max }));
+        }
+
+        /// The path, the instance layout and the counts, as the validator
+        /// checks them.
+        fn checkScript() void {
+            if (rel.len == 0 or rel.len > limits.max_string or !isRelativePath(rel) or
+                std.mem.indexOfScalar(u8, rel, 0) != null or !std.unicode.utf8ValidateSlice(rel))
+                fail(unnamed, "The script path must be a relative UTF-8 path of at most 4096 bytes with non-empty parts and no '.' or '..' part.");
+            if (@sizeOf(S) > limits.max_instance_size)
+                fail(unnamed, std.fmt.comptimePrint("The script struct is {d} bytes; the limit is {d}.", .{ @sizeOf(S), limits.max_instance_size }));
+            if (@alignOf(S) > 4096)
+                fail(unnamed, std.fmt.comptimePrint("The script struct needs {d}-byte alignment; the limit is 4096.", .{@alignOf(S)}));
+            checkCount(info.field_names.len, limits.max_fields, "fields");
+            checkCount(properties.len, limits.max_properties, "properties and groups");
+            checkCount(method_decls.len, limits.max_methods, "methods");
+            checkCount(@typeInfo(Signals).@"struct".decl_names.len, limits.max_signals, "signals");
+        }
 
         const tool: bool = blk: {
             if (!isPub("tool")) break :blk false;
@@ -229,7 +272,8 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
         fn metaIdentifier(comptime owner: []const u8, comptime key: []const u8) ?[]const u8 {
             const s = metaString(owner, key) orelse return null;
             if (!isIdentifier(s))
-                fail(owner, "meta key '" ++ key ++ "' for '" ++ owner ++ "' must be an identifier, found '" ++ s ++ "'.");
+                fail(owner, "meta key '" ++ key ++ "' for '" ++ owner ++ "' must be an identifier, found '" ++ clip(s) ++ "'.");
+            checkLength(owner, "meta " ++ key ++ " for '" ++ owner ++ "'", s);
             return s;
         }
 
@@ -237,6 +281,7 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
 
         fn checkFields() void {
             for (info.field_names, info.field_types, info.field_attrs) |name, FT, attrs| {
+                checkName(name, "Field '" ++ clip(name) ++ "'", name);
                 if (attrs.@"comptime") fail(name, "Field '" ++ name ++ "' must not be comptime.");
                 if (eql(name, "base")) {
                     if (FT != *Extends)
@@ -289,6 +334,7 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             const g = metaString(name, "group") orelse return null;
             if (g.len == 0 or std.mem.indexOfScalar(u8, g, 0) != null or !std.unicode.utf8ValidateSlice(g))
                 fail(name, "meta group for '" ++ name ++ "' must be non-empty UTF-8 text without NUL bytes.");
+            checkLength(name, "meta group for '" ++ name ++ "'", g);
             return g;
         }
 
@@ -359,6 +405,9 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                 hint = h;
             }
             if (metaString(name, "hint_string")) |hs| hint_string = hs;
+            checkLength(name, "The hint string of '" ++ name ++ "'", hint_string);
+            if (std.mem.indexOfScalar(u8, hint_string, 0) != null or !std.unicode.utf8ValidateSlice(hint_string))
+                fail(name, "The hint string of '" ++ name ++ "' must be UTF-8 text without NUL bytes.");
             return .{
                 .name = str(godotFieldName(name)),
                 .field_index = fieldIndex(name).?,
@@ -453,6 +502,9 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
         fn checkMethods() void {
             for (method_decls) |d| {
                 const f = @typeInfo(@TypeOf(@field(S, d))).@"fn";
+                if (f.param_types.len - 1 > limits.max_args)
+                    fail(d, std.fmt.comptimePrint("Method '{s}' takes {d} arguments; Godot allows at most {d}.", .{ clip(d), f.param_types.len - 1, limits.max_args }));
+                checkLength(d, "The Godot name of method '" ++ clip(d) ++ "'", godotMethodName(d));
                 for (f.param_types[1..]) |maybe_p| {
                     const P = maybe_p orelse
                         fail(d, "Method '" ++ d ++ "' has a parameter of type anytype, which Godot cannot pass.");
@@ -475,6 +527,7 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                     for (0..have) |i| {
                         if (!isString(@TypeOf(args[i])) or !isIdentifier(args[i]))
                             fail(d, "meta args for '" ++ d ++ "' must be identifiers in quotes.");
+                        checkLength(d, "An argument name in meta args for '" ++ d ++ "'", args[i]);
                     }
                 }
             }
@@ -536,9 +589,13 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                 if (@TypeOf(T) != type or @typeInfo(T) != .@"struct")
                     fail("signals", "Signal '" ++ sname ++ "' must be a struct type whose fields are its arguments.");
                 if (!isIdentifier(sname))
-                    fail("signals", "Signal '" ++ sname ++ "' must have an identifier name.");
+                    fail("signals", "Signal '" ++ clip(sname) ++ "' must have an identifier name.");
+                checkLength("signals", "The name of signal '" ++ clip(sname) ++ "'", sname);
                 const si = @typeInfo(T).@"struct";
+                if (si.field_names.len > limits.max_args)
+                    fail("signals", std.fmt.comptimePrint("Signal '{s}' has {d} arguments; Godot allows at most {d}.", .{ sname, si.field_names.len, limits.max_args }));
                 for (si.field_names, si.field_types) |aname, AT| {
+                    checkName("signals", "Signal '" ++ sname ++ "' argument '" ++ clip(aname) ++ "'", aname);
                     if (!convert.supported(AT))
                         fail("signals", "Signal '" ++ sname ++ "' argument '" ++ aname ++ "' has type " ++ @typeName(AT) ++ ", which Godot cannot hold.");
                 }
@@ -646,6 +703,7 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             checkMethods();
             checkSignals();
             checkCollisions();
+            checkScript();
         }
 
         const W = wrap.Wrappers(S, rel, method_decls, properties, &defaults);
@@ -680,6 +738,41 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             };
         };
     };
+}
+
+/// Refuses at compile time a table over `descs` that is above the
+/// validator's whole-table limits: the script count, the item budget and
+/// the string byte budget (each descriptor already passed its own checks).
+pub fn checkTable(comptime descs: []const *const abi.ScriptDesc, comptime sdk_version: []const u8, comptime build_id: []const u8) void {
+    comptime {
+        @setEvalBranchQuota(100_000 + 2_000 * descs.len);
+        if (descs.len > limits.max_scripts)
+            @compileError(std.fmt.comptimePrint("ziggurat: the project has {d} scripts; the limit is {d}.", .{ descs.len, limits.max_scripts }));
+        if (build_id.len > limits.max_string or sdk_version.len > limits.max_string)
+            @compileError("ziggurat: the build id or SDK version is longer than 4096 bytes.");
+        var items: u64 = descs.len;
+        var bytes: u64 = sdk_version.len + build_id.len;
+        for (descs) |d| {
+            items += @as(u64, d.field_count) + d.property_count + d.method_count + d.signal_count;
+            bytes += d.path.len + d.class_name.len + d.base_class.len;
+            for (d.fields[0..d.field_count]) |f| bytes += f.name.len;
+            for (d.properties[0..d.property_count]) |p| bytes += p.name.len + p.class_name.len + p.hint_string.len;
+            for (d.methods[0..d.method_count]) |m| {
+                items += m.arg_count;
+                bytes += m.name.len + m.ret.name.len + m.ret.class_name.len;
+                for (m.args[0..m.arg_count]) |a| bytes += a.name.len + a.class_name.len;
+            }
+            for (d.signals[0..d.signal_count]) |g| {
+                items += g.arg_count;
+                bytes += g.name.len;
+                for (g.args[0..g.arg_count]) |a| bytes += a.name.len + a.class_name.len;
+            }
+        }
+        if (items > limits.max_total_items)
+            @compileError(std.fmt.comptimePrint("ziggurat: the project's scripts have {d} fields, properties, methods, signals and arguments in total; the limit is {d}.", .{ items, limits.max_total_items }));
+        if (bytes > limits.max_total_string_bytes)
+            @compileError(std.fmt.comptimePrint("ziggurat: the project's descriptors hold {d} bytes of names and hints; the limit is {d}.", .{ bytes, limits.max_total_string_bytes }));
+    }
 }
 
 /// Reads every scalar in `v`, so an `undefined` one is a compile error
@@ -794,6 +887,21 @@ fn isString(comptime T: type) bool {
         .one => @typeInfo(p.child) == .array and @typeInfo(p.child).array.child == u8,
         else => false,
     };
+}
+
+/// At most 64 bytes of `s` for a compile error, with "..." when cut.
+fn clip(comptime s: []const u8) []const u8 {
+    return if (s.len <= 64) s else s[0..64] ++ "...";
+}
+
+/// As the validator: `/`-separated, no empty, `.` or `..` part, no `\`.
+fn isRelativePath(s: []const u8) bool {
+    if (s.len == 0 or std.mem.indexOfScalar(u8, s, '\\') != null) return false;
+    var it = std.mem.splitScalar(u8, s, '/');
+    while (it.next()) |part| {
+        if (part.len == 0 or eql(part, ".") or eql(part, "..")) return false;
+    }
+    return true;
 }
 
 fn isIdentifier(s: []const u8) bool {

@@ -69,6 +69,7 @@ pub const layout_stamp: u64 = abi.expectedStamp(sdk_options);
 /// (incremental) rebuild the service reads the id back from the staged
 /// library: a different id means the compiler kept stale code.
 pub fn makeTable(comptime descs: []const *const ScriptDescriptor, comptime build_id: []const u8) Table {
+    comptime describe_mod.checkTable(descs, version, build_id);
     const scripts = &Scripts(descs).list;
     return .{
         .magic = abi.magic,
