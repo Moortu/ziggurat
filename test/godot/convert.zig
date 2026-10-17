@@ -471,6 +471,8 @@ test "moduleInit with the real proc table" {
     };
     ziggurat.moduleInit(&test_api, 7);
     try testing.expectEqual(@as(u32, 7), ziggurat.generation());
+    // moduleInit warmed the SDK's own caches on this (the main) thread.
+    try testing.expect(ziggurat.warm.sdkReady());
     // gdzig still works after moduleInit re-initialised it.
     var v = makeInt(11);
     defer destroy(&v);

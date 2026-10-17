@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const abi = @import("ziggurat_abi");
 const godot = @import("gdzig");
 const fmtlog = @import("fmtlog.zig");
+const warm = @import("warm.zig");
 
 pub const HostApi = abi.HostApi;
 
@@ -25,10 +26,9 @@ const line_max = 1024;
 /// on the layout: the call logs an error if the log function is inside the
 /// struct the host gave, and returns without setting anything.
 ///
-/// Lazy-cache warming belongs here. The SDK itself caches nothing beyond
-/// `StaticName` values yet; later tasks register their caches in this
-/// function, so every cache is filled on the main thread before other threads
-/// can race on it.
+/// With a real proc table it then warms the SDK's lazy caches (`warm.zig`)
+/// for every script of the generated root, so they are filled on the main
+/// thread before other threads can race on them.
 pub fn moduleInit(api: *const HostApi, generation_number: u32) void {
     if (api.size != @sizeOf(HostApi)) {
         const log_end = @offsetOf(HostApi, "log") + @sizeOf(@FieldType(HostApi, "log"));
@@ -46,6 +46,7 @@ pub fn moduleInit(api: *const HostApi, generation_number: u32) void {
     const library = api.library orelse return log(.warning, "no library: gdzig left uninitialised", .{});
     godot.raw = .init(@ptrCast(@alignCast(get_proc)), @ptrCast(library));
     godot.raw.getGodotVersion(@ptrCast(&godot.version));
+    warm.all();
 }
 
 /// The HostApi `moduleInit` stored, or null before it ran.

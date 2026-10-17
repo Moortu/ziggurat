@@ -426,6 +426,29 @@ test "ref release frees the last reference" {
     try testing.expect(!alive(e_id));
 }
 
+test "ref adopt takes over the first reference" {
+    // `init` returns a RefCounted at refcount 1 that the caller owns.
+    const c = RefCounted.init();
+    const c_id = idOf(c);
+    try testing.expectEqual(@as(i32, 1), refCount(c));
+    // `adopt` takes that reference over without adding one.
+    var h: Ref(RefCounted) = .adopt(c);
+    try testing.expect(h.get() == c);
+    try testing.expectEqual(@as(i32, 1), refCount(c));
+    // `set` still adds its own reference.
+    var other: Ref(RefCounted) = .{};
+    other.set(c);
+    try testing.expectEqual(@as(i32, 2), refCount(c));
+    other.release();
+    try testing.expectEqual(@as(i32, 1), refCount(c));
+    try testing.expect(alive(c_id));
+    // One release frees it: no reference was left behind.
+    h.release();
+    try testing.expect(!alive(c_id));
+    try testing.expect(h.get() == null);
+    h.release();
+}
+
 test "typed null object Variant" {
     // An OBJECT Variant built from a null pointer: type OBJECT, id 0.
     var v = makeObject(@as(?*anyopaque, null));

@@ -18,12 +18,16 @@ const names = @import("names.zig");
 
 const Object = godot.class.Object;
 const RefCounted = godot.class.RefCounted;
-const StringName = godot.builtin.StringName;
 
-// Thread note: the `StaticName` behind the class check and gdzig's lazy
-// method-bind cache for `is_class` are plain variables written without
-// atomics. Their first use must happen on the main thread (warm them in
-// `moduleInit`) before any other thread resolves a handle.
+// Thread note: the `StaticName` behind the class check and the `is_class`
+// method bind are plain variables written without atomics. `moduleInit`
+// fills the bind and the names of every class check a script's descriptor
+// shows (see `warm.zig`); a class used only in private fields or local
+// handles is named lazily, on first use, which must be on the main thread.
+
+/// Hash of `Object.is_class` in extension_api.json (Godot 4.7.2).
+const is_class_hash: i64 = 2619796661;
+pub const IsClass = names.MethodBind("Object", "is_class", is_class_hash);
 
 /// Marks a struct as an object handle for `convert`. Value: `.obj` or `.ref`.
 pub const handle_decl = "ziggurat_handle";
@@ -70,10 +74,15 @@ fn instanceFromId(id: u64) ?*Object {
     return @ptrCast(@alignCast(godot.raw.objectGetInstanceFromId(id)));
 }
 
-/// True when the live object `o` is a `T` or inherits from it.
+/// True when the live object `o` is a `T` or inherits from it. False when
+/// Godot has no `is_class` bind (`moduleInit` logs that once).
 fn isClassOf(comptime T: type, o: *Object) bool {
-    const name: *const StringName = @ptrCast(@alignCast(names.StaticName(engineClassName(T)).ptr()));
-    return o.isClass(name.*);
+    const bind = IsClass.get() orelse return false;
+    const name = names.StaticName(engineClassName(T)).ptr();
+    var args = [1]?*const anyopaque{name};
+    var result: bool = false;
+    godot.raw.objectMethodBindPtrcall(bind, @ptrCast(o), @ptrCast(&args), @ptrCast(&result));
+    return result;
 }
 
 /// The live object with ObjectID `id` as a `*T`, or null when the id is not
@@ -113,6 +122,10 @@ pub fn Obj(comptime T: type) type {
 
 /// An owning handle to a RefCounted object: holds one counted reference.
 /// The holder must call `release` (or `set(null)`) when done.
+///
+/// A new object comes from `T.init()` at refcount 1, owned by the caller:
+/// hand that reference to the handle with `.adopt(T.init())`. `set` is for
+/// an object someone else already holds; it adds a reference of its own.
 pub fn Ref(comptime T: type) type {
     comptime {
         requireClass(T);
@@ -124,6 +137,15 @@ pub fn Ref(comptime T: type) type {
         pub const Class = T;
 
         ptr: ?*T = null,
+
+        /// A handle that takes over the caller's reference to `o` without
+        /// adding one (Godot's first-reference semantics): for an object
+        /// fresh from `T.init()`, `var r: Ref(T) = .adopt(T.init());` and
+        /// one `release` frees it. In a field, release the old value first:
+        /// `self.r.release(); self.r = .adopt(T.init());`.
+        pub fn adopt(o: *T) @This() {
+            return .{ .ptr = o };
+        }
 
         pub fn get(self: @This()) ?*T {
             return self.ptr;

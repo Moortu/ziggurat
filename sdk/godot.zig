@@ -110,7 +110,10 @@ pub const ClassDB = struct {
     /// A new instance of `class`, owned by the caller (free a Node with
     /// `queueFree` or `free`). Null when Godot cannot instantiate it, and for
     /// RefCounted classes: their only reference would be the temporary
-    /// Variant, so build those with `T.init()` and keep them in `z.Ref`.
+    /// Variant. Build those with `T.init()`, which returns the first
+    /// reference, and hand it to a handle: `var r: z.Ref(T) = .adopt(T.init());`
+    /// (or `return .init(.adopt(T.init()));` from a method returning
+    /// `z.Owned(z.Ref(T))`). `Ref.set` would add a second reference and leak.
     pub fn instantiate(class: StringName) ?*gdzig.class.Object {
         const ref_counted = builtin.StringName.fromComptimeLatin1("RefCounted");
         if (class.eql(ref_counted) or Db.isParentClass(class, ref_counted)) return null;

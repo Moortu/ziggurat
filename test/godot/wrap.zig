@@ -212,6 +212,12 @@ const Probe = struct {
         return .init(b.String.fromUtf8("probe") catch .empty);
     }
 
+    /// A new Resource, handed over with `Owned` and built with `adopt`.
+    pub fn makeItem(self: *const Probe) ziggurat.Owned(Ref(Resource)) {
+        _ = self;
+        return .init(.adopt(Resource.init()));
+    }
+
     /// Fields returned as they are: borrowed, so the fields stay intact.
     pub fn heldName(self: *const Probe) b.String {
         return self.name;
@@ -712,6 +718,25 @@ test "wrap returns are borrowed" {
     try expectUtf8("held by the field", &got);
 }
 
+test "wrap returns an adopted Owned Ref without a leak" {
+    setup();
+    const q = try Instance(Node).init(&probe_desc);
+    defer q.deinit(&probe_desc);
+    const m = try methodIndex(&probe_desc, "make_item");
+    for (0..3) |_| {
+        var c = callMethod(&probe_desc, q.inst, m, &.{});
+        try expectCallOk(&c);
+        try testing.expectEqual(t_object, typeOf(&c.ret));
+        const id = godot.raw.variantGetObjectInstanceId.?(&c.ret);
+        const o = godot.raw.objectGetInstanceFromId(id) orelse return error.NotAlive;
+        const res: *Resource = @ptrCast(o);
+        // The result Variant holds the only reference.
+        try testing.expectEqual(@as(i32, 1), refCount(res));
+        destroy(&c.ret);
+        try testing.expect(!alive(id));
+    }
+}
+
 test "wrap setter stores with assign" {
     setup();
     const q = try Instance(Node).init(&probe_desc);
@@ -750,4 +775,72 @@ test "wrap call with null args" {
     try testing.expectEqual(abi.CallError{ .@"error" = abi.call_invalid_argument, .argument = 0, .expected = @intCast(t_int) }, err);
     try testing.expectEqual(t_nil, typeOf(&ret));
     destroy(&ret);
+}
+
+// ---- lazy caches: warm-up, and emit without a method bind ----
+
+/// A script whose class checks and signal use names no other test uses, so
+/// their caches start cold.
+const WarmProbe = struct {
+    pub const extends = Node;
+    pub const signals = struct {
+        pub const zz_warm_probe_signal = struct {};
+    };
+
+    base: *Node,
+    target: ziggurat.Obj(godot.class.Marker3d) = .{},
+
+    pub fn aim(self: *WarmProbe, at: ?*godot.class.Path3d) void {
+        _ = self;
+        _ = at;
+    }
+};
+
+/// Stands in for the generated root: descriptors as `pub const s<i>`.
+const WarmRoot = struct {
+    pub const s0 = ziggurat.describe(WarmProbe, "warm_probe.zig");
+    pub const unrelated: u32 = 5;
+};
+
+var warm_runs: u32 = 0;
+
+test "warm fills the names of a script's class checks and signals" {
+    setup();
+    const N = ziggurat.StaticName;
+    // One name spelled two ways is one cache.
+    comptime std.debug.assert(N("Marker3D") == N("Marker" ++ "3D"));
+    // The clean-exit run repeats every test; only the first starts cold.
+    warm_runs += 1;
+    if (warm_runs == 1) {
+        try testing.expect(!N("Marker3D").isReady());
+        try testing.expect(!N("Path3D").isReady());
+        try testing.expect(!N("zz_warm_probe_signal").isReady());
+    }
+    ziggurat.warm.fromRoot(WarmRoot);
+    try testing.expect(N("Marker3D").isReady());
+    try testing.expect(N("Path3D").isReady());
+    try testing.expect(N("zz_warm_probe_signal").isReady());
+    // The SDK's own method binds are filled too.
+    ziggurat.warm.sdk();
+    try testing.expect(ziggurat.warm.sdkReady());
+}
+
+const Emitter = struct {
+    pub const signals = struct {
+        pub const ping = struct { n: i32 };
+    };
+    base: *Node,
+};
+
+test "emit without a method bind logs and returns" {
+    setup();
+    const owner = Node.init();
+    defer godot.raw.objectDestroy(@ptrCast(owner));
+    var e: Emitter = .{ .base = owner };
+    // A wrong hash: Godot finds no bind (and prints why).
+    const NoBind = ziggurat.MethodBind("Object", "emit_signal", 1);
+    try testing.expect(NoBind.get() == null);
+    const before = log_count;
+    ziggurat.signal.emitWith(NoBind, &e, .ping, .{ .n = 1 });
+    try testing.expectEqual(before + 1, log_count);
 }

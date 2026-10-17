@@ -12,6 +12,11 @@
 //!   returns `Owned(T)`, and the wrapper releases that value after the
 //!   write. A new value returned without `Owned` leaks (the in-Godot leak
 //!   checks report it); it never dangles.
+//! - A new RefCounted object comes from `T.init()` with one reference that
+//!   the caller owns. Wrap it with `Ref(T).adopt`, which takes that
+//!   reference over: `return .init(.adopt(T.init()));` for a method that
+//!   returns `Owned(Ref(T))`. `Ref.set` adds a reference of its own, so
+//!   `set(T.init())` leaks one.
 const std = @import("std");
 const godot = @import("gdzig");
 const object = @import("object.zig");
@@ -41,8 +46,9 @@ fn requireOwning(comptime T: type) void {
 }
 
 /// A return value that hands a new String, StringName, NodePath or `Ref`
-/// to the caller: `return .init(s);`. The wrapper writes `value` into the
-/// result and then releases it.
+/// to the caller: `return .init(s);`, or `return .init(.adopt(T.init()));`
+/// for a new RefCounted object. The wrapper writes `value` into the result
+/// and then releases it.
 pub fn Owned(comptime T: type) type {
     comptime requireOwning(T);
     return struct {

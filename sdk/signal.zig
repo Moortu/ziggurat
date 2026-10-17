@@ -23,8 +23,9 @@
 //! method bind (gdzig's own `emit` helpers convert through `Variant.init`
 //! and read the result with `Variant.as`, which the SDK never uses). A
 //! failed emit (for example a signal the host has not registered) is logged
-//! as a warning, never a panic. The method bind is cached in a plain `var`
-//! without atomics: the first `emit` must run on the main thread.
+//! as a warning, never a panic; so is a missing method bind, which is then
+//! never called. The bind and the signal names are cached in plain `var`s
+//! without atomics; `moduleInit` fills them on the main thread (`warm.zig`).
 const std = @import("std");
 const abi = @import("ziggurat_abi");
 const godot = @import("gdzig");
@@ -39,11 +40,25 @@ const StringName = godot.builtin.StringName;
 /// Emits `signal` on the script instance `self` (a `*Script`) with `args`,
 /// a struct literal with one field per signal argument.
 pub fn emit(self: anytype, comptime signal: @EnumLiteral(), args: anytype) void {
+    emitWith(EmitSignal, self, signal, args);
+}
+
+/// Hash of `Object.emit_signal` in extension_api.json (Godot 4.7.2).
+const emit_signal_hash: i64 = 4047867050;
+pub const EmitSignal = names.MethodBind("Object", "emit_signal", emit_signal_hash);
+
+/// `emit` through the method bind `Bind` (a `names.MethodBind`); `emit`
+/// passes `EmitSignal`. Public so tests can pass a bind Godot lacks.
+pub fn emitWith(comptime Bind: type, self: anytype, comptime signal: @EnumLiteral(), args: anytype) void {
     const S = comptime ScriptOf(@TypeOf(self));
     const sname = @tagName(signal);
     const Sig = comptime SignalArgs(S, sname);
     comptime checkArgs(S, sname, Sig, @TypeOf(args));
 
+    const bind = Bind.get() orelse {
+        runtime.log(.err, "emit of signal '{s}' skipped: Godot has no method bind for Object.emit_signal.", .{sname});
+        return;
+    };
     const si = @typeInfo(Sig).@"struct";
     const n = si.field_names.len;
     var slots: [1 + n]Variant = undefined;
@@ -59,28 +74,12 @@ pub fn emit(self: anytype, comptime signal: @EnumLiteral(), args: anytype) void 
 
     var ret: Variant = undefined;
     var err: godot.c.GDExtensionCallError = undefined;
-    godot.raw.objectMethodBindCall(emitBind(), @ptrCast(self.base), @ptrCast(&ptrs), ptrs.len, @ptrCast(&ret), &err);
+    godot.raw.objectMethodBindCall(bind, @ptrCast(self.base), @ptrCast(&ptrs), ptrs.len, @ptrCast(&ret), &err);
     defer godot.raw.variantDestroy(&ret);
     var code: i64 = 0;
     const bad_ret = convert.read(i64, &ret, &code) != null;
     if (err.@"error" != 0 or bad_ret or code != 0)
         runtime.log(.warning, "emit of signal '{s}' failed (call error {d}, result {d}); is the signal registered?", .{ sname, err.@"error", code });
-}
-
-/// Hash of `Object.emit_signal` in extension_api.json (Godot 4.7.2).
-const emit_signal_hash: i64 = 4047867050;
-
-var emit_bind: godot.c.GDExtensionMethodBindPtr = null;
-
-fn emitBind() godot.c.GDExtensionMethodBindPtr {
-    if (emit_bind == null) {
-        emit_bind = godot.raw.classdbGetMethodBind(
-            @ptrCast(names.StaticName("Object").ptr()),
-            @ptrCast(names.StaticName("emit_signal").ptr()),
-            emit_signal_hash,
-        );
-    }
-    return emit_bind;
 }
 
 /// The script struct behind `self`, which must be `*S` or `*const S` for a
@@ -199,7 +198,7 @@ fn sameTypeName(comptime stem: []const u8, comptime want: []const u8) bool {
 }
 
 /// True for `s` followed by digits, the generated root's descriptor names.
-fn isScriptDecl(comptime d: []const u8) bool {
+pub fn isScriptDecl(comptime d: []const u8) bool {
     if (d.len < 2 or d[0] != 's') return false;
     for (d[1..]) |c| if (!std.ascii.isDigit(c)) return false;
     return true;

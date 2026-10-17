@@ -8,7 +8,6 @@ const abi = @import("ziggurat_abi");
 const runtime = @import("runtime.zig");
 const names = @import("names.zig");
 const describe_mod = @import("describe.zig");
-const builtin = @import("builtin");
 
 /// The curated Godot surface: engine classes, builtin value types and
 /// global enums under their Godot names, for example `ziggurat.godot.Node2D`.
@@ -27,6 +26,9 @@ pub const generation = runtime.generation;
 pub const log = runtime.log;
 pub const allocator = runtime.allocator;
 pub const StaticName = names.StaticName;
+pub const MethodBind = names.MethodBind;
+/// Warm-up of the SDK's lazy caches; `moduleInit` runs it. See `warm.zig`.
+pub const warm = @import("warm.zig");
 /// Checked conversion between Godot Variants and Zig values.
 pub const convert = @import("convert.zig");
 /// Object handles: `Obj(T)`, `Ref(T)` and the engine class check.
@@ -44,6 +46,8 @@ pub const assign = @import("own.zig").assign;
 /// Emits a signal the script declares, checked at compile time:
 /// `z.emit(self, .hit, .{ .damage = 3 })`. See `signal.zig`.
 pub const emit = @import("signal.zig").emit;
+/// What `emit` is built on; scripts call `emit`.
+pub const signal = @import("signal.zig");
 
 /// One script's descriptor (C ABI), built at compile time by `describe`.
 pub const ScriptDescriptor = abi.ScriptDesc;
@@ -57,15 +61,8 @@ pub const Table = abi.Table;
 pub const describe = describe_mod.describe;
 
 /// The layout stamp this module's table carries. A host computes the same
-/// value from its own build facts with `ziggurat_abi.layoutStamp`.
-pub const layout_stamp: u64 = abi.layoutStamp(.{
-    .api_json_sha256 = &sdk_options.api_json_sha256,
-    .interface_h_sha256 = &sdk_options.interface_h_sha256,
-    .zig_version = builtin.zig_version_string,
-    .target = abi.stampTarget(builtin.target),
-    .precision = sdk_options.precision,
-    .sdk_version = version,
-});
+/// value with `ziggurat_abi.expectedStamp(sdk_options)`.
+pub const layout_stamp: u64 = abi.expectedStamp(sdk_options);
 
 /// The table over `descs`, which the generated root passes sorted by path,
 /// with the build id the build service wrote into the root. After a fast
