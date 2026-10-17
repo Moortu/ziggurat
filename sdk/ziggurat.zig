@@ -34,6 +34,10 @@ pub const convert = @import("convert.zig");
 /// Object handles: `Obj(T)`, `Ref(T)` and the engine class check.
 pub const object = @import("object.zig");
 pub const Obj = object.Obj;
+/// An owning RefCounted handle. A RefCounted from `T.init()` or returned by
+/// an engine method (`ResourceLoader.load`, ...) carries one reference for
+/// the caller: keep it with `.adopt(p)`, not `.set(p)`, which adds another
+/// and leaks. `set` is for objects the caller does not own a reference to.
 pub const Ref = object.Ref;
 /// A return value that hands a new String, StringName, NodePath or Ref to
 /// Godot. Plain return values are borrowed (Godot copies them).

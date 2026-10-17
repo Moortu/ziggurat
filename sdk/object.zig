@@ -123,9 +123,15 @@ pub fn Obj(comptime T: type) type {
 /// An owning handle to a RefCounted object: holds one counted reference.
 /// The holder must call `release` (or `set(null)`) when done.
 ///
-/// A new object comes from `T.init()` at refcount 1, owned by the caller:
-/// hand that reference to the handle with `.adopt(T.init())`. `set` is for
-/// an object someone else already holds; it adds a reference of its own.
+/// Which call to use depends on whether the caller owns a reference:
+/// - The caller owns one: an object from `T.init()` (refcount 1), and any
+///   RefCounted an engine method returns (`ResourceLoader.load`,
+///   `Resource.duplicate`, ...; Godot adds one reference for the caller
+///   when it returns a `Ref<T>`, even when a cache also holds the object).
+///   Keep it with `.adopt(p)`, or drop it with `unreference()`; never pass
+///   it to `set`, which would leak that reference.
+/// - The caller owns none: a borrowed argument, an object read from a
+///   field or another handle. `set` adds the handle's own reference.
 pub fn Ref(comptime T: type) type {
     comptime {
         requireClass(T);
@@ -140,8 +146,8 @@ pub fn Ref(comptime T: type) type {
 
         /// A handle that takes over the caller's reference to `o` without
         /// adding one (Godot's first-reference semantics): for an object
-        /// fresh from `T.init()`, `var r: Ref(T) = .adopt(T.init());` and
-        /// one `release` frees it. In a field, release the old value first:
+        /// fresh from `T.init()` or returned by an engine method,
+        /// `var r: Ref(T) = .adopt(T.init());` and one `release` drops it. In a field, release the old value first:
         /// `self.r.release(); self.r = .adopt(T.init());`.
         pub fn adopt(o: *T) @This() {
             return .{ .ptr = o };
@@ -151,7 +157,9 @@ pub fn Ref(comptime T: type) type {
             return self.ptr;
         }
 
-        /// Takes a reference on `o`, then drops the one held on the old
+        /// For an object the caller holds no reference to (see the type's
+        /// doc; use `adopt` for `T.init()` and engine results). Takes a
+        /// reference on `o`, then drops the one held on the old
         /// object, freeing it when that was the last. Setting the object
         /// already held changes nothing. If Godot refuses the new reference
         /// (the object is already being destroyed) the handle becomes null.

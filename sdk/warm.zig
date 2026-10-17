@@ -8,8 +8,11 @@
 //!
 //! - `sdk()`: the `is_class` and `emit_signal` method binds and the names
 //!   they need, gdzig's `RefCounted` name (used by `ClassDB.instantiate`),
-//!   and gdzig's copy and destroy functions of String, StringName and
-//!   NodePath (used by `assign` and the wrappers).
+//!   gdzig's copy and destroy functions of String, StringName and NodePath
+//!   (used by `assign` and the wrappers), and the `init_ref`, `reference`
+//!   and `unreference` binds behind `Ref` (it makes and frees one
+//!   RefCounted, so it needs a running Godot that can construct objects;
+//!   `moduleInit` calls it only with a real proc table).
 //! - `fromRoot(@import("root"))`: for each script descriptor of the
 //!   generated root, the class name of every property and method argument
 //!   (the names of the class checks those values go through) and every
@@ -18,8 +21,7 @@
 //! Still lazy, so their first use must be on the main thread: class checks
 //! on types that appear in no descriptor (private fields, local handles),
 //! names given to `Callable.init`, and the method binds gdzig caches inside
-//! engine class methods (including `RefCounted.reference` and
-//! `unreference`, which `Ref` calls).
+//! other engine class methods scripts call.
 const std = @import("std");
 const abi = @import("ziggurat_abi");
 const godot = @import("gdzig");
@@ -47,6 +49,14 @@ pub fn sdk() void {
         var copy = T.copy(empty);
         copy.deinit();
     }
+    // `Ref`'s gdzig binds: `init_ref` (in `init`), `reference` (in `set`)
+    // and `unreference` (in `release`), with one throwaway object.
+    const RefCounted = godot.class.RefCounted;
+    var first: object.Ref(RefCounted) = .adopt(RefCounted.init());
+    var second: object.Ref(RefCounted) = .{};
+    second.set(first.get());
+    second.release();
+    first.release();
 }
 
 /// True when the SDK's own method binds have been looked up.

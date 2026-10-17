@@ -739,7 +739,7 @@ pub const BuildService = struct {
             return .{ .invalid = s };
         };
         defer platform.loader.close(lib);
-        const describe = platform.loader.lookup(lib, *const fn () callconv(.c) *const abi.Table, "ziggurat_describe") orelse {
+        const describe = platform.loader.lookup(lib, abi.DescribeFn, abi.describe_symbol) orelse {
             platform.elf.setDiag(&s.buf, "The built library {s} has no ziggurat_describe export.", .{gen.lib.bytes});
             return .{ .invalid = s };
         };

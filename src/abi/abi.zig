@@ -9,13 +9,16 @@
 //! governs. The SDK's `sdk/wrap.zig` implements the module side.
 //!
 //! Loading, in this order:
-//! 1. Load the library and look up `ziggurat_describe` and `ziggurat_init`.
+//! 1. Load the library and look up `ziggurat_describe` (`DescribeFn`) and
+//!    `ziggurat_init` (`InitFn`).
 //!    `ziggurat_describe` may be called before `ziggurat_init`; it runs no
 //!    code beyond returning a pointer to static data.
 //! 2. Run `validate` on the table with the stamp from `expectedStamp`
 //!    (computed from the same `sdk_options` the SDK was built with) before
 //!    reading anything else from it. A table that fails is refused whole.
-//! 3. Call `ziggurat_init(api, gen)` exactly once, on the main thread, with
+//! 3. Call `ziggurat_init(api, gen)` exactly once, on the main thread, at a
+//!    time when Godot can construct objects (the module makes and frees one
+//!    RefCounted while it warms its caches), with
 //!    a `HostApi` whose `size` is `@sizeOf(HostApi)` and with the
 //!    generation number of this load. It returns nothing: a size mismatch
 //!    is logged through `api.log` (when the struct reaches that far) and the
@@ -36,6 +39,10 @@
 //! - Variants the module writes into `ret` are owned by the host, which
 //!   destroys them. Variants the host passes in stay the host's.
 //!
+//! Threads: `HostApi.alloc`, `free` and `log` may be called from any thread
+//! (script code in Godot thread groups reaches `ziggurat.allocator` and
+//! `ziggurat.log`), so the host must make all three thread-safe.
+//!
 //! Memory: instance memory comes from `HostApi.alloc` with the instance's
 //! generation as tag, at least 1 byte and an alignment of up to 4096. Tag 0
 //! is the shared user heap (`ziggurat.allocator`), not tied to a generation.
@@ -52,6 +59,16 @@ pub const Str = extern struct {
 };
 
 pub const LogLevel = enum(u32) { info = 0, warning = 1, err = 2 };
+
+/// `export fn ziggurat_init(api: *const HostApi, gen: u32) callconv(.c) void`,
+/// declared in the generated root (`src/build/rootgen.zig`).
+pub const InitFn = *const fn (api: *const HostApi, gen: u32) callconv(.c) void;
+
+/// `export fn ziggurat_describe() callconv(.c) *const Table`, declared in the
+/// generated root. Look both up by these names.
+pub const DescribeFn = *const fn () callconv(.c) *const Table;
+pub const init_symbol = "ziggurat_init";
+pub const describe_symbol = "ziggurat_describe";
 
 /// What the host gives `ziggurat_init`. The pointer must stay valid until
 /// the library is unloaded; the module keeps it.
@@ -70,6 +87,7 @@ pub const HostApi = extern struct {
     /// Frees memory from `alloc` with the same `gen`, `size` and `alignment`.
     free: *const fn (gen: u32, ptr: ?*anyopaque, size: usize, alignment: u32) callconv(.c) void,
     /// One line of UTF-8 text, not NUL-terminated; `level` is a `LogLevel`.
+    /// `alloc`, `free` and `log` must be safe to call from any thread.
     log: *const fn (level: u32, msg: [*]const u8, len: usize) callconv(.c) void,
     /// Asks the host to swap in a newer generation when it next can.
     request_swap: *const fn () callconv(.c) void,
@@ -160,8 +178,9 @@ pub const ScriptDesc = extern struct {
     instance_size: u32,
     instance_align: u32,
     /// An instance with every field at its default value. `base` in it is
-    /// undefined (a `*E` cannot be zero at compile time): the host must not
-    /// read `base` from it and sets `base` on every instance it makes.
+    /// undefined (a `*E` cannot be zero at compile time): the host never
+    /// reads `base` from it; `create` sets `base` of each new instance from
+    /// its `owner`.
     /// Engine values in it (String, StringName, NodePath, Ref) are always
     /// empty, so a byte copy is safe; the host must never destroy them.
     defaults: *const anyopaque,

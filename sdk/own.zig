@@ -15,8 +15,10 @@
 //! - A new RefCounted object comes from `T.init()` with one reference that
 //!   the caller owns. Wrap it with `Ref(T).adopt`, which takes that
 //!   reference over: `return .init(.adopt(T.init()));` for a method that
-//!   returns `Owned(Ref(T))`. `Ref.set` adds a reference of its own, so
-//!   `set(T.init())` leaks one.
+//!   returns `Owned(Ref(T))`. The same holds for a RefCounted that an
+//!   engine method returns (`ResourceLoader.load`, `Resource.duplicate`):
+//!   Godot gives the caller one reference. `Ref.set` adds a reference of
+//!   its own, so `set(T.init())` or `set(loaded)` leaks one.
 const std = @import("std");
 const godot = @import("gdzig");
 const object = @import("object.zig");

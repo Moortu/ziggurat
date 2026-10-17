@@ -449,6 +449,30 @@ test "ref adopt takes over the first reference" {
     h.release();
 }
 
+test "ref adopts a RefCounted an engine method returns" {
+    const src = Resource.init();
+    const src_id = idOf(src);
+    // `duplicate` returns a Ref<Resource>; Godot hands the caller one
+    // reference to the new object.
+    const dup = src.duplicate(.{}) orelse return error.NoDuplicate;
+    const dup_id = idOf(dup);
+    try testing.expect(dup_id != src_id);
+    try testing.expectEqual(@as(i32, 1), refCount(RefCounted.upcast(dup)));
+    var h: Ref(Resource) = .adopt(dup);
+    try testing.expectEqual(@as(i32, 1), refCount(RefCounted.upcast(dup)));
+    var other: Ref(Resource) = .{};
+    other.set(dup);
+    try testing.expectEqual(@as(i32, 2), refCount(RefCounted.upcast(dup)));
+    other.release();
+    try testing.expectEqual(@as(i32, 1), refCount(RefCounted.upcast(dup)));
+    // One release frees it: the engine's reference was taken over, not added to.
+    h.release();
+    try testing.expect(!alive(dup_id));
+    try testing.expect(alive(src_id));
+    dropCreation(RefCounted.upcast(src));
+    try testing.expect(!alive(src_id));
+}
+
 test "typed null object Variant" {
     // An OBJECT Variant built from a null pointer: type OBJECT, id 0.
     var v = makeObject(@as(?*anyopaque, null));
