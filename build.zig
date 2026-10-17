@@ -232,10 +232,15 @@ fn addGodotTests(
     // Where gdzig's harness installs the project and library.
     scan.addDirectoryArg2(.{ .relative = .{ .base = .install_prefix, .sub_path = "test/" ++ name } }, .{ .make_absolute = true });
     _ = scan.addOutputDirectoryArg("project");
-    // The runner copies the library from the install directory; these
-    // inputs make it rerun exactly when the library or Godot changes.
+    // The runner copies the library and the project files from the install
+    // directory; these inputs make it rerun exactly when one of them or
+    // Godot changes.
     scan.addFileInput(lib.getEmittedBin());
     scan.addFileInput(godot_file);
+    const project_dir = harnessProjectDir(&run.step) orelse @panic("gdzig.addTest: no project directory found under its run step");
+    for ([_][]const u8{ "project.godot", "main.tscn", "test_extension.gdextension" }) |file| {
+        scan.addFileInput(project_dir.path(b, file));
+    }
     // After the harness run: it installs the project, and one Godot at a time.
     scan.step.dependOn(&run.step);
     step.dependOn(&scan.step);
@@ -248,6 +253,17 @@ fn harnessLibrary(step: *std.Build.Step) ?*std.Build.Step.Compile {
     for (step.dependencies.items) |dep| {
         if (dep.cast(std.Build.Step.InstallArtifact)) |ia| return ia.artifact;
         if (harnessLibrary(dep)) |found| return found;
+    }
+    return null;
+}
+
+/// The generated project folder `gdzig.addTest` installs next to the
+/// library: the source of the first `InstallDir` step found under the
+/// harness run step.
+fn harnessProjectDir(step: *std.Build.Step) ?std.Build.LazyPath {
+    for (step.dependencies.items) |dep| {
+        if (dep.cast(std.Build.Step.InstallDir)) |id| return id.options.source_dir;
+        if (harnessProjectDir(dep)) |found| return found;
     }
     return null;
 }
