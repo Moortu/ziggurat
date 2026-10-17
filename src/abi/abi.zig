@@ -111,7 +111,8 @@ pub const ScriptDesc = extern struct {
     signal_count: u32,
     create: *const fn (owner: *anyopaque, gen: u32) callconv(.c) ?*anyopaque,
     destroy: *const fn (inst: *anyopaque) callconv(.c) void,
-    call: *const fn (inst: *anyopaque, method: u32, args: [*]const *const anyopaque, argc: i64, ret: *anyopaque, err: *CallError) callconv(.c) void,
+    /// `args` may be null when `argc` is 0.
+    call: *const fn (inst: *anyopaque, method: u32, args: ?[*]const *const anyopaque, argc: i64, ret: *anyopaque, err: *CallError) callconv(.c) void,
     get: *const fn (inst: *anyopaque, property: u32, ret: *anyopaque) callconv(.c) u8,
     set: *const fn (inst: *anyopaque, property: u32, value: *const anyopaque) callconv(.c) u8,
     get_default: *const fn (property: u32, ret: *anyopaque) callconv(.c) u8,

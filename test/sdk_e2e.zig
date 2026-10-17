@@ -158,6 +158,54 @@ const prelude =
 
 const bad_scripts = [_]BadScript{
     .{
+        .rel = "bad_getter.zig",
+        .data = prelude ++
+            \\pub const extends = class.Node;
+            \\speed: f32 = 1,
+            \\pub fn get_speed(self: *const @This()) f64 {
+            \\    return self.speed;
+            \\}
+            \\
+        ,
+        .sentence = "'get_speed' overrides reading 'speed' and must be 'pub fn get_speed(self: *const @This()) f32'.",
+        .decl = "pub fn get_speed",
+    },
+    .{
+        .rel = "bad_init.zig",
+        .data = prelude ++
+            \\pub const extends = class.Node;
+            \\pub fn init(self: *@This()) bool {
+            \\    _ = self;
+            \\    return true;
+            \\}
+            \\
+        ,
+        .sentence = "'init' must be 'pub fn init(self: *@This()) void'.",
+        .decl = "pub fn init",
+    },
+    .{
+        .rel = "bad_deinit.zig",
+        .data = prelude ++
+            \\pub const extends = class.Node;
+            \\pub fn deinit(self: *const @This()) void {
+            \\    _ = self;
+            \\}
+            \\
+        ,
+        .sentence = "'deinit' must be 'pub fn deinit(self: *@This()) void'.",
+        .decl = "pub fn deinit",
+    },
+    .{
+        .rel = "full_default.zig",
+        .data = prelude ++
+            \\pub const extends = class.Node;
+            \\title: z.godot.builtin.String = .{ .@"_" = .{ 1, 0, 0, 0, 0, 0, 0, 0 } },
+            \\
+        ,
+        .sentence = "Field 'title' must default to an empty value (.empty or .{}), because every instance starts as a copy of the defaults.",
+        .decl = "title:",
+    },
+    .{
         .rel = "bad_setter.zig",
         .data = prelude ++
             \\pub const extends = class.Node;

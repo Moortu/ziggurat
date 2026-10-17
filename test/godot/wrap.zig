@@ -30,10 +30,21 @@ const test_gen: u32 = 3;
 var api: abi.HostApi = undefined;
 var live_bytes: usize = 0;
 var refuse_alloc = false;
+/// When set, `alloc` returns its block plus one byte: memory that is not
+/// aligned for any script with alignment above 1.
+var misalign_alloc = false;
+var misaligned_block: ?[*]u8 = null;
+var free_count: usize = 0;
 var log_count: usize = 0;
 
 fn hostAlloc(_: u32, size: usize, alignment: u32) callconv(.c) ?*anyopaque {
     if (refuse_alloc) return null;
+    if (misalign_alloc) {
+        const p = std.heap.page_allocator.rawAlloc(size + 1, .fromByteUnits(alignment), @returnAddress()) orelse return null;
+        misaligned_block = p;
+        live_bytes += size;
+        return p + 1;
+    }
     const p = std.heap.page_allocator.rawAlloc(size, .fromByteUnits(alignment), @returnAddress()) orelse return null;
     live_bytes += size;
     return p;
@@ -41,8 +52,15 @@ fn hostAlloc(_: u32, size: usize, alignment: u32) callconv(.c) ?*anyopaque {
 
 fn hostFree(_: u32, ptr: ?*anyopaque, size: usize, alignment: u32) callconv(.c) void {
     const p: [*]u8 = @ptrCast(ptr orelse return);
-    std.heap.page_allocator.rawFree(p[0..size], .fromByteUnits(alignment), @returnAddress());
+    free_count += 1;
     live_bytes -= size;
+    if (misaligned_block) |block| {
+        if (p == block + 1) {
+            misaligned_block = null;
+            return std.heap.page_allocator.rawFree(block[0 .. size + 1], .fromByteUnits(alignment), @returnAddress());
+        }
+    }
+    std.heap.page_allocator.rawFree(p[0..size], .fromByteUnits(alignment), @returnAddress());
 }
 
 fn hostLog(_: u32, _: [*]const u8, _: usize) callconv(.c) void {
@@ -65,6 +83,7 @@ fn setup() void {
     };
     ziggurat.moduleInit(&api, test_gen);
     refuse_alloc = false;
+    misalign_alloc = false;
     log_count = 0;
 }
 
@@ -154,6 +173,7 @@ const Probe = struct {
     item: Ref(Resource) = .{},
     _inited: bool = false,
     _last_what: i32 = -1,
+    alias: b.String = .empty,
     _tag: b.StringName = .empty,
 
     pub fn init(self: *Probe) void {
@@ -186,9 +206,29 @@ const Probe = struct {
         return s.length() + extra;
     }
 
-    pub fn label(self: *const Probe) b.String {
+    /// A new String, handed over with `Owned`.
+    pub fn label(self: *const Probe) ziggurat.Owned(b.String) {
         _ = self;
-        return b.String.fromUtf8("probe") catch .empty;
+        return .init(b.String.fromUtf8("probe") catch .empty);
+    }
+
+    /// Fields returned as they are: borrowed, so the fields stay intact.
+    pub fn heldName(self: *const Probe) b.String {
+        return self.name;
+    }
+
+    pub fn heldItem(self: *const Probe) Ref(Resource) {
+        return self.item;
+    }
+
+    /// A setter that keeps its borrowed argument with `assign`.
+    pub fn set_alias(self: *Probe, value: b.String) void {
+        ziggurat.assign(&self.alias, value);
+    }
+
+    /// A getter that returns a new copy through `Owned`.
+    pub fn get_alias(self: *const Probe) ziggurat.Owned(b.String) {
+        return .init(b.String.copy(self.alias));
     }
 };
 
@@ -345,6 +385,15 @@ test "wrap create fails cleanly" {
     // A generation other than moduleInit's is refused, with one log line.
     try testing.expect(probe_desc.create(@ptrCast(owner), test_gen + 1) == null);
     try testing.expectEqual(@as(usize, 2), log_count);
+    try testing.expectEqual(start, live_bytes);
+    // Memory the host returns misaligned is freed again, with one log line.
+    misalign_alloc = true;
+    defer misalign_alloc = false;
+    const frees = free_count;
+    try testing.expect(probe_desc.create(@ptrCast(owner), test_gen) == null);
+    try testing.expectEqual(@as(usize, 3), log_count);
+    try testing.expectEqual(frees + 1, free_count);
+    try testing.expect(misaligned_block == null);
     try testing.expectEqual(start, live_bytes);
 }
 
@@ -625,4 +674,80 @@ test "wrap get_default" {
     try testing.expectEqual(@as(u8, 1), probe_desc.get_default(try propertyIndex(&probe_desc, "level"), &v));
     try testing.expectEqual(@as(i64, 1), try readAs(i64, &v));
     destroy(&v);
+}
+
+test "wrap returns are borrowed" {
+    setup();
+    const q = try Instance(Node).init(&probe_desc);
+    defer q.deinit(&probe_desc);
+    const res = Resource.init();
+    defer dropCreation(res);
+    var rv = makeObject(res);
+    defer destroy(&rv);
+    try testing.expectEqual(@as(u8, 1), try setProp(&probe_desc, q.inst, "item", &rv));
+    var text = try makeString("held by the field");
+    defer destroy(&text);
+    try testing.expectEqual(@as(u8, 1), try setProp(&probe_desc, q.inst, "name", &text));
+
+    // Returning a Ref field: the field keeps its reference on every call.
+    const held = refCount(res);
+    const item = try methodIndex(&probe_desc, "held_item");
+    for (0..5) |_| {
+        var c = callMethod(&probe_desc, q.inst, item, &.{});
+        try expectCallOk(&c);
+        try testing.expectEqual(idOf(res), godot.raw.variantGetObjectInstanceId.?(&c.ret));
+        destroy(&c.ret);
+        try testing.expectEqual(held, refCount(res));
+    }
+    // Returning a String field: the field stays readable.
+    const name = try methodIndex(&probe_desc, "held_name");
+    for (0..5) |_| {
+        var c = callMethod(&probe_desc, q.inst, name, &.{});
+        try expectCallOk(&c);
+        try expectUtf8("held by the field", &c.ret);
+        destroy(&c.ret);
+    }
+    var got = try getProp(&probe_desc, q.inst, "name");
+    defer destroy(&got);
+    try expectUtf8("held by the field", &got);
+}
+
+test "wrap setter stores with assign" {
+    setup();
+    const q = try Instance(Node).init(&probe_desc);
+    defer q.deinit(&probe_desc);
+    // Each Variant is gone before the value is read back, so the field
+    // must hold its own copy.
+    for ([_][]const u8{ "first", "second \u{2728}", "second \u{2728}" }) |t| {
+        var v = try makeString(t);
+        try testing.expectEqual(@as(u8, 1), try setProp(&probe_desc, q.inst, "alias", &v));
+        destroy(&v);
+    }
+    var got = try getProp(&probe_desc, q.inst, "alias");
+    defer destroy(&got);
+    try expectUtf8("second \u{2728}", &got);
+    // assign of a value to itself keeps it.
+    const probe: *Probe = @ptrCast(@alignCast(q.inst));
+    ziggurat.assign(&probe.alias, probe.alias);
+    var again = try getProp(&probe_desc, q.inst, "alias");
+    defer destroy(&again);
+    try expectUtf8("second \u{2728}", &again);
+}
+
+test "wrap call with null args" {
+    setup();
+    const q = try Instance(Node).init(&probe_desc);
+    defer q.deinit(&probe_desc);
+    var ret: Variant = undefined;
+    var err: abi.CallError = undefined;
+    // No arguments: a null pointer is fine.
+    probe_desc.call(q.inst, try methodIndex(&probe_desc, "label"), null, 0, &ret, &err);
+    try testing.expectEqual(abi.call_ok, err.@"error");
+    try expectUtf8("probe", &ret);
+    destroy(&ret);
+    // A null pointer with arguments is an invalid argument 0.
+    probe_desc.call(q.inst, try methodIndex(&probe_desc, "add"), null, 2, &ret, &err);
+    try testing.expectEqual(abi.CallError{ .@"error" = abi.call_invalid_argument, .argument = 0, .expected = @intCast(t_int) }, err);
+    try testing.expectEqual(t_nil, typeOf(&ret));
+    destroy(&ret);
 }

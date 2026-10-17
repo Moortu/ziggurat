@@ -32,6 +32,13 @@ pub const convert = @import("convert.zig");
 pub const object = @import("object.zig");
 pub const Obj = object.Obj;
 pub const Ref = object.Ref;
+/// A return value that hands a new String, StringName, NodePath or Ref to
+/// Godot. Plain return values are borrowed (Godot copies them).
+pub const Owned = @import("own.zig").Owned;
+/// Stores a String, StringName, NodePath or Ref with its own copy or
+/// reference and releases the old value. Arguments are borrowed for the
+/// length of the call, so a method that keeps one stores it with `assign`.
+pub const assign = @import("own.zig").assign;
 
 /// One script's descriptor (C ABI), built at compile time by `describe`.
 pub const ScriptDescriptor = abi.ScriptDesc;

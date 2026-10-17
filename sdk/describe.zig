@@ -39,6 +39,7 @@ const convert = @import("convert.zig");
 const object = @import("object.zig");
 const godot = @import("gdzig");
 const wrap = @import("wrap.zig");
+const own = @import("own.zig");
 
 /// Usage of an exported field: STORAGE | EDITOR | SCRIPT_VARIABLE, as
 /// GDScript sets for script variables.
@@ -251,6 +252,11 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                 }
                 const d = attrs.defaultValue(FT) orelse fail(name, "Field '" ++ name ++ "' needs a default value.");
                 requireDefined(FT, d);
+                // Every instance starts as a shallow copy of the defaults
+                // image, so an engine reference in it would be shared and
+                // released by every destroy.
+                if (own.ownsEngineValue(FT) and !emptyEngineValue(FT, d))
+                    fail(name, "Field '" ++ name ++ "' must default to an empty value (.empty or .{}), because every instance starts as a copy of the defaults.");
             }
         }
 
@@ -453,8 +459,8 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                     if (!convert.supported(P))
                         fail(d, "Method '" ++ d ++ "' has a parameter of type " ++ @typeName(P) ++ ", which Godot cannot pass.");
                 }
-                const R = f.return_type orelse
-                    fail(d, "Method '" ++ d ++ "' returns a generic type, which Godot cannot hold.");
+                const R = own.ReturnValue(f.return_type orelse
+                    fail(d, "Method '" ++ d ++ "' returns a generic type, which Godot cannot hold."));
                 if (R != void and !convert.supported(R))
                     fail(d, "Method '" ++ d ++ "' returns " ++ @typeName(R) ++ ", which Godot cannot hold.");
                 if (@hasField(Meta, d) and @hasField(@TypeOf(@field(meta, d)), "args")) {
@@ -502,7 +508,7 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             for (method_decls, 0..) |d, i| {
                 const f = @typeInfo(@TypeOf(@field(S, d))).@"fn";
                 const args = methodArgs(d);
-                const R = f.return_type.?;
+                const R = own.ReturnValue(f.return_type.?);
                 out[i] = .{
                     .name = str(godotMethodName(d)),
                     .args = args.ptr,
@@ -595,6 +601,16 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             return true;
         }
 
+        /// A getter returns the field type (borrowed) or, for a type that
+        /// holds an engine reference, `Owned` of it (a new value).
+        fn getterMatches(comptime g: []const u8, comptime FT: type) bool {
+            for ([_]type{ *S, *const S }) |Self| {
+                if (fnMatches(g, &.{Self}, FT)) return true;
+                if (own.ownsEngineValue(FT) and fnMatches(g, &.{Self}, own.Owned(FT))) return true;
+            }
+            return false;
+        }
+
         /// `init`, `deinit`, `_notification` and the `get_<field>` and
         /// `set_<field>` overrides of exported fields, as `wrap.zig` calls them.
         fn checkHooks() void {
@@ -607,11 +623,13 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             for (info.field_names, info.field_types) |name, FT| {
                 if (!exported(name)) continue;
                 const getter = "get_" ++ name;
-                if (isPub(getter) and !fnMatches(getter, &.{*S}, FT) and !fnMatches(getter, &.{*const S}, FT))
-                    fail(getter, "'" ++ getter ++ "' overrides reading '" ++ name ++ "' and must be 'pub fn " ++ getter ++ "(self: *const @This()) " ++ @typeName(FT) ++ "'.");
+                if (isPub(getter) and !getterMatches(getter, FT))
+                    fail(getter, "'" ++ getter ++ "' overrides reading '" ++ name ++ "' and must be 'pub fn " ++ getter ++ "(self: *const @This()) " ++ @typeName(FT) ++ "'" ++
+                        (if (own.ownsEngineValue(FT)) " (or return z.Owned(" ++ @typeName(FT) ++ ") for a new value)" else "") ++ ".");
                 const setter = "set_" ++ name;
                 if (isPub(setter) and !fnMatches(setter, &.{ *S, FT }, void))
-                    fail(setter, "'" ++ setter ++ "' overrides writing '" ++ name ++ "' and must be 'pub fn " ++ setter ++ "(self: *@This(), value: " ++ @typeName(FT) ++ ") void'.");
+                    fail(setter, "'" ++ setter ++ "' overrides writing '" ++ name ++ "' and must be 'pub fn " ++ setter ++ "(self: *@This(), value: " ++ @typeName(FT) ++ ") void'" ++
+                        (if (own.ownsEngineValue(FT)) "; the value is borrowed, so store it with z.assign" else "") ++ ".");
             }
         }
 
@@ -688,6 +706,16 @@ fn requireDefined(comptime T: type, comptime v: T) void {
         },
         else => {},
     }
+}
+
+/// True when the String, StringName, NodePath or Ref default `v` holds no
+/// engine reference (all-zero bytes, or a null handle).
+fn emptyEngineValue(comptime T: type, comptime v: T) bool {
+    if (@hasField(T, "ptr")) return v.ptr == null;
+    for (@field(v, "_")) |byte| {
+        if (byte != 0) return false;
+    }
+    return true;
 }
 
 /// `.obj` or `.ref` when `T` is a `z.Obj` or `z.Ref` handle.

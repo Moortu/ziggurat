@@ -17,23 +17,33 @@
 //! properties, group entries included (those have no value, so `get`,
 //! `set` and `get_default` return 0 for them).
 //!
-//! Ownership:
-//! - Arguments are borrowed for the call. A String, StringName, NodePath or
-//!   `Ref` argument is a temporary that is released after the method
-//!   returns; a method that keeps one must copy it (`String.copy`, or
-//!   `Ref.set` on its own handle).
-//! - A returned String, StringName, NodePath or `Ref` belongs to the
-//!   wrapper, which writes it into `ret` and then releases it, so a method
-//!   returns a new value, never a field's own value.
+//! `args` may be null when `argc` is 0. A null `args` with a matching
+//! non-zero `argc` is INVALID_ARGUMENT at argument 0.
+//!
+//! Ownership (helpers in `own.zig`):
+//! - Arguments are borrowed for the length of the call. A String,
+//!   StringName, NodePath or `Ref` argument is a temporary that is released
+//!   after the method returns; a method or setter that keeps one stores it
+//!   with `z.assign(&self.field, value)`, which takes its own copy or
+//!   reference and releases the old value.
+//! - Plain return values are borrowed too: Godot's from-type constructor
+//!   copies a String, StringName or NodePath and takes the Variant's own
+//!   reference to an object, so the wrapper writes `ret` and leaves the
+//!   returned value alone (`return self.title;` is correct). A method that
+//!   returns a value it made itself returns `z.Owned(T)`; the wrapper
+//!   releases `value` after the write. A new value returned without
+//!   `Owned` leaks, which the in-Godot leak checks report; it never dangles.
 //! - `set` reads into a temporary first. Only when the read succeeds is the
 //!   old field value released and the new one stored, so a failed `set`
 //!   leaves the field as it was.
 //! - `get_<field>` and `set_<field>` (`pub fn`, exact Zig names) replace
 //!   direct field access; they follow the same rules as methods (the
-//!   getter returns a new value; the setter's argument is borrowed).
+//!   getter's plain return value is borrowed, `Owned` is released; the
+//!   setter's argument is borrowed).
 //! - `destroy` calls `deinit` first, while every field is still intact, then
 //!   releases each top-level String, StringName, NodePath and `Ref` field
-//!   (an `Obj` holds no reference), then frees the memory.
+//!   (an `Obj` holds no reference), then frees the memory. `deinit` need not
+//!   release those fields itself; a second release is harmless.
 //!
 //! `notification` ignores `reversed`: a script is one class, so there is
 //! no chain of classes whose order could be reversed.
@@ -41,10 +51,10 @@ const std = @import("std");
 const abi = @import("ziggurat_abi");
 const godot = @import("gdzig");
 const convert = @import("convert.zig");
-const object = @import("object.zig");
 const runtime = @import("runtime.zig");
-
-const b = godot.builtin;
+const own = @import("own.zig");
+const ownsEngineValue = own.ownsEngineValue;
+const release = own.release;
 
 /// The wrapper functions of script `S` at `rel`. `method_decls` are the
 /// Zig names of the descriptor's methods in order, `properties` the
@@ -92,6 +102,9 @@ pub fn Wrappers(
                 return null;
             }
             const self: *S = @ptrCast(@alignCast(raw));
+            // A shallow copy. Safe because every String, StringName,
+            // NodePath and Ref default is empty or null (describe asserts
+            // it), so the image holds no engine reference to share.
             self.* = defaults.*;
             // `base` in the image is undefined; it is always set here.
             if (@hasField(S, "base")) self.base = @ptrCast(owner);
@@ -115,7 +128,7 @@ pub fn Wrappers(
         pub fn call(
             inst: *anyopaque,
             method: u32,
-            args: [*]const *const anyopaque,
+            args: ?[*]const *const anyopaque,
             argc: i64,
             ret: *anyopaque,
             err: *abi.CallError,
@@ -131,7 +144,7 @@ pub fn Wrappers(
         fn callMethod(
             comptime d: []const u8,
             self: *S,
-            args: [*]const *const anyopaque,
+            args: ?[*]const *const anyopaque,
             argc: i64,
             ret: *anyopaque,
             err: *abi.CallError,
@@ -148,6 +161,10 @@ pub fn Wrappers(
                 };
                 return godot.raw.variantNewNil(ret);
             }
+            if (params.len > 0 and args == null) {
+                err.* = .{ .@"error" = abi.call_invalid_argument, .argument = 0, .expected = comptime convert.variantType(params[0].?) };
+                return godot.raw.variantNewNil(ret);
+            }
             var tuple: std.meta.ArgsTuple(F) = undefined;
             tuple[0] = self;
             // Arguments read so far; only those are released.
@@ -160,7 +177,7 @@ pub fn Wrappers(
                 }
             }
             inline for (params, 0..) |P, i| {
-                if (convert.read(P.?, args[i], &tuple[i + 1])) |e| {
+                if (convert.read(P.?, args.?[i], &tuple[i + 1])) |e| {
                     err.* = .{ .@"error" = abi.call_invalid_argument, .argument = i, .expected = @intCast(e.expected) };
                     return godot.raw.variantNewNil(ret);
                 }
@@ -172,7 +189,7 @@ pub fn Wrappers(
                 godot.raw.variantNewNil(ret);
             } else {
                 var r: R = @call(.auto, func, tuple);
-                writeOwned(R, &r, ret);
+                writeReturned(R, &r, ret);
             }
         }
 
@@ -188,8 +205,9 @@ pub fn Wrappers(
         fn getField(comptime name: []const u8, self: *S, ret: *anyopaque) u8 {
             const FT = @FieldType(S, name);
             if (comptime hasPub("get_" ++ name)) {
-                var v: FT = @field(S, "get_" ++ name)(self);
-                writeOwned(FT, &v, ret);
+                const G = @typeInfo(@TypeOf(@field(S, "get_" ++ name))).@"fn".return_type.?;
+                var v: G = @field(S, "get_" ++ name)(self);
+                writeReturned(G, &v, ret);
             } else {
                 convert.write(FT, &@field(self, name), ret);
             }
@@ -239,25 +257,15 @@ pub fn Wrappers(
     };
 }
 
-/// True for the types whose values own an engine reference: String,
-/// StringName, NodePath and `Ref`.
-fn ownsEngineValue(comptime T: type) bool {
-    if (T == b.String or T == b.StringName or T == b.NodePath) return true;
-    return @typeInfo(T) == .@"struct" and @hasDecl(T, object.handle_decl) and T.ziggurat_handle == .ref;
-}
-
-/// Releases the engine reference `p` owns.
-fn release(comptime T: type, p: *T) void {
-    if (T == b.String or T == b.StringName or T == b.NodePath) {
-        p.deinit();
+/// Writes a method's or getter's return value into `ret`. A plain value
+/// is borrowed and left alone; an `Owned(T)` value is released after the
+/// write, so the Variant becomes its only owner.
+fn writeReturned(comptime R: type, v: *R, ret: *anyopaque) void {
+    if (comptime own.isOwned(R)) {
+        const T = R.ziggurat_owned;
+        convert.write(T, &v.value, ret);
+        release(T, &v.value);
     } else {
-        p.release();
+        convert.write(R, v, ret);
     }
-}
-
-/// Writes `v` into `ret`, then releases `v`: the value's ownership moves
-/// into the Variant.
-fn writeOwned(comptime T: type, v: *T, ret: *anyopaque) void {
-    convert.write(T, v, ret);
-    if (comptime ownsEngineValue(T)) release(T, v);
 }

@@ -474,7 +474,7 @@ fn dummyCreate(_: *anyopaque, _: u32) callconv(.c) ?*anyopaque {
     return null;
 }
 fn dummyDestroy(_: *anyopaque) callconv(.c) void {}
-fn dummyCall(_: *anyopaque, _: u32, _: [*]const *const anyopaque, _: i64, _: *anyopaque, _: *abi.CallError) callconv(.c) void {}
+fn dummyCall(_: *anyopaque, _: u32, _: ?[*]const *const anyopaque, _: i64, _: *anyopaque, _: *abi.CallError) callconv(.c) void {}
 fn dummyGet(_: *anyopaque, _: u32, _: *anyopaque) callconv(.c) u8 {
     return 0;
 }
