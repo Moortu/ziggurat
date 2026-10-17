@@ -29,6 +29,7 @@ pub const Table = abi.Table;
 pub const StampInputs = abi.StampInputs;
 pub const layoutStamp = abi.layoutStamp;
 pub const stampTarget = abi.stampTarget;
+pub const expectedStamp = abi.expectedStamp;
 pub const usage_group = abi.usage_group;
 pub const validate = validator.validate;
 pub const Limits = validator.Limits;

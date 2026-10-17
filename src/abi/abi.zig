@@ -1,6 +1,44 @@
 //! C-ABI layouts shared by the SDK and the host. Every struct here crosses a
 //! dlopen boundary, so all of them are `extern` and all function pointers use
 //! the C calling convention. Strings are UTF-8 and not NUL-terminated.
+//!
+//! # Host contract
+//!
+//! A host imports this module (`ziggurat_abi`), never the SDK. What it must
+//! do, and what it may rely on, is written here and next to the fields it
+//! governs. The SDK's `sdk/wrap.zig` implements the module side.
+//!
+//! Loading, in this order:
+//! 1. Load the library and look up `ziggurat_describe` and `ziggurat_init`.
+//!    `ziggurat_describe` may be called before `ziggurat_init`; it runs no
+//!    code beyond returning a pointer to static data.
+//! 2. Run `validate` on the table with the stamp from `expectedStamp`
+//!    (computed from the same `sdk_options` the SDK was built with) before
+//!    reading anything else from it. A table that fails is refused whole.
+//! 3. Call `ziggurat_init(api, gen)` exactly once, on the main thread, with
+//!    a `HostApi` whose `size` is `@sizeOf(HostApi)` and with the
+//!    generation number of this load. It returns nothing: a size mismatch
+//!    is logged through `api.log` (when the struct reaches that far) and the
+//!    module stays uninitialised, which the stamp check in step 2 should
+//!    already have ruled out. The module warms its lazy caches here.
+//!
+//! Instances and calls (see `ScriptDesc` for each function):
+//! - `create` must get the same generation number `ziggurat_init` got; it
+//!   returns null on refusal (no init yet, another generation, the
+//!   allocation failed or was misaligned) and logs why.
+//! - `destroy`, `call`, `get`, `set` and `notification` take only a pointer
+//!   that this descriptor's `create` returned and `destroy` has not freed.
+//!   Calls on one instance must not overlap.
+//! - Methods and properties are addressed by index into the descriptor's
+//!   arrays, never by name; property indexes count group entries too.
+//! - Everything else the host passes (indexes, argument counts, Variant
+//!   contents) is checked by the module and never makes it panic.
+//! - Variants the module writes into `ret` are owned by the host, which
+//!   destroys them. Variants the host passes in stay the host's.
+//!
+//! Memory: instance memory comes from `HostApi.alloc` with the instance's
+//! generation as tag, at least 1 byte and an alignment of up to 4096. Tag 0
+//! is the shared user heap (`ziggurat.allocator`), not tied to a generation.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -15,13 +53,25 @@ pub const Str = extern struct {
 
 pub const LogLevel = enum(u32) { info = 0, warning = 1, err = 2 };
 
+/// What the host gives `ziggurat_init`. The pointer must stay valid until
+/// the library is unloaded; the module keeps it.
 pub const HostApi = extern struct {
+    /// Must be `@sizeOf(HostApi)`; the module refuses any other value.
     size: u32,
+    /// Godot's `GDExtensionInterfaceGetProcAddress`. Null only in test hosts:
+    /// the module then never calls into Godot.
     get_proc_address: ?*const anyopaque,
+    /// Godot's `GDExtensionClassLibraryPtr` of the host extension.
     library: ?*anyopaque,
+    /// Returns memory of at least `size` bytes aligned to `alignment` (a
+    /// power of two up to 4096), or null. `gen` tags the memory: an
+    /// instance's generation, or 0 for the shared user heap.
     alloc: *const fn (gen: u32, size: usize, alignment: u32) callconv(.c) ?*anyopaque,
+    /// Frees memory from `alloc` with the same `gen`, `size` and `alignment`.
     free: *const fn (gen: u32, ptr: ?*anyopaque, size: usize, alignment: u32) callconv(.c) void,
+    /// One line of UTF-8 text, not NUL-terminated; `level` is a `LogLevel`.
     log: *const fn (level: u32, msg: [*]const u8, len: usize) callconv(.c) void,
+    /// Asks the host to swap in a newer generation when it next can.
     request_swap: *const fn () callconv(.c) void,
 };
 
@@ -33,6 +83,10 @@ pub const call_too_many_arguments: u32 = 3;
 pub const call_too_few_arguments: u32 = 4;
 pub const call_instance_is_null: u32 = 5;
 
+/// Godot's `GDExtensionCallError`, with Godot's meaning for each field:
+/// for INVALID_ARGUMENT, `argument` is the bad argument's index and
+/// `expected` the Variant type wanted; for TOO_MANY/TOO_FEW_ARGUMENTS,
+/// `expected` is the argument count wanted.
 pub const CallError = extern struct {
     @"error": u32,
     argument: i32,
@@ -89,43 +143,76 @@ pub const SignalDesc = extern struct {
 
 pub const script_flag_tool: u32 = 1;
 
+/// One script. Variant pointers (`ret`, `args`, `value`) point to Godot
+/// Variant storage. A `ret` is uninitialised on entry; once written it is an
+/// owned Variant that the host destroys.
 pub const ScriptDesc = extern struct {
+    /// Project-relative path with `/` separators, unique in the table.
     path: Str,
+    /// Global class name, or empty; unique in the table when not empty.
     class_name: Str,
+    /// Engine class the script extends, as Godot names it.
     base_class: Str,
+    /// `script_flag_tool` when the script runs in the editor.
     flags: u32,
+    /// Changes when the instance layout changes (not when defaults do).
     layout_hash: u64,
     instance_size: u32,
     instance_align: u32,
     /// An instance with every field at its default value. `base` in it is
     /// undefined (a `*E` cannot be zero at compile time): the host must not
     /// read `base` from it and sets `base` on every instance it makes.
+    /// Engine values in it (String, StringName, NodePath, Ref) are always
+    /// empty, so a byte copy is safe; the host must never destroy them.
     defaults: *const anyopaque,
     fields: [*]const FieldDesc,
     field_count: u32,
+    /// Exported fields in source order, with group entries (`usage_group`,
+    /// `field_index = no_field`) between them. `get`, `set` and
+    /// `get_default` take an index into this array.
     properties: [*]const PropertyDesc,
     property_count: u32,
+    /// `call` takes an index into this array.
     methods: [*]const MethodDesc,
     method_count: u32,
     signals: [*]const SignalDesc,
     signal_count: u32,
+    /// A new instance owned by the engine object `owner`, or null on
+    /// refusal. `gen` must be the generation `ziggurat_init` got.
     create: *const fn (owner: *anyopaque, gen: u32) callconv(.c) ?*anyopaque,
+    /// Runs the script's `deinit`, releases its engine values and frees
+    /// `inst`, which must not be used afterwards.
     destroy: *const fn (inst: *anyopaque) callconv(.c) void,
-    /// `args` may be null when `argc` is 0.
+    /// Calls method `method` with `argc` arguments. Always writes `ret`
+    /// (NIL on every error) and `err`. `args` may be null when `argc` is 0;
+    /// a null `args` with a non-zero `argc` is INVALID_ARGUMENT at 0.
+    /// Arguments are borrowed for the call.
     call: *const fn (inst: *anyopaque, method: u32, args: ?[*]const *const anyopaque, argc: i64, ret: *anyopaque, err: *CallError) callconv(.c) void,
+    /// 1 and writes `ret` when `property` has a value; 0 and leaves `ret`
+    /// alone otherwise (group entries, indexes past the end).
     get: *const fn (inst: *anyopaque, property: u32, ret: *anyopaque) callconv(.c) u8,
+    /// 1 when `value` was stored; 0 when the index has no value or `value`
+    /// does not convert (the field is then unchanged). `value` is borrowed.
     set: *const fn (inst: *anyopaque, property: u32, value: *const anyopaque) callconv(.c) u8,
+    /// As `get`, for the default value; needs no instance.
     get_default: *const fn (property: u32, ret: *anyopaque) callconv(.c) u8,
+    /// Passes a Godot notification. `reversed` is ignored: a script is one
+    /// class.
     notification: *const fn (inst: *anyopaque, what: i32, reversed: u8) callconv(.c) void,
+    /// Always null in ABI version 1.
     migrate: ?*const anyopaque,
 };
 
+/// What `ziggurat_describe` returns: static data, valid until the library
+/// is unloaded. Validate it (`validate`) before reading anything else.
 pub const Table = extern struct {
     magic: u32,
     abi_version: u32,
     size: u32,
     layout_stamp: u64,
     sdk_version: Str,
+    /// The build service's id for this build (16 hex characters); the
+    /// service compares it after a fast rebuild to catch stale output.
     build_id: Str,
     scripts: [*]const ScriptDesc,
     script_count: u32,
@@ -146,6 +233,34 @@ pub const StampInputs = struct {
 /// for example `x86_64-linux-gnu`. The SDK and the host both use this.
 pub fn stampTarget(comptime t: std.Target) []const u8 {
     return @tagName(t.cpu.arch) ++ "-" ++ @tagName(t.os.tag) ++ "-" ++ @tagName(t.abi);
+}
+
+/// The layout stamp a module built by this compilation carries, and so the
+/// stamp a host built by it must expect: `layoutStamp` over `opts` with this
+/// compilation's Zig version and `stampTarget(builtin.target)`.
+///
+/// `opts` is the SDK's `sdk_options` module (pass the namespace itself) or
+/// any value with the same fields: `api_json_sha256`, `interface_h_sha256`
+/// (byte arrays or strings), `precision` and `sdk_version`. The SDK and a
+/// host both call this, so the six stamp inputs are spelled in one place.
+pub fn expectedStamp(comptime opts: anytype) u64 {
+    return layoutStamp(.{
+        .api_json_sha256 = bytesOf(opts.api_json_sha256),
+        .interface_h_sha256 = bytesOf(opts.interface_h_sha256),
+        .zig_version = builtin.zig_version_string,
+        .target = stampTarget(builtin.target),
+        .precision = bytesOf(opts.precision),
+        .sdk_version = bytesOf(opts.sdk_version),
+    });
+}
+
+/// A comptime byte array, or anything that coerces to a byte slice, as a slice.
+fn bytesOf(comptime v: anytype) []const u8 {
+    if (@typeInfo(@TypeOf(v)) == .array) {
+        const copy = v;
+        return &copy;
+    }
+    return v;
 }
 
 /// Wyhash (seed 0) over, for each struct above in declaration order, its
@@ -232,6 +347,31 @@ test "stamp changes with a function pointer signature" {
         break :blk ha.final() != hb.final();
     };
     try std.testing.expect(differ);
+}
+
+test "expectedStamp matches layoutStamp with this build's facts" {
+    const opts = struct {
+        pub const api_json_sha256: [2]u8 = "aa".*;
+        pub const interface_h_sha256: [2]u8 = "bb".*;
+        pub const precision = "single";
+        pub const sdk_version = "0.1.0";
+    };
+    const want = comptime layoutStamp(.{
+        .api_json_sha256 = "aa",
+        .interface_h_sha256 = "bb",
+        .zig_version = builtin.zig_version_string,
+        .target = stampTarget(builtin.target),
+        .precision = "single",
+        .sdk_version = "0.1.0",
+    });
+    // A namespace such as the `sdk_options` module, and a struct value.
+    try std.testing.expectEqual(want, expectedStamp(opts));
+    try std.testing.expectEqual(want, expectedStamp(.{
+        .api_json_sha256 = "aa",
+        .interface_h_sha256 = "bb",
+        .precision = "single",
+        .sdk_version = "0.1.0",
+    }));
 }
 
 test "layout pinned" {

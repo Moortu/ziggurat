@@ -127,6 +127,21 @@ pub fn validate(
         }
         gop.value_ptr.* = @intCast(i);
     }
+
+    // Non-empty class names are unique: Godot keeps one global class table.
+    seen.clearRetainingCapacity();
+    for (scripts, 0..) |*sc, i| {
+        const name = slice(&sc.class_name);
+        if (name.len == 0) continue;
+        const gop = seen.getOrPutAssumeCapacity(name);
+        if (gop.found_existing) {
+            const first = &scripts[gop.value_ptr.*];
+            return c.fail(error.Duplicate, "has two scripts with the class name \"{f}\": \"{f}\" and \"{f}\".", .{
+                Clip{ .s = name }, Clip{ .s = slice(&first.path) }, Clip{ .s = slice(&sc.path) },
+            });
+        }
+        gop.value_ptr.* = @intCast(i);
+    }
 }
 
 const Set = std.StringHashMapUnmanaged(u32);
@@ -867,6 +882,19 @@ test "validate duplicates" {
             f.signals[0][1] = f.signals[0][0];
         }
     }.m, error.Duplicate, "two signals named \"died\"");
+    try expectRule(struct {
+        fn m(f: *Fixture) void {
+            setStr(&f.scripts[1].class_name, "X");
+        }
+    }.m, error.Duplicate, "has two scripts with the class name \"X\": \"a/x.zig\" and \"b/y.zig\"");
+}
+
+test "validate allows two scripts without a class name" {
+    var f = Fixture.init();
+    f.link();
+    f.scripts[0].class_name = .{ .ptr = null, .len = 0 };
+    var diag: [256]u8 = undefined;
+    try f.check(.{}, &diag);
 }
 
 test "validate group entries" {
