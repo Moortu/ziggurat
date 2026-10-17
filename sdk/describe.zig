@@ -38,6 +38,7 @@ const snake = @import("snake.zig");
 const convert = @import("convert.zig");
 const object = @import("object.zig");
 const godot = @import("gdzig");
+const wrap = @import("wrap.zig");
 
 /// Usage of an exported field: STORAGE | EDITOR | SCRIPT_VARIABLE, as
 /// GDScript sets for script variables.
@@ -579,6 +580,41 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             }
         }
 
+        // ---- hooks and accessors the wrappers call ----
+
+        /// True when `@field(S, d)` is a function with exactly `params` and
+        /// return type `R`.
+        fn fnMatches(comptime d: []const u8, comptime params: []const type, comptime R: type) bool {
+            const T = @TypeOf(@field(S, d));
+            if (@typeInfo(T) != .@"fn") return false;
+            const f = @typeInfo(T).@"fn";
+            if (f.param_types.len != params.len or f.return_type != R) return false;
+            for (f.param_types, params) |have, want| {
+                if (have != want) return false;
+            }
+            return true;
+        }
+
+        /// `init`, `deinit`, `_notification` and the `get_<field>` and
+        /// `set_<field>` overrides of exported fields, as `wrap.zig` calls them.
+        fn checkHooks() void {
+            for ([_][]const u8{ "init", "deinit" }) |n| {
+                if (isPub(n) and !fnMatches(n, &.{*S}, void))
+                    fail(n, "'" ++ n ++ "' must be 'pub fn " ++ n ++ "(self: *@This()) void'.");
+            }
+            if (isPub("_notification") and !fnMatches("_notification", &.{ *S, i32 }, void))
+                fail("_notification", "'_notification' must be 'pub fn _notification(self: *@This(), what: i32) void'.");
+            for (info.field_names, info.field_types) |name, FT| {
+                if (!exported(name)) continue;
+                const getter = "get_" ++ name;
+                if (isPub(getter) and !fnMatches(getter, &.{*S}, FT) and !fnMatches(getter, &.{*const S}, FT))
+                    fail(getter, "'" ++ getter ++ "' overrides reading '" ++ name ++ "' and must be 'pub fn " ++ getter ++ "(self: *const @This()) " ++ @typeName(FT) ++ "'.");
+                const setter = "set_" ++ name;
+                if (isPub(setter) and !fnMatches(setter, &.{ *S, FT }, void))
+                    fail(setter, "'" ++ setter ++ "' overrides writing '" ++ name ++ "' and must be 'pub fn " ++ setter ++ "(self: *@This(), value: " ++ @typeName(FT) ++ ") void'.");
+            }
+        }
+
         fn check() void {
             @setEvalBranchQuota(quota);
             _ = Extends;
@@ -586,12 +622,15 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             _ = tool;
             checkByValue();
             checkFields();
+            checkHooks();
             checkMeta();
             _ = properties;
             checkMethods();
             checkSignals();
             checkCollisions();
         }
+
+        const W = wrap.Wrappers(S, rel, method_decls, properties, &defaults);
 
         const desc: abi.ScriptDesc = blk: {
             check();
@@ -612,66 +651,18 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                 .method_count = methods.len,
                 .signals = signals.ptr,
                 .signal_count = signals.len,
-                .create = placeholder.create,
-                .destroy = placeholder.destroy,
-                .call = placeholder.call,
-                .get = placeholder.get,
-                .set = placeholder.set,
-                .get_default = placeholder.getDefault,
-                .notification = placeholder.notification,
+                .create = W.create,
+                .destroy = W.destroy,
+                .call = W.call,
+                .get = W.get,
+                .set = W.set,
+                .get_default = W.getDefault,
+                .notification = W.notification,
                 .migrate = null,
             };
         };
     };
 }
-
-/// Stand-ins until the wrappers exist: no method, no property, no instance.
-const placeholder = struct {
-    fn create(owner: *anyopaque, gen: u32) callconv(.c) ?*anyopaque {
-        _ = owner;
-        _ = gen;
-        return null;
-    }
-
-    fn destroy(inst: *anyopaque) callconv(.c) void {
-        _ = inst;
-    }
-
-    fn call(inst: *anyopaque, method: u32, args: [*]const *const anyopaque, argc: i64, ret: *anyopaque, err: *abi.CallError) callconv(.c) void {
-        _ = inst;
-        _ = method;
-        _ = args;
-        _ = argc;
-        _ = ret;
-        err.* = .{ .@"error" = abi.call_invalid_method, .argument = 0, .expected = 0 };
-    }
-
-    fn get(inst: *anyopaque, property: u32, ret: *anyopaque) callconv(.c) u8 {
-        _ = inst;
-        _ = property;
-        _ = ret;
-        return 0;
-    }
-
-    fn set(inst: *anyopaque, property: u32, value: *const anyopaque) callconv(.c) u8 {
-        _ = inst;
-        _ = property;
-        _ = value;
-        return 0;
-    }
-
-    fn getDefault(property: u32, ret: *anyopaque) callconv(.c) u8 {
-        _ = property;
-        _ = ret;
-        return 0;
-    }
-
-    fn notification(inst: *anyopaque, what: i32, reversed: u8) callconv(.c) void {
-        _ = inst;
-        _ = what;
-        _ = reversed;
-    }
-};
 
 /// Reads every scalar in `v`, so an `undefined` one is a compile error
 /// (see the file header). Padding is never read.

@@ -158,6 +158,32 @@ const prelude =
 
 const bad_scripts = [_]BadScript{
     .{
+        .rel = "bad_setter.zig",
+        .data = prelude ++
+            \\pub const extends = class.Node;
+            \\speed: f32 = 1,
+            \\pub fn set_speed(self: *@This(), value: f64) void {
+            \\    self.speed = @floatCast(value);
+            \\}
+            \\
+        ,
+        .sentence = "'set_speed' overrides writing 'speed' and must be 'pub fn set_speed(self: *@This(), value: f32) void'.",
+        .decl = "pub fn set_speed",
+    },
+    .{
+        .rel = "bad_notification.zig",
+        .data = prelude ++
+            \\pub const extends = class.Node;
+            \\pub fn _notification(self: *@This(), what: i64) void {
+            \\    _ = self;
+            \\    _ = what;
+            \\}
+            \\
+        ,
+        .sentence = "'_notification' must be 'pub fn _notification(self: *@This(), what: i32) void'.",
+        .decl = "pub fn _notification",
+    },
+    .{
         .rel = "h#a%25x[b]:c/bad_type.zig",
         .data = prelude ++
             \\pub const extends = class.Node;

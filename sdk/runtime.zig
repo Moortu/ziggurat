@@ -48,6 +48,11 @@ pub fn moduleInit(api: *const HostApi, generation_number: u32) void {
     godot.raw.getGodotVersion(@ptrCast(&godot.version));
 }
 
+/// The HostApi `moduleInit` stored, or null before it ran.
+pub fn hostApi() ?*const HostApi {
+    return host;
+}
+
 /// The generation number the host gave `moduleInit`.
 pub fn generation() u32 {
     return gen;

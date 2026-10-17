@@ -155,18 +155,6 @@ test "describe player: defaults image" {
     try testing.expectEqual(@as(f32, 0), v._dash_timer);
 }
 
-test "describe player: placeholder wrappers" {
-    const d = &player_desc;
-    var dummy: u64 = 0;
-    var err: abi.CallError = .{ .@"error" = abi.call_ok, .argument = 0, .expected = 0 };
-    d.call(&dummy, 0, undefined, 0, &dummy, &err);
-    try testing.expectEqual(abi.call_invalid_method, err.@"error");
-    try testing.expectEqual(@as(u8, 0), d.get(&dummy, 0, &dummy));
-    try testing.expectEqual(@as(u8, 0), d.set(&dummy, 0, &dummy));
-    try testing.expectEqual(@as(u8, 0), d.get_default(0, &dummy));
-    try testing.expect(d.create(&dummy, 1) == null);
-}
-
 const A = struct {
     pub const extends = Node;
     base: *Node,
