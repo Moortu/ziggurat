@@ -6,17 +6,21 @@
 //! - A script field that holds text has an owning type: `z.String`,
 //!   `z.StringName` or `z.NodePath`, never the engine's own type (`describe`
 //!   refuses that). `field.set(v)` stores its own copy of the borrowed `v`
-//!   and releases the old text; `field.get()` gives the text, borrowed from
-//!   the field. `self.name = v` with a borrowed `v` is then a type error, as
-//!   is `Owned(String).init(self.name)`.
+//!   and releases the old text; `field.get()` gives a `*const` pointer to
+//!   the text, borrowed from the field (`.get().*` where a value is needed).
+//!   `self.name = v` with a borrowed `v` is then a type error, as are
+//!   `Owned(String).init(self.name)` and `Owned(String).init(self.name.get())`.
 //! - Arguments are borrowed for the length of the call. A method or setter
 //!   that keeps a String, StringName or NodePath stores it with the field's
 //!   `set`; one that keeps a `Ref` stores it with `assign`, which takes its
 //!   own reference. Both take their own copy or reference, so the value the
 //!   wrapper releases when the call returns is never kept.
+//! - A method or `get_<field>` may return `*const String` (likewise
+//!   StringName, NodePath), as `field.get()` gives it: a borrowed return,
+//!   copied into the result and never released.
 //! - Plain return values are borrowed: the wrapper writes a copy into the
 //!   result Variant and leaves the returned value alone, so `return
-//!   self.title.get();` is correct. A method that returns a value it made itself
+//!   self.title.get();` (a `*const String`) is correct. A method that returns a value it made itself
 //!   returns `Owned(T)`, and the wrapper releases that value after the
 //!   write. A new value returned without `Owned` leaks (the in-Godot leak
 //!   checks report it); it never dangles.
@@ -52,7 +56,7 @@ pub fn release(comptime T: type, p: *T) void {
 
 fn requireOwning(comptime T: type) void {
     if (isText(T))
-        @compileError("ziggurat: " ++ textName(T) ++ " is a field type; use the engine value from .get(), and .set() to store one");
+        @compileError("ziggurat: " ++ textName(T) ++ " is a field type; read the text with .get() and store it with .set()");
     if (!ownsEngineValue(T))
         @compileError("ziggurat: " ++ @typeName(T) ++ " holds no engine reference; only String, StringName, NodePath and Ref(T) do");
 }
@@ -79,9 +83,21 @@ pub fn isOwned(comptime R: type) bool {
     return @typeInfo(R) == .@"struct" and @hasDecl(R, "ziggurat_owned");
 }
 
-/// The type a return type `R` is written as: `T` for `Owned(T)`, else `R`.
+/// The type a return type `R` is written as: `T` for `Owned(T)` and for a
+/// borrowed `*const T` (String, StringName, NodePath), else `R`.
 pub fn ReturnValue(comptime R: type) type {
-    return if (isOwned(R)) R.ziggurat_owned else R;
+    if (isOwned(R)) return R.ziggurat_owned;
+    if (BorrowedText(R)) |T| return T;
+    return R;
+}
+
+/// `T` when `R` is `*const T` for T String, StringName or NodePath: a
+/// borrowed return (what a text field's `get` gives).
+pub fn BorrowedText(comptime R: type) ?type {
+    const i = @typeInfo(R);
+    if (i != .pointer or i.pointer.size != .one or !i.pointer.attrs.@"const") return null;
+    const T = i.pointer.child;
+    return if (T == b.String or T == b.StringName or T == b.NodePath) T else null;
 }
 
 /// Stores `src` in `dst.*` with its own copy (String, StringName,
@@ -112,57 +128,57 @@ pub fn assign(dst: anytype, src: anytype) void {
 }
 
 /// An owning String field: `name: z.String = .empty`. `set` stores its own
-/// copy of a borrowed String and releases the old one; `get` returns the
-/// text, borrowed from the field (valid until the next `set` or the
-/// instance's destroy). The instance's destroy releases it.
+/// copy of a borrowed String and releases the old one; `get` returns a
+/// pointer to the text, borrowed from the field (valid until the next `set`
+/// or the instance's destroy). The instance's destroy releases it.
 pub const String = extern struct {
     pub const ziggurat_text = b.String;
-    pub const empty: String = .{ .raw = std.mem.zeroes(b.String) };
+    pub const empty: String = .{ ._raw = std.mem.zeroes(b.String) };
 
-    /// The engine value. Use `set` and `get`; storing into `raw` directly
+    /// The engine value. Use `set` and `get`; storing into `_raw` directly
     /// skips the copy and the release.
-    raw: b.String,
+    _raw: b.String,
 
     pub fn set(self: *String, value: b.String) void {
-        setText(b.String, &self.raw, value);
+        setText(b.String, &self._raw, value);
     }
 
-    pub fn get(self: *const String) b.String {
-        return self.raw;
+    pub fn get(self: *const String) *const b.String {
+        return &self._raw;
     }
 };
 
 /// An owning StringName field: `tag: z.StringName = .empty`. As `String`.
 pub const StringName = extern struct {
     pub const ziggurat_text = b.StringName;
-    pub const empty: StringName = .{ .raw = std.mem.zeroes(b.StringName) };
+    pub const empty: StringName = .{ ._raw = std.mem.zeroes(b.StringName) };
 
     /// The engine value. Use `set` and `get`.
-    raw: b.StringName,
+    _raw: b.StringName,
 
     pub fn set(self: *StringName, value: b.StringName) void {
-        setText(b.StringName, &self.raw, value);
+        setText(b.StringName, &self._raw, value);
     }
 
-    pub fn get(self: *const StringName) b.StringName {
-        return self.raw;
+    pub fn get(self: *const StringName) *const b.StringName {
+        return &self._raw;
     }
 };
 
 /// An owning NodePath field: `target: z.NodePath = .empty`. As `String`.
 pub const NodePath = extern struct {
     pub const ziggurat_text = b.NodePath;
-    pub const empty: NodePath = .{ .raw = std.mem.zeroes(b.NodePath) };
+    pub const empty: NodePath = .{ ._raw = std.mem.zeroes(b.NodePath) };
 
     /// The engine value. Use `set` and `get`.
-    raw: b.NodePath,
+    _raw: b.NodePath,
 
     pub fn set(self: *NodePath, value: b.NodePath) void {
-        setText(b.NodePath, &self.raw, value);
+        setText(b.NodePath, &self._raw, value);
     }
 
-    pub fn get(self: *const NodePath) b.NodePath {
-        return self.raw;
+    pub fn get(self: *const NodePath) *const b.NodePath {
+        return &self._raw;
     }
 };
 
@@ -194,7 +210,7 @@ pub fn fieldOwns(comptime T: type) bool {
 /// Releases what a field of type `T` holds (see `fieldOwns`).
 pub fn releaseField(comptime T: type, p: *T) void {
     if (comptime isText(T)) {
-        p.raw.deinit();
+        p._raw.deinit();
     } else {
         release(T, p);
     }
@@ -208,5 +224,5 @@ pub fn Access(comptime T: type) type {
 
 /// The value of field `p` as `Access(T)`, borrowed from the field.
 pub fn access(comptime T: type, p: *const T) Access(T) {
-    return if (comptime isText(T)) p.raw else p.*;
+    return if (comptime isText(T)) p._raw else p.*;
 }

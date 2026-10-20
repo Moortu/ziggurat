@@ -477,7 +477,7 @@ const bad_scripts = [_]BadScript{
         .rel = "full_default.zig",
         .data = prelude ++
             \\pub const extends = g.Node;
-            \\title: z.String = .{ .raw = .{ .@"_" = .{ 1, 0, 0, 0, 0, 0, 0, 0 } } },
+            \\title: z.String = .{ ._raw = .{ .@"_" = .{ 1, 0, 0, 0, 0, 0, 0, 0 } } },
             \\
         ,
         .sentence = "Field 'title' must default to an empty value (.empty or .{}), because every instance starts as a copy of the defaults.",
@@ -951,6 +951,14 @@ test "integration: compile errors map to the script" {
             \\}
             \\
         , .sentence = "expected type", .decl = "    return .init(self.name);" },
+        .{ .rel = "owned_get.zig", .data = prelude ++
+            \\pub const extends = g.Node;
+            \\name: z.String = .empty,
+            \\pub fn label(self: *const @This()) z.Owned(g.String) {
+            \\    return .init(self.name.get());
+            \\}
+            \\
+        , .sentence = "expected type", .decl = "    return .init(self.name.get());" },
     };
     for (misuse_cases) |c| {
         errdefer std.debug.print("case {s}\n", .{c.rel});

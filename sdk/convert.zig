@@ -174,7 +174,7 @@ pub fn write(comptime T: type, value: *const T, ret: *anyopaque) void {
             construct(t_float, ret, &x);
         },
         .builtin => construct(builtinType(T).?, ret, @ptrCast(@constCast(value))),
-        .text => write(T.ziggurat_text, &value.raw, ret),
+        .text => write(T.ziggurat_text, &value._raw, ret),
         // Godot's from-type constructor for OBJECT adds the Variant's own
         // reference to a RefCounted. No reference is taken by hand here, and
         // the caller's own reference (a `Ref`, a creation reference) stays.
@@ -240,7 +240,7 @@ pub fn read(comptime T: type, v: *const anyopaque, out: *T) ?ReadError {
         .text => {
             var x: T.ziggurat_text = undefined;
             if (read(T.ziggurat_text, v, &x)) |e| return e;
-            out.* = .{ .raw = x };
+            out.* = .{ ._raw = x };
         },
         .obj_ptr => {
             const Class = comptime objectPtrClass(@typeInfo(T).optional.child).?;

@@ -221,7 +221,7 @@ const Probe = struct {
     }
 
     /// Fields returned as they are: borrowed, so the fields stay intact.
-    pub fn heldName(self: *const Probe) b.String {
+    pub fn heldName(self: *const Probe) *const b.String {
         return self.name.get();
     }
 
@@ -236,7 +236,7 @@ const Probe = struct {
 
     /// A getter that returns a new copy through `Owned`.
     pub fn get_alias(self: *const Probe) ziggurat.Owned(b.String) {
-        return .init(b.String.copy(self.alias.get()));
+        return .init(b.String.copy(self.alias.get().*));
     }
 };
 
@@ -759,7 +759,7 @@ test "wrap setter stores with set" {
     try expectUtf8("second \u{2728}", &got);
     // Setting a field to its own value keeps it.
     const probe: *Probe = @ptrCast(@alignCast(q.inst));
-    probe.alias.set(probe.alias.get());
+    probe.alias.set(probe.alias.get().*);
     var again = try getProp(&probe_desc, q.inst, "alias");
     defer destroy(&again);
     try expectUtf8("second \u{2728}", &again);
@@ -784,12 +784,17 @@ const Texts = struct {
         self.tag.set(value);
     }
 
-    pub fn heldNote(self: *const Texts) b.String {
+    /// A getter that returns the field's text as `get` gives it: borrowed.
+    pub fn get_tag(self: *const Texts) *const b.StringName {
+        return self.tag.get();
+    }
+
+    pub fn heldNote(self: *const Texts) *const b.String {
         return self._note.get();
     }
 
     pub fn greeting(self: *const Texts) ziggurat.Owned(b.String) {
-        return .init(b.String.copy(self.name.get()));
+        return .init(b.String.copy(self.name.get().*));
     }
 };
 
@@ -874,6 +879,7 @@ test "owned string fields" {
         const rename = try methodIndex(d, "rename");
         const held = try methodIndex(d, "held_note");
         const greeting = try methodIndex(d, "greeting");
+        try testing.expectEqual(t_string, d.methods[held].ret.variant_type);
         for ([_][]const u8{ "from a method", "again", "again" }) |t| {
             var arg = try makeString(t);
             var c = callMethod(d, q.inst, rename, &.{&arg});

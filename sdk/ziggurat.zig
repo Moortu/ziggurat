@@ -55,7 +55,8 @@ pub const assign = @import("own.zig").assign;
 /// `z.StringName` or `z.NodePath` (default `.empty`), never as the engine's
 /// own `godot.String`, ... (a compile error). `self.name.set(v)` stores a
 /// copy of the borrowed `v` and releases the old text; `self.name.get()`
-/// gives the text, borrowed from the field. Method arguments and return
+/// gives a `*const` pointer to the text, borrowed from the field; a method
+/// may return it as it is. Method arguments and return
 /// values keep the engine types.
 pub const String = @import("own.zig").String;
 pub const StringName = @import("own.zig").StringName;

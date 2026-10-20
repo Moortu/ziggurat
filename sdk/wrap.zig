@@ -37,7 +37,8 @@
 //! - Plain return values are borrowed too: Godot's from-type constructor
 //!   copies a String, StringName or NodePath and takes the Variant's own
 //!   reference to an object, so the wrapper writes `ret` and leaves the
-//!   returned value alone (`return self.title.get();` is correct). A method that
+//!   returned value alone (`return self.title.get();`, a `*const String`,
+//!   is correct). A method that
 //!   returns a value it made itself returns `z.Owned(T)`; the wrapper
 //!   releases `value` after the write. A new value returned without
 //!   `Owned` leaks, which the in-Godot leak checks report; it never dangles.
@@ -274,10 +275,13 @@ pub fn Wrappers(
 }
 
 /// Writes a method's or getter's return value into `ret`. A plain value
-/// is borrowed and left alone; an `Owned(T)` value is released after the
+/// or a `*const` String, StringName or NodePath is borrowed and left alone; an `Owned(T)` value is released after the
 /// write, so the Variant becomes its only owner.
 fn writeReturned(comptime R: type, v: *R, ret: *anyopaque) void {
-    if (comptime own.isOwned(R)) {
+    if (comptime own.BorrowedText(R)) |T| {
+        // A pointer into a field: copied into `ret`, never released.
+        convert.write(T, v.*, ret);
+    } else if (comptime own.isOwned(R)) {
         const T = R.ziggurat_owned;
         convert.write(T, &v.value, ret);
         release(T, &v.value);

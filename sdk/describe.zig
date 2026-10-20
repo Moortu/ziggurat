@@ -690,12 +690,14 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             return true;
         }
 
-        /// A getter returns the field's access type (borrowed) or, for a
-        /// type that holds an engine reference, `Owned` of it (a new value).
+        /// A getter returns the field's access type (borrowed), a `*const`
+        /// pointer to it for a text field (borrowed), or, for a type that
+        /// holds an engine reference, `Owned` of it (a new value).
         fn getterMatches(comptime g: []const u8, comptime FT: type) bool {
             const A = own.Access(FT);
             for ([_]type{ *S, *const S }) |Self| {
                 if (fnMatches(g, &.{Self}, A)) return true;
+                if (own.isText(FT) and fnMatches(g, &.{Self}, *const A)) return true;
                 if (own.ownsEngineValue(A) and fnMatches(g, &.{Self}, own.Owned(A))) return true;
             }
             return false;
@@ -717,6 +719,7 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                 const getter = "get_" ++ name;
                 if (isPub(getter) and !getterMatches(getter, FT))
                     fail(getter, "'" ++ getter ++ "' overrides reading '" ++ name ++ "' and must be 'pub fn " ++ getter ++ "(self: *const @This()) " ++ spelled ++ "'" ++
+                        (if (own.isText(FT)) " or *const " ++ spelled ++ " (as self." ++ name ++ ".get() gives it)" else "") ++
                         (if (own.ownsEngineValue(A)) " (or return z.Owned(" ++ spelled ++ ") for a new value)" else "") ++ ".");
                 const setter = "set_" ++ name;
                 if (isPub(setter) and !fnMatches(setter, &.{ *S, A }, void))
@@ -839,7 +842,7 @@ fn requireDefined(comptime T: type, comptime v: T) void {
 /// True when the String, StringName, NodePath or Ref default `v` holds no
 /// engine reference (all-zero bytes, or a null handle).
 fn emptyEngineValue(comptime T: type, comptime v: T) bool {
-    if (own.isText(T)) return emptyEngineValue(T.ziggurat_text, v.raw);
+    if (own.isText(T)) return emptyEngineValue(T.ziggurat_text, v._raw);
     if (@hasField(T, "ptr")) return v.ptr == null;
     for (@field(v, "_")) |byte| {
         if (byte != 0) return false;

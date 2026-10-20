@@ -35,7 +35,7 @@ pub fn _notification(self: *@This(), what: i32) void {
     self.notifications += 1;
 }
 
-pub fn _toString(self: *const @This()) g.String {
+pub fn _toString(self: *const @This()) *const g.String {
     return self.title.get();
 }
 
