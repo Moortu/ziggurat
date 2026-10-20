@@ -64,6 +64,12 @@ func _ready() -> void:
 	var err := EditorInterface.save_scene()
 	var after := FileAccess.get_file_as_string(SCENE)
 	why = "" if err == OK else "save_scene returned %s; " % error_string(err)
+	# Proof the editor wrote the file: the fixture has no uid, and a save
+	# always writes one into the header (and unique node ids).
+	if after == before:
+		why += "the file is unchanged, so the editor did not write it; "
+	if before.contains("uid=\"uid://") or not after.get_slice("\n", 0).contains("uid=\"uid://"):
+		why += "no uid header written by the save; "
 	for line in KEPT:
 		if not before.contains(line):
 			why += "fixture lacks %s; " % line
