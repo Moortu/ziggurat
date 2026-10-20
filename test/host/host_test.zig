@@ -657,3 +657,52 @@ test "scene save keeps values without descriptors" {
         "ZTEST PASS scene_save_keeps_values_without_descriptors",
     } });
 }
+
+// ------------------------------------------------------------ language
+
+test "language: global class scan, validate from diagnostics, completion, frame queue" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("language");
+    defer p.deinit();
+    try p.addCheck("language.gd");
+    try p.runScript(&.{
+        "ZTEST PASS global_class_top_level",
+        "ZTEST PASS global_class_subfolder",
+        "ZTEST PASS global_class_none res://plain.zig",
+        "ZTEST PASS global_class_none res://commented.zig",
+        "ZTEST PASS global_class_none res://nested.zig",
+        "ZTEST PASS global_class_none res://missing.zig",
+        "ZTEST PASS global_class_none user://alpha.zig",
+        "ZTEST PASS global_class_none res://../alpha.zig",
+        "ZTEST PASS validate_unknown_file_valid",
+        "ZTEST PASS validate_cached_error",
+        "ZTEST PASS validate_other_file_unaffected",
+        "ZTEST PASS validate_after_good_build",
+        "ZTEST PASS validate_line_zero_clamped",
+        "ZTEST PASS complete_code_empty_ok",
+        "ZTEST PASS lookup_code_unavailable",
+        "ZTEST PASS queue_pushed",
+        "ZTEST PASS frame_drains_queue_bounded",
+    });
+}
+
+test "language in the editor: templates through Create Script, autoload constant" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("empty");
+    defer p.deinit();
+    // The check is an autoload, so the editor calls _add_named_global_constant.
+    try p.addAutoloadCheck("language_editor.gd");
+    try p.runEditorChecked("120", .{
+        .expect = &.{
+            "ZTEST PASS autoload_named_global_constant",
+            "ZTEST PASS template_offered",
+            "ZTEST PASS make_template_default",
+            "ZTEST PASS make_template_templates_off",
+            "ZTEST PASS make_template_refuses_script_parent",
+        },
+        // Godot names a missing or failing virtual in its error line.
+        .reject = &.{"_add_named_global_constant"},
+    });
+}

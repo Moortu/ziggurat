@@ -290,4 +290,9 @@ test {
     _ = script;
     _ = instance;
     _ = placeholder;
+    _ = language;
+    _ = @import("global_class.zig");
+    _ = @import("template.zig");
+    _ = @import("diag_cache.zig");
+    _ = @import("main_queue.zig");
 }

@@ -14,6 +14,9 @@ const default_value = @import("default_value.zig");
 const host_io = @import("host_io.zig");
 const script_mod = @import("script.zig");
 const instance = @import("instance.zig");
+const language = @import("language.zig");
+const diag_cache = @import("diag_cache.zig");
+const main_queue = @import("main_queue.zig");
 
 const Allocator = std.mem.Allocator;
 const String = godot.builtin.String;
@@ -346,6 +349,74 @@ pub const ZigguratTestProbe = struct {
         return instance.propertyStateOf(obj orelse return Dictionary.init());
     }
 
+    // ZigLanguage virtuals that `ScriptLanguage` does not expose to GDScript.
+
+    /// `_validate` of the registered language for `path`.
+    pub fn languageValidate(_: *ZigguratTestProbe, path: String) Dictionary {
+        const lang = language.registered orelse return Dictionary.init();
+        var empty = String.init();
+        defer empty.deinit();
+        return lang._validate(empty, path, false, true, false, false);
+    }
+
+    /// `_get_global_class_name` of the registered language for `path`.
+    pub fn languageGlobalClass(_: *ZigguratTestProbe, path: String) Dictionary {
+        const lang = language.registered orelse return Dictionary.init();
+        return lang._getGlobalClassName(path);
+    }
+
+    pub fn languageCompleteCode(_: *ZigguratTestProbe) Dictionary {
+        const lang = language.registered orelse return Dictionary.init();
+        var empty = String.init();
+        defer empty.deinit();
+        return lang._completeCode(empty, empty, null);
+    }
+
+    pub fn languageLookupCode(_: *ZigguratTestProbe) Dictionary {
+        const lang = language.registered orelse return Dictionary.init();
+        var empty = String.init();
+        defer empty.deinit();
+        return lang._lookupCode(empty, empty, empty, null);
+    }
+
+    /// Records the diagnostics of `rel` as a build would: one error at
+    /// `line`/`column`, or a clean build when `line` is negative.
+    pub fn setDiagnostics(_: *ZigguratTestProbe, rel: String, line: i64, column: i64, message: String) bool {
+        var rel_buf: [1024]u8 = undefined;
+        var msg_buf: [1024]u8 = undefined;
+        const r = props.stringText(&rel, &rel_buf) orelse return false;
+        if (line < 0) {
+            diag_cache.set(r, &.{}) catch return false;
+            return true;
+        }
+        const m = props.stringText(&message, &msg_buf) orelse return false;
+        const d: diag_cache.Diagnostic = .{
+            .line = std.math.cast(u32, line) orelse return false,
+            .column = std.math.cast(u32, column) orelse return false,
+            .message = m,
+        };
+        diag_cache.set(r, &.{d}) catch return false;
+        return true;
+    }
+
+    pub fn hasGlobalConstant(_: *ZigguratTestProbe, name: String) bool {
+        const lang = language.registered orelse return false;
+        var buf: [1024]u8 = undefined;
+        return lang.hasGlobal(props.stringText(&name, &buf) orelse return false);
+    }
+
+    /// Pushes `n` callbacks onto the main-thread queue; returns how many
+    /// were queued. Each one adds 1 to `queue_runs`.
+    pub fn queuePush(_: *ZigguratTestProbe, n: i64) i64 {
+        var pushed: i64 = 0;
+        while (pushed < n) : (pushed += 1) main_queue.push(countRun, null) catch break;
+        return pushed;
+    }
+
+    pub fn queueRuns(_: *ZigguratTestProbe) i64 {
+        return queue_runs.load(.monotonic);
+    }
+
     pub fn propertyIsGroup(_: *ZigguratTestProbe, script: i64, index: i64) bool {
         const d = scriptDesc(script) orelse return false;
         const i = std.math.cast(u32, index) orelse return false;
@@ -353,6 +424,13 @@ pub const ZigguratTestProbe = struct {
         return d.properties[i].field_index == abi.no_field;
     }
 };
+
+/// Callbacks of `queue_push` that ran.
+var queue_runs: std.atomic.Value(i64) = .init(0);
+
+fn countRun(_: ?*anyopaque) void {
+    _ = queue_runs.fetchAdd(1, .monotonic);
+}
 
 /// The cache `cache_read` loaded.
 var cache: ?desc_cache.Cache = null;
@@ -380,6 +458,8 @@ pub const method_names = [_][:0]const u8{
     "script_members",        "script_member_line",      "script_method_info",       "script_has_default",
     "script_update_exports", "script_method_arg_count", "live_instances",           "live_bytes",
     "call_error",            "property_state",          "script_placeholder_count", "script_set_build_failed",
+    "language_validate",     "language_global_class",   "language_complete_code",   "language_lookup_code",
+    "set_diagnostics",       "has_global_constant",     "queue_push",               "queue_runs",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {
