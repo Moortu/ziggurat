@@ -15,7 +15,8 @@
 //! flag structs whose integer fits in `i64`; the gdzig builtins Vector2,
 //! Vector2i, Vector3, Vector3i, Vector4, Vector4i, Color, Rect2, Rect2i,
 //! Quaternion, Plane, Aabb, Basis, Transform2d, Transform3d, Projection,
-//! String, StringName and NodePath. Not in v1: `u64`, `usize`, arrays,
+//! String, StringName and NodePath, and the owning field types `z.String`,
+//! `z.StringName` and `z.NodePath` (as the engine type they hold). Not in v1: `u64`, `usize`, arrays,
 //! dictionaries, slices. Object types: `?*Class` (engine class), `object.Obj(Class)` and
 //! `object.Ref(Class)`; see `object.zig`.
 //!
@@ -40,7 +41,7 @@ const t_string: u32 = 4;
 const t_string_name: u32 = 21;
 const t_object: u32 = 24;
 
-const Kind = enum { bool, int, float, enum_int, flags, builtin, obj_ptr, obj, ref, unsupported };
+const Kind = enum { bool, int, float, enum_int, flags, builtin, text, obj_ptr, obj, ref, unsupported };
 
 const builtins = .{
     .{ b.String, 4 },   .{ b.Vector2, 5 },     .{ b.Vector2i, 6 },     .{ b.Rect2, 7 },
@@ -83,6 +84,8 @@ fn kind(comptime T: type) Kind {
             .@"enum" => |e| if (fitsI64(e.tag_type)) .enum_int else .unsupported,
             .@"struct" => |s| if (s.backing_integer) |I|
                 (if (fitsI64(I)) .flags else .unsupported)
+            else if (@hasDecl(T, "ziggurat_text"))
+                .text
             else if (@hasDecl(T, object.handle_decl))
                 (if (T.ziggurat_handle == .obj) .obj else .ref)
             else
@@ -105,6 +108,7 @@ pub fn variantType(comptime T: type) u32 {
         .int, .enum_int, .flags => t_int,
         .float => t_float,
         .builtin => builtinType(T).?,
+        .text => builtinType(T.ziggurat_text).?,
         .obj_ptr, .obj, .ref => t_object,
         .unsupported => @compileError("ziggurat: no Variant conversion for type " ++ @typeName(T)),
     };
@@ -170,6 +174,7 @@ pub fn write(comptime T: type, value: *const T, ret: *anyopaque) void {
             construct(t_float, ret, &x);
         },
         .builtin => construct(builtinType(T).?, ret, @ptrCast(@constCast(value))),
+        .text => write(T.ziggurat_text, &value.raw, ret),
         // Godot's from-type constructor for OBJECT adds the Variant's own
         // reference to a RefCounted. No reference is taken by hand here, and
         // the caller's own reference (a `Ref`, a creation reference) stays.
@@ -184,7 +189,8 @@ pub fn write(comptime T: type, value: *const T, ret: *anyopaque) void {
 /// type and leaves `out` unchanged. Never panics.
 ///
 /// Never keeps a reference to `v`. A String, StringName or NodePath read
-/// is a new engine value owned by the caller, who frees it with `deinit`.
+/// (also into a `z.String`, ...) is a new engine value owned by the
+/// caller, who frees it with `deinit`.
 pub fn read(comptime T: type, v: *const anyopaque, out: *T) ?ReadError {
     const expected = variantType(T);
     const fail: ReadError = .{ .expected = expected };
@@ -230,6 +236,11 @@ pub fn read(comptime T: type, v: *const anyopaque, out: *T) ?ReadError {
             var x: T = undefined;
             if (!extract(expected, v, &x)) return fail;
             out.* = x;
+        },
+        .text => {
+            var x: T.ziggurat_text = undefined;
+            if (read(T.ziggurat_text, v, &x)) |e| return e;
+            out.* = .{ .raw = x };
         },
         .obj_ptr => {
             const Class = comptime objectPtrClass(@typeInfo(T).optional.child).?;

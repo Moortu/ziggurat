@@ -21,10 +21,18 @@
 //! ends the group before the next field without one.
 //!
 //! Hints (as GDScript exports): `.range` gives RANGE; an enum gives ENUM with
-//! `"tag:value,..."`; `z.Obj(T)` of a Node class gives NODE_TYPE and
-//! `z.Ref(T)` of a Resource class RESOURCE_TYPE, each with the engine class
-//! name. Other object handles cannot be exported. `meta` `.hint` and
-//! `.hint_string` override all of these.
+//! `"tag:value,..."`; a packed struct of bools only (at most 32) gives FLAGS
+//! with `"name:bit,..."` (each field's `toSnakeCase` name and bit value, in
+//! field order); `z.Obj(T)` of a Node class gives NODE_TYPE and `z.Ref(T)`
+//! of a Resource class RESOURCE_TYPE, each with the engine class name. Other
+//! object handles cannot be exported. `meta` `.hint` and `.hint_string`
+//! override all of these.
+//!
+//! Text fields: a field (exported or not) has the owning type `z.String`,
+//! `z.StringName` or `z.NodePath`, never the engine's own String,
+//! StringName or NodePath, so that `self.name = borrowed` cannot compile
+//! (see `own.zig`). Methods, signals, getters and setters use the engine
+//! types, which are borrowed.
 //!
 //! Limit: a field that defaults to `undefined` fails the build, but with Zig's
 //! own "use of undefined value" error at this file, not at the script line.
@@ -49,6 +57,8 @@ pub const hint_none: u32 = 0;
 pub const hint_range: u32 = 1;
 /// PROPERTY_HINT_ENUM; the hint string is `"Tag:value,..."`.
 pub const hint_enum: u32 = 2;
+/// PROPERTY_HINT_FLAGS; the hint string is `"name:bit,..."`.
+pub const hint_flags: u32 = 6;
 /// PROPERTY_HINT_RESOURCE_TYPE; the hint string is the engine class name.
 pub const hint_resource_type: u32 = 17;
 /// PROPERTY_HINT_NODE_TYPE; the hint string is the engine class name.
@@ -288,6 +298,8 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                         fail("base", "Field 'base' must have type *" ++ shortName(Extends) ++ ".");
                     continue;
                 }
+                if (borrowedTextName(FT)) |t|
+                    fail(name, "Field '" ++ name ++ "' has type " ++ t ++ "; use z." ++ t ++ " for a field, so stored text is owned.");
                 if (exported(name)) {
                     if (engineOptionalPtr(FT)) |C|
                         fail(name, "Field '" ++ name ++ "' has type ?*" ++ shortName(C) ++ ", which Godot cannot hold; use z.Obj(" ++ shortName(C) ++ ").");
@@ -300,7 +312,7 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                 // Every instance starts as a shallow copy of the defaults
                 // image, so an engine reference in it would be shared and
                 // released by every destroy.
-                if (own.ownsEngineValue(FT) and !emptyEngineValue(FT, d))
+                if (own.fieldOwns(FT) and !emptyEngineValue(FT, d))
                     fail(name, "Field '" ++ name ++ "' must default to an empty value (.empty or .{}), because every instance starts as a copy of the defaults.");
             }
         }
@@ -322,6 +334,12 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                 for (@typeInfo(FT).@"enum".field_names) |tag| {
                     if (std.mem.indexOfAny(u8, tag, ",:") != null)
                         fail(name, "Field '" ++ name ++ "' has the enum tag '" ++ tag ++ "', which Godot's enum hint cannot show because it contains ',' or ':'.");
+                }
+            }
+            if (isBoolFlags(FT)) {
+                for (@typeInfo(FT).@"struct".field_names) |flag| {
+                    if (!isIdentifier(flag))
+                        fail(name, "Field '" ++ name ++ "' has the flag '" ++ clip(flag) ++ "', which needs an identifier name (" ++ identifier_rule ++ ") for Godot's flags hint.");
                 }
             }
         }
@@ -381,6 +399,14 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                     out = out ++ (if (i == 0) "" else ",") ++ tag ++ ":" ++ std.fmt.comptimePrint("{d}", .{value});
                 }
                 return .{ .hint = hint_enum, .string = out };
+            }
+            if (isBoolFlags(FT)) {
+                var out: []const u8 = "";
+                for (@typeInfo(FT).@"struct".field_names, 0..) |flag, i| {
+                    const bit: u32 = 1 << @bitOffsetOf(FT, flag);
+                    out = out ++ (if (i == 0) "" else ",") ++ snake.toSnakeCase(flag) ++ ":" ++ std.fmt.comptimePrint("{d}", .{bit});
+                }
+                return .{ .hint = hint_flags, .string = out };
             }
             return .{ .hint = hint_none, .string = "" };
         }
@@ -508,11 +534,15 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                 for (f.param_types[1..]) |maybe_p| {
                     const P = maybe_p orelse
                         fail(d, "Method '" ++ d ++ "' has a parameter of type anytype, which Godot cannot pass.");
+                    if (own.isText(P))
+                        fail(d, "Method '" ++ d ++ "' has a parameter of type " ++ own.textName(P) ++ ", which is a field type; take the borrowed " ++ shortName(P.ziggurat_text) ++ ".");
                     if (!convert.supported(P))
                         fail(d, "Method '" ++ d ++ "' has a parameter of type " ++ @typeName(P) ++ ", which Godot cannot pass.");
                 }
                 const R = own.ReturnValue(f.return_type orelse
                     fail(d, "Method '" ++ d ++ "' returns a generic type, which Godot cannot hold."));
+                if (own.isText(R))
+                    fail(d, "Method '" ++ d ++ "' returns " ++ own.textName(R) ++ ", which is a field type; return field.get() or z.Owned(" ++ shortName(R.ziggurat_text) ++ ").");
                 if (R != void and !convert.supported(R))
                     fail(d, "Method '" ++ d ++ "' returns " ++ @typeName(R) ++ ", which Godot cannot hold.");
                 if (@hasField(Meta, d) and @hasField(@TypeOf(@field(meta, d)), "args")) {
@@ -596,6 +626,8 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                     fail("signals", std.fmt.comptimePrint("Signal '{s}' has {d} arguments; Godot allows at most {d}.", .{ sname, si.field_names.len, limits.max_args }));
                 for (si.field_names, si.field_types) |aname, AT| {
                     checkName("signals", "Signal '" ++ sname ++ "' argument '" ++ clip(aname) ++ "'", aname);
+                    if (own.isText(AT))
+                        fail("signals", "Signal '" ++ sname ++ "' argument '" ++ aname ++ "' has type " ++ own.textName(AT) ++ ", which is a field type; use " ++ shortName(AT.ziggurat_text) ++ ".");
                     if (!convert.supported(AT))
                         fail("signals", "Signal '" ++ sname ++ "' argument '" ++ aname ++ "' has type " ++ @typeName(AT) ++ ", which Godot cannot hold.");
                 }
@@ -658,12 +690,13 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             return true;
         }
 
-        /// A getter returns the field type (borrowed) or, for a type that
-        /// holds an engine reference, `Owned` of it (a new value).
+        /// A getter returns the field's access type (borrowed) or, for a
+        /// type that holds an engine reference, `Owned` of it (a new value).
         fn getterMatches(comptime g: []const u8, comptime FT: type) bool {
+            const A = own.Access(FT);
             for ([_]type{ *S, *const S }) |Self| {
-                if (fnMatches(g, &.{Self}, FT)) return true;
-                if (own.ownsEngineValue(FT) and fnMatches(g, &.{Self}, own.Owned(FT))) return true;
+                if (fnMatches(g, &.{Self}, A)) return true;
+                if (own.ownsEngineValue(A) and fnMatches(g, &.{Self}, own.Owned(A))) return true;
             }
             return false;
         }
@@ -679,14 +712,16 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                 fail("_notification", "'_notification' must be 'pub fn _notification(self: *@This(), what: i32) void'.");
             for (info.field_names, info.field_types) |name, FT| {
                 if (!exported(name)) continue;
+                const A = own.Access(FT);
+                const spelled = if (own.isText(FT)) shortName(A) else @typeName(A);
                 const getter = "get_" ++ name;
                 if (isPub(getter) and !getterMatches(getter, FT))
-                    fail(getter, "'" ++ getter ++ "' overrides reading '" ++ name ++ "' and must be 'pub fn " ++ getter ++ "(self: *const @This()) " ++ @typeName(FT) ++ "'" ++
-                        (if (own.ownsEngineValue(FT)) " (or return z.Owned(" ++ @typeName(FT) ++ ") for a new value)" else "") ++ ".");
+                    fail(getter, "'" ++ getter ++ "' overrides reading '" ++ name ++ "' and must be 'pub fn " ++ getter ++ "(self: *const @This()) " ++ spelled ++ "'" ++
+                        (if (own.ownsEngineValue(A)) " (or return z.Owned(" ++ spelled ++ ") for a new value)" else "") ++ ".");
                 const setter = "set_" ++ name;
-                if (isPub(setter) and !fnMatches(setter, &.{ *S, FT }, void))
-                    fail(setter, "'" ++ setter ++ "' overrides writing '" ++ name ++ "' and must be 'pub fn " ++ setter ++ "(self: *@This(), value: " ++ @typeName(FT) ++ ") void'" ++
-                        (if (own.ownsEngineValue(FT)) "; the value is borrowed, so store it with z.assign" else "") ++ ".");
+                if (isPub(setter) and !fnMatches(setter, &.{ *S, A }, void))
+                    fail(setter, "'" ++ setter ++ "' overrides writing '" ++ name ++ "' and must be 'pub fn " ++ setter ++ "(self: *@This(), value: " ++ spelled ++ ") void'" ++
+                        (if (own.isText(FT)) "; the value is borrowed, so store it with self." ++ name ++ ".set(value)" else if (own.ownsEngineValue(A)) "; the value is borrowed, so store it with z.assign" else "") ++ ".");
             }
         }
 
@@ -804,9 +839,30 @@ fn requireDefined(comptime T: type, comptime v: T) void {
 /// True when the String, StringName, NodePath or Ref default `v` holds no
 /// engine reference (all-zero bytes, or a null handle).
 fn emptyEngineValue(comptime T: type, comptime v: T) bool {
+    if (own.isText(T)) return emptyEngineValue(T.ziggurat_text, v.raw);
     if (@hasField(T, "ptr")) return v.ptr == null;
     for (@field(v, "_")) |byte| {
         if (byte != 0) return false;
+    }
+    return true;
+}
+
+/// `String`, `StringName` or `NodePath` when `T` is that engine type, which
+/// a field must not have (see the file header).
+fn borrowedTextName(comptime T: type) ?[]const u8 {
+    const b = godot.builtin;
+    return if (T == b.String) "String" else if (T == b.StringName) "StringName" else if (T == b.NodePath) "NodePath" else null;
+}
+
+/// True for a packed struct of 1 to 32 bools and nothing else, which Godot
+/// shows as a set of flags.
+fn isBoolFlags(comptime T: type) bool {
+    const i = @typeInfo(T);
+    if (i != .@"struct") return false;
+    const I = i.@"struct".backing_integer orelse return false;
+    if (@bitSizeOf(I) > 32 or i.@"struct".field_types.len == 0) return false;
+    for (i.@"struct".field_types) |FT| {
+        if (FT != bool) return false;
     }
     return true;
 }

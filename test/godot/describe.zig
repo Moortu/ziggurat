@@ -22,6 +22,7 @@ const usage_script: u32 = 4102;
 const usage_group: u32 = 64;
 const hint_range: u32 = 1;
 const hint_enum: u32 = 2;
+const hint_flags: u32 = 6;
 const hint_resource_type: u32 = 17;
 const hint_node_type: u32 = 34;
 const group = "Movement/Fast motion";
@@ -219,6 +220,44 @@ test "describe coin: resource handle hint" {
     try testing.expectEqualStrings("Texture2D", str(tex.hint_string));
 }
 
+/// Packed structs of bools as exported fields.
+const Flagged = struct {
+    pub const extends = Node;
+    pub const meta = .{ .overridden = .{ .hint = 0, .hint_string = "" }, .marked = .{ .hint = 3 } };
+
+    abilities: packed struct { can_fly: bool = false, swimFast: bool = true, glow: bool = false } = .{},
+    one: packed struct(u8) { a: bool = false, b: bool = false, c: bool = false, d: bool = false, e: bool = false, f: bool = false, g: bool = false, h: bool = false } = .{},
+    mixed: packed struct { a: bool = false, rest: u7 = 0 } = .{},
+    wide: packed struct { b0: bool = false, b1: bool = false, b2: bool = false, b3: bool = false, b4: bool = false, b5: bool = false, b6: bool = false, b7: bool = false, b8: bool = false, b9: bool = false, b10: bool = false, b11: bool = false, b12: bool = false, b13: bool = false, b14: bool = false, b15: bool = false, b16: bool = false, b17: bool = false, b18: bool = false, b19: bool = false, b20: bool = false, b21: bool = false, b22: bool = false, b23: bool = false, b24: bool = false, b25: bool = false, b26: bool = false, b27: bool = false, b28: bool = false, b29: bool = false, b30: bool = false, b31: bool = false, b32: bool = false } = .{},
+    overridden: packed struct { x: bool = false } = .{},
+    marked: packed struct { x: bool = false } = .{},
+};
+
+test "flags hint" {
+    const d = ziggurat.describe(Flagged, "flagged.zig");
+    const want = [_]PropWant{
+        .{ .name = "abilities", .field = 0, .vt = t_int, .hint = hint_flags, .hint_string = "can_fly:1,swim_fast:2,glow:4" },
+        .{ .name = "one", .field = 1, .vt = t_int, .hint = hint_flags, .hint_string = "a:1,b:2,c:4,d:8,e:16,f:32,g:64,h:128" },
+        // A packed struct with a field that is not a bool, or wider than
+        // 32 bits, is a plain integer.
+        .{ .name = "mixed", .field = 2, .vt = t_int },
+        .{ .name = "wide", .field = 3, .vt = t_int },
+        // meta wins over the type's hint.
+        .{ .name = "overridden", .field = 4, .vt = t_int },
+        .{ .name = "marked", .field = 5, .vt = t_int, .hint = 3, .hint_string = "x:1" },
+    };
+    try testing.expectEqual(@as(u32, want.len), d.property_count);
+    for (want, 0..) |w, i| {
+        const p = d.properties[i];
+        errdefer std.debug.print("property {d} ({s})\n", .{ i, w.name });
+        try testing.expectEqualStrings(w.name, str(p.name));
+        try testing.expectEqual(w.field, p.field_index);
+        try testing.expectEqual(w.vt, p.variant_type);
+        try testing.expectEqual(w.hint, p.hint);
+        try testing.expectEqualStrings(w.hint_string, str(p.hint_string));
+    }
+}
+
 test "describe: layout hash follows fields, not method bodies" {
     const ha = ziggurat.describe(A, "a.zig").layout_hash;
     try testing.expect(ha != ziggurat.describe(B, "a.zig").layout_hash);
@@ -356,7 +395,7 @@ const Stress = struct {
     base: *godot.class.Node2d,
     speed: f32 = 1,
     accel: f64 = 2,
-    note: godot.builtin.String = .empty,
+    note: ziggurat.String = .empty,
     mode: enum { tag_0, tag_1, tag_2, tag_3, tag_4, tag_5, tag_6, tag_7, tag_8, tag_9, tag_10, tag_11, tag_12, tag_13, tag_14, tag_15, tag_16, tag_17, tag_18, tag_19, tag_20, tag_21, tag_22, tag_23, tag_24, tag_25, tag_26, tag_27, tag_28, tag_29, tag_30, tag_31, tag_32, tag_33, tag_34, tag_35, tag_36, tag_37, tag_38, tag_39, tag_40, tag_41, tag_42, tag_43, tag_44, tag_45, tag_46, tag_47, tag_48, tag_49, tag_50, tag_51, tag_52, tag_53, tag_54, tag_55, tag_56, tag_57, tag_58, tag_59, tag_60, tag_61, tag_62, tag_63, tag_64, tag_65, tag_66, tag_67, tag_68, tag_69, tag_70, tag_71, tag_72, tag_73, tag_74, tag_75, tag_76, tag_77, tag_78, tag_79, tag_80, tag_81, tag_82, tag_83, tag_84, tag_85, tag_86, tag_87, tag_88, tag_89, tag_90, tag_91, tag_92, tag_93, tag_94, tag_95, tag_96, tag_97, tag_98, tag_99, tag_100, tag_101, tag_102, tag_103, tag_104, tag_105, tag_106, tag_107, tag_108, tag_109, tag_110, tag_111, tag_112, tag_113, tag_114, tag_115, tag_116, tag_117, tag_118, tag_119, tag_120, tag_121, tag_122, tag_123, tag_124, tag_125, tag_126, tag_127, tag_128, tag_129, tag_130, tag_131, tag_132, tag_133, tag_134, tag_135, tag_136, tag_137, tag_138, tag_139, tag_140, tag_141, tag_142, tag_143, tag_144, tag_145, tag_146, tag_147, tag_148, tag_149, tag_150, tag_151, tag_152, tag_153, tag_154, tag_155, tag_156, tag_157, tag_158, tag_159, tag_160, tag_161, tag_162, tag_163, tag_164, tag_165, tag_166, tag_167, tag_168, tag_169, tag_170, tag_171, tag_172, tag_173, tag_174, tag_175, tag_176, tag_177, tag_178, tag_179, tag_180, tag_181, tag_182, tag_183, tag_184, tag_185, tag_186, tag_187, tag_188, tag_189, tag_190, tag_191, tag_192, tag_193, tag_194, tag_195, tag_196, tag_197, tag_198, tag_199, tag_200, tag_201, tag_202, tag_203, tag_204, tag_205, tag_206, tag_207, tag_208, tag_209, tag_210, tag_211, tag_212, tag_213, tag_214, tag_215, tag_216, tag_217, tag_218, tag_219, tag_220, tag_221, tag_222, tag_223, tag_224, tag_225, tag_226, tag_227, tag_228, tag_229, tag_230, tag_231, tag_232, tag_233, tag_234, tag_235, tag_236, tag_237, tag_238, tag_239, tag_240, tag_241, tag_242, tag_243, tag_244, tag_245, tag_246, tag_247, tag_248, tag_249, tag_250, tag_251, tag_252, tag_253, tag_254, tag_255, tag_256, tag_257, tag_258, tag_259, tag_260, tag_261, tag_262, tag_263, tag_264, tag_265, tag_266, tag_267, tag_268, tag_269, tag_270, tag_271, tag_272, tag_273, tag_274, tag_275, tag_276, tag_277, tag_278, tag_279, tag_280, tag_281, tag_282, tag_283, tag_284, tag_285, tag_286, tag_287, tag_288, tag_289, tag_290, tag_291, tag_292, tag_293, tag_294, tag_295, tag_296, tag_297, tag_298, tag_299 } = .tag_0,
     target: ziggurat.Obj(Node) = .{},
     skin: ziggurat.Ref(godot.class.Texture2d) = .{},

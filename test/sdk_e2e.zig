@@ -477,11 +477,44 @@ const bad_scripts = [_]BadScript{
         .rel = "full_default.zig",
         .data = prelude ++
             \\pub const extends = g.Node;
-            \\title: z.godot.String = .{ .@"_" = .{ 1, 0, 0, 0, 0, 0, 0, 0 } },
+            \\title: z.String = .{ .raw = .{ .@"_" = .{ 1, 0, 0, 0, 0, 0, 0, 0 } } },
             \\
         ,
         .sentence = "Field 'title' must default to an empty value (.empty or .{}), because every instance starts as a copy of the defaults.",
         .decl = "title:",
+    },
+    // A field of a borrowed text type: the owning field types are required.
+    .{
+        .rel = "plain_string.zig",
+        .data = prelude ++
+            \\pub const extends = g.Node;
+            \\speed: f32 = 1,
+            \\title: g.String = .empty,
+            \\
+        ,
+        .sentence = "Field 'title' has type String; use z.String for a field, so stored text is owned.",
+        .decl = "title:",
+    },
+    .{
+        .rel = "plain_string_name.zig",
+        .data = prelude ++
+            \\pub const extends = g.Node;
+            \\_tag: g.StringName = .empty,
+            \\
+        ,
+        .sentence = "Field '_tag' has type StringName; use z.StringName for a field, so stored text is owned.",
+        .decl = "_tag:",
+    },
+    .{
+        .rel = "plain_node_path.zig",
+        .data = prelude ++
+            \\pub const extends = g.Node;
+            \\target: g.NodePath = std.mem.zeroes(g.NodePath),
+            \\const std = @import("std");
+            \\
+        ,
+        .sentence = "Field 'target' has type NodePath; use z.NodePath for a field, so stored text is owned.",
+        .decl = "target:",
     },
     .{
         .rel = "bad_setter.zig",
@@ -873,7 +906,7 @@ test "integration: compile errors map to the script" {
         },
         .{ .rel = "undef_string.zig", .data = prelude ++
             \\pub const extends = g.Node;
-            \\_name: z.godot.String = undefined,
+            \\_name: z.String = undefined,
             \\
         },
     };
@@ -891,7 +924,53 @@ test "integration: compile errors map to the script" {
         } else return error.NoUndefinedError;
         if (timingOn()) std.debug.print("sdk_e2e: {s}: undefined default reported as {?s}:{d}: {s}\n", .{ c.rel, undef.rel, undef.line, undef.message });
     }
-    if (timingOn()) std.debug.print("sdk_e2e: {d} failing builds took {d} ms in total\n", .{ bad_scripts.len + undef_cases.len, total_ms });
+    // Storing a borrowed value in an owned text field, or handing a field
+    // to `Owned`, is Zig's own type error at the script line.
+    const misuse_cases = [_]BadScript{
+        .{ .rel = "store_arg.zig", .data = prelude ++
+            \\pub const extends = g.Node;
+            \\name: z.String = .empty,
+            \\pub fn rename(self: *@This(), value: g.String) void {
+            \\    self.name = value;
+            \\}
+            \\
+        , .sentence = "expected type", .decl = "    self.name = value;" },
+        .{ .rel = "store_owned.zig", .data = prelude ++
+            \\pub const extends = g.Node;
+            \\name: z.String = .empty,
+            \\pub fn rename(self: *@This(), value: g.String) void {
+            \\    self.name = z.Owned(g.String).init(g.String.copy(value));
+            \\}
+            \\
+        , .sentence = "expected type", .decl = "    self.name = z.Owned" },
+        .{ .rel = "owned_field.zig", .data = prelude ++
+            \\pub const extends = g.Node;
+            \\name: z.String = .empty,
+            \\pub fn label(self: *const @This()) z.Owned(g.String) {
+            \\    return .init(self.name);
+            \\}
+            \\
+        , .sentence = "expected type", .decl = "    return .init(self.name);" },
+    };
+    for (misuse_cases) |c| {
+        errdefer std.debug.print("case {s}\n", .{c.rel});
+        const sub = try std.fmt.allocPrint(a, "proj/{s}", .{c.rel});
+        try h.tmp.dir.writeFile(io, .{ .sub_path = sub, .data = c.data });
+        defer h.tmp.dir.deleteFile(io, sub) catch {};
+        const o = try h.build(.save);
+        total_ms += o.ms;
+        errdefer printDiagnostics(o);
+        try testing.expect(!o.ok);
+        const want_line = lineOf(c.data, c.decl);
+        try testing.expect(want_line != 0);
+        const d = for (o.diagnostics) |d| {
+            if (d.rel != null and std.mem.eql(u8, d.rel.?, c.rel)) break d;
+        } else return error.NoDiagnosticForScript;
+        try testing.expectEqual(want_line, d.line);
+        try testing.expect(std.mem.indexOf(u8, d.message, c.sentence) != null);
+        if (timingOn()) std.debug.print("sdk_e2e: {s}: {s}:{d}: {s}\n", .{ c.rel, d.rel.?, d.line, d.message });
+    }
+    if (timingOn()) std.debug.print("sdk_e2e: {d} failing builds took {d} ms in total\n", .{ bad_scripts.len + undef_cases.len + misuse_cases.len, total_ms });
 }
 
 /// A script with two signals and a method that emits one. `{s}` is the

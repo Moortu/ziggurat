@@ -22,6 +22,8 @@ const t_bool: u32 = 1;
 const t_int: u32 = 2;
 const t_float: u32 = 3;
 const t_string: u32 = 4;
+const t_string_name: u32 = 21;
+const t_node_path: u32 = 22;
 const t_object: u32 = 24;
 
 // ---- test HostApi ----
@@ -169,12 +171,12 @@ const Probe = struct {
 
     base: *Node,
     level: i32 = 1,
-    name: b.String = .empty,
+    name: ziggurat.String = .empty,
     item: Ref(Resource) = .{},
     _inited: bool = false,
     _last_what: i32 = -1,
-    alias: b.String = .empty,
-    _tag: b.StringName = .empty,
+    alias: ziggurat.String = .empty,
+    _tag: ziggurat.StringName = .empty,
 
     pub fn init(self: *Probe) void {
         self._inited = true;
@@ -220,21 +222,21 @@ const Probe = struct {
 
     /// Fields returned as they are: borrowed, so the fields stay intact.
     pub fn heldName(self: *const Probe) b.String {
-        return self.name;
+        return self.name.get();
     }
 
     pub fn heldItem(self: *const Probe) Ref(Resource) {
         return self.item;
     }
 
-    /// A setter that keeps its borrowed argument with `assign`.
+    /// A setter that keeps its borrowed argument with the field's `set`.
     pub fn set_alias(self: *Probe, value: b.String) void {
-        ziggurat.assign(&self.alias, value);
+        self.alias.set(value);
     }
 
     /// A getter that returns a new copy through `Owned`.
     pub fn get_alias(self: *const Probe) ziggurat.Owned(b.String) {
-        return .init(b.String.copy(self.alias));
+        return .init(b.String.copy(self.alias.get()));
     }
 };
 
@@ -637,7 +639,11 @@ test "wrap destroy releases" {
     try testing.expectEqual(@as(u8, 1), try setProp(&probe_desc, q.inst, "name", &text));
     destroy(&text);
     // A private StringName field is released too.
-    probe._tag = b.StringName.fromUtf8("ziggurat_wrap_probe_tag");
+    {
+        var tag = b.StringName.fromUtf8("ziggurat_wrap_probe_tag");
+        defer tag.deinit();
+        probe._tag.set(tag);
+    }
 
     deinit_saw_item = false;
     q.deinit(&probe_desc);
@@ -737,7 +743,7 @@ test "wrap returns an adopted Owned Ref without a leak" {
     }
 }
 
-test "wrap setter stores with assign" {
+test "wrap setter stores with set" {
     setup();
     const q = try Instance(Node).init(&probe_desc);
     defer q.deinit(&probe_desc);
@@ -751,12 +757,156 @@ test "wrap setter stores with assign" {
     var got = try getProp(&probe_desc, q.inst, "alias");
     defer destroy(&got);
     try expectUtf8("second \u{2728}", &got);
-    // assign of a value to itself keeps it.
+    // Setting a field to its own value keeps it.
     const probe: *Probe = @ptrCast(@alignCast(q.inst));
-    ziggurat.assign(&probe.alias, probe.alias);
+    probe.alias.set(probe.alias.get());
     var again = try getProp(&probe_desc, q.inst, "alias");
     defer destroy(&again);
     try expectUtf8("second \u{2728}", &again);
+}
+
+/// Owned text fields of each kind, a private one, and methods that keep a
+/// borrowed argument with `set` and return a field with `get`.
+const Texts = struct {
+    pub const extends = Node;
+
+    name: ziggurat.String = .empty,
+    tag: ziggurat.StringName = .empty,
+    path: ziggurat.NodePath = .empty,
+    _note: ziggurat.String = .empty,
+
+    pub fn rename(self: *Texts, value: b.String) void {
+        self.name.set(value);
+        self._note.set(value);
+    }
+
+    pub fn retag(self: *Texts, value: b.StringName) void {
+        self.tag.set(value);
+    }
+
+    pub fn heldNote(self: *const Texts) b.String {
+        return self._note.get();
+    }
+
+    pub fn greeting(self: *const Texts) ziggurat.Owned(b.String) {
+        return .init(b.String.copy(self.name.get()));
+    }
+};
+
+const texts_desc = ziggurat.describe(Texts, "texts.zig");
+
+fn makeNodePath(text: []const u8) !Variant {
+    var s = try b.String.fromUtf8(text);
+    defer s.deinit();
+    var p = b.NodePath.fromString(s);
+    defer p.deinit();
+    return make(t_node_path, p);
+}
+
+fn expectNodePath(expected: []const u8, v: *const Variant) !void {
+    try testing.expectEqual(t_node_path, typeOf(v));
+    var p = try readAs(b.NodePath, v);
+    defer p.deinit();
+    var s = b.String.fromNodePath(p);
+    defer s.deinit();
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings(expected, s.toUtf8Buf(&buf));
+}
+
+test "owned string fields" {
+    setup();
+    const d = &texts_desc;
+    // Field types: the Variant type of the text they hold, no hint.
+    for ([_]struct { []const u8, u32 }{ .{ "name", t_string }, .{ "tag", t_string_name }, .{ "path", t_node_path } }) |w| {
+        const p = d.properties[try propertyIndex(d, w[0])];
+        try testing.expectEqual(w[1], p.variant_type);
+        try testing.expectEqual(@as(u32, 0), p.hint);
+    }
+    // Defaults are empty.
+    var v: Variant = undefined;
+    try testing.expectEqual(@as(u8, 1), d.get_default(try propertyIndex(d, "name"), &v));
+    try expectUtf8("", &v);
+    destroy(&v);
+    try testing.expectEqual(@as(u8, 1), d.get_default(try propertyIndex(d, "tag"), &v));
+    try testing.expectEqual(t_string_name, typeOf(&v));
+    destroy(&v);
+    try testing.expectEqual(@as(u8, 1), d.get_default(try propertyIndex(d, "path"), &v));
+    try expectNodePath("", &v);
+    destroy(&v);
+
+    const start = live_bytes;
+    {
+        const q = try Instance(Node).init(d);
+        defer q.deinit(d);
+        // Set through Godot; each Variant is gone before the read back.
+        for ([_][]const u8{ "first", "second \u{2728}" }) |t| {
+            var sv = try makeString(t);
+            try testing.expectEqual(@as(u8, 1), try setProp(d, q.inst, "name", &sv));
+            destroy(&sv);
+            var tv = try makeString(t);
+            try testing.expectEqual(@as(u8, 1), try setProp(d, q.inst, "tag", &tv));
+            destroy(&tv);
+            var pv = try makeNodePath("a/b:c");
+            try testing.expectEqual(@as(u8, 1), try setProp(d, q.inst, "path", &pv));
+            destroy(&pv);
+        }
+        var got = try getProp(d, q.inst, "name");
+        try expectUtf8("second \u{2728}", &got);
+        destroy(&got);
+        got = try getProp(d, q.inst, "tag");
+        try testing.expectEqual(t_string_name, typeOf(&got));
+        try expectUtf8("second \u{2728}", &got);
+        destroy(&got);
+        got = try getProp(d, q.inst, "path");
+        try expectNodePath("a/b:c", &got);
+        destroy(&got);
+
+        // A failed set leaves the field as it was.
+        var bad = makeInt(7);
+        try testing.expectEqual(@as(u8, 0), try setProp(d, q.inst, "name", &bad));
+        destroy(&bad);
+        got = try getProp(d, q.inst, "name");
+        try expectUtf8("second \u{2728}", &got);
+        destroy(&got);
+
+        // A method keeps its borrowed argument with `set`; the argument
+        // Variant and the wrapper's temporary are gone before the reads.
+        const rename = try methodIndex(d, "rename");
+        const held = try methodIndex(d, "held_note");
+        const greeting = try methodIndex(d, "greeting");
+        for ([_][]const u8{ "from a method", "again", "again" }) |t| {
+            var arg = try makeString(t);
+            var c = callMethod(d, q.inst, rename, &.{&arg});
+            destroy(&arg);
+            try expectCallOk(&c);
+            destroy(&c.ret);
+        }
+        for (0..3) |_| {
+            var c = callMethod(d, q.inst, held, &.{});
+            try expectCallOk(&c);
+            try expectUtf8("again", &c.ret);
+            destroy(&c.ret);
+            c = callMethod(d, q.inst, greeting, &.{});
+            try expectCallOk(&c);
+            try expectUtf8("again", &c.ret);
+            destroy(&c.ret);
+        }
+        got = try getProp(d, q.inst, "name");
+        try expectUtf8("again", &got);
+        destroy(&got);
+        const retag = try methodIndex(d, "retag");
+        var tag_arg = try makeString("tagged");
+        var c = callMethod(d, q.inst, retag, &.{&tag_arg});
+        destroy(&tag_arg);
+        try expectCallOk(&c);
+        destroy(&c.ret);
+        got = try getProp(d, q.inst, "tag");
+        try expectUtf8("tagged", &got);
+        destroy(&got);
+    }
+    // Destroy released every field; the clean-exit runner checks Godot's
+    // own memory for leaked text.
+    try testing.expectEqual(start, live_bytes);
 }
 
 test "wrap call with null args" {

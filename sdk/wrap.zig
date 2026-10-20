@@ -24,15 +24,20 @@
 //! non-zero `argc` is INVALID_ARGUMENT at argument 0.
 //!
 //! Ownership (helpers in `own.zig`):
+//! - Text fields have the owning types `z.String`, `z.StringName` and
+//!   `z.NodePath`; a field of the engine's own String, StringName or
+//!   NodePath type fails in `describe`. The wrappers read and write such a
+//!   field as the text it holds.
 //! - Arguments are borrowed for the length of the call. A String,
 //!   StringName, NodePath or `Ref` argument is a temporary that is released
 //!   after the method returns; a method or setter that keeps one stores it
-//!   with `z.assign(&self.field, value)`, which takes its own copy or
-//!   reference and releases the old value.
+//!   with `self.field.set(value)` (text) or `z.assign(&self.field, value)`
+//!   (`Ref`), which take their own copy or reference and release the old
+//!   value. `self.field = value` does not compile for a text field.
 //! - Plain return values are borrowed too: Godot's from-type constructor
 //!   copies a String, StringName or NodePath and takes the Variant's own
 //!   reference to an object, so the wrapper writes `ret` and leaves the
-//!   returned value alone (`return self.title;` is correct). A method that
+//!   returned value alone (`return self.title.get();` is correct). A method that
 //!   returns a value it made itself returns `z.Owned(T)`; the wrapper
 //!   releases `value` after the write. A new value returned without
 //!   `Owned` leaks, which the in-Godot leak checks report; it never dangles.
@@ -42,10 +47,11 @@
 //! - `get_<field>` and `set_<field>` (`pub fn`, exact Zig names) replace
 //!   direct field access; they follow the same rules as methods (the
 //!   getter's plain return value is borrowed, `Owned` is released; the
-//!   setter's argument is borrowed).
+//!   setter's argument is borrowed). For a `z.String` field they return
+//!   and take `String` (likewise StringName and NodePath).
 //! - `destroy` calls `deinit` first, while every field is still intact, then
-//!   releases each top-level String, StringName, NodePath and `Ref` field
-//!   (an `Obj` holds no reference), then frees the memory. `deinit` need not
+//!   releases each top-level `z.String`, `z.StringName`, `z.NodePath` and
+//!   `Ref` field (an `Obj` holds no reference), then frees the memory. `deinit` need not
 //!   release those fields itself; a second release is harmless.
 //!   `deinit` runs while Godot is destroying the owner (from the script
 //!   instance's free, inside `~Object`), so it must not use `base`; cleanup
@@ -61,6 +67,8 @@ const runtime = @import("runtime.zig");
 const own = @import("own.zig");
 const ownsEngineValue = own.ownsEngineValue;
 const release = own.release;
+const fieldOwns = own.fieldOwns;
+const releaseField = own.releaseField;
 
 /// The wrapper functions of script `S` at `rel`. `method_decls` are the
 /// Zig names of the descriptor's methods in order, `properties` the
@@ -123,7 +131,7 @@ pub fn Wrappers(
             if (comptime hasPub("deinit")) S.deinit(self);
             inline for (info.field_names) |name| {
                 const FT = @FieldType(S, name);
-                if (comptime ownsEngineValue(FT)) release(FT, &@field(self, name));
+                if (comptime fieldOwns(FT)) releaseField(FT, &@field(self, name));
             }
             // Without a host the memory cannot be returned; moduleInit
             // always runs before any create, so this does not happen.
@@ -236,10 +244,10 @@ pub fn Wrappers(
             var tmp: FT = undefined;
             if (convert.read(FT, value, &tmp) != null) return 0;
             if (comptime hasPub("set_" ++ name)) {
-                @field(S, "set_" ++ name)(self, tmp);
-                if (comptime ownsEngineValue(FT)) release(FT, &tmp);
+                @field(S, "set_" ++ name)(self, own.access(FT, &tmp));
+                if (comptime fieldOwns(FT)) releaseField(FT, &tmp);
             } else {
-                if (comptime ownsEngineValue(FT)) release(FT, &@field(self, name));
+                if (comptime fieldOwns(FT)) releaseField(FT, &@field(self, name));
                 @field(self, name) = tmp;
             }
             return 1;

@@ -46,10 +46,20 @@ pub const Ref = object.Ref;
 /// A return value that hands a new String, StringName, NodePath or Ref to
 /// Godot. Plain return values are borrowed (Godot copies them).
 pub const Owned = @import("own.zig").Owned;
-/// Stores a String, StringName, NodePath or Ref with its own copy or
-/// reference and releases the old value. Arguments are borrowed for the
-/// length of the call, so a method that keeps one stores it with `assign`.
+/// Stores a Ref with its own reference and releases the old value.
+/// Arguments are borrowed for the length of the call, so a method that
+/// keeps one stores it with `assign`. Text goes in a `String`,
+/// `StringName` or `NodePath` field with that field's `set`.
 pub const assign = @import("own.zig").assign;
+/// The owning text field types. A script field holds text as `z.String`,
+/// `z.StringName` or `z.NodePath` (default `.empty`), never as the engine's
+/// own `godot.String`, ... (a compile error). `self.name.set(v)` stores a
+/// copy of the borrowed `v` and releases the old text; `self.name.get()`
+/// gives the text, borrowed from the field. Method arguments and return
+/// values keep the engine types.
+pub const String = @import("own.zig").String;
+pub const StringName = @import("own.zig").StringName;
+pub const NodePath = @import("own.zig").NodePath;
 
 /// Emits a signal the script declares, checked at compile time:
 /// `z.emit(self, .hit, .{ .damage = 3 })`. See `signal.zig`.

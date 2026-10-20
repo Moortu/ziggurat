@@ -13,7 +13,7 @@ alive: bool = true,
 mood: Mood = .calm,
 layers: Layers = .{},
 spawn: g.Vector2 = .{ .x = 1, .y = 2 },
-title: g.String = .empty,
+title: z.String = .empty,
 target: z.Obj(g.Node) = .{},
 _dash_timer: f32 = 0,
 

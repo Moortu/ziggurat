@@ -6,7 +6,7 @@ pub const extends = g.Label;
 pub const class_name = "HudLabel";
 pub const tool = true;
 
-prefix: g.String = .empty,
+prefix: z.String = .empty,
 blink: f64 = 0.5,
 
 pub fn _process(self: *@This(), delta: f64) void {

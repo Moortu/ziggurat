@@ -10,7 +10,7 @@ pub const class_name = "Mover";
 
 base: *g.Node2D,
 speed: f32 = 5,
-title: g.String = .empty,
+title: z.String = .empty,
 steps: i32 = 0,
 ready_calls: i32 = 0,
 notifications: i32 = 0,
@@ -36,7 +36,7 @@ pub fn _notification(self: *@This(), what: i32) void {
 }
 
 pub fn _toString(self: *const @This()) g.String {
-    return self.title;
+    return self.title.get();
 }
 
 pub fn scaled(self: *const @This(), x: i32) i32 {
