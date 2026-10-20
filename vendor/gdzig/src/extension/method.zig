@@ -1,0 +1,274 @@
+const std = @import("std");
+const DeclEnum = std.meta.DeclEnum;
+
+const casez = @import("casez");
+const common = @import("common");
+const godot_case = common.godot_case;
+
+const gdzig = @import("gdzig");
+const class = gdzig.class;
+const ptrcall = @import("../class/ptrcall.zig");
+const classdb = gdzig.class.ClassDb;
+const MethodFlags = gdzig.global.MethodFlags;
+const StringName = gdzig.builtin.StringName;
+const Variant = gdzig.builtin.Variant;
+
+const Registry = @import("Registry.zig");
+
+/// Registers a method on a class.
+///
+/// Example:
+/// ```
+/// godot.registerMethod(MyClass, .decl(.myMethod));
+/// ```
+pub fn registerMethod(comptime Class: type, comptime config: MethodConfig(Class)) void {
+    var class_name: StringName = .fromType(Class);
+    var method_name: StringName = .fromComptimeLatin1(config.name);
+
+    classdb.registerMethod(Class, void, &class_name, .{
+        .name = &method_name,
+        .flags = config.flags,
+        .return_value_info = config.return_value_info,
+        .return_value_metadata = config.return_value_metadata,
+        .argument_info = config.argument_info,
+        .argument_metadata = config.argument_metadata,
+        .default_arguments = config.default_arguments,
+    }, .{
+        .call = config.call,
+        .ptr_call = config.ptr_call,
+    });
+}
+
+pub fn MethodConfig(comptime Class: type) type {
+    return struct {
+        name: [:0]const u8,
+        return_type: type = void,
+        flags: MethodFlags = .{},
+        return_value_info: ?*classdb.PropertyInfo = null,
+        return_value_metadata: classdb.MethodArgumentMetadata = .none,
+        argument_info: []const classdb.PropertyInfo = &.{},
+        argument_metadata: []const classdb.MethodArgumentMetadata = &.{},
+        default_arguments: []const *const Variant = &.{},
+        call: ?classdb.Call(Class, void) = null,
+        ptr_call: ?classdb.PtrCall(Class, void) = null,
+
+        const Self = @This();
+
+        /// Creates a MethodConfig from a method name and decl name.
+        /// The name is what Godot sees (snake_case), decl_name is the Zig decl.
+        pub fn fromName(comptime name: [:0]const u8, comptime decl_name: [:0]const u8, comptime options: Registry.Method(Class).CreateOptions) Self {
+            const MethodType = @TypeOf(@field(Class, decl_name));
+            const Args = @typeInfo(MethodType).@"fn".param_types;
+            const ReturnType = @typeInfo(MethodType).@"fn".return_type orelse void;
+            const arg_count = Args.len - 1;
+
+            const return_value: classdb.PropertyInfo = .{
+                .type = .forType(ReturnType),
+            };
+
+            const arg_infos: [arg_count]classdb.PropertyInfo = comptime blk: {
+                var infos: [arg_count]classdb.PropertyInfo = undefined;
+                for (0..arg_count) |i| {
+                    const ArgType = Args[i + 1].?;
+                    infos[i] = .{ .type = .forType(ArgType) };
+                }
+                break :blk infos;
+            };
+
+            const arg_metas: [arg_count]classdb.MethodArgumentMetadata = comptime blk: {
+                var metas: [arg_count]classdb.MethodArgumentMetadata = undefined;
+                for (0..arg_count) |i| {
+                    metas[i] = .none;
+                }
+                break :blk metas;
+            };
+
+            const Callbacks = struct {
+                const method = @field(Class, decl_name);
+
+                fn call(instance: *Class, args: []const *const Variant) gdzig.CallError!Variant {
+                    var call_args: std.meta.ArgsTuple(MethodType) = undefined;
+                    call_args[0] = instance;
+
+                    var initialized_arg_count: usize = 0;
+                    defer inline for (1..Args.len) |i| {
+                        if (i <= initialized_arg_count) {
+                            const ArgType = Args[i].?;
+                            releaseVarValue(ArgType, call_args[i]);
+                        }
+                    };
+
+                    inline for (1..Args.len) |i| {
+                        const ArgType = Args[i].?;
+                        if (i - 1 < args.len) {
+                            call_args[i] = args[i - 1].as(ArgType) orelse return error.InvalidArgument;
+                            initialized_arg_count += 1;
+                        }
+                    }
+                    if (ReturnType == void) {
+                        @call(.auto, method, call_args);
+                        return Variant.nil;
+                    } else {
+                        const result = @call(.auto, method, call_args);
+                        const variant = Variant.init(ReturnType, result);
+                        releaseVarValue(ReturnType, result);
+                        return variant;
+                    }
+                }
+
+                fn ptrCall(instance: *Class, args: [*]const *const anyopaque, ret: ?*anyopaque) void {
+                    var call_args: std.meta.ArgsTuple(MethodType) = undefined;
+                    call_args[0] = instance;
+                    inline for (1..Args.len) |i| {
+                        const ArgType = Args[i].?;
+                        call_args[i] = ptrToArg(ArgType, args[i - 1]);
+                    }
+                    if (ReturnType == void) {
+                        @call(.auto, method, call_args);
+                    } else {
+                        const result = @call(.auto, method, call_args);
+                        if (ret) |r| {
+                            writePtrReturn(ReturnType, r, result);
+                        }
+                    }
+                }
+            };
+
+            return .{
+                .name = name,
+                .return_type = ReturnType,
+                .flags = options.flags,
+                .return_value_info = if (ReturnType != void) @constCast(&return_value) else null,
+                .argument_info = @constCast(&arg_infos),
+                .argument_metadata = @constCast(&arg_metas),
+                .default_arguments = options.default_arguments,
+                .call = Callbacks.call,
+                .ptr_call = Callbacks.ptrCall,
+            };
+        }
+
+        /// Creates a getter method for a class field.
+        /// name: the method name Godot sees (e.g., "get_health")
+        /// field_name: the Zig field name (e.g., "health")
+        pub fn getter(comptime name: [:0]const u8, comptime field_name: [:0]const u8) Self {
+            const FieldType = @FieldType(Class, field_name);
+
+            const return_value: classdb.PropertyInfo = .{ .type = .forType(FieldType) };
+
+            const Callbacks = struct {
+                fn call(instance: *Class, _: []const *const Variant) gdzig.CallError!Variant {
+                    return Variant.init(FieldType, @field(instance, field_name));
+                }
+
+                fn ptrCall(instance: *Class, _: [*]const *const anyopaque, ret: ?*anyopaque) void {
+                    if (ret) |r| {
+                        writePtrReturn(FieldType, r, @field(instance, field_name));
+                    }
+                }
+            };
+
+            return .{
+                .name = name,
+                .return_type = FieldType,
+                .return_value_info = @constCast(&return_value),
+                .call = Callbacks.call,
+                .ptr_call = Callbacks.ptrCall,
+            };
+        }
+
+        /// Creates a setter method for a class field.
+        /// name: the method name Godot sees (e.g., "set_health")
+        /// field_name: the Zig field name (e.g., "health")
+        pub fn setter(comptime name: [:0]const u8, comptime field_name: [:0]const u8) Self {
+            const FieldType = @FieldType(Class, field_name);
+
+            const arg_info: [1]classdb.PropertyInfo = .{.{ .type = .forType(FieldType) }};
+            const arg_meta: [1]classdb.MethodArgumentMetadata = .{.none};
+
+            const Callbacks = struct {
+                fn call(instance: *Class, args: []const *const Variant) gdzig.CallError!Variant {
+                    if (args.len < 1) return error.TooFewArguments;
+                    const value = args[0].as(FieldType) orelse return error.InvalidArgument;
+                    @field(instance, field_name) = value;
+                    return Variant.nil;
+                }
+
+                fn ptrCall(instance: *Class, args: [*]const *const anyopaque, _: ?*anyopaque) void {
+                    @field(instance, field_name) = ptrToArg(FieldType, args[0]);
+                }
+            };
+
+            return .{
+                .name = name,
+                .argument_info = @constCast(&arg_info),
+                .argument_metadata = @constCast(&arg_meta),
+                .call = Callbacks.call,
+                .ptr_call = Callbacks.ptrCall,
+            };
+        }
+    };
+}
+
+/// Decode one extension-method ptrcall argument. RefCounted values travel
+/// through Godot's Ref ABI, including extension classes and nullable Refs;
+/// their slot is not the raw object pointer represented by the Zig type.
+fn ptrToArg(comptime ArgType: type, p_arg: *const anyopaque) ArgType {
+    if (comptime class.isRefCountedPtr(ArgType)) {
+        const Ptr = class.ClassPtrOf(ArgType);
+        const object = gdzig.raw.refGetObject(@ptrCast(p_arg)) orelse {
+            if (comptime class.isNullableClassPtr(ArgType)) return null;
+            @panic("non-null RefCounted ptrcall argument contained a null Ref");
+        };
+
+        const value: Ptr = if (comptime class.isOpaqueClassPtr(Ptr))
+            @ptrCast(@alignCast(object))
+        else blk: {
+            const Class = std.meta.Child(Ptr);
+            const Base = class.BaseOf(Class);
+            const base: *Base = @ptrCast(@alignCast(object));
+            break :blk base.asInstance(Class) orelse @panic("Ref ptrcall argument has the wrong extension class");
+        };
+        return @as(ArgType, value);
+    }
+
+    if (comptime class.isOpaqueClassPtr(ArgType)) {
+        return @ptrCast(@constCast(p_arg));
+    }
+    return ptrcall.readArg(ArgType, p_arg);
+}
+
+/// Encode one extension-method ptrcall return. Godot supplies storage for a
+/// Ref wrapper when the declared type is RefCounted, so populate that wrapper
+/// instead of writing the Zig object pointer directly into it.
+fn writePtrReturn(comptime ReturnType: type, p_ret: *anyopaque, value: ReturnType) void {
+    if (comptime class.isRefCountedPtr(ReturnType)) {
+        const object: ?*gdzig.class.Object = if (comptime class.isNullableClassPtr(ReturnType))
+            if (value) |object_value| .upcast(object_value) else null
+        else
+            .upcast(value);
+        gdzig.raw.refSetObject(@ptrCast(p_ret), if (object) |obj| @ptrCast(obj) else null);
+        return;
+    }
+    ptrcall.writeReturn(ReturnType, p_ret, value);
+}
+
+/// Releases varcall-owned builtin temporaries after the callback no longer needs them.
+///
+/// Varcall materializes destructor-backed builtin arguments with `Variant.as`, and boxes
+/// destructor-backed builtin returns with `Variant.init`. Both operations copy the value and leave
+/// this adapter owning a local handle. Releasing that local keeps `Array`, `Dictionary`, `String`,
+/// and other destructor-backed builtins from retaining an extra reference. Plain math builtins and
+/// object pointers own nothing here and are left alone.
+///
+/// Ptrcall arguments are deliberately excluded: ptrcall reads Godot-owned argument slots directly,
+/// so there is no adapter-owned temporary to release.
+///
+/// `Variant` also has `deinit`, but is not a supported method argument or return type today because
+/// `Variant.Tag.forType` rejects it. If passthrough `Variant` values become valid, revisit this
+/// rule first.
+fn releaseVarValue(comptime T: type, value: T) void {
+    if (comptime @typeInfo(T) == .@"struct" and @hasDecl(T, "deinit")) {
+        var owned: T = value;
+        owned.deinit();
+    }
+}

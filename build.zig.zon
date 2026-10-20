@@ -5,8 +5,7 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .gdzig = .{
-            .url = "git+https://github.com/gdzig/gdzig#c8e0768c9eb768827163f0ac893a5038bda799cb",
-            .hash = "godot-0.0.0-dev-q0GYjsfPwgCDsHpBgBeKR6ph6EbtJLqaMCY7waAmKGty",
+            .path = "vendor/gdzig",
         },
     },
     .paths = .{
@@ -16,6 +15,8 @@
         "src",
         "test",
         "tools",
+        "vendor",
+        "addon",
         "LICENSE",
     },
 }
