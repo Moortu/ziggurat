@@ -1,0 +1,27 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://hero.zig" id="1_hero"]
+[ext_resource type="Script" path="res://beacon.zig" id="2_beacon"]
+[ext_resource type="Script" path="res://target.zig" id="3_target"]
+[ext_resource type="Script" path="res://listener.gd" id="4_listener"]
+
+[node name="Main" type="Node2D"]
+
+[node name="Hero" type="Node2D" parent="."]
+script = ExtResource("1_hero")
+speed = 12.5
+title = "stored title"
+layers = 5
+spawn = Vector2(3, 4)
+
+[node name="Beacon" type="Node" parent="."]
+script = ExtResource("2_beacon")
+pulses = 3
+
+[node name="Target" type="Node" parent="."]
+script = ExtResource("3_target")
+
+[node name="Listener" type="Node" parent="."]
+script = ExtResource("4_listener")
+
+[connection signal="hit" from="Target" to="Listener" method="_on_scene_hit"]

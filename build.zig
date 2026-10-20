@@ -33,6 +33,7 @@ pub fn build(b: *std.Build) void {
     const godot_step = b.step("test-godot", "Run the SDK tests inside a headless Godot (needs Godot)");
     const host_step = b.step("host", "Install the host library and its .gdextension into <prefix>/addon (zig build host -p <project>)");
     const host_test_step = b.step("test-host", "Run the host tests in a headless Godot (needs Godot)");
+    const gui_test_step = b.step("test-gui", "Run the GUI editor test under Xvfb (needs Godot and xvfb-run); not part of test");
 
     const sdk = addSdk(b, target, optimize, godot_path);
     const manifest_tool = b.addExecutable(.{
@@ -86,6 +87,7 @@ pub fn build(b: *std.Build) void {
     host_step.dependOn(&b.addInstallFileWithDir(gdextension_file, addon_dir, "ziggurat_host.gdextension").step);
     if (godot_found == null) {
         host_test_step.dependOn(&b.addFail("test-host needs Godot on PATH or -Dgodot-path=<absolute path>").step);
+        gui_test_step.dependOn(&b.addFail("test-gui needs Godot on PATH or -Dgodot-path=<absolute path>").step);
     } else {
         const probe_host = addHost(b, target, optimize, godot_path, zig_exe, sdk_options, .{ .test_probe = true });
         const export_host = addHost(b, target, optimize, godot_path, zig_exe, sdk_options, .{ .export_build = true });
@@ -99,6 +101,7 @@ pub fn build(b: *std.Build) void {
             .sdk_manifest = test_manifest,
             .sdk_options = sdk_options,
             .filter = host_test_filter,
+            .gui_step = gui_test_step,
         });
     }
     test_step.dependOn(host_test_step);
@@ -287,6 +290,9 @@ const HostTestInputs = struct {
     sdk_options: *std.Build.Module,
     /// Runs only the host tests whose name contains this text.
     filter: ?[]const u8 = null,
+    /// The step that runs the GUI test (`test-gui`): the host tests named
+    /// "gui: ..." with a GUI editor under Xvfb. It needs xvfb-run on PATH.
+    gui_step: *std.Build.Step,
 };
 
 /// The host tests (test/host): a Zig test that copies a fixture project,
@@ -354,6 +360,42 @@ fn addHostTests(
             .{ .name = "ziggurat_abi", .module = abi },
         },
     });
+    // `test-host` skips the GUI test; `test-gui` runs only that test.
+    const headless = hostTestRun(b, target, optimize, in, options_mod, platform, build_mod, abi, .{ .run_gui = false, .filter = in.filter });
+    step.dependOn(&headless.step);
+    if (b.findProgram(.{ .names = &.{"xvfb-run"} })) |xvfb| {
+        const gui = hostTestRun(b, target, optimize, in, options_mod, platform, build_mod, abi, .{ .run_gui = true, .xvfb_run = xvfb, .filter = "gui: " });
+        // Never cached: it drives a GUI and reports timing.
+        gui.has_side_effects = true;
+        in.gui_step.dependOn(&gui.step);
+    } else {
+        in.gui_step.dependOn(&b.addFail("test-gui needs xvfb-run on PATH (nix shell nixpkgs#xvfb-run)").step);
+    }
+}
+
+const GuiChoice = struct {
+    run_gui: bool,
+    xvfb_run: []const u8 = "",
+    filter: ?[]const u8,
+};
+
+/// One run of test/host/host_test.zig; `gui` decides whether the "gui: "
+/// test runs (module `host_gui_options`).
+fn hostTestRun(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    in: HostTestInputs,
+    options_mod: *std.Build.Module,
+    platform: *std.Build.Module,
+    build_mod: *std.Build.Module,
+    abi: *std.Build.Module,
+    gui: GuiChoice,
+) *std.Build.Step.Run {
+    const gui_options = b.addOptions();
+    gui_options.addOption(bool, "run_gui", gui.run_gui);
+    gui_options.addOption([]const u8, "xvfb_run", gui.xvfb_run);
+    gui_options.addOption([]const u8, "gui_dir", b.root.joinString(b.allocator, "test/host/gui") catch @panic("OOM"));
     const t = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("test/host/host_test.zig"),
         .target = target,
@@ -361,18 +403,19 @@ fn addHostTests(
         .link_libc = true,
         .imports = &.{
             .{ .name = "host_test_options", .module = options_mod },
+            .{ .name = "host_gui_options", .module = gui_options.createModule() },
             .{ .name = "ziggurat_platform", .module = platform },
             .{ .name = "ziggurat_build", .module = build_mod },
             .{ .name = "ziggurat_abi", .module = abi },
             .{ .name = "sdk_options", .module = in.sdk_options },
         },
-    }), .filters = if (in.filter) |f| b.dupeStrings(&.{f}) else &.{} });
+    }), .filters = if (gui.filter) |f| b.dupeStrings(&.{f}) else &.{} });
     const run = b.addRunArtifact(t);
     // The fixtures and check scripts are read at run time, and the SDK is
     // compiled from source by a child compiler; Godot is an input too.
     addSourceInputs(b, run, &.{ "test/host", "test/fixtures", "sdk", "src/abi" });
     run.addFileInput(.{ .cwd_relative = in.godot_exe });
-    step.dependOn(&run.step);
+    return run;
 }
 
 /// A fixture script as a module that imports the SDK.

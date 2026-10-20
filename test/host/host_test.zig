@@ -8,6 +8,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const opts = @import("host_test_options");
+const gui_opts = @import("host_gui_options");
 const platform = @import("ziggurat_platform");
 const zbuild = @import("ziggurat_build");
 const abi = @import("ziggurat_abi");
@@ -1313,6 +1314,154 @@ test "game runs ready" {
         },
         .reject = &.{ refused_prefix, "placeholder" },
     });
+}
+
+// ------------------------------------------------------------ end to end
+
+/// The game pass's ZTEST cases (test/host/projects/e2e/listener.gd).
+const e2e_game_cases = [_][]const u8{
+    "ZTEST PASS game_scripts_attached",
+    "ZTEST PASS ready_ran",
+    "ZTEST PASS exported_values_from_scene",
+    "ZTEST PASS property_list_hints",
+    "ZTEST PASS signal_declared",
+    "ZTEST PASS emit_reaches_connect",
+    "ZTEST PASS emit_reaches_signal_property",
+    "ZTEST PASS emit_reaches_scene_connection",
+    "ZTEST PASS handler_reads_emitter",
+    "ZTEST PASS metadata_not_swallowed",
+    "ZTEST PASS method_call_returns",
+    "ZTEST PASS method_callable_property",
+};
+
+test "e2e headless" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.init("e2e");
+    defer p.deinit();
+    try addBuildSettings(&p);
+    try p.addAutoloadCheck("e2e_editor.gd");
+    // Editor pass: the build at open stages generation 1 for the game.
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS editor_built_and_staged",
+            "ZTEST PASS editor_tool_instance",
+            "ZTEST PASS editor_placeholder_values",
+            "ziggurat: build 1 loaded (open, ",
+        },
+        .deadline = build_deadline_s,
+    });
+    // Game pass: the main scene with the staged generation, no builds.
+    try p.run(&.{ "game", "res://main.tscn" }, .{
+        .expect = &e2e_game_cases,
+        .once = &.{
+            "ziggurat: generation 1 loaded",
+            "[ziggurat] hero ready speed=12.5 spawn=3,4\n",
+            "[ziggurat] beacon ready pulses=3\n",
+            "e2e game: checks done",
+        },
+        .reject = &.{ refused_prefix, "emit of signal", "placeholder", "ziggurat: build" },
+    });
+}
+
+// ------------------------------------------------------------ GUI editor
+
+/// Seconds for the whole GUI run: the build at open, the game, the save
+/// and the build it starts.
+const gui_deadline_s = "900";
+
+/// The GUI editor's steps (test/host/gui/save_path.gd).
+const gui_cases = [_][]const u8{
+    "ZTEST PASS gui_editor",
+    "ZTEST PASS gui_build_at_open",
+    "ZTEST PASS gui_script_open",
+    "ZTEST PASS gui_game_running",
+    "ZTEST PASS gui_no_reload_before_save",
+    "ZTEST PASS gui_script_edited",
+    "ZTEST PASS gui_script_saved",
+    "ZTEST PASS gui_save_reaches_game",
+    "ZTEST PASS gui_save_builds",
+};
+
+// Run by `zig build test-gui` only (spec section 12, check 6): the GUI
+// editor under Xvfb plays the e2e project's main scene, a tool autoload
+// edits res://hero.zig in the script editor and saves it with
+// ScriptEditor.save_all_scripts(), and the running game logs the host's
+// `_reload_scripts` line within 10 s. The manual desktop run of the same
+// steps is in test/host/gui/README.md.
+test "gui: save in the script editor reaches the running game" {
+    if (!gui_opts.run_gui) return error.SkipZigTest;
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.init("e2e");
+    defer p.deinit();
+    const a = p.arena_state.allocator();
+    try addBuildSettings(&p);
+    // The editor test as the autoload res://check.gd.
+    const cwd = Io.Dir.cwd();
+    var gui_dir = try cwd.openDir(io, gui_opts.gui_dir, .{});
+    defer gui_dir.close(io);
+    var dir = try cwd.openDir(io, p.path, .{});
+    defer dir.close(io);
+    try gui_dir.copyFile("save_path.gd", dir, "check.gd", io, .{});
+    const old = try dir.readFileAlloc(io, "project.godot", a, .limited(64 * 1024));
+    // The game renders like the editor: OpenGL compatibility, which Xvfb
+    // runs without a GPU.
+    const new = try std.mem.concat(a, u8, &.{ old, "\n[autoload]\n\ncheck=\"*res://check.gd\"\n\n[rendering]\n\nrenderer/rendering_method=\"gl_compatibility\"\n" });
+    try dir.writeFile(io, .{ .sub_path = "project.godot", .data = new });
+    try dir.createDirPath(io, ".godot");
+    try dir.writeFile(io, .{ .sub_path = ".godot/extension_list.cfg", .data = "res://addon/ziggurat_host.gdextension\n" });
+
+    // Editor settings, data and the log stay in the test's folder: nothing
+    // of the user's own Godot setup is read or changed.
+    try p.tmp.dir.createDirPath(io, "config");
+    try p.tmp.dir.createDirPath(io, "data");
+    const root = try p.tmp.dir.realPathFileAlloc(io, ".", a);
+    const log_path = try std.fs.path.join(a, &.{ root, "gui.log" });
+    const env = p.env.?;
+    try env.put("XDG_CONFIG_HOME", try std.fs.path.join(a, &.{ root, "config" }));
+    try env.put("XDG_DATA_HOME", try std.fs.path.join(a, &.{ root, "data" }));
+    try env.put("ZTEST_LOG", log_path);
+    try env.put("ZTEST_GUI", "1");
+
+    const script = try std.fs.path.join(a, &.{ gui_opts.gui_dir, "run-gui.sh" });
+    const result = try std.process.run(a, io, .{
+        .argv = &.{ "bash", script, gui_opts.xvfb_run, opts.godot_exe, p.path, log_path, gui_deadline_s },
+        .environ_map = env,
+    });
+    const out = cwd.readFileAlloc(io, log_path, a, .limited(64 << 20)) catch "";
+
+    var problems: std.ArrayList([]const u8) = .empty;
+    if (!result.term.success()) try problems.append(a, "the editor did not exit with status 0 before the deadline");
+    const needed = gui_cases ++ e2e_game_cases ++ [_][]const u8{
+        "ZTEST DONE",
+        "ziggurat: build 1 loaded (open, ",
+        " loaded (save, ",
+        // The game's line; Play may have built a newer generation first.
+        "ziggurat: generation ",
+    };
+    for (needed) |text| {
+        if (std.mem.indexOf(u8, out, text) == null)
+            try problems.append(a, try std.fmt.allocPrint(a, "missing expected text: {s}", .{text}));
+    }
+    for ([_][]const u8{ "ZTEST FAIL", "Program crashed", "emit of signal" }) |text| {
+        if (std.mem.indexOf(u8, out, text) != null)
+            try problems.append(a, try std.fmt.allocPrint(a, "rejected text present: {s}", .{text}));
+    }
+    // The game asks for a reload once per process (src/host/language.zig).
+    if (std.mem.count(u8, out, "Ziggurat: reload requested for 1 scripts") != 1)
+        try problems.append(a, "the game's reload line is not there exactly once");
+    if (problems.items.len == 0) {
+        // The timing and what Play did, for the record.
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "gui save path: ")) std.debug.print("{s}\n", .{line});
+        }
+        return;
+    }
+    std.debug.print("--- GUI log ({s}) ---\n{s}\n---\n{s}{s}", .{ log_path, out, result.stdout, result.stderr });
+    for (problems.items) |text| std.debug.print("gui test: {s}\n", .{text});
+    return error.GuiRunFailed;
 }
 
 /// Case-insensitive search.

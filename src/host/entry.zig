@@ -155,6 +155,7 @@ const Lifecycle = struct {
         }
         zig_language = lang;
         language.registered = lang;
+        instance.warm(.upcast(lang.base));
         resource.register();
         log("ziggurat_host {s} ready", .{host_version});
         // Builds run in the editor only; a game loads what the editor built.

@@ -4,11 +4,13 @@
 //! Usage:
 //!   runner <godot> <project dir> script <check.gd> <deadline s> [--expect <text>]...
 //!   runner <godot> <project dir> editor <quit-after frames> <deadline s> [--expect <text>]...
+//!   runner <godot> <project dir> game <scene> <deadline s> [--expect <text>]...
 //!
 //! Writes `<project>/.godot/extension_list.cfg` with every `.gdextension`
 //! file of the project (Godot #111645), then runs
 //! `godot --headless --verbose --path <project> --script <check.gd>` (or
-//! `--editor --quit-after <frames>`) with stdin from /dev/null and one
+//! `--editor --quit-after <frames>`, or the scene path for a game run of that
+//! scene) with stdin from /dev/null and one
 //! deadline for the whole run. The run fails when Godot times out or exits
 //! non-zero, the output has no `ZTEST DONE` line, has a `ZTEST FAIL` line,
 //! lacks an `--expect` text, has an `--expect-once` text other than exactly
@@ -34,6 +36,7 @@ const editor_stock = [_]scan.StockOrphan{.{ .name = "Node", .non_static = 1 }};
 const usage =
     \\usage: runner <godot> <project dir> script <check.gd> <deadline s> [--expect[-once] <text> | --reject <text>]...
     \\       runner <godot> <project dir> editor <quit-after frames> <deadline s> [--expect[-once] <text> | --reject <text>]...
+    \\       runner <godot> <project dir> game <scene> <deadline s> [--expect[-once] <text> | --reject <text>]...
     \\
 ;
 
@@ -83,6 +86,8 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         };
         try argv.appendSlice(arena, &.{ "--editor", "--quit-after", mode_arg });
+    } else if (std.mem.eql(u8, mode, "game")) {
+        try argv.append(arena, mode_arg);
     } else {
         std.debug.print("runner: unknown mode '{s}'\n{s}", .{ mode, usage });
         return 2;

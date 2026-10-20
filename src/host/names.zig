@@ -1,8 +1,8 @@
-//! Name maps: from a Godot `StringName` to a method or property index of one
-//! script (plan decision "Names to indexes").
+//! Name maps: from a Godot `StringName` to a method, property or signal
+//! index of one script (plan decision "Names to indexes").
 //!
 //! Godot calls a script with names, the module takes indexes. At load the
-//! host makes one engine `StringName` per method name and per property name
+//! host makes one engine `StringName` per method, property and signal name
 //! (group entries have no value and are left out), keeps it for the
 //! generation's lifetime, and maps the StringName's data pointer to the index.
 //!
@@ -61,11 +61,12 @@ pub const NameMap = struct {
     }
 };
 
-/// The method and property maps of one script, with the StringNames they
-/// keep alive.
+/// The method, property and signal maps of one script, with the
+/// StringNames they keep alive.
 pub const ScriptNames = struct {
     methods: NameMap = .{},
     properties: NameMap = .{},
+    signals: NameMap = .{},
     /// One per mapped name, owned; released by `deinit`.
     names: []StringName = &.{},
 
@@ -81,12 +82,18 @@ pub const ScriptNames = struct {
         return self.properties.get(dataKey(&sn));
     }
 
-    /// Makes the StringNames of `desc`'s methods and non-group properties and
-    /// maps them. `desc` must have passed `abi.validate`; its strings must
-    /// outlive the result (they are static data of a library that is never
-    /// unloaded). Main thread only.
+    /// The signal index for `sn`, or null when the script declares no
+    /// signal of that name.
+    pub fn signal(self: *const ScriptNames, sn: StringName) ?u32 {
+        return self.signals.get(dataKey(&sn));
+    }
+
+    /// Makes the StringNames of `desc`'s methods, non-group properties and
+    /// signals and maps them. `desc` must have passed `abi.validate`; its
+    /// strings must outlive the result (they are static data of a library
+    /// that is never unloaded). Main thread only.
     pub fn build(a: Allocator, desc: *const abi.ScriptDesc) error{OutOfMemory}!ScriptNames {
-        var count: usize = desc.method_count;
+        var count: usize = desc.method_count + desc.signal_count;
         for (desc.properties[0..desc.property_count]) |*p| {
             if (!isGroup(p)) count += 1;
         }
@@ -100,6 +107,7 @@ pub const ScriptNames = struct {
         errdefer {
             self.methods.deinit(a);
             self.properties.deinit(a);
+            self.signals.deinit(a);
         }
 
         const m_texts = try a.alloc(NameMap.Entry, desc.method_count);
@@ -113,7 +121,7 @@ pub const ScriptNames = struct {
             made += 1;
         }
 
-        const p_texts = try a.alloc(NameMap.Entry, count - desc.method_count);
+        const p_texts = try a.alloc(NameMap.Entry, count - desc.method_count - desc.signal_count);
         self.properties.texts = p_texts;
         try self.properties.by_key.ensureTotalCapacity(a, @intCast(p_texts.len));
         var k: usize = 0;
@@ -127,6 +135,17 @@ pub const ScriptNames = struct {
             k += 1;
         }
 
+        const s_texts = try a.alloc(NameMap.Entry, desc.signal_count);
+        self.signals.texts = s_texts;
+        try self.signals.by_key.ensureTotalCapacity(a, desc.signal_count);
+        for (desc.signals[0..desc.signal_count], 0..) |*sig, i| {
+            const text = str(sig.name);
+            names[made] = StringName.fromUtf8(text);
+            s_texts[i] = .{ .text = text, .index = @intCast(i) };
+            insert(&self.signals, &names[made], @intCast(i));
+            made += 1;
+        }
+
         self.names = names;
         return self;
     }
@@ -137,6 +156,7 @@ pub const ScriptNames = struct {
         a.free(self.names);
         self.methods.deinit(a);
         self.properties.deinit(a);
+        self.signals.deinit(a);
         self.* = .{};
     }
 };

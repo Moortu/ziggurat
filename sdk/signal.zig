@@ -21,11 +21,17 @@
 //! At run time the arguments go through the checked conversions into
 //! Variants, and `Object.emit_signal` is called on `self.base` through the
 //! method bind (gdzig's own `emit` helpers convert through `Variant.init`
-//! and read the result with `Variant.as`, which the SDK never uses). A
-//! failed emit (for example a signal the host has not registered) is logged
-//! as a warning, never a panic; so is a missing method bind, which is then
-//! never called. The bind and the signal names are cached in plain `var`s
-//! without atomics; `moduleInit` fills them on the main thread (`warm.zig`).
+//! and read the result with `Variant.as`, which the SDK never uses). Godot
+//! knows a script's signals through the script (`has_script_signal`), so
+//! connections and emits need no registration on the object. Two results
+//! are normal and stay silent: ERR_UNAVAILABLE, which `emit_signal` returns
+//! when nothing is connected (and, for a signal nobody declared, after
+//! printing its own error), and ERR_CANT_ACQUIRE_RESOURCE, which it returns
+//! while the object's signals are blocked (core/object/object.cpp,
+//! `Object::emit_signalp`). Any other failed emit is logged as a warning,
+//! never a panic; so is a missing method bind, which is then never called.
+//! The bind and the signal names are cached in plain `var`s without
+//! atomics; `moduleInit` fills them on the main thread (`warm.zig`).
 const std = @import("std");
 const abi = @import("ziggurat_abi");
 const godot = @import("gdzig");
@@ -80,8 +86,19 @@ pub fn emitWith(comptime Bind: type, self: anytype, comptime signal: @EnumLitera
     defer godot.raw.variantDestroy(&ret);
     var code: i64 = 0;
     const bad_ret = convert.read(i64, &ret, &code) != null;
-    if (err.@"error" != 0 or bad_ret or code != 0)
+    if (err.@"error" != 0 or bad_ret or !emitResultOk(code))
         runtime.log(.warning, "emit of signal '{s}' failed (call error {d}, result {d}); is the signal registered?", .{ sname, err.@"error", code });
+}
+
+/// Godot's `Error` values `Object.emit_signal` returns without a fault.
+const err_ok: i64 = 0;
+const err_unavailable: i64 = 2;
+const err_cant_acquire_resource: i64 = 28;
+
+/// True for an `emit_signal` result that is not a failure: OK, nothing
+/// connected (ERR_UNAVAILABLE) or signals blocked (ERR_CANT_ACQUIRE_RESOURCE).
+fn emitResultOk(code: i64) bool {
+    return code == err_ok or code == err_unavailable or code == err_cant_acquire_resource;
 }
 
 /// The script struct behind `self`, which must be `*S` or `*const S` for a

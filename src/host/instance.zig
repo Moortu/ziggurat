@@ -55,6 +55,8 @@ const String = godot.builtin.String;
 const StringName = godot.builtin.StringName;
 const Variant = godot.builtin.Variant;
 const Dictionary = godot.builtin.Dictionary;
+const Signal = godot.builtin.Signal;
+const Callable = godot.builtin.Callable;
 const Object = godot.class.Object;
 const RefCounted = godot.class.RefCounted;
 const ScriptExtension = godot.class.ScriptExtension;
@@ -101,6 +103,18 @@ pub const Instance = struct {
         const d = self.desc();
         for (d.properties[0..d.property_count], 0..) |p, i| {
             if (p.field_index != abi.no_field and std.mem.eql(u8, props.text(p.name), name)) return @intCast(i);
+        }
+        return null;
+    }
+
+    /// The signal index of `sn`, looked up as `methodIndex` does.
+    fn signalIndex(self: *const Instance, sn: *const StringName) ?u32 {
+        if (self.index < self.gen.names.len) return self.gen.names[self.index].signal(sn.*);
+        var buf: [max_name_bytes]u8 = undefined;
+        const name = props.nameText(sn.*, &buf) orelse return null;
+        const d = self.desc();
+        for (d.signals[0..d.signal_count], 0..) |sig, i| {
+            if (std.mem.eql(u8, props.text(sig.name), name)) return @intCast(i);
         }
         return null;
     }
@@ -205,14 +219,55 @@ fn set(p: c.GDExtensionScriptInstanceDataPtr, name: c.GDExtensionConstStringName
     return @intFromBool(rec.desc().set(rec.data, i, v) != 0);
 }
 
+/// A property's value; else, as GDScript instances answer
+/// (modules/gdscript/gdscript.cpp, `GDScriptInstance::get`), a script signal
+/// as a `Signal` and a script method as a `Callable` on the owner, so that
+/// `node.hit.connect(f)` and `node.score.call(1)` work from GDScript. Godot
+/// asks the script instance first for every name it gets (core/object/
+/// object.cpp, `Object::get`); names of neither kind fall through to the
+/// engine class.
 fn get(p: c.GDExtensionScriptInstanceDataPtr, name: c.GDExtensionConstStringNamePtr, r_ret: c.GDExtensionVariantPtr) callconv(.c) c.GDExtensionBool {
     const rec = record(p) orelse return 0;
     if (r_ret == null) return 0;
-    const i = rec.propertyIndex(nameOf(name) orelse return 0) orelse return 0;
-    var v: Variant = .nil;
-    if (rec.desc().get(rec.data, i, @ptrCast(&v)) == 0) return 0;
-    moveInto(r_ret, &v);
-    return 1;
+    const sn = nameOf(name) orelse return 0;
+    if (rec.propertyIndex(sn)) |i| {
+        var v: Variant = .nil;
+        if (rec.desc().get(rec.data, i, @ptrCast(&v)) == 0) return 0;
+        moveInto(r_ret, &v);
+        return 1;
+    }
+    if (rec.signalIndex(sn) != null) {
+        var sig = Signal.initObjectSignal(rec.owner, sn.*);
+        defer sig.deinit();
+        var v = Variant.init(Signal, sig);
+        moveInto(r_ret, &v);
+        return 1;
+    }
+    if (rec.methodIndex(sn) != null) {
+        var call_ = Callable.initObjectMethod(rec.owner, sn.*);
+        defer call_.deinit();
+        var v = Variant.init(Callable, call_);
+        moveInto(r_ret, &v);
+        return 1;
+    }
+    return 0;
+}
+
+/// Resolves on the main thread the lazy gdzig pointers `get` uses for
+/// signals and methods (the Signal and Callable constructors, destructors
+/// and Variant conversions), so a first `get` on another thread never
+/// resolves one. Called at SCENE init with any live object (the language).
+pub fn warm(obj: *Object) void {
+    var sn = StringName.fromUtf8("ziggurat_warm");
+    defer sn.deinit();
+    var sig = Signal.initObjectSignal(obj, sn);
+    const sv = Variant.init(Signal, sig);
+    sv.deinit();
+    sig.deinit();
+    var call_ = Callable.initObjectMethod(obj, sn);
+    const cv = Variant.init(Callable, call_);
+    cv.deinit();
+    call_.deinit();
 }
 
 fn propertyCanRevert(p: c.GDExtensionScriptInstanceDataPtr, name: c.GDExtensionConstStringNamePtr) callconv(.c) c.GDExtensionBool {
