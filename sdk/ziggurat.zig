@@ -2,6 +2,10 @@
 //!
 //! It satisfies the root contract documented in `src/build/rootgen.zig`,
 //! and gives scripts the curated Godot surface as `godot`.
+//!
+//! A script's `pub fn deinit(self: *@This()) void` runs while Godot is
+//! destroying the owner object, so it must not use `base`; cleanup that
+//! needs the owner belongs in `_notification` on NOTIFICATION_PREDELETE.
 const std = @import("std");
 const sdk_options = @import("sdk_options");
 const abi = @import("ziggurat_abi");

@@ -242,6 +242,17 @@ func second_run(probe: Object) -> void:
 		why += "argument count; "
 	report("script_reports_descriptors_from_cache_queries", why == "", why)
 
+	# Cached descriptors cannot run: instances are refused, logged once per
+	# script however often it is attached (the Zig test counts the line).
+	why = ""
+	for i in 2:
+		var node := Node.new()
+		node.set_script(player)
+		if node.get_script() != null:
+			why += "attempt %d attached; " % i
+		node.free()
+	report("cache_only_instance_refused", why == "", why)
+
 	# Default presence: the same answer from the cache and from the module.
 	var names := ["speed", "health", "alive", "mood", "layers", "spawn_point", "title", "target", "Movement/Fast motion", "nope"]
 	var cached_defaults := []

@@ -237,7 +237,10 @@ pub fn liveBytes(gen: u32) ?u64 {
 /// Releases the engine names of every generation (Godot reports names still
 /// held at exit) and clears `current`. Libraries stay open and generations
 /// stay registered, so a late `HostApi` call from module code stays safe.
-/// Main thread, at SCENE exit.
+/// Main thread, at SCENE exit, after the language is unregistered. No other
+/// thread may call into script instances then: `names` is replaced without
+/// synchronisation, and readers (instance.zig) check its length first and
+/// fall back to text lookup once it is empty.
 pub fn shutdown() void {
     current_gen.store(null, .release);
     const io = host_io.get();

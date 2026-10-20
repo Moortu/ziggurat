@@ -47,6 +47,9 @@
 //!   releases each top-level String, StringName, NodePath and `Ref` field
 //!   (an `Obj` holds no reference), then frees the memory. `deinit` need not
 //!   release those fields itself; a second release is harmless.
+//!   `deinit` runs while Godot is destroying the owner (from the script
+//!   instance's free, inside `~Object`), so it must not use `base`; cleanup
+//!   that needs the owner belongs in `_notification` on NOTIFICATION_PREDELETE.
 //!
 //! `notification` ignores `reversed`: a script is one class, so there is
 //! no chain of classes whose order could be reversed.

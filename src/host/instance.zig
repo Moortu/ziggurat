@@ -32,8 +32,17 @@
 //! - The fallback callbacks serve placeholder instances only and stay null.
 //!
 //! Threads: Godot calls these on the thread that uses the object. The
-//! record is only read after `create`, and calls on one instance do not
-//! overlap (Godot's rule for an object; the host contract asks the same).
+//! record is only read after `create`. The host contract asks that calls on
+//! one instance do not overlap, but Godot does not guarantee it: a node in a
+//! thread group can be called from its group's thread and from the main
+//! thread at once. The host does not enforce it yet; the Stage 4 gate (spec
+//! section 6) is where it will be enforced.
+//!
+//! Name maps: `runtime.shutdown` frees them at SCENE exit, after the entry
+//! has unregistered the language. Godot deletes the main loop (and with it
+//! the scene tree) before it deinitialises extensions at SCENE level
+//! (main/main.cpp, `Main::cleanup`), so only objects that leaked can still
+//! hold an instance then; those look names up by text.
 const std = @import("std");
 const godot = @import("gdzig");
 const abi = @import("ziggurat_abi");

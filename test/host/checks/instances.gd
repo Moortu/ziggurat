@@ -90,6 +90,7 @@ func first_frame() -> void:
 	check_properties()
 	check_calls()
 	check_owner()
+	check_refcounted_owner()
 
 
 func check_properties() -> void:
@@ -191,6 +192,19 @@ func check_owner() -> void:
 	report("derived_owner_accepted", sprite.get_script() != null and sprite.get("speed") == 5.0, "sprite script %s" % [sprite.get_script()])
 	sprite.free()
 	report("instance_freed", probe.live_instances() == count_before, "%d instances, %d before" % [probe.live_instances(), count_before])
+
+
+# A RefCounted owner dies with its last reference: refcount_decremented
+# lets it, the instance is freed and the script's deinit runs once (the Zig
+# test counts its log line).
+func check_refcounted_owner() -> void:
+	var before: int = probe.live_instances()
+	var rc := RefCounted.new()
+	rc.set_script(zig_script("res://keeper.zig"))
+	report("refcounted_owner_attached", rc.get_script() != null and probe.live_instances() == before + 1 and rc.get("uses") == 7,
+		"script %s, %d instances (before %d)" % [rc.get_script(), probe.live_instances(), before])
+	rc = null
+	report("refcounted_owner_released", probe.live_instances() == before, "%d instances (before %d)" % [probe.live_instances(), before])
 
 
 func _process(_delta: float) -> bool:

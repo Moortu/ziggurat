@@ -416,7 +416,7 @@ pub const ZigScript = struct {
     /// Set once a reload request has been logged.
     reload_logged: bool = false,
     /// Set once a refused instance has been logged.
-    instance_logged: bool = false,
+    instance_logged: std.atomic.Value(bool) = .init(false),
 
     pub fn create(allocator: *Allocator) !*ZigScript {
         const self = try allocator.create(ZigScript);
@@ -556,7 +556,7 @@ pub const ZigScript = struct {
         defer cls.deinit();
         var cls_buf: [max_name_bytes]u8 = undefined;
         const c = stringText(&cls, &cls_buf) orelse "(name too long)";
-        log("Script {s} extends {s}, so it cannot be attached to an object of class {s}.", .{ if (p.len == 0) "(unsaved)" else p, base_class, c });
+        logError("Script {s} extends {s}, so it cannot be attached to an object of class {s}.", .{ if (p.len == 0) "(unsaved)" else p, base_class, c });
     }
 
     pub fn _placeholderInstanceCreate(self: *ZigScript, _: ?*Object) ?*anyopaque {
@@ -564,10 +564,14 @@ pub const ZigScript = struct {
         return null;
     }
 
+    /// Any thread: Godot instantiates scenes on worker threads too.
     fn logRefusedInstance(self: *ZigScript) void {
-        if (self.instance_logged) return;
-        self.instance_logged = true;
-        self.logScript("cannot create instances yet.");
+        if (self.instance_logged.swap(true, .acq_rel)) return;
+        var path = self.base.getPath();
+        defer path.deinit();
+        var buf: [max_path_bytes]u8 = undefined;
+        const p = stringText(&path, &buf) orelse "(path too long)";
+        logError("Script {s} cannot create instances yet.", .{if (p.len == 0) "(unsaved)" else p});
     }
 
     /// The script keeps no list of placeholder instances, so there is
@@ -737,6 +741,15 @@ pub const ZigScript = struct {
         return .init();
     }
 };
+
+/// Reports one line through Godot's error printing (`print_error`: shown
+/// as an error in the editor's Errors tab), as GDScript reports a refused
+/// instance (ERR_FAIL_V_MSG, modules/gdscript/gdscript.cpp:415).
+fn logError(comptime fmt: []const u8, args: anytype) void {
+    var buf: [max_path_bytes + 2 * max_name_bytes + 256]u8 = undefined;
+    const msg = std.fmt.bufPrintSentinel(&buf, fmt, args, 0) catch return;
+    godot.raw.printError(msg.ptr, "ZigScript", "src/host/script.zig", @src().line, 1);
+}
 
 /// Prints one line to Godot's output.
 fn log(comptime fmt: []const u8, args: anytype) void {

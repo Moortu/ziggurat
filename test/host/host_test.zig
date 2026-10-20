@@ -487,19 +487,23 @@ test "script reports descriptors, script without descriptors, update_exports is 
         "ZTEST PASS reload_returns_ok",
         "ZTEST PASS script_cache_write",
         // A Node is not a CharacterBody2D: refused, one line per attempt.
-        "Script res://player.zig extends CharacterBody2D, so it cannot be attached to an object of class Node.",
+        "ERROR: Script res://player.zig extends CharacterBody2D, so it cannot be attached to an object of class Node.",
     }, &.{
         // Two reloads, one line.
         "Script res://player.zig reloads when a new build is loaded",
     });
-    try p.runScript(&.{
+    try p.runScriptOnce(&.{
         "ZTEST PASS second_run_has_no_module",
         "ZTEST PASS script_reports_descriptors_from_cache\n",
         "ZTEST PASS script_reports_descriptors_from_cache_queries",
+        "ZTEST PASS cache_only_instance_refused",
         "ZTEST PASS update_exports_is_idempotent",
         "ZTEST PASS has_default_same_from_cache_and_module",
         "ZTEST PASS cache_ignored_after_load",
         "ZTEST PASS script_reports_loaded_after_cache",
+    }, &.{
+        // Two refused attempts while only the cache describes the script.
+        "ERROR: Script res://player.zig cannot create instances yet.",
     });
 }
 
@@ -568,11 +572,15 @@ test "ready runs, properties through the object, call falls through, strong refe
         "ZTEST PASS attach_idle",
         "ZTEST PASS process_only_when_defined",
         "ZTEST PASS instances_released",
+        "ZTEST PASS refcounted_owner_attached",
+        "ZTEST PASS refcounted_owner_released",
     }, &.{
         // `_ready` ran once, through the instance (two instances of mover
         // were made, but only one entered the tree).
         "[ziggurat] mover ready speed=5\n",
         // One line naming the script and both classes.
-        "Script res://mover.zig extends Node2D, so it cannot be attached to an object of class Node.",
+        "ERROR: Script res://mover.zig extends Node2D, so it cannot be attached to an object of class Node.",
+        // The RefCounted owner died with its last reference: deinit ran once.
+        "[ziggurat] keeper deinit uses=7\n",
     });
 }

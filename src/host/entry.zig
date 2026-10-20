@@ -20,6 +20,7 @@ const test_probe = @import("test_probe.zig");
 const props = @import("props.zig");
 const desc_cache = @import("desc_cache.zig");
 const script = @import("script.zig");
+const instance = @import("instance.zig");
 
 const c = godot.c;
 const Registry = godot.extension.Registry;
@@ -149,15 +150,23 @@ const Lifecycle = struct {
 
     pub fn exit(_: *Lifecycle, level: godot.extension.InitializationLevel) void {
         if (level != .scene) return;
+        // Order: the language goes first, then the module names. Godot has
+        // deleted the main loop and its scene tree before this point
+        // (main/main.cpp, `Main::cleanup`), so a script instance still alive
+        // belongs to a leaked object; it looks names up by text once the
+        // maps are gone (instance.zig).
+        if (zig_language) |lang| {
+            _ = Engine.unregisterScriptLanguage(.upcast(lang.base));
+            var alloc = godot.engine_allocator;
+            language.registered = null;
+            lang.destroy(&alloc);
+            zig_language = null;
+        }
+        const left = instance.live.load(.acquire);
+        if (left != 0) log("ziggurat_host: {d} Zig script instance(s) still alive at exit (leaked objects)", .{left});
         // Module names are engine StringNames; Godot reports any still held.
         runtime.shutdown();
         script.dropStartupCache();
-        const lang = zig_language orelse return;
-        _ = Engine.unregisterScriptLanguage(.upcast(lang.base));
-        var alloc = godot.engine_allocator;
-        language.registered = null;
-        lang.destroy(&alloc);
-        zig_language = null;
     }
 };
 
@@ -278,5 +287,5 @@ test {
     _ = props;
     _ = desc_cache;
     _ = script;
-    _ = @import("instance.zig");
+    _ = instance;
 }
