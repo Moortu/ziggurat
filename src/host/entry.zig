@@ -22,6 +22,7 @@ const desc_cache = @import("desc_cache.zig");
 const script = @import("script.zig");
 const instance = @import("instance.zig");
 const placeholder = @import("placeholder.zig");
+const resource = @import("resource.zig");
 
 const c = godot.c;
 const Registry = godot.extension.Registry;
@@ -81,6 +82,8 @@ export fn ziggurat_host_init(
 
     registry.addClass(ZigLanguage, registry.allocator, .auto);
     registry.addClass(script.ZigScript, registry.allocator, .auto);
+    registry.addClass(resource.ZigLoader, registry.allocator, .auto);
+    registry.addClass(resource.ZigSaver, registry.allocator, .auto);
     if (host_options.test_probe) {
         const probe = registry.createClass(test_probe.ZigguratTestProbe, registry.allocator, .auto);
         inline for (test_probe.method_names) |name| probe.addMethod(name, .auto);
@@ -146,6 +149,7 @@ const Lifecycle = struct {
         }
         zig_language = lang;
         language.registered = lang;
+        resource.register();
         log("ziggurat_host {s} ready", .{host_version});
     }
 
@@ -155,7 +159,9 @@ const Lifecycle = struct {
         // deleted the main loop and its scene tree before this point
         // (main/main.cpp, `Main::cleanup`), so a script instance still alive
         // belongs to a leaked object; it looks names up by text once the
-        // maps are gone (instance.zig).
+        // maps are gone (instance.zig). The file loader and saver go before
+        // the language, so no load or save can reach a destroyed language.
+        resource.unregister();
         if (zig_language) |lang| {
             _ = Engine.unregisterScriptLanguage(.upcast(lang.base));
             var alloc = godot.engine_allocator;
@@ -290,6 +296,7 @@ test {
     _ = script;
     _ = instance;
     _ = placeholder;
+    _ = resource;
     _ = language;
     _ = @import("global_class.zig");
     _ = @import("template.zig");

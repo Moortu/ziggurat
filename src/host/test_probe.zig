@@ -17,6 +17,8 @@ const instance = @import("instance.zig");
 const language = @import("language.zig");
 const diag_cache = @import("diag_cache.zig");
 const main_queue = @import("main_queue.zig");
+const resource = @import("resource.zig");
+const PackedStringArray = godot.builtin.PackedStringArray;
 
 const Allocator = std.mem.Allocator;
 const String = godot.builtin.String;
@@ -417,6 +419,32 @@ pub const ZigguratTestProbe = struct {
         return queue_runs.load(.monotonic);
     }
 
+    /// Sets `resource.on_saved` to a recorder of the paths it is called with.
+    pub fn savedHookInstall(_: *ZigguratTestProbe) void {
+        resource.on_saved = &recordSaved;
+    }
+
+    /// Forgets the recorded paths.
+    pub fn savedHookClear(_: *ZigguratTestProbe) void {
+        saved_mu.lockUncancelable(host_io.get());
+        defer saved_mu.unlock(host_io.get());
+        for (saved_paths.items) |p| std.heap.c_allocator.free(p);
+        saved_paths.clearRetainingCapacity();
+    }
+
+    /// The paths `resource.on_saved` was called with, in order.
+    pub fn savedHookPaths(_: *ZigguratTestProbe) PackedStringArray {
+        var list: PackedStringArray = .init();
+        saved_mu.lockUncancelable(host_io.get());
+        defer saved_mu.unlock(host_io.get());
+        for (saved_paths.items) |p| {
+            var s = String.fromUtf8(p) catch continue;
+            defer s.deinit();
+            _ = list.pushBack(s);
+        }
+        return list;
+    }
+
     pub fn propertyIsGroup(_: *ZigguratTestProbe, script: i64, index: i64) bool {
         const d = scriptDesc(script) orelse return false;
         const i = std.math.cast(u32, index) orelse return false;
@@ -424,6 +452,17 @@ pub const ZigguratTestProbe = struct {
         return d.properties[i].field_index == abi.no_field;
     }
 };
+
+/// The paths `resource.on_saved` received (`saved_hook_install`).
+var saved_paths: std.ArrayList([]u8) = .empty;
+var saved_mu: std.Io.Mutex = .init;
+
+fn recordSaved(path: []const u8) void {
+    const copy = std.heap.c_allocator.dupe(u8, path) catch return;
+    saved_mu.lockUncancelable(host_io.get());
+    defer saved_mu.unlock(host_io.get());
+    saved_paths.append(std.heap.c_allocator, copy) catch std.heap.c_allocator.free(copy);
+}
 
 /// Callbacks of `queue_push` that ran.
 var queue_runs: std.atomic.Value(i64) = .init(0);
@@ -460,6 +499,7 @@ pub const method_names = [_][:0]const u8{
     "call_error",            "property_state",          "script_placeholder_count", "script_set_build_failed",
     "language_validate",     "language_global_class",   "language_complete_code",   "language_lookup_code",
     "set_diagnostics",       "has_global_constant",     "queue_push",               "queue_runs",
+    "saved_hook_install",    "saved_hook_clear",        "saved_hook_paths",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

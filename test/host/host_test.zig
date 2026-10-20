@@ -181,6 +181,33 @@ fn buildModule(
     sdk: []const zbuild.workspace.ModuleDep,
     check_tables: bool,
 ) ![]const u8 {
+    const dir = try std.fs.path.join(a, &.{ opts.fixtures_dir, fixture });
+    switch (try buildModuleFrom(a, work, name, dir, sdk, check_tables)) {
+        .ok => |lib| return lib,
+        .failed => |message| {
+            std.debug.print("build of {s} failed: {s}\n", .{ name, message });
+            return error.BuildFailed;
+        },
+    }
+}
+
+const BuildResult = union(enum) {
+    /// The staged library.
+    ok: []const u8,
+    /// The service's message and diagnostics, as text.
+    failed: []const u8,
+};
+
+/// As `buildModule`, from the scripts in the folder `src_dir`. A build that
+/// fails is a result, not an error.
+fn buildModuleFrom(
+    a: std.mem.Allocator,
+    work: []const u8,
+    name: []const u8,
+    src_dir: []const u8,
+    sdk: []const zbuild.workspace.ModuleDep,
+    check_tables: bool,
+) !BuildResult {
     const cwd = Io.Dir.cwd();
     const root = try std.fs.path.join(a, &.{ work, name });
     const src_path = try std.fs.path.join(a, &.{ root, "src" });
@@ -189,9 +216,7 @@ fn buildModule(
     try cwd.createDirPath(io, src_path);
     try cwd.createDirPath(io, cache);
 
-    var fixtures = try cwd.openDir(io, opts.fixtures_dir, .{});
-    defer fixtures.close(io);
-    var src = try fixtures.openDir(io, fixture, .{ .iterate = true });
+    var src = try cwd.openDir(io, src_dir, .{ .iterate = true });
     defer src.close(io);
     var dst = try cwd.openDir(io, src_path, .{});
     defer dst.close(io);
@@ -225,12 +250,13 @@ fn buildModule(
     try svc.waitIdle(build_wait_ms);
     const o = svc.last() orelse return error.NoOutcome;
     if (!o.ok) {
-        std.debug.print("build of {s} failed: {?s}\n", .{ name, o.message });
-        for (o.diagnostics) |d| std.debug.print("  {?s}:{d}:{d}: {s}\n", .{ d.rel, d.line, d.column, d.message });
-        return error.BuildFailed;
+        var text: std.ArrayList(u8) = .empty;
+        try text.print(a, "{?s}", .{o.message});
+        for (o.diagnostics) |d| try text.print(a, "\n  {?s}:{d}:{d}: {s}", .{ d.rel, d.line, d.column, d.message });
+        return .{ .failed = text.items };
     }
     const gen = o.generation orelse return error.NoGeneration;
-    return a.dupe(u8, gen.lib.bytes);
+    return .{ .ok = try a.dupe(u8, gen.lib.bytes) };
 }
 
 /// The SDK manifest the build wrote (`opts.sdk_manifest_path`).
@@ -706,4 +732,151 @@ test "language in the editor: templates through Create Script, autoload constant
         // Godot names a missing or failing virtual in its error line.
         .reject = &.{"_add_named_global_constant"},
     });
+}
+
+// ------------------------------------------------------------ loader and saver
+
+test "loader and saver: extension, load, broken and missing files, side effects, atomic save, hook" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("resource_files");
+    defer p.deinit();
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+    defer dir.close(io);
+    try dir.writeFile(io, .{ .sub_path = "tab_in.txt", .data = tab_script });
+    try p.addCheck("resource_files.gd");
+    try p.runScript(&.{
+        "ZTEST PASS extension_zig_recognized\n",
+        "ZTEST PASS extension_zig_recognized_for_zigscript",
+        "ZTEST PASS saver_extension_zig",
+        "ZTEST PASS saver_ignores_other_resources",
+        "ZTEST PASS loader_ignores_other_types",
+        "ZTEST PASS exists_true",
+        "ZTEST PASS exists_false",
+        "ZTEST PASS load_returns_zigscript",
+        "ZTEST PASS load_source_text",
+        "ZTEST PASS load_sets_path",
+        "ZTEST PASS load_reuses_cached",
+        "ZTEST PASS load_ignore_cache_is_new_object",
+        "ZTEST PASS load_type_hint",
+        "ZTEST PASS broken_script_loads",
+        "ZTEST PASS missing_file_is_null",
+        "ZTEST PASS missing_folder_is_null",
+        "ZTEST PASS loader_is_side_effect_free",
+        "ZTEST PASS save_ok",
+        "ZTEST PASS save_writes_text",
+        "ZTEST PASS save_then_load_roundtrip",
+        "ZTEST PASS save_replaces_whole_file",
+        "ZTEST PASS save_to_own_path",
+        "ZTEST PASS save_leaves_no_temporary_file",
+        "ZTEST PASS save_missing_folder_fails",
+        "ZTEST PASS save_other_resource_unrecognized",
+        "ZTEST PASS save_wrong_extension_unrecognized",
+        "ZTEST PASS save_is_atomic",
+        "ZTEST PASS hook_called_with_project_relative_path",
+        "ZTEST PASS hook_not_called_for_failures",
+        "ZTEST PASS hook_not_called_outside_project",
+        "ZTEST PASS tab_save_written",
+    });
+}
+
+/// A script indented with tabs, as the script editor writes it on save
+/// (`convert_indent_on_save`). Built here, not kept as a fixture file,
+/// because `zig fmt` turns tabs into spaces.
+const tab_script =
+    "const z = @import(\"ziggurat\");\n" ++
+    "const g = z.godot;\n\n" ++
+    "pub const extends = g.Node;\n\n" ++
+    "base: *g.Node,\n" ++
+    "count: i32 = 0,\n\n" ++
+    "pub fn ping(self: *@This(), x: i32) i32 {\n" ++
+    "\tif (x > 0) {\n" ++
+    "\t\tself.count += x;\n" ++
+    "\t}\n" ++
+    "\treturn self.count;\n" ++
+    "}\n";
+
+/// True when `text` has a tab in the white space that starts a line.
+fn hasLeadingTab(text: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const rest = std.mem.trimStart(u8, line, " ");
+        if (rest.len > 0 and rest[0] == '\t') return true;
+    }
+    return false;
+}
+
+/// Writes `text` as `<work>/<name>/tabby.zig` and builds that folder.
+fn buildText(a: std.mem.Allocator, work: []const u8, name: []const u8, text: []const u8, sdk: []const zbuild.workspace.ModuleDep) !BuildResult {
+    const src = try std.fs.path.join(a, &.{ work, try std.fmt.allocPrint(a, "{s}_src", .{name}) });
+    const cwd = Io.Dir.cwd();
+    try cwd.createDirPath(io, src);
+    const file = try std.fs.path.join(a, &.{ src, "tabby.zig" });
+    try cwd.writeFile(io, .{ .sub_path = file, .data = text });
+    return buildModuleFrom(a, work, name, src, sdk, true);
+}
+
+test "tabs compile or are converted" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("resource_files");
+    defer p.deinit();
+    const a = p.arena_state.allocator();
+    var manifest = try loadManifest(testing.allocator);
+    defer manifest.deinit(testing.allocator);
+    try p.tmp.dir.createDirPath(io, "work");
+    const work = try p.tmp.dir.realPathFileAlloc(io, "work", a);
+
+    // The finding: does the real SDK build accept tab indentation?
+    const accepted = switch (try buildText(a, work, "tabs_in", tab_script, manifest.modules)) {
+        .ok => true,
+        .failed => |message| blk: {
+            std.debug.print("tab-indented script: the build refused it: {s}\n", .{message});
+            break :blk false;
+        },
+    };
+    std.debug.print("TAB FINDING: Zig 0.17 build {s} tab indentation\n", .{if (accepted) "accepts" else "rejects"});
+
+    // Save it through the saver, in Godot.
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+    defer dir.close(io);
+    try dir.writeFile(io, .{ .sub_path = "tab_in.txt", .data = tab_script });
+    try p.addCheck("resource_files.gd");
+    try p.runScript(&.{"ZTEST PASS tab_save_written"});
+    const saved = try dir.readFileAlloc(io, "tab_out.zig", a, .limited(1 << 20));
+
+    if (accepted) {
+        // Nothing to convert: the saver writes the text as it is.
+        try testing.expectEqualStrings(tab_script, saved);
+    } else {
+        // Converted: no tab starts a line, and the result builds.
+        try testing.expect(!hasLeadingTab(saved));
+        try testing.expect(saved.len > 0);
+        switch (try buildText(a, work, "tabs_out", saved, manifest.modules)) {
+            .ok => {},
+            .failed => |message| {
+                std.debug.print("converted script does not build: {s}\n", .{message});
+                return error.ConvertedScriptDoesNotBuild;
+            },
+        }
+    }
+}
+
+test "loader and saver in the editor: global class scan, file type, save from the script editor" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("language");
+    defer p.deinit();
+    try p.addAutoloadCheck("resource_editor.gd");
+    try p.runEditorChecked("300", .{ .expect = &.{
+        "ZTEST PASS scan_global_class_top_level",
+        "ZTEST PASS scan_global_class_subfolder",
+        "ZTEST PASS scan_no_class_without_class_name",
+        "ZTEST PASS filesystem_file_type",
+        "ZTEST PASS global_class_resolves_to_script",
+        "ZTEST PASS editor_save_written",
+        "ZTEST PASS editor_save_indentation",
+        "ZTEST PASS editor_save_hook",
+        "ZTEST PASS editor_save_loads_back",
+    } });
 }

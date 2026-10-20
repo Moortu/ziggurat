@@ -681,7 +681,12 @@ pub const ZigScript = struct {
         return .ok;
     }
 
-    /// False: the script editor does not reload the text from disk.
+    /// False, as for Godot's own `Script` (core/object/script_language.h).
+    /// With true, the editor's file-changed path (`EditorNode::
+    /// _resources_changed`) would call `Script::reload_from_file`, which only
+    /// asks the language to reload and never re-reads the text. The script
+    /// editor re-reads a changed file itself, with a `CACHE_MODE_IGNORE` load
+    /// through the `.zig` loader (script_editor_plugin.cpp, `_reload_scripts`).
     pub fn _editorCanReloadFromFile(_: *ZigScript) bool {
         return false;
     }

@@ -6,10 +6,9 @@ extends Node
 # res://saved.tscn (a copy of test/host/checks/placeholder_scene.tscn),
 # saves it through the editor and checks that every stored value and signal
 # connection is still in the file.
-# The resource loader for `.zig` files arrives in a later task. Until then
-# this check puts a ZigScript for res://mover.zig into Godot's resource
+# This check puts a ZigScript for res://mover.zig into Godot's resource
 # cache (setting resource_path does that), and the scene loader reuses it
-# for the scene's ext_resource.
+# for the scene's ext_resource, so the script has no file text.
 
 const SCENE := "res://saved.tscn"
 const KEPT := [

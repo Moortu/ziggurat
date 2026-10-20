@@ -4,8 +4,7 @@ extends SceneTree
 # from test/fixtures/instance_project, attaches its scripts to nodes in the
 # running scene and checks what Godot sees through the owner objects. The
 # Zig test checks the log lines (the `_ready` line, the refusal line).
-# Scenes are built in code: a .tscn that names a .zig script needs the
-# resource loader, which arrives in a later task.
+# Scenes are built in code, with scripts made from the module (no file).
 
 const FRAMES := 3
 
