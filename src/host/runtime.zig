@@ -11,14 +11,17 @@
 //! stack or in a Godot callback, and its static data backs the table.
 //!
 //! Threads: `load`, `current`, `shutdown` and `ScriptNames` construction run
-//! on the main thread. The `HostApi` functions run on any thread; they take
-//! `mu`, which guards the list of generations and the byte counters.
+//! on the main thread (`load` refuses any other). The `HostApi` functions run
+//! on any thread: `mu` (locked with the process Io, `host_io`) guards the
+//! list of generations; the byte counters are atomics, and memory is
+//! allocated and freed outside the lock.
 const std = @import("std");
 const godot = @import("gdzig");
 const abi = @import("ziggurat_abi");
 const platform = @import("ziggurat_platform");
 const sdk_options = @import("sdk_options");
 const names = @import("names.zig");
+const host_io = @import("host_io.zig");
 
 const Allocator = std.mem.Allocator;
 const OsPath = platform.path.OsPath;
@@ -48,8 +51,7 @@ pub const Generation = struct {
     /// Times `ziggurat_init` was called for this generation (always 1).
     init_calls: u32 = 0,
     /// Bytes this generation holds from `HostApi.alloc` with its own tag.
-    /// Guarded by `mu`.
-    live_bytes: u64 = 0,
+    live_bytes: std.atomic.Value(u64) = .init(0),
 
     /// The scripts of the table.
     pub fn scripts(self: *const Generation) []const abi.ScriptDesc {
@@ -57,17 +59,18 @@ pub const Generation = struct {
     }
 };
 
-/// Guards `generations`, each `Generation.live_bytes` and `user_heap_bytes`.
+/// Guards `generations`. Locked with `host_io.get()`.
 var mu: std.Io.Mutex = .init;
-/// The Io whose futex calls back `mu`; set by the first `load`, before any
-/// module can call the `HostApi`.
-var mu_io: ?std.Io = null;
 /// Every generation that ran `ziggurat_init`, oldest first. Allocated with
-/// `list_allocator`.
+/// `list_allocator`. Entries are never removed or freed, so a pointer read
+/// under `mu` stays valid after unlocking.
 var generations: std.ArrayList(*Generation) = .empty;
 var list_allocator: ?Allocator = null;
-/// Bytes held on the shared user heap (tag 0).
-var user_heap_bytes: u64 = 0;
+/// Bytes held on the shared user heap (tag 0). Works from the start, before
+/// any load.
+var user_heap_bytes: std.atomic.Value(u64) = .init(0);
+/// The thread `setEngine` ran on (Godot's main thread), or null before it.
+var main_thread: ?std.Thread.Id = null;
 /// The generation scripts use now. Main thread only.
 var current_gen: ?*Generation = null;
 /// Set once `request_swap` has logged.
@@ -89,13 +92,16 @@ var host_api: abi.HostApi = .{
 };
 
 /// Gives modules what Godot passed the host's entry point
-/// (`HostApi.get_proc_address` and `library`). Call once, before `load`.
+/// (`HostApi.get_proc_address` and `library`) and records the calling
+/// thread as the main thread. Call once, on Godot's main thread, before
+/// `load`.
 pub fn setEngine(get_proc_address: ?*const anyopaque, library: ?*anyopaque) void {
     host_api.get_proc_address = get_proc_address;
     host_api.library = library;
+    main_thread = std.Thread.getCurrentId();
 }
 
-pub const LoadError = error{ Refused, OutOfMemory };
+pub const LoadError = error{ Refused, NotMainThread, OutOfMemory };
 
 /// Loads the staged library at `path` as generation `n`, which must be
 /// non-zero and not loaded yet, and makes it `current`. Main thread only, at
@@ -104,10 +110,21 @@ pub const LoadError = error{ Refused, OutOfMemory };
 /// On `error.Refused` nothing was initialised, the library is closed again,
 /// `current` is unchanged and `diag` holds one sentence naming the file and
 /// the loader's or validator's reason. The caller logs it.
-/// `a` must be thread-safe and outlive the generation (it is never freed).
-pub fn load(a: Allocator, io: std.Io, path: OsPath, n: u32, diag: *[256]u8) LoadError!*Generation {
+/// On `error.NotMainThread` (called on another thread than `setEngine`)
+/// nothing was touched; `diag` holds the sentence, which is also logged.
+/// `a` must be thread-safe and never destroyed (the generation, its maps
+/// and the generation list are never freed), like `std.heap.c_allocator`.
+pub fn load(a: Allocator, path: OsPath, n: u32, diag: *[256]u8) LoadError!*Generation {
     @memset(diag, 0);
     const file = std.fs.path.basename(path.bytes);
+    if (!onMainThread()) {
+        var w: std.Io.Writer = .fixed(diag[0..255]);
+        w.print("Ziggurat cannot load the module {s} from a thread other than the main thread.", .{file}) catch {};
+        const text = std.mem.sliceTo(diag, 0);
+        apiLog(@backingInt(abi.LogLevel.err), text.ptr, text.len);
+        return error.NotMainThread;
+    }
+    const io = host_io.get();
     if (n == 0) return refuse(diag, file, "generation 0 is reserved for the shared user heap.", .{});
     if (find(n) != null) return refuse(diag, file, "generation {d} is already loaded.", .{n});
 
@@ -155,7 +172,6 @@ pub fn load(a: Allocator, io: std.Io, path: OsPath, n: u32, diag: *[256]u8) Load
 
     // Register before init: the module may allocate with its tag in init.
     mu.lockUncancelable(io);
-    if (mu_io == null) mu_io = io;
     if (list_allocator == null) list_allocator = a;
     const appended = generations.append(list_allocator.?, gen);
     mu.unlock(io);
@@ -173,6 +189,13 @@ pub fn hostApi() *const abi.HostApi {
     return &host_api;
 }
 
+/// True on the thread `setEngine` ran on, or anywhere before `setEngine`
+/// (unit tests have no engine).
+fn onMainThread() bool {
+    const id = main_thread orelse return true;
+    return std.Thread.getCurrentId() == id;
+}
+
 /// The generation scripts use now, or null before the first good load.
 /// Main thread only.
 pub fn current() ?*Generation {
@@ -181,7 +204,7 @@ pub fn current() ?*Generation {
 
 /// The loaded generation `n`, or null.
 pub fn find(n: u32) ?*Generation {
-    const io = mu_io orelse return null;
+    const io = host_io.get();
     mu.lockUncancelable(io);
     defer mu.unlock(io);
     return findLocked(n);
@@ -203,12 +226,8 @@ pub fn findScript(gen: *const Generation, rel: []const u8) ?u32 {
 /// Bytes held through `HostApi.alloc` with tag `gen` (0: the shared user
 /// heap), or null for a generation that is not loaded.
 pub fn liveBytes(gen: u32) ?u64 {
-    const io = mu_io orelse return if (gen == 0) 0 else null;
-    mu.lockUncancelable(io);
-    defer mu.unlock(io);
-    if (gen == 0) return user_heap_bytes;
-    const g = findLocked(gen) orelse return null;
-    return g.live_bytes;
+    const counter = counterFor(gen) orelse return null;
+    return counter.load(.acquire);
 }
 
 /// Releases the engine names of every generation (Godot reports names still
@@ -217,7 +236,7 @@ pub fn liveBytes(gen: u32) ?u64 {
 /// Main thread, at SCENE exit.
 pub fn shutdown() void {
     current_gen = null;
-    const io = mu_io orelse return;
+    const io = host_io.get();
     const a = list_allocator orelse return;
     mu.lockUncancelable(io);
     const gens = generations.items;
@@ -260,22 +279,32 @@ fn validAlignment(alignment: u32) ?std.mem.Alignment {
 }
 
 /// The byte counter for tag `gen`, or null for an unknown generation.
-/// Needs `mu`.
-fn counterLocked(gen: u32) ?*u64 {
+/// Tag 0 takes no lock. A generation's counter lives as long as the process
+/// (generations are never freed), so it is used after `mu` is released.
+fn counterFor(gen: u32) ?*std.atomic.Value(u64) {
     if (gen == 0) return &user_heap_bytes;
-    const g = findLocked(gen) orelse return null;
+    const g = find(gen) orelse return null;
     return &g.live_bytes;
+}
+
+/// Adds `size` to `counter`, saturating.
+fn countAlloc(counter: *std.atomic.Value(u64), size: usize) void {
+    var old = counter.load(.monotonic);
+    while (counter.cmpxchgWeak(old, old +| size, .acq_rel, .monotonic)) |seen| old = seen;
+}
+
+/// Takes `size` from `counter`, saturating at 0.
+fn countFree(counter: *std.atomic.Value(u64), size: usize) void {
+    var old = counter.load(.monotonic);
+    while (counter.cmpxchgWeak(old, old -| size, .acq_rel, .monotonic)) |seen| old = seen;
 }
 
 fn apiAlloc(gen: u32, size: usize, alignment: u32) callconv(.c) ?*anyopaque {
     if (size == 0) return null;
     const al = validAlignment(alignment) orelse return null;
-    const io = mu_io orelse return null;
-    mu.lockUncancelable(io);
-    defer mu.unlock(io);
-    const counter = counterLocked(gen) orelse return null;
+    const counter = counterFor(gen) orelse return null;
     const p = heap.rawAlloc(size, al, @returnAddress()) orelse return null;
-    counter.* +|= size;
+    countAlloc(counter, size);
     return p;
 }
 
@@ -284,11 +313,8 @@ fn apiFree(gen: u32, ptr: ?*anyopaque, size: usize, alignment: u32) callconv(.c)
     if (size == 0) return;
     // Memory with an alignment `alloc` would refuse cannot be ours.
     const al = validAlignment(alignment) orelse return;
-    const io = mu_io orelse return;
-    mu.lockUncancelable(io);
-    defer mu.unlock(io);
-    if (counterLocked(gen)) |counter| counter.* -|= size;
     heap.rawFree(@as([*]u8, @ptrCast(p))[0..size], al, @returnAddress());
+    if (counterFor(gen)) |counter| countFree(counter, size);
 }
 
 /// Longest message text logged; longer text is cut.
@@ -333,7 +359,6 @@ const testing = std.testing;
 
 /// Registers a fake generation for the HostApi tests, bypassing `load`.
 fn testRegister(gen: *Generation) !void {
-    mu_io = testing.io;
     list_allocator = testing.allocator;
     try generations.append(testing.allocator, gen);
 }
@@ -341,9 +366,77 @@ fn testRegister(gen: *Generation) !void {
 fn testReset() void {
     generations.deinit(testing.allocator);
     generations = .empty;
-    user_heap_bytes = 0;
-    mu_io = null;
+    user_heap_bytes.store(0, .release);
     list_allocator = null;
+}
+
+test "HostApi tag 0 works before any load" {
+    defer testReset();
+    try testing.expectEqual(@as(usize, 0), generations.items.len);
+    const p = apiAlloc(0, 48, 16) orelse return error.AllocFailed;
+    try testing.expectEqual(@as(?u64, 48), liveBytes(0));
+    apiFree(0, p, 48, 16);
+    try testing.expectEqual(@as(?u64, 0), liveBytes(0));
+    // A generation tag still needs a loaded generation.
+    try testing.expect(apiAlloc(1, 8, 8) == null);
+}
+
+test "HostApi counters stay right with allocations held across threads" {
+    var g: Generation = .{ .n = 5, .lib = undefined, .table = undefined, .names = &.{}, .by_path = .empty };
+    try testRegister(&g);
+    defer testReset();
+
+    const per_thread = 500;
+    const Held = struct { ptrs: [per_thread]*anyopaque = undefined, bytes: u64 = 0 };
+    const Worker = struct {
+        fn alloc(tag: u32, held: *Held) void {
+            for (&held.ptrs, 0..) |*slot, i| {
+                const size = 1 + (i * 7) % 300;
+                slot.* = apiAlloc(tag, size, 32) orelse @panic("alloc failed");
+                held.bytes += size;
+            }
+        }
+        fn free(tag: u32, held: *Held) void {
+            for (held.ptrs, 0..) |ptr, i| apiFree(tag, ptr, 1 + (i * 7) % 300, 32);
+        }
+    };
+    var held: [8]Held = @splat(.{});
+    var threads: [8]std.Thread = undefined;
+    // All threads allocate at once and keep their memory.
+    for (&threads, &held, 0..) |*t, *h, i| t.* = try std.Thread.spawn(.{}, Worker.alloc, .{ @as(u32, if (i % 2 == 0) 5 else 0), h });
+    for (threads) |t| t.join();
+    var want_gen: u64 = 0;
+    var want_heap: u64 = 0;
+    for (held, 0..) |h, i| {
+        if (i % 2 == 0) want_gen += h.bytes else want_heap += h.bytes;
+    }
+    try testing.expectEqual(@as(?u64, want_gen), liveBytes(5));
+    try testing.expectEqual(@as(?u64, want_heap), liveBytes(0));
+    // Then all free at once.
+    for (&threads, &held, 0..) |*t, *h, i| t.* = try std.Thread.spawn(.{}, Worker.free, .{ @as(u32, if (i % 2 == 0) 5 else 0), h });
+    for (threads) |t| t.join();
+    try testing.expectEqual(@as(?u64, 0), liveBytes(5));
+    try testing.expectEqual(@as(?u64, 0), liveBytes(0));
+}
+
+test "load refuses a thread other than the main thread" {
+    const saved = main_thread;
+    defer main_thread = saved;
+    main_thread = std.Thread.getCurrentId();
+    const Worker = struct {
+        fn run(diag: *[256]u8, result: *?LoadError) void {
+            // `load` logs its sentence through Godot, which a unit test does
+            // not have; the Godot check covers `load` itself.
+            _ = diag;
+            result.* = if (onMainThread()) null else error.NotMainThread;
+        }
+    };
+    var diag: [256]u8 = undefined;
+    var result: ?LoadError = null;
+    const t = try std.Thread.spawn(.{}, Worker.run, .{ &diag, &result });
+    t.join();
+    try testing.expectEqual(@as(?LoadError, error.NotMainThread), result);
+    try testing.expect(onMainThread());
 }
 
 test "HostApi alloc and free count bytes per tag" {
@@ -413,4 +506,5 @@ test "refusal sentence names the file and lowers the reason" {
 
 test {
     _ = names;
+    _ = host_io;
 }

@@ -14,9 +14,6 @@ const String = godot.builtin.String;
 const StringName = godot.builtin.StringName;
 const RefCounted = godot.class.RefCounted;
 
-/// The Io the probe loads with.
-var threaded: std.Io.Threaded = .init_single_threaded;
-
 pub const ZigguratTestProbe = struct {
     base: *RefCounted,
 
@@ -38,8 +35,8 @@ pub const ZigguratTestProbe = struct {
         const p = path.toUtf8Buf(&buf);
         var diag: [256]u8 = undefined;
         const n = std.math.cast(u32, gen) orelse return .fromLatin1("generation out of range");
-        _ = runtime.load(std.heap.c_allocator, threaded.io(), .fromTrusted(p), n, &diag) catch |err| switch (err) {
-            error.Refused => return String.fromUtf8(std.mem.sliceTo(&diag, 0)) catch .fromLatin1("refused"),
+        _ = runtime.load(std.heap.c_allocator, .fromTrusted(p), n, &diag) catch |err| switch (err) {
+            error.Refused, error.NotMainThread => return String.fromUtf8(std.mem.sliceTo(&diag, 0)) catch .fromLatin1("refused"),
             error.OutOfMemory => return .fromLatin1("out of memory"),
         };
         return .fromLatin1("");

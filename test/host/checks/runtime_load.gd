@@ -149,6 +149,13 @@ func host_api(probe: Object) -> void:
 	for i in 50:
 		probe.api_log(0, "info from main %d" % i)
 	t.wait_to_finish()
+	# load from another thread is refused before anything is touched.
+	var t2 := Thread.new()
+	t2.start(func() -> String:
+		return probe.load_module(modules()["good"], 9))
+	var diag: String = t2.wait_to_finish()
+	report("load_refuses_other_thread", diag.contains("main thread") and probe.init_calls(9) == 0 and probe.current_generation() == 1,
+		"diag '%s', init calls %d, current %d" % [diag, probe.init_calls(9), probe.current_generation()])
 	probe.api_request_swap()
 	probe.api_request_swap()
 	report("host_api_log_returns", true, "")

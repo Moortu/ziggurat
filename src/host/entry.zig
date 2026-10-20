@@ -14,6 +14,7 @@ const godot = @import("gdzig");
 const version = @import("version.zig");
 const language = @import("language.zig");
 const runtime = @import("runtime.zig");
+const host_io = @import("host_io.zig");
 const host_options = @import("host_options");
 const test_probe = @import("test_probe.zig");
 
@@ -70,6 +71,7 @@ export fn ziggurat_host_init(
     library = p_library;
     godot.raw = .init(gpa, lib);
     godot.raw.getGodotVersion(@ptrCast(&godot.version));
+    host_io.init();
     runtime.setEngine(@ptrCast(gpa), lib);
 
     registry.addClass(ZigLanguage, registry.allocator, .auto);
@@ -99,8 +101,10 @@ fn enter(_: ?*anyopaque, level: c.GDExtensionInitializationLevel) callconv(.c) v
 
 fn exit(_: ?*anyopaque, level: c.GDExtensionInitializationLevel) callconv(.c) void {
     if (level > c.GDEXTENSION_INITIALIZATION_EDITOR) return;
-    if (refused) return;
-    registry.exit(@fromBackingInt(@intCast(level)));
+    if (!refused) registry.exit(@fromBackingInt(@intCast(level)));
+    // The process Io goes last: the runtime's shutdown (in `Lifecycle.exit`)
+    // still locks with it.
+    if (level == c.GDEXTENSION_INITIALIZATION_SCENE) host_io.deinit();
 }
 
 /// The authoritative precision check: engine singletons exist at SCENE init,

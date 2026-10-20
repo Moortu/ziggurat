@@ -292,5 +292,6 @@ test "runtime: load good module, load refuses bad module, name maps use interned
         "[ziggurat] error from main",
         "[ziggurat] info from thread 49\n",
         "[ziggurat] swap requested (swaps arrive in a later version)",
+        "ERROR: [ziggurat] Ziggurat cannot load the module libzmod.1.so from a thread other than the main thread.",
     });
 }
