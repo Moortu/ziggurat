@@ -486,9 +486,10 @@ test "script reports descriptors, script without descriptors, update_exports is 
         "ZTEST PASS instance_create_refused",
         "ZTEST PASS reload_returns_ok",
         "ZTEST PASS script_cache_write",
+        // A Node is not a CharacterBody2D: refused, one line per attempt.
+        "Script res://player.zig extends CharacterBody2D, so it cannot be attached to an object of class Node.",
     }, &.{
-        // Two refused instances of the same script, one line; two reloads, one line.
-        "Script res://player.zig cannot create instances yet.",
+        // Two reloads, one line.
         "Script res://player.zig reloads when a new build is loaded",
     });
     try p.runScript(&.{
@@ -521,5 +522,57 @@ test "can_instantiate rule in the editor" {
         "ZTEST PASS editor_placeholder_refused",
         "ZTEST PASS editor_load_module",
         "ZTEST PASS editor_rule_after_load",
+    });
+}
+
+// ------------------------------------------------------------ instances
+
+/// Builds the `instance_project` fixture and lists the staged library in
+/// `res://modules.txt` of `p` as `good=<path>`.
+fn buildInstanceModule(p: *Project) !void {
+    const a = p.arena_state.allocator();
+    var manifest = try loadManifest(testing.allocator);
+    defer manifest.deinit(testing.allocator);
+    try p.tmp.dir.createDirPath(io, "work");
+    const work = try p.tmp.dir.realPathFileAlloc(io, "work", a);
+    const good = try buildModule(a, work, "good", "instance_project", manifest.modules, true);
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+    defer dir.close(io);
+    const list = try std.fmt.allocPrint(a, "good={s}\n", .{good});
+    try dir.writeFile(io, .{ .sub_path = "modules.txt", .data = list });
+}
+
+test "ready runs, properties through the object, call falls through, strong reference, wrong owner type" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("empty");
+    defer p.deinit();
+    try buildInstanceModule(&p);
+    try p.addCheck("instances.gd");
+    try p.runScriptOnce(&.{
+        "ZTEST PASS attach\n",
+        "ZTEST PASS strong_reference",
+        "ZTEST PASS instance_count",
+        "ZTEST PASS ready_runs",
+        "ZTEST PASS notifications_forwarded",
+        "ZTEST PASS properties_get_set",
+        "ZTEST PASS property_list_through_object",
+        "ZTEST PASS property_revert",
+        "ZTEST PASS property_state",
+        "ZTEST PASS to_string",
+        "ZTEST PASS call_falls_through",
+        "ZTEST PASS call_errors",
+        "ZTEST PASS wrong_owner_refused",
+        "ZTEST PASS derived_owner_accepted",
+        "ZTEST PASS instance_freed",
+        "ZTEST PASS attach_idle",
+        "ZTEST PASS process_only_when_defined",
+        "ZTEST PASS instances_released",
+    }, &.{
+        // `_ready` ran once, through the instance (two instances of mover
+        // were made, but only one entered the tree).
+        "[ziggurat] mover ready speed=5\n",
+        // One line naming the script and both classes.
+        "Script res://mover.zig extends Node2D, so it cannot be attached to an object of class Node.",
     });
 }

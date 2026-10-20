@@ -33,6 +33,7 @@ const desc_cache = @import("desc_cache.zig");
 const default_value = @import("default_value.zig");
 const host_io = @import("host_io.zig");
 const language = @import("language.zig");
+const instance = @import("instance.zig");
 
 const Allocator = std.mem.Allocator;
 const Array = godot.builtin.Array;
@@ -318,20 +319,8 @@ fn findDesc(rel: []const u8) ?Desc {
     return null;
 }
 
-/// The UTF-8 text of `s` in `buf`, or null when it does not fit.
-fn stringText(s: *const String, buf: []u8) ?[]const u8 {
-    const n: usize = @intCast(@max(0, godot.raw.stringToUtf8Chars(s.constPtr(), null, 0)));
-    if (n > buf.len) return null;
-    if (n != 0) _ = godot.raw.stringToUtf8Chars(s.constPtr(), buf.ptr, @intCast(n));
-    return buf[0..n];
-}
-
-/// The UTF-8 text of `sn` in `buf`, or null when it does not fit.
-fn nameText(sn: StringName, buf: []u8) ?[]const u8 {
-    var s = String.fromStringName(sn);
-    defer s.deinit();
-    return stringText(&s, buf);
-}
+const stringText = props.stringText;
+const nameText = props.nameText;
 
 /// The project-relative path of a `res://` resource path, normalised into
 /// `buf` like Godot's `String::simplify_path` (core/string/ustring.cpp:4149):
@@ -532,11 +521,42 @@ pub const ZigScript = struct {
 
     // ---------------------------------------------------------- instances
 
-    /// Godot keeps the object without a script when this returns null.
-    /// Logged once per script.
-    pub fn _instanceCreate(self: *ZigScript, _: ?*Object) ?*anyopaque {
-        self.logRefusedInstance();
-        return null;
+    /// A script instance for `owner` (`instance.create`), or null: Godot
+    /// then keeps the object without a script. Refused when the owner's
+    /// class is neither the script's `extends` class nor derived from it
+    /// (one line naming the script and both classes, each time), and when
+    /// no loaded module describes the script (cached descriptors cannot
+    /// run; logged once per script).
+    pub fn _instanceCreate(self: *ZigScript, owner: ?*Object) ?*anyopaque {
+        const o = owner orelse return null;
+        const d = self.desc() orelse {
+            self.logRefusedInstance();
+            return null;
+        };
+        const l = switch (d) {
+            .loaded => |l| l,
+            .cached => {
+                self.logRefusedInstance();
+                return null;
+            },
+        };
+        if (!instance.ownerFits(o, d.baseClass())) {
+            self.logWrongOwner(o, d.baseClass());
+            return null;
+        }
+        return instance.create(self.base, o, l.gen, l.index);
+    }
+
+    fn logWrongOwner(self: *const ZigScript, owner: *Object, base_class: []const u8) void {
+        var path = self.base.getPath();
+        defer path.deinit();
+        var buf: [max_path_bytes]u8 = undefined;
+        const p = stringText(&path, &buf) orelse "(path too long)";
+        var cls = owner.getClass();
+        defer cls.deinit();
+        var cls_buf: [max_name_bytes]u8 = undefined;
+        const c = stringText(&cls, &cls_buf) orelse "(name too long)";
+        log("Script {s} extends {s}, so it cannot be attached to an object of class {s}.", .{ if (p.len == 0) "(unsaved)" else p, base_class, c });
     }
 
     pub fn _placeholderInstanceCreate(self: *ZigScript, _: ?*Object) ?*anyopaque {
@@ -720,7 +740,7 @@ pub const ZigScript = struct {
 
 /// Prints one line to Godot's output.
 fn log(comptime fmt: []const u8, args: anytype) void {
-    var buf: [max_path_bytes + 256]u8 = undefined;
+    var buf: [max_path_bytes + 2 * max_name_bytes + 256]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
     var s: String = String.fromUtf8(msg) catch String.fromLatin1(msg);
     defer s.deinit();

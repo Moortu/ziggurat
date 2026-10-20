@@ -90,6 +90,21 @@ pub fn utf8Alloc(a: Allocator, s: *const String) Allocator.Error![]u8 {
     return buf;
 }
 
+/// The UTF-8 text of `s` in `buf`, or null when it does not fit.
+pub fn stringText(s: *const String, buf: []u8) ?[]const u8 {
+    const n: usize = @intCast(@max(0, godot.raw.stringToUtf8Chars(s.constPtr(), null, 0)));
+    if (n > buf.len) return null;
+    if (n != 0) _ = godot.raw.stringToUtf8Chars(s.constPtr(), buf.ptr, @intCast(n));
+    return buf[0..n];
+}
+
+/// The UTF-8 text of `sn` in `buf`, or null when it does not fit.
+pub fn nameText(sn: StringName, buf: []u8) ?[]const u8 {
+    var s = String.fromStringName(sn);
+    defer s.deinit();
+    return stringText(&s, buf);
+}
+
 fn putVariant(d: *Dictionary, comptime key: []const u8, value: Variant) void {
     var k_string = String.fromLatin1(key);
     defer k_string.deinit();

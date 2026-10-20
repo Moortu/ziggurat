@@ -278,4 +278,5 @@ test {
     _ = props;
     _ = desc_cache;
     _ = script;
+    _ = @import("instance.zig");
 }

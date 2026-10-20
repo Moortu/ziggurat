@@ -13,6 +13,7 @@ const desc_cache = @import("desc_cache.zig");
 const default_value = @import("default_value.zig");
 const host_io = @import("host_io.zig");
 const script_mod = @import("script.zig");
+const instance = @import("instance.zig");
 
 const Allocator = std.mem.Allocator;
 const String = godot.builtin.String;
@@ -21,6 +22,8 @@ const RefCounted = godot.class.RefCounted;
 const Array = godot.builtin.Array;
 const Dictionary = godot.builtin.Dictionary;
 const ZigScript = script_mod.ZigScript;
+const Object = godot.class.Object;
+const Variant = godot.builtin.Variant;
 
 pub const ZigguratTestProbe = struct {
     base: *RefCounted,
@@ -304,6 +307,36 @@ pub const ZigguratTestProbe = struct {
         return zs.export_refreshes;
     }
 
+    /// Script instance records alive now.
+    pub fn liveInstances(_: *ZigguratTestProbe) i64 {
+        return instance.live.load(.monotonic);
+    }
+
+    /// Bytes held through `HostApi.alloc` with tag `gen`; -1 for a
+    /// generation that is not loaded.
+    pub fn liveBytes(_: *ZigguratTestProbe, gen: i64) i64 {
+        const n = std.math.cast(u32, gen) orelse return -1;
+        const b = runtime.liveBytes(n) orelse return -1;
+        return std.math.cast(i64, b) orelse -1;
+    }
+
+    /// Calls `method` on `obj` with no arguments through Godot's Variant
+    /// call and returns the call error code (0 is OK).
+    pub fn callError(_: *ZigguratTestProbe, obj: ?*Object, method: StringName) i64 {
+        var self_v = Variant.init(?*Object, obj);
+        defer self_v.deinit();
+        var ret: Variant = .nil;
+        var err: godot.c.GDExtensionCallError = .{ .@"error" = 0, .argument = 0, .expected = 0 };
+        godot.raw.variantCall(@ptrCast(&self_v), @ptrCast(&method), null, 0, @ptrCast(&ret), &err);
+        ret.deinit();
+        return err.@"error";
+    }
+
+    /// What the script instance of `obj` reports from `get_property_state`.
+    pub fn propertyState(_: *ZigguratTestProbe, obj: ?*Object) Dictionary {
+        return instance.propertyStateOf(obj orelse return Dictionary.init());
+    }
+
     pub fn propertyIsGroup(_: *ZigguratTestProbe, script: i64, index: i64) bool {
         const d = scriptDesc(script) orelse return false;
         const i = std.math.cast(u32, index) orelse return false;
@@ -336,7 +369,8 @@ pub const method_names = [_][:0]const u8{
     "method_name",           "property_count",          "property_name",       "property_is_group",
     "api_log",               "api_request_swap",        "script_is_valid",     "script_fallback_enabled",
     "script_members",        "script_member_line",      "script_method_info",  "script_has_default",
-    "script_update_exports", "script_method_arg_count",
+    "script_update_exports", "script_method_arg_count", "live_instances",      "live_bytes",
+    "call_error",            "property_state",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

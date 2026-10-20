@@ -195,16 +195,11 @@ func first_run(probe: Object) -> void:
 	# valid script can make instances.
 	report("can_instantiate_game", player.can_instantiate() and hud.can_instantiate(), "player %s, hud %s" % [player.can_instantiate(), hud.can_instantiate()])
 
-	# Instances are refused with one line naming the script; the node keeps
-	# no script.
+	# player.zig extends CharacterBody2D: a plain Node is refused with a line
+	# naming the script and both classes; the node keeps no script.
 	var node := Node.new()
 	node.set_script(player)
 	report("instance_create_refused", node.get_script() == null, "node has a script")
-	node.free()
-	# A second refusal of the same script is not logged again (the Zig test
-	# counts the log line).
-	node = Node.new()
-	node.set_script(player)
 	node.free()
 
 	report("reload_returns_ok", player.reload() == OK and player.reload(true) == OK, "reload failed")
