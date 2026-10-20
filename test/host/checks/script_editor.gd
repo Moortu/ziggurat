@@ -33,10 +33,10 @@ func _ready() -> void:
 	report("can_instantiate_editor_non_tool", not player.can_instantiate(), "a non-tool script can make instances in the editor")
 	report("can_instantiate_editor_tool", hud.can_instantiate(), "a tool script cannot make instances in the editor")
 	report("can_instantiate_editor_no_descriptors", not none.can_instantiate(), "a script without descriptors can make instances")
-	# A non-tool script in the editor asks for a placeholder instead.
-	var node := Node.new()
+	# A non-tool script in the editor gets a placeholder instead.
+	var node := CharacterBody2D.new()
 	node.set_script(player)
-	report("editor_placeholder_refused", node.get_script() == null, "node has a script")
+	report("editor_placeholder_created", node.get_script() == player and probe.script_placeholder_count(player) == 1, "script %s" % node.get_script())
 	node.free()
 	# Loading a module in the editor leaves the module's static StringNames
 	# at exit; the runner accepts them (only non-static references count).

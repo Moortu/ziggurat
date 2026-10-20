@@ -14,7 +14,15 @@
 //!    scene values with placeholder fallback.
 //! Nothing is copied: every answer is read from the descriptor in use, so a
 //! new generation changes the answers at once. `_update_exports` compares
-//! the descriptor generation (`DescKey`) with the one it saw last.
+//! the descriptor generation (`DescKey`) with the one the script's
+//! placeholders were fed last (`placeholder.zig`).
+//!
+//! Placeholders: in the editor a script that is not a tool script gets a
+//! placeholder instance (`_placeholder_instance_create`), fed with the
+//! property list and defaults. Placeholder fallback is on while the script
+//! has no descriptors or its last build failed (`setBuildFailed`); Godot
+//! then stores every scene value in the placeholder as it is, and nothing
+//! feeds the placeholders.
 //!
 //! The code that runs is the module generation, never the text this object
 //! holds.
@@ -34,6 +42,7 @@ const default_value = @import("default_value.zig");
 const host_io = @import("host_io.zig");
 const language = @import("language.zig");
 const instance = @import("instance.zig");
+const placeholder = @import("placeholder.zig");
 
 const Allocator = std.mem.Allocator;
 const Array = godot.builtin.Array;
@@ -305,6 +314,30 @@ const Desc = union(enum) {
     }
 };
 
+/// Makes what placeholders are fed from a descriptor: its property list and
+/// a default per exported property (`Desc.defaultValue`). Without a
+/// descriptor, empty data.
+const Feed = struct {
+    d: ?Desc,
+
+    pub fn make(f: Feed) placeholder.Data {
+        var values = Dictionary.init();
+        const d = f.d orelse return .{ .properties = .init(), .values = values };
+        for (0..d.propertyCount()) |i| {
+            const p = d.property(@intCast(i));
+            if (p.label) continue;
+            const v = d.defaultValue(@intCast(i)) orelse continue;
+            defer v.deinit();
+            var sn = StringName.fromUtf8(p.name);
+            defer sn.deinit();
+            const k = Variant.init(StringName, sn);
+            defer k.deinit();
+            _ = values.set(k, v);
+        }
+        return .{ .properties = d.propertyList(), .values = values };
+    }
+};
+
 /// The descriptor of the script at project-relative path `rel`. Once a
 /// generation is loaded the cache is never asked (no stale validity for a
 /// script the module no longer has).
@@ -409,10 +442,10 @@ pub const ZigScript = struct {
     base: *ScriptExtension,
     /// The file's text, as the script editor shows it.
     source: String,
-    /// The descriptors `_update_exports` saw last.
-    exports_seen: DescKey = .{},
-    /// How many times `_update_exports` found new descriptors.
-    export_refreshes: u32 = 0,
+    /// The live placeholder instances and the descriptors they were fed.
+    placeholders: placeholder.Set(DescKey) = .{},
+    /// Set while the script's last build failed (`setBuildFailed`).
+    build_failed: std.atomic.Value(bool) = .init(false),
     /// Set once a reload request has been logged.
     reload_logged: bool = false,
     /// Set once a refused instance has been logged.
@@ -426,6 +459,7 @@ pub const ZigScript = struct {
     }
 
     pub fn destroy(self: *ZigScript, allocator: *Allocator) void {
+        self.placeholders.deinit();
         self.source.deinit();
         self.base.destroy();
         allocator.destroy(self);
@@ -449,6 +483,21 @@ pub const ZigScript = struct {
         const res_path = stringText(&path, &buf) orelse return null;
         var rel_buf: [max_path_bytes]u8 = undefined;
         return findDesc(relPath(res_path, &rel_buf) orelse return null);
+    }
+
+    /// The descriptor placeholders are fed from: null while placeholder
+    /// fallback is on (no descriptor, or the last build failed).
+    fn liveDesc(self: *const ZigScript) ?Desc {
+        if (self.build_failed.load(.acquire)) return null;
+        return self.desc();
+    }
+
+    /// Marks the script's last build as failed (true) or good (false).
+    /// While it is failed, placeholder fallback is on and placeholders keep
+    /// what they hold; the next `_update_exports` after a good build feeds
+    /// them again. Any thread.
+    pub fn setBuildFailed(self: *ZigScript, failed: bool) void {
+        self.build_failed.store(failed, .release);
     }
 
     /// Writes `Script <path> <what>` to Godot's output.
@@ -526,9 +575,13 @@ pub const ZigScript = struct {
     /// class is neither the script's `extends` class nor derived from it
     /// (one line naming the script and both classes, each time), and when
     /// no loaded module describes the script (cached descriptors cannot
-    /// run; logged once per script).
+    /// run; logged once per script). In the editor a tool script that no
+    /// loaded module describes gets a placeholder instead, so the scene
+    /// keeps its values until a module runs it.
     pub fn _instanceCreate(self: *ZigScript, owner: ?*Object) ?*anyopaque {
         const o = owner orelse return null;
+        const loaded = if (self.desc()) |d| d == .loaded else false;
+        if (!loaded and editor_hint.load(.acquire)) return self._placeholderInstanceCreate(o);
         const d = self.desc() orelse {
             self.logRefusedInstance();
             return null;
@@ -559,9 +612,16 @@ pub const ZigScript = struct {
         logError("Script {s} extends {s}, so it cannot be attached to an object of class {s}.", .{ if (p.len == 0) "(unsaved)" else p, base_class, c });
     }
 
-    pub fn _placeholderInstanceCreate(self: *ZigScript, _: ?*Object) ?*anyopaque {
-        self.logRefusedInstance();
-        return null;
+    /// A placeholder instance for `owner` (`placeholder.create`), recorded
+    /// and, unless fallback is on, fed with the descriptor's property list
+    /// and defaults, as GDScript does (modules/gdscript/gdscript.cpp:427-436).
+    pub fn _placeholderInstanceCreate(self: *ZigScript, owner: ?*Object) ?*anyopaque {
+        const o = owner orelse return null;
+        const lang = language.registered orelse return null;
+        const p = placeholder.create(lang.base, self.base, o) orelse return null;
+        const d = self.liveDesc();
+        self.placeholders.add(p, if (d) |x| x.key() else null, Feed{ .d = d });
+        return p;
     }
 
     /// Any thread: Godot instantiates scenes on worker threads too.
@@ -574,26 +634,26 @@ pub const ZigScript = struct {
         logError("Script {s} cannot create instances yet.", .{if (p.len == 0) "(unsaved)" else p});
     }
 
-    /// The script keeps no list of placeholder instances, so there is
-    /// nothing to remove.
-    pub fn _placeholderErased(_: *ZigScript, _: ?*anyopaque) void {}
-
-    /// Idempotent: Godot calls it once per property while saving a scene.
-    /// Only when the descriptors differ from those seen last (another
-    /// generation, or the cache replaced by a module) is a refresh counted;
-    /// the script has no placeholder instances to update.
-    pub fn _updateExports(self: *ZigScript) void {
-        const key: DescKey = if (self.desc()) |d| d.key() else .{};
-        if (key.eql(self.exports_seen)) return;
-        self.exports_seen = key;
-        self.export_refreshes += 1;
+    /// Godot is deleting placeholder `p` (`~PlaceHolderScriptInstance`).
+    pub fn _placeholderErased(self: *ZigScript, p: ?*anyopaque) void {
+        self.placeholders.remove(p orelse return);
     }
 
-    /// True while the script has no descriptors: Godot then keeps every
-    /// scene value of a placeholder instead of dropping the ones the
-    /// script does not list (spec section 2).
+    /// Idempotent: Godot calls it once per property while saving a scene.
+    /// Only when the descriptors differ from those the placeholders were fed
+    /// last (another generation, the cache replaced by a module, or the
+    /// first good build after a failed one) are they fed again. Nothing is
+    /// fed while fallback is on.
+    pub fn _updateExports(self: *ZigScript) void {
+        const d = self.liveDesc();
+        _ = self.placeholders.refresh(if (d) |x| x.key() else null, Feed{ .d = d });
+    }
+
+    /// True while the script has no descriptors or its last build failed:
+    /// Godot then keeps every scene value of a placeholder instead of
+    /// dropping the ones the script does not list (spec section 2).
     pub fn _isPlaceholderFallbackEnabled(self: *ZigScript) bool {
-        return self.desc() == null;
+        return self.liveDesc() == null;
     }
 
     // ---------------------------------------------------------- source

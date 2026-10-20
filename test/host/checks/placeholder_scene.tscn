@@ -1,0 +1,17 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://mover.zig" id="1_mover"]
+
+[node name="Root" type="Node2D"]
+
+[node name="Mover" type="Node2D" parent="."]
+script = ExtResource("1_mover")
+speed = 9.0
+title = "hello"
+steps = 3
+retired = 42
+
+[node name="Tick" type="Timer" parent="."]
+
+[connection signal="timeout" from="Tick" to="Mover" method="on_tick"]
+[connection signal="visibility_changed" from="Mover" to="Tick" method="set_wait_time" binds= [0.5]]

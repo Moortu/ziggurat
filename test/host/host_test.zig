@@ -99,27 +99,41 @@ const Project = struct {
     /// Runs `res://check.gd` headless; every `expect` text must appear in
     /// Godot's output. Fails the test with the runner's report otherwise.
     fn runScript(p: *Project, expect: []const []const u8) !void {
-        return p.run(&.{ "script", "res://check.gd" }, expect, &.{});
+        return p.run(&.{ "script", "res://check.gd" }, .{ .expect = expect });
     }
 
     /// As `runScript`; each `once` text must appear exactly once.
     fn runScriptOnce(p: *Project, expect: []const []const u8, once: []const []const u8) !void {
-        return p.run(&.{ "script", "res://check.gd" }, expect, once);
+        return p.run(&.{ "script", "res://check.gd" }, .{ .expect = expect, .once = once });
     }
 
     /// Opens the project in the headless editor for `frames` frames.
     fn runEditor(p: *Project, frames: []const u8, expect: []const []const u8) !void {
-        return p.run(&.{ "editor", frames }, expect, &.{});
+        return p.run(&.{ "editor", frames }, .{ .expect = expect });
     }
 
-    fn run(p: *Project, mode: []const []const u8, expect: []const []const u8, once: []const []const u8) !void {
+    /// As `runEditor`, with every text check of the runner.
+    fn runEditorChecked(p: *Project, frames: []const u8, texts: Texts) !void {
+        return p.run(&.{ "editor", frames }, texts);
+    }
+
+    /// Output checks: each `expect` text must appear, each `once` text
+    /// exactly once, and no `reject` text at all.
+    const Texts = struct {
+        expect: []const []const u8 = &.{},
+        once: []const []const u8 = &.{},
+        reject: []const []const u8 = &.{},
+    };
+
+    fn run(p: *Project, mode: []const []const u8, texts: Texts) !void {
         const a = p.arena_state.allocator();
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.appendSlice(a, &.{ opts.runner_exe, opts.godot_exe, p.path });
         try argv.appendSlice(a, mode);
         try argv.append(a, deadline_s);
-        for (expect) |text| try argv.appendSlice(a, &.{ "--expect", text });
-        for (once) |text| try argv.appendSlice(a, &.{ "--expect-once", text });
+        for (texts.expect) |text| try argv.appendSlice(a, &.{ "--expect", text });
+        for (texts.once) |text| try argv.appendSlice(a, &.{ "--expect-once", text });
+        for (texts.reject) |text| try argv.appendSlice(a, &.{ "--reject", text });
         const result = try std.process.run(a, io, .{ .argv = argv.items });
         if (result.term.success()) return;
         std.debug.print("{s}{s}", .{ result.stdout, result.stderr });
@@ -523,7 +537,7 @@ test "can_instantiate rule in the editor" {
         "ZTEST PASS can_instantiate_editor_non_tool",
         "ZTEST PASS can_instantiate_editor_tool",
         "ZTEST PASS can_instantiate_editor_no_descriptors",
-        "ZTEST PASS editor_placeholder_refused",
+        "ZTEST PASS editor_placeholder_created",
         "ZTEST PASS editor_load_module",
         "ZTEST PASS editor_rule_after_load",
     });
@@ -583,4 +597,63 @@ test "ready runs, properties through the object, call falls through, strong refe
         // The RefCounted owner died with its last reference: deinit ran once.
         "[ziggurat] keeper deinit uses=7\n",
     });
+}
+
+// ------------------------------------------------------------ placeholders
+
+/// Copies test/host/checks/<name> into `p` as `res://<as>`.
+fn addCheckFile(p: *Project, name: []const u8, as: []const u8) !void {
+    const cwd = Io.Dir.cwd();
+    var checks = try cwd.openDir(io, opts.checks_dir, .{});
+    defer checks.close(io);
+    var dst = try cwd.openDir(io, p.path, .{});
+    defer dst.close(io);
+    try checks.copyFile(name, dst, as, io, .{});
+}
+
+test "placeholder shows properties, tool script runs in the editor" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("empty");
+    defer p.deinit();
+    try buildInstanceModule(&p);
+    // A script run writes the descriptor cache; the editor reads it at
+    // startup, so the placeholder has descriptors before the module loads.
+    try p.addCheck("instance_cache.gd");
+    try p.runScript(&.{"ZTEST PASS instance_cache_written"});
+    try p.addAutoloadCheck("placeholders_editor.gd");
+    try p.runEditorChecked("120", .{
+        .expect = &.{
+            "ZTEST PASS editor_has_cached_descriptors",
+            "ZTEST PASS placeholder_created",
+            "ZTEST PASS placeholder_shows_properties_from_cache",
+            "ZTEST PASS placeholder_keeps_set_values",
+            "ZTEST PASS placeholder_ready_not_run",
+            "ZTEST PASS editor_load_module",
+            "ZTEST PASS placeholder_refreshed_once_per_generation",
+            "ZTEST PASS build_failed_enables_fallback",
+            "ZTEST PASS tool_script_real_instance",
+            "ZTEST PASS tool_script_ready_ran",
+            "ZTEST PASS placeholder_erased",
+        },
+        // The tool script's `_ready` ran once, in the editor.
+        .once = &.{"[ziggurat] gadget ready calls=1\n"},
+        // The non-tool script's `_ready` never ran.
+        .reject = &.{"mover ready"},
+    });
+}
+
+test "scene save keeps values without descriptors" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("empty");
+    defer p.deinit();
+    // No descriptor cache and no module: the script has no descriptors.
+    try addCheckFile(&p, "placeholder_scene.tscn", "saved.tscn");
+    try p.addAutoloadCheck("placeholder_save.gd");
+    try p.runEditorChecked("120", .{ .expect = &.{
+        "ZTEST PASS no_descriptors",
+        "ZTEST PASS scene_opened_with_placeholder",
+        "ZTEST PASS scene_save_keeps_values_without_descriptors",
+    } });
 }

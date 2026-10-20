@@ -12,7 +12,7 @@
 //! deadline for the whole run. The run fails when Godot times out or exits
 //! non-zero, the output has no `ZTEST DONE` line, has a `ZTEST FAIL` line,
 //! lacks an `--expect` text, has an `--expect-once` text other than exactly
-//! once, or has one of Godot's leak or crash reports
+//! once, has a `--reject` text, or has one of Godot's leak or crash reports
 //! (`test/godot/output_scan.zig`). Godot's output is printed only on failure.
 //! Exits 0 on success, 1 on failure and 2 on a usage error.
 //!
@@ -32,8 +32,8 @@ const scan = @import("godot_output_scan");
 const editor_stock = [_]scan.StockOrphan{.{ .name = "Node", .non_static = 1 }};
 
 const usage =
-    \\usage: runner <godot> <project dir> script <check.gd> <deadline s> [--expect[-once] <text>]...
-    \\       runner <godot> <project dir> editor <quit-after frames> <deadline s> [--expect[-once] <text>]...
+    \\usage: runner <godot> <project dir> script <check.gd> <deadline s> [--expect[-once] <text> | --reject <text>]...
+    \\       runner <godot> <project dir> editor <quit-after frames> <deadline s> [--expect[-once] <text> | --reject <text>]...
     \\
 ;
 
@@ -55,14 +55,22 @@ pub fn main(init: std.process.Init) !u8 {
     };
     var expects: std.ArrayList([]const u8) = .empty;
     var expects_once: std.ArrayList([]const u8) = .empty;
+    var rejects: std.ArrayList([]const u8) = .empty;
     var i: usize = 6;
     while (i < args.len) : (i += 2) {
-        const once = std.mem.eql(u8, args[i], "--expect-once");
-        if (!(once or std.mem.eql(u8, args[i], "--expect")) or i + 1 >= args.len) {
+        const list = if (std.mem.eql(u8, args[i], "--expect"))
+            &expects
+        else if (std.mem.eql(u8, args[i], "--expect-once"))
+            &expects_once
+        else if (std.mem.eql(u8, args[i], "--reject"))
+            &rejects
+        else
+            null;
+        if (list == null or i + 1 >= args.len) {
             std.debug.print("runner: unexpected argument '{s}'\n{s}", .{ args[i], usage });
             return 2;
         }
-        try (if (once) &expects_once else &expects).append(arena, args[i + 1]);
+        try list.?.append(arena, args[i + 1]);
     }
 
     var argv: std.ArrayList([]const u8) = .empty;
@@ -106,6 +114,10 @@ pub fn main(init: std.process.Init) !u8 {
         const n = std.mem.count(u8, out, text);
         if (n != 1)
             try problems.append(arena, try std.fmt.allocPrint(arena, "expected text {d} times, want once: {s}", .{ n, text }));
+    }
+    for (rejects.items) |text| {
+        if (std.mem.indexOf(u8, out, text) != null)
+            try problems.append(arena, try std.fmt.allocPrint(arena, "rejected text present: {s}", .{text}));
     }
 
     if (problems.items.len == 0) return 0;

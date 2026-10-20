@@ -21,6 +21,7 @@ const props = @import("props.zig");
 const desc_cache = @import("desc_cache.zig");
 const script = @import("script.zig");
 const instance = @import("instance.zig");
+const placeholder = @import("placeholder.zig");
 
 const c = godot.c;
 const Registry = godot.extension.Registry;
@@ -288,4 +289,5 @@ test {
     _ = desc_cache;
     _ = script;
     _ = instance;
+    _ = placeholder;
 }
