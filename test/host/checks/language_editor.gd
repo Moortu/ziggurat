@@ -37,10 +37,13 @@ func _ready() -> void:
 
 	var s := await create(dialog, "Node2D", true)
 	report("template_offered", template_items(dialog).has("Object: Default"), "template menu: %s" % [template_items(dialog)])
-	report("make_template_default", s != null and s.get_class() == "ZigScript" and s.source_code.contains("pub const extends = z.godot.Node2D;") and s.source_code.contains("base: *z.godot.Node2D,"), source_of(s))
+	report("make_template_default", s != null and s.get_class() == "ZigScript" and s.source_code.contains("pub const extends = z.godot.Node2D;") and s.source_code.contains("base: *z.godot.Node2D,") and s.source_code.contains("pub fn _ready(self: *@This()) void"), source_of(s))
 
 	s = await create(dialog, "Node", false)
 	report("make_template_templates_off", s != null and s.source_code.contains("pub const extends = z.godot.Node;"), source_of(s))
+
+	s = await create(dialog, "Resource", true)
+	report("make_template_non_node_init", s != null and s.source_code.contains("pub const extends = z.godot.Resource;") and s.source_code.contains("pub fn init(self: *@This()) void") and not s.source_code.contains("_ready"), source_of(s))
 
 	s = await create(dialog, "\"res://nope.gd\"", true)
 	report("make_template_refuses_script_parent", s != null and s.source_code.begins_with("// Zig scripts extend engine classes only") and not s.source_code.contains("pub const extends"), source_of(s))

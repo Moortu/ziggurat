@@ -409,7 +409,7 @@ pub const ZigguratTestProbe = struct {
     /// were queued. Each one adds 1 to `queue_runs`.
     pub fn queuePush(_: *ZigguratTestProbe, n: i64) i64 {
         var pushed: i64 = 0;
-        while (pushed < n) : (pushed += 1) main_queue.push(countRun, null) catch break;
+        while (pushed < n) : (pushed += 1) main_queue.push(countRun, null, null) catch break;
         return pushed;
     }
 

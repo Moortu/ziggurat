@@ -82,13 +82,16 @@ pub const ZigLanguage = struct {
         const self = try allocator.create(ZigLanguage);
         self.* = .{ .base = ScriptLanguageExtension.init() };
         self.base.setInstance(ZigLanguage, self);
+        main_queue.open();
         return self;
     }
 
-    /// At SCENE exit (or when Godot refused the language): drops queued
-    /// main-thread work and cached diagnostics, and frees the names.
+    /// At SCENE exit (or when Godot refused the language): closes the
+    /// main-thread queue (waiting work is dropped through its drop hooks; a
+    /// later push frees its context at once), drops cached diagnostics and
+    /// frees the names.
     pub fn destroy(self: *ZigLanguage, allocator: *Allocator) void {
-        _ = main_queue.reset();
+        _ = main_queue.close();
         diag_cache.reset();
         var it = self.globals.keyIterator();
         while (it.next()) |k| gpa.free(k.*);
@@ -143,6 +146,7 @@ pub const ZigLanguage = struct {
         setProjectRoot();
         var stack = self._debugGetCurrentStackInfo();
         stack.deinit();
+        warmScanPath();
     }
     pub fn _finish(_: *ZigLanguage) void {}
     /// Runs queued main-thread work, at most `main_queue.per_frame` items.
@@ -277,16 +281,10 @@ pub const ZigLanguage = struct {
     /// (`global_class.scan`) and makes no engine value besides the returned
     /// Strings and Dictionary.
     pub fn _getGlobalClassName(_: *ZigLanguage, path: String) Dictionary {
-        var d: Dictionary = .init();
-        const text = readScript(&path) orelse return d;
+        const text = readScript(&path) orelse return .init();
         defer gpa.free(text);
-        const info = global_class.scan(text) orelse return d;
-        dictSetString(&d, "name", info.name);
-        dictSetString(&d, "base_type", info.base_type);
-        dictSetString(&d, "icon_path", "");
-        dictSetBool(&d, "is_abstract", false);
-        dictSetBool(&d, "is_tool", info.is_tool);
-        return d;
+        const info = global_class.scan(text) orelse return .init();
+        return classDict(info);
     }
 
     // ------------------------------------------------------------ editor
@@ -457,6 +455,32 @@ pub const ZigLanguage = struct {
 
 // ------------------------------------------------------------ module helpers
 
+/// The dictionary `_get_global_class_name` returns for `info`. Any thread,
+/// once `warmScanPath` has run.
+fn classDict(info: global_class.Info) Dictionary {
+    var d: Dictionary = .init();
+    dictSetString(&d, "name", info.name);
+    dictSetString(&d, "base_type", info.base_type);
+    dictSetString(&d, "icon_path", "");
+    dictSetBool(&d, "is_abstract", false);
+    dictSetBool(&d, "is_tool", info.is_tool);
+    return d;
+}
+
+/// Resolves, on the main thread, every lazy gdzig function pointer the
+/// `_get_global_class_name` path uses, so the file-scan thread never
+/// resolves one first. `Dictionary.set` looks its method up by a
+/// StringName ("set") on first use, which the scan thread must not create
+/// (spec section 2). The others need no StringName but are warmed too:
+/// the Dictionary constructor and destructor, the Variant-from-type
+/// constructors for String, bool and int, and the Variant and String
+/// destructors. `props.stringText` and `String.fromUtf8`/`fromLatin1` call
+/// interface functions directly and need no warming. Called from `_init`.
+fn warmScanPath() void {
+    var d = classDict(.{ .name = "Warm", .base_type = "Object", .is_tool = true });
+    d.deinit();
+}
+
 /// Records the project folder (`res://` globalized). Main thread, in
 /// `_init`, before the editor's file scan starts.
 fn setProjectRoot() void {
@@ -506,12 +530,15 @@ fn templateText(content: String, class_name: String, base_class_name: String) Al
     defer gpa.free(n);
     const b = try props.utf8Alloc(gpa, &base_class_name);
     defer gpa.free(b);
-    const engine = global_class.isIdentifier(b) and blk: {
+    const kind: template.Base = if (!global_class.isIdentifier(b)) .unknown else blk: {
         var sn = StringName.fromUtf8(b);
         defer sn.deinit();
-        break :blk ClassDb.classExists(sn);
+        if (!ClassDb.classExists(sn)) break :blk .unknown;
+        var node = StringName.fromUtf8("Node");
+        defer node.deinit();
+        break :blk if (ClassDb.isParentClass(sn, node)) .node else .other;
     };
-    const text = try template.make(gpa, c, n, b, engine);
+    const text = try template.make(gpa, c, n, b, kind);
     defer gpa.free(text);
     return String.fromUtf8(text) catch .fromLatin1("");
 }

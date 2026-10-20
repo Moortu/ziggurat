@@ -700,6 +700,7 @@ test "language in the editor: templates through Create Script, autoload constant
             "ZTEST PASS template_offered",
             "ZTEST PASS make_template_default",
             "ZTEST PASS make_template_templates_off",
+            "ZTEST PASS make_template_non_node_init",
             "ZTEST PASS make_template_refuses_script_parent",
         },
         // Godot names a missing or failing virtual in its error line.

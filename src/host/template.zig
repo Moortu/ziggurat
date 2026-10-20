@@ -23,7 +23,11 @@ const Allocator = std.mem.Allocator;
 /// The one built-in template, offered for every class (its `inherit` is
 /// `Object`, the root of every class hierarchy the dialog walks).
 pub const default_name = "Default";
-pub const default_description = "A Zig script with a _ready method.";
+pub const default_description = "A Zig script with _ready (Node classes) or init (other classes).";
+/// `_HOOK_DOC_` and `_HOOK_` (Ziggurat's own placeholders) become the
+/// first method: `_ready` when the parent class derives from Node (a Node
+/// virtual), else the SDK's `init` hook, which runs once when the instance
+/// is created (sdk/wrap.zig).
 pub const default_content =
     \\//! _CLASS_: a Zig script that extends _BASE_.
     \\const z = @import("ziggurat");
@@ -32,11 +36,22 @@ pub const default_content =
     \\
     \\base: *z.godot._BASE_,
     \\
-    \\pub fn _ready(self: *@This()) void {
+    \\/// _HOOK_DOC_
+    \\pub fn _HOOK_(self: *@This()) void {
     \\_TS__ = self;
     \\}
     \\
 ;
+
+/// How Godot knows the parent class.
+pub const Base = enum {
+    /// Not an engine class (a script's global class name, or unknown).
+    unknown,
+    /// An engine class that derives from Node (or is Node).
+    node,
+    /// Any other engine class.
+    other,
+};
 
 /// One indentation level: four spaces, as `zig fmt` writes.
 const indent = "    ";
@@ -45,11 +60,11 @@ const indent = "    ";
 const max_quoted = 200;
 
 /// The source of a new script made from `content` for file name
-/// `class_name` and parent class `base`. `base_is_engine_class` is true when
-/// Godot knows `base` as an engine class. Caller frees.
-pub fn make(a: Allocator, content: []const u8, class_name: []const u8, base: []const u8, base_is_engine_class: bool) Allocator.Error![]u8 {
+/// `class_name` and parent class `base`, which Godot knows as `kind`.
+/// Caller frees.
+pub fn make(a: Allocator, content: []const u8, class_name: []const u8, base: []const u8, kind: Base) Allocator.Error![]u8 {
     if (isQuoted(base)) return refusal(a, base, "a script");
-    if (!isIdentifier(base) or !base_is_engine_class) return refusal(a, base, "not an engine class");
+    if (!isIdentifier(base) or kind == .unknown) return refusal(a, base, "not an engine class");
 
     const text = if (content.len == 0) default_content else content;
     const pascal = try pascalCase(a, class_name);
@@ -57,7 +72,10 @@ pub fn make(a: Allocator, content: []const u8, class_name: []const u8, base: []c
     const snake = try snakeCase(a, class_name);
     defer a.free(snake);
     // `_CLASS_SNAKE_CASE_` before `_CLASS_`, which it contains.
+    const node = kind == .node;
     const pairs = [_][2][]const u8{
+        .{ "_HOOK_DOC_", if (node) "Runs when the node enters the scene tree for the first time." else "Runs once, when the instance is created." },
+        .{ "_HOOK_", if (node) "_ready" else "init" },
         .{ "_BASE_", base },
         .{ "_CLASS_SNAKE_CASE_", snake },
         .{ "_CLASS_", pascal },
@@ -134,7 +152,7 @@ fn snakeCase(a: Allocator, s: []const u8) Allocator.Error![]u8 {
 const testing = std.testing;
 
 test "default template for an engine class" {
-    const s = try make(testing.allocator, default_content, "my_mover", "Node2D", true);
+    const s = try make(testing.allocator, default_content, "my_mover", "Node2D", .node);
     defer testing.allocator.free(s);
     try testing.expectEqualStrings(
         \\//! MyMover: a Zig script that extends Node2D.
@@ -144,6 +162,7 @@ test "default template for an engine class" {
         \\
         \\base: *z.godot.Node2D,
         \\
+        \\/// Runs when the node enters the scene tree for the first time.
         \\pub fn _ready(self: *@This()) void {
         \\    _ = self;
         \\}
@@ -151,20 +170,39 @@ test "default template for an engine class" {
     , s);
 }
 
+test "a base that is not a Node gets the init hook, not _ready" {
+    const s = try make(testing.allocator, default_content, "stats", "Resource", .other);
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings(
+        \\//! Stats: a Zig script that extends Resource.
+        \\const z = @import("ziggurat");
+        \\
+        \\pub const extends = z.godot.Resource;
+        \\
+        \\base: *z.godot.Resource,
+        \\
+        \\/// Runs once, when the instance is created.
+        \\pub fn init(self: *@This()) void {
+        \\    _ = self;
+        \\}
+        \\
+    , s);
+}
+
 test "empty content uses the default template" {
-    const s = try make(testing.allocator, "", "x", "Node", true);
+    const s = try make(testing.allocator, "", "x", "Node", .node);
     defer testing.allocator.free(s);
     try testing.expect(std.mem.indexOf(u8, s, "pub const extends = z.godot.Node;") != null);
 }
 
 test "user template placeholders" {
-    const s = try make(testing.allocator, "_CLASS_ _CLASS_SNAKE_CASE_ _BASE_\n_TS_x", "3d-Thing", "Node3D", true);
+    const s = try make(testing.allocator, "_CLASS_ _CLASS_SNAKE_CASE_ _BASE_\n_TS_x", "3d-Thing", "Node3D", .node);
     defer testing.allocator.free(s);
     try testing.expectEqualStrings("_3dThing _3d_thing Node3D\n    x", s);
 }
 
 test "a quoted script path as parent class is refused with a comment" {
-    const s = try make(testing.allocator, default_content, "x", "\"res://base.gd\"", false);
+    const s = try make(testing.allocator, default_content, "x", "\"res://base.gd\"", .unknown);
     defer testing.allocator.free(s);
     try testing.expect(std.mem.startsWith(u8, s, "// Zig scripts extend engine classes only"));
     try testing.expect(std.mem.indexOf(u8, s, "\"res://base.gd\" is a script") != null);
@@ -175,13 +213,13 @@ test "a quoted script path as parent class is refused with a comment" {
 }
 
 test "a name that is not an engine class is refused; control characters are blanked" {
-    const a = try make(testing.allocator, default_content, "x", "Mover", false);
+    const a = try make(testing.allocator, default_content, "x", "Mover", .unknown);
     defer testing.allocator.free(a);
     try testing.expect(std.mem.indexOf(u8, a, "Mover is not an engine class") != null);
-    const b = try make(testing.allocator, default_content, "x", "Bad\nName", true);
+    const b = try make(testing.allocator, default_content, "x", "Bad\nName", .other);
     defer testing.allocator.free(b);
     try testing.expect(std.mem.indexOf(u8, b, "Bad Name is not an engine class") != null);
-    const c = try make(testing.allocator, default_content, "x", "", true);
+    const c = try make(testing.allocator, default_content, "x", "", .other);
     defer testing.allocator.free(c);
     try testing.expect(std.mem.startsWith(u8, c, "// Zig scripts extend engine classes only"));
 }
@@ -189,8 +227,8 @@ test "a name that is not an engine class is refused; control characters are blan
 test "make does not leak on allocation failure" {
     try testing.checkAllAllocationFailures(testing.allocator, struct {
         fn f(a: Allocator) !void {
-            a.free(try make(a, default_content, "my_x", "Node", true));
-            a.free(try make(a, default_content, "my_x", "\"res://x.gd\"", false));
+            a.free(try make(a, default_content, "my_x", "Node", .node));
+            a.free(try make(a, default_content, "my_x", "\"res://x.gd\"", .unknown));
         }
     }.f, .{});
 }
