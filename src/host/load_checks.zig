@@ -1,14 +1,16 @@
 //! Load checks the SDK cannot make, because they need the engine's class
 //! data (Stage 3 plan, "Host-side load checks"). They run on the main thread
 //! after a generation is loaded and report, per script:
-//! - a property or method whose Godot name already exists in the script's
-//!   `extends` class or an ancestor: the script's member would hide the
-//!   engine's (Godot looks a name up in the script first);
+//! - a property, method or signal whose Godot name already exists in the
+//!   script's `extends` class or an ancestor as a property, method or
+//!   signal: the script's member would hide the engine's (Godot looks a
+//!   name up in the script first, and the script instance answers a signal
+//!   or method name with a `Signal` or `Callable`, as GDScript does);
 //! - an object field whose class is a Node, in a script whose `extends` is
 //!   not a Node: such an object owns no scene tree, so the field could only
 //!   hold a node nothing frees with the tree.
-//! Each finding is one sentence (`propertyHides`, `methodHides`,
-//! `nodeField`) for the script's diagnostics, without a line. Virtual
+//! Each finding is one sentence (`hides`, `nodeField`) for the script's
+//! diagnostics, without a line. Virtual
 //! methods (`_ready`, `_process`, ...) override the engine on purpose and
 //! are not checked. Only exported fields are described with their type, so
 //! only those are checked for Node types.
@@ -43,15 +45,29 @@ pub fn freeFindings(a: Allocator, list: []Finding) void {
     a.free(list);
 }
 
-/// `Property '<p>' of <script> hides <Class>.<p>; ...`. `script` is the
-/// script's `res://` path.
-pub fn propertyHides(a: Allocator, script: []const u8, name: []const u8, class: []const u8) Allocator.Error![]u8 {
-    return std.fmt.allocPrint(a, "Property '{s}' of {s} hides {s}.{s}; rename it or give it a name override in meta.", .{ name, script, class, name });
-}
+/// The kind of a script or engine member.
+pub const Kind = enum {
+    property,
+    method,
+    signal,
 
-/// `Method '<m>' of <script> hides <Class>.<m>; ...`.
-pub fn methodHides(a: Allocator, script: []const u8, name: []const u8, class: []const u8) Allocator.Error![]u8 {
-    return std.fmt.allocPrint(a, "Method '{s}' of {s} hides {s}.{s}; rename it or give it a name override in meta.", .{ name, script, class, name });
+    fn title(k: Kind) []const u8 {
+        return switch (k) {
+            .property => "Property",
+            .method => "Method",
+            .signal => "Signal",
+        };
+    }
+};
+
+/// `<Kind> '<n>' of <script> hides <Class>.<n>; ...` when both members are
+/// of one kind, else `... hides <engine kind> <Class>.<n>; ...` (for
+/// example `Method 'draw' of res://a.zig hides signal Node2D.draw; ...`).
+/// `script` is the script's `res://` path.
+pub fn hides(a: Allocator, script: []const u8, kind: Kind, name: []const u8, engine_kind: Kind, class: []const u8) Allocator.Error![]u8 {
+    const sep = if (kind == engine_kind) "" else " ";
+    const word = if (kind == engine_kind) "" else @tagName(engine_kind);
+    return std.fmt.allocPrint(a, "{s} '{s}' of {s} hides {s}{s}{s}.{s}; rename it or give it a name override in meta.", .{ kind.title(), name, script, word, sep, class, name });
 }
 
 /// `<script> extends <Class>, which is not a Node, so field '<f>' ...`.
@@ -93,18 +109,30 @@ fn checkScript(a: Allocator, index: u32, desc: *const abi.ScriptDesc, out: *std.
     for (desc.properties[0..desc.property_count]) |p| {
         if (p.field_index == abi.no_field) continue;
         const name = str(p.name);
-        if (chain.propertyOwner(name)) |class| {
-            try out.append(a, .{ .script = index, .message = try propertyHides(a, script, name, class) });
-        }
+        try checkName(a, index, script, &chain, .property, name, out);
         if (!base_is_node and p.variant_type == variant_object and holdsNode(p)) {
             try out.append(a, .{ .script = index, .message = try nodeField(a, script, base, name) });
         }
     }
     for (desc.methods[0..desc.method_count]) |m| {
         if (m.flags & abi.method_flag_virtual != 0) continue;
-        const name = str(m.name);
-        if (chain.methodOwner(name)) |class| {
-            try out.append(a, .{ .script = index, .message = try methodHides(a, script, name, class) });
+        try checkName(a, index, script, &chain, .method, str(m.name), out);
+    }
+    for (desc.signals[0..desc.signal_count]) |sig| {
+        try checkName(a, index, script, &chain, .signal, str(sig.name), out);
+    }
+}
+
+/// One finding per engine member kind that already has `name`.
+fn checkName(a: Allocator, index: u32, script: []const u8, chain: *const Chain, kind: Kind, name: []const u8, out: *std.ArrayList(Finding)) Allocator.Error!void {
+    inline for (.{ Kind.property, Kind.method, Kind.signal }) |engine_kind| {
+        const owner = switch (engine_kind) {
+            .property => chain.propertyOwner(name),
+            .method => chain.methodOwner(name),
+            .signal => chain.signalOwner(name),
+        };
+        if (owner) |class| {
+            try out.append(a, .{ .script = index, .message = try hides(a, script, kind, name, engine_kind, class) });
         }
     }
 }
@@ -125,8 +153,8 @@ fn isNode(class: []const u8) bool {
     return ClassDb.isParentClass(sn, .fromComptimeLatin1("Node"));
 }
 
-/// A class and its ancestors, with each one's own property names, read
-/// once per script.
+/// A class and its ancestors, with each one's own property and signal
+/// names, read once per script.
 const Chain = struct {
     a: Allocator,
     /// Class names, the `extends` class first. Owned.
@@ -134,6 +162,8 @@ const Chain = struct {
     /// Property name -> index into `classes` of the class that declares it
     /// (the nearest one). Keys owned.
     props: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Signal name -> index into `classes`, as `props`. Keys owned.
+    signals: std.StringHashMapUnmanaged(u32) = .empty,
 
     fn init(a: Allocator, base: []const u8) Allocator.Error!Chain {
         var c: Chain = .{ .a = a };
@@ -150,7 +180,16 @@ const Chain = struct {
             const at: u32 = @intCast(c.classes.items.len - 1);
             var sn = StringName.fromUtf8(class);
             defer sn.deinit();
-            try c.addOwnProperties(sn, at);
+            {
+                var list = ClassDb.classGetPropertyList(sn, .{ .no_inheritance = true });
+                defer list.deinit();
+                try c.addOwnNames(&c.props, &list, at);
+            }
+            {
+                var list = ClassDb.classGetSignalList(sn, .{ .no_inheritance = true });
+                defer list.deinit();
+                try c.addOwnNames(&c.signals, &list, at);
+            }
             var parent = ClassDb.getParentClass(sn);
             defer parent.deinit();
             class = try nameAlloc(a, parent);
@@ -161,16 +200,18 @@ const Chain = struct {
     }
 
     fn deinit(c: *Chain) void {
-        var it = c.props.keyIterator();
-        while (it.next()) |k| c.a.free(k.*);
-        c.props.deinit(c.a);
+        for ([_]*std.StringHashMapUnmanaged(u32){ &c.props, &c.signals }) |map| {
+            var it = map.keyIterator();
+            while (it.next()) |k| c.a.free(k.*);
+            map.deinit(c.a);
+        }
         for (c.classes.items) |s| c.a.free(s);
         c.classes.deinit(c.a);
     }
 
-    fn addOwnProperties(c: *Chain, class: StringName, at: u32) Allocator.Error!void {
-        var list = ClassDb.classGetPropertyList(class, .{ .no_inheritance = true });
-        defer list.deinit();
+    /// Adds the `name` of every entry of `list` (property or signal
+    /// dictionaries) to `map`, skipping label entries (group, category).
+    fn addOwnNames(c: *Chain, map: *std.StringHashMapUnmanaged(u32), list: *const Array, at: u32) Allocator.Error!void {
         var name_key = String.fromLatin1("name");
         defer name_key.deinit();
         var usage_key = String.fromLatin1("usage");
@@ -193,7 +234,7 @@ const Chain = struct {
             var s = name.as(String) orelse continue;
             defer s.deinit();
             const text = try stringAlloc(c.a, &s);
-            const gop = c.props.getOrPut(c.a, text) catch |err| {
+            const gop = map.getOrPut(c.a, text) catch |err| {
                 c.a.free(text);
                 return err;
             };
@@ -204,6 +245,11 @@ const Chain = struct {
 
     fn propertyOwner(c: *const Chain, name: []const u8) ?[]const u8 {
         const at = c.props.get(name) orelse return null;
+        return c.classes.items[at];
+    }
+
+    fn signalOwner(c: *const Chain, name: []const u8) ?[]const u8 {
+        const at = c.signals.get(name) orelse return null;
         return c.classes.items[at];
     }
 
@@ -238,12 +284,21 @@ const testing = std.testing;
 
 test "finding sentences" {
     const a = testing.allocator;
-    const p = try propertyHides(a, "res://named.zig", "name", "Node");
+    const p = try hides(a, "res://named.zig", .property, "name", .property, "Node");
     defer a.free(p);
     try testing.expectEqualStrings("Property 'name' of res://named.zig hides Node.name; rename it or give it a name override in meta.", p);
-    const m = try methodHides(a, "res://named.zig", "get_name", "Node");
+    const m = try hides(a, "res://named.zig", .method, "get_name", .method, "Node");
     defer a.free(m);
     try testing.expectEqualStrings("Method 'get_name' of res://named.zig hides Node.get_name; rename it or give it a name override in meta.", m);
+    const ms = try hides(a, "res://a.zig", .method, "draw", .signal, "CanvasItem");
+    defer a.free(ms);
+    try testing.expectEqualStrings("Method 'draw' of res://a.zig hides signal CanvasItem.draw; rename it or give it a name override in meta.", ms);
+    const sp = try hides(a, "res://a.zig", .signal, "visible", .property, "CanvasItem");
+    defer a.free(sp);
+    try testing.expectEqualStrings("Signal 'visible' of res://a.zig hides property CanvasItem.visible; rename it or give it a name override in meta.", sp);
+    const sm = try hides(a, "res://a.zig", .signal, "hide", .method, "CanvasItem");
+    defer a.free(sm);
+    try testing.expectEqualStrings("Signal 'hide' of res://a.zig hides method CanvasItem.hide; rename it or give it a name override in meta.", sm);
     const f = try nodeField(a, "res://holder.zig", "Resource", "target");
     defer a.free(f);
     try testing.expectEqualStrings("res://holder.zig extends Resource, which is not a Node, so field 'target' cannot hold a Node.", f);

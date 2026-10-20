@@ -19,7 +19,11 @@ Files:
   `Ziggurat: reload requested for 1 scripts (swaps arrive in a later version).`
 - `run-gui.sh`: starts the editor under `xvfb-run` in its own session with a
   deadline, writes the editor's and the game's output to one log file, and
-  kills whatever of the run is left at the end.
+  kills whatever of the run is left at the end, also when it is interrupted.
+
+On success the test prints nothing. To keep the timing (how long the reload
+line took) set `ZTEST_GUI_RECORD=<file>`; the test writes its
+`gui save path: ...` lines there.
 - The test itself is `gui: save in the script editor reaches the running
   game` in `test/host/host_test.zig`. It copies `test/host/projects/e2e`,
   installs the host, points the project at the test's Zig and SDK manifest,

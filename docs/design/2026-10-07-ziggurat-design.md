@@ -287,6 +287,7 @@ The export plugin builds one library per target platform with every script linke
 - L1 and L2: plain `zig build test`, with Windows and macOS cross-compile of L1 and L2 in CI from stage 1.
 - SDK, conversions and descriptors: in-Godot tests through gdzig's harness.
 - L3 to L5: headless Godot 4.7.2 scenes. The harness pre-creates `.godot/extension_list.cfg` to avoid the first-start crash.
+- The save path from the GUI editor's script editor into a running game: `zig build test-gui` under Xvfb (needs `xvfb-run`; not part of `zig build test`; an optional CI job). The test commands are listed in `docs/testing.md`.
 - Reload stress test: hundreds of reloads with property changes, removed properties, failing builds, a multi-threaded caller, and a script that triggers nested `Main::iteration()`; check for crashes, deadlocks and ObjectDB leaks.
 - Fuzz tests for the `ErrorBundle` decoder and for host-side validation of descriptor tables from untrusted modules.
 - Regression tests for each verified bug: static StringName double-free deadlock, Variant type confusion, enum out of range, RefCounted leak, scene save with no descriptors.

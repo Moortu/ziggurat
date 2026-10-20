@@ -14,6 +14,8 @@ name: ci
 on:
   push:
   pull_request:
+  # Started by hand: also runs the GUI editor job below.
+  workflow_dispatch:
 
 jobs:
   test:
@@ -104,3 +106,87 @@ jobs:
 
       - name: Cross-compile check
         run: zig build cross
+
+  # The GUI editor test (spec section 12, check 6: a script saved in the
+  # script editor reaches the running game) under Xvfb. Optional: it runs
+  # only when the workflow is started by hand, and its failure does not fail
+  # the workflow. Untested like the rest of this file.
+  gui:
+    if: github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    runs-on: docker
+    env:
+      ZIG_VERSION: "0.17.0"
+      # Zig's published minisign public key.
+      ZIG_MINISIGN_KEY: "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
+      GODOT_VERSION: "4.7.2-stable"
+      GODOT_ZIP: "Godot_v4.7.2-stable_linux.x86_64.zip"
+      # From SHA512-SUMS.txt of the official 4.7.2-stable release
+      # (github.com/godotengine/godot/releases/tag/4.7.2-stable).
+      GODOT_SHA512: "9aa00f7a605200940bce3027a567b782f49bd8e940dd06ae9e987bd65aee1b1467edd56ed84fcdcbdd44354bf613bdbb4e5d2913e925850368e150c59ed54c65"
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install minisign and archive tools
+        run: |
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo_cmd=""; [ "$(id -u)" -ne 0 ] && sudo_cmd="sudo"
+            $sudo_cmd apt-get update
+            $sudo_cmd apt-get install -y minisign xz-utils curl unzip \
+              libx11-6 libxcursor1 libxinerama1 libxrandr2 libxi6 libgl1 libasound2 libfontconfig1 \
+              xvfb xauth libgl1-mesa-dri procps
+          else
+            # The official Godot build links against glibc, so a musl image
+            # (Alpine) cannot run the Godot tests.
+            echo "This job needs a Debian or Ubuntu runner image (apt-get); the official Godot build needs glibc." >&2
+            exit 1
+          fi
+
+      - name: Download and verify Zig
+        run: |
+          set -eu
+          file="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl -fsSLO "https://ziglang.org/download/${ZIG_VERSION}/${file}"
+          curl -fsSLO "https://ziglang.org/download/${ZIG_VERSION}/${file}.minisig"
+          minisign -Vm "$file" -P "$ZIG_MINISIGN_KEY" || {
+            echo "minisign verification of $file failed" >&2
+            exit 1
+          }
+          # Outside root's home, so the non-root test user can run it.
+          if [ "$(id -u)" -eq 0 ]; then zig_dir=/opt/zig; else zig_dir="$HOME/zig"; fi
+          mkdir -p "$zig_dir"
+          tar -xJf "$file" -C "$zig_dir" --strip-components=1
+          echo "$zig_dir" >> "$GITHUB_PATH"
+
+      - name: Download and verify Godot
+        run: |
+          set -eu
+          curl -fsSLO "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/${GODOT_ZIP}"
+          echo "${GODOT_SHA512}  ${GODOT_ZIP}" | sha512sum -c - || {
+            echo "sha512 check of ${GODOT_ZIP} failed" >&2
+            exit 1
+          }
+          # Outside root's home, so the non-root test user can run it.
+          if [ "$(id -u)" -eq 0 ]; then godot_dir=/opt/godot; else godot_dir="$HOME/godot"; fi
+          mkdir -p "$godot_dir"
+          unzip -o -q "$GODOT_ZIP" -d "$godot_dir"
+          chmod 755 "$godot_dir/Godot_v${GODOT_VERSION}_linux.x86_64"
+          echo "GODOT_BIN=$godot_dir/Godot_v${GODOT_VERSION}_linux.x86_64" >> "$GITHUB_ENV"
+
+      - name: Create a non-root test user
+        run: |
+          set -eu
+          if [ "$(id -u)" -eq 0 ]; then
+            useradd -m ziguser
+            chown -R ziguser "$PWD"
+          fi
+
+      - name: GUI test
+        run: |
+          set -eu
+          if [ "$(id -u)" -eq 0 ]; then
+            su -s /bin/sh ziguser -c "cd '$PWD' && PATH='$PATH' zig build test-gui --summary all -Dgodot-path='$GODOT_BIN'"
+          else
+            zig build test-gui --summary all -Dgodot-path="$GODOT_BIN"
+          fi

@@ -24,6 +24,7 @@ extends Node
 const BUILD_WAIT_MS := 600000
 const GAME_WAIT_MS := 120000
 const RELOAD_WAIT_MS := 10000
+const OPEN_WAIT_MS := 30000
 const MANIFEST := "res://.godot/ziggurat/manifest"
 const RELOAD_LINE := "Ziggurat: reload requested for 1 scripts (swaps arrive in a later version)."
 const GAME_READY_LINE := "e2e game: checks done"
@@ -45,13 +46,9 @@ func _ready() -> void:
 	await run()
 	if EditorInterface.is_playing_scene():
 		EditorInterface.stop_playing_scene()
-		await seconds(1.0)
+		await wait_for(func(): return not EditorInterface.is_playing_scene(), OPEN_WAIT_MS)
 	print("ZTEST DONE")
 	get_tree().quit()
-
-
-func seconds(s: float) -> void:
-	await get_tree().create_timer(s).timeout
 
 
 # The generation the manifest names, or 0.
@@ -89,8 +86,8 @@ func run() -> void:
 	# 2. The script in the script editor.
 	var hero: Script = load("res://hero.zig")
 	EditorInterface.edit_script(hero)
-	await seconds(0.5)
 	var se := EditorInterface.get_script_editor()
+	await wait_for(func(): return se.get_current_script() == hero and se.get_current_editor() != null, OPEN_WAIT_MS)
 	var current := se.get_current_editor()
 	var code: CodeEdit = null
 	if current != null:

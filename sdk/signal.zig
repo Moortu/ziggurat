@@ -24,12 +24,15 @@
 //! and read the result with `Variant.as`, which the SDK never uses). Godot
 //! knows a script's signals through the script (`has_script_signal`), so
 //! connections and emits need no registration on the object. Two results
-//! are normal and stay silent: ERR_UNAVAILABLE, which `emit_signal` returns
-//! when nothing is connected (and, for a signal nobody declared, after
-//! printing its own error), and ERR_CANT_ACQUIRE_RESOURCE, which it returns
-//! while the object's signals are blocked (core/object/object.cpp,
-//! `Object::emit_signalp`). Any other failed emit is logged as a warning,
-//! never a panic; so is a missing method bind, which is then never called.
+//! are normal and stay silent: ERR_UNAVAILABLE when nothing is connected,
+//! and ERR_CANT_ACQUIRE_RESOURCE while the object's signals are blocked
+//! (core/object/object.cpp, `Object::emit_signalp`). ERR_UNAVAILABLE is
+//! also the result for a signal the object does not know; only debug
+//! builds of Godot print an error for that, so on that result the SDK asks
+//! `Object.has_signal` and warns, in every build, when the object does not
+//! have the signal (the host and the descriptor disagree). Any other failed
+//! emit is logged as a warning, never a panic; so is a missing method bind,
+//! which is then never called.
 //! The bind and the signal names are cached in plain `var`s without
 //! atomics; `moduleInit` fills them on the main thread (`warm.zig`).
 const std = @import("std");
@@ -52,6 +55,9 @@ pub fn emit(self: anytype, comptime signal: @EnumLiteral(), args: anytype) void 
 /// Hash of `Object.emit_signal` in extension_api.json (Godot 4.7.2).
 const emit_signal_hash: i64 = 4047867050;
 pub const EmitSignal = names.MethodBind("Object", "emit_signal", emit_signal_hash);
+/// Hash of `Object.has_signal` in extension_api.json (Godot 4.7.2).
+const has_signal_hash: i64 = 2619796661;
+pub const HasSignal = names.MethodBind("Object", "has_signal", has_signal_hash);
 
 /// `emit` through the method bind `Bind` (a `names.MethodBind`); `emit`
 /// passes `EmitSignal`. Public so tests can pass a bind Godot lacks.
@@ -86,8 +92,27 @@ pub fn emitWith(comptime Bind: type, self: anytype, comptime signal: @EnumLitera
     defer godot.raw.variantDestroy(&ret);
     var code: i64 = 0;
     const bad_ret = convert.read(i64, &ret, &code) != null;
-    if (err.@"error" != 0 or bad_ret or !emitResultOk(code))
-        runtime.log(.warning, "emit of signal '{s}' failed (call error {d}, result {d}); is the signal registered?", .{ sname, err.@"error", code });
+    if (err.@"error" != 0 or bad_ret or !emitResultOk(code)) {
+        runtime.log(.warning, "emit of signal '{s}' of {s} failed (call error {d}, result {d}).", .{ sname, comptime scriptName(S), err.@"error", code });
+    } else if (code == err_unavailable and !objectHasSignal(@ptrCast(self.base), name)) {
+        runtime.log(.warning, "emit of signal '{s}' of {s} did nothing: the object has no signal of that name, so Godot does not know the script's signals.", .{ sname, comptime scriptName(S) });
+    }
+}
+
+/// The script's `res://` path when it can be found, else its type name.
+fn scriptName(comptime S: type) []const u8 {
+    if (scriptRel(S)) |rel| return "res://" ++ rel;
+    return @typeName(S);
+}
+
+/// `Object.has_signal(name)` on `obj`; true when the bind is missing (the
+/// emit itself already reported that case).
+fn objectHasSignal(obj: *anyopaque, name: *const StringName) bool {
+    const bind = HasSignal.get() orelse return true;
+    var args = [1]?*const anyopaque{name};
+    var result: bool = true;
+    godot.raw.objectMethodBindPtrcall(bind, @ptrCast(obj), @ptrCast(&args), @ptrCast(&result));
+    return result;
 }
 
 /// Godot's `Error` values `Object.emit_signal` returns without a fault.

@@ -3,7 +3,8 @@ extends Node
 # Host test "load checks": runs as a tool autoload in the headless editor of
 # test/host/projects/load_checks. After the build at open, the host's load
 # checks report a property and a method whose Godot names
-# already exist in Node (named.zig) and a Node field in a Resource script
+# already exist in Node (named.zig), members that hide engine members of
+# another kind (kinds.zig) and a Node field in a Resource script
 # (holder.zig), as diagnostics without a line; clean.zig has none. Prints
 # one ZTEST line per case, then ZTEST DONE, and quits the editor. The
 # findings fail the build: its generation is not used.
@@ -41,6 +42,16 @@ func _ready() -> void:
 		named.has("Property 'name' of res://named.zig hides Node.name; rename it or give it a name override in meta."), str(named))
 	report("load_check_method_hides",
 		named.has("Method 'get_name' of res://named.zig hides Node.get_name; rename it or give it a name override in meta."), str(named))
+	# Members of another kind: a method hides a signal, signals hide a
+	# method and a property.
+	var kinds := messages("res://kinds.zig")
+	report("load_check_method_hides_signal",
+		kinds.has("Method 'draw' of res://kinds.zig hides signal CanvasItem.draw; rename it or give it a name override in meta."), str(kinds))
+	report("load_check_signal_hides_method",
+		kinds.has("Signal 'hide' of res://kinds.zig hides method CanvasItem.hide; rename it or give it a name override in meta."), str(kinds))
+	report("load_check_signal_hides_property",
+		kinds.has("Signal 'visible' of res://kinds.zig hides property CanvasItem.visible; rename it or give it a name override in meta."), str(kinds))
+	report("load_check_kinds_count", kinds.size() == 3, str(kinds))
 	var holder := messages("res://holder.zig")
 	report("load_check_node_field",
 		holder == ["res://holder.zig extends Resource, which is not a Node, so field 'target' cannot hold a Node."], str(holder))

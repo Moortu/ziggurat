@@ -984,9 +984,26 @@ test "warm fills the names of a script's class checks and signals" {
 const Emitter = struct {
     pub const signals = struct {
         pub const ping = struct { n: i32 };
+        /// Node's own signal: known to the object, nothing connected.
+        pub const ready = struct {};
     };
     base: *Node,
 };
+
+test "emit of a signal the object does not know warns; an unconnected known one is silent" {
+    setup();
+    const owner = Node.init();
+    defer godot.raw.objectDestroy(@ptrCast(owner));
+    var e: Emitter = .{ .base = owner };
+    // No script on the node, so Godot does not know `ping` (a debug Godot
+    // also prints its own error); the SDK warns in every build.
+    const before = log_count;
+    ziggurat.emit(&e, .ping, .{ .n = 1 });
+    try testing.expectEqual(before + 1, log_count);
+    // `ready` exists on Node and nothing is connected: no log.
+    ziggurat.emit(&e, .ready, .{});
+    try testing.expectEqual(before + 1, log_count);
+}
 
 test "emit without a method bind logs and returns" {
     setup();

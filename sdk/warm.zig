@@ -43,6 +43,8 @@ pub fn sdk() void {
         runtime.log(.err, "ziggurat: Godot has no method bind for Object.is_class; every object argument will read as null.", .{});
     if (signal.EmitSignal.get() == null)
         runtime.log(.err, "ziggurat: Godot has no method bind for Object.emit_signal; every emit will be skipped.", .{});
+    if (signal.HasSignal.get() == null)
+        runtime.log(.err, "ziggurat: Godot has no method bind for Object.has_signal; an emit of a signal Godot does not know is not reported.", .{});
     _ = godot.builtin.StringName.fromComptimeLatin1("RefCounted");
     inline for (.{ godot.builtin.String, godot.builtin.StringName, godot.builtin.NodePath }) |T| {
         const empty = std.mem.zeroes(T);
@@ -61,7 +63,7 @@ pub fn sdk() void {
 
 /// True when the SDK's own method binds have been looked up.
 pub fn sdkReady() bool {
-    return object.IsClass.isReady() and signal.EmitSignal.isReady();
+    return object.IsClass.isReady() and signal.EmitSignal.isReady() and signal.HasSignal.isReady();
 }
 
 /// Warms the names of every script descriptor `R` declares as `pub const

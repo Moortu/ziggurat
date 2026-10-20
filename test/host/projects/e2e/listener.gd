@@ -92,7 +92,9 @@ func _ready() -> void:
 	if sig is Signal:
 		sig_err = sig.connect(_on_signal_hit)
 	var strikes = target.strike(5)
-	report("emit_reaches_connect", err == OK and hits == [5] and strikes == 1, "connect %s hits %s strikes %s" % [error_string(err), hits, strikes])
+	# The i32 argument arrives as an int, not a float.
+	report("emit_reaches_connect", err == OK and hits == [5] and typeof(hits[0]) == TYPE_INT and strikes == 1,
+		"connect %s hits %s types %s strikes %s" % [error_string(err), hits, hits.map(func(h): return type_string(typeof(h))), strikes])
 	report("emit_reaches_signal_property", sig is Signal and sig_err == OK and signal_hits == [5], "property %s connect %s hits %s" % [sig, sig_err, signal_hits])
 	report("emit_reaches_scene_connection", scene_hits == [5], "hits %s" % [scene_hits])
 	report("handler_reads_emitter", seen_strikes == [1], "strikes seen %s" % [seen_strikes])

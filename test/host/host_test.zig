@@ -1033,6 +1033,10 @@ test "load checks" {
             "ZTEST PASS load_checks_build_done",
             "ZTEST PASS load_check_property_hides",
             "ZTEST PASS load_check_method_hides",
+            "ZTEST PASS load_check_method_hides_signal",
+            "ZTEST PASS load_check_signal_hides_method",
+            "ZTEST PASS load_check_signal_hides_property",
+            "ZTEST PASS load_check_kinds_count",
             "ZTEST PASS load_check_node_field",
             "ZTEST PASS load_check_clean",
             "ZTEST PASS load_check_generation_not_used",
@@ -1452,11 +1456,16 @@ test "gui: save in the script editor reaches the running game" {
     if (std.mem.count(u8, out, "Ziggurat: reload requested for 1 scripts") != 1)
         try problems.append(a, "the game's reload line is not there exactly once");
     if (problems.items.len == 0) {
-        // The timing and what Play did, for the record.
+        // The timing and what Play did go to the file named by
+        // ZTEST_GUI_RECORD, when set. Nothing is printed: output on success
+        // makes the build runner report the test command as failed.
+        const record = env.get("ZTEST_GUI_RECORD") orelse return;
+        var text: std.ArrayList(u8) = .empty;
         var lines = std.mem.splitScalar(u8, out, '\n');
         while (lines.next()) |line| {
-            if (std.mem.startsWith(u8, line, "gui save path: ")) std.debug.print("{s}\n", .{line});
+            if (std.mem.startsWith(u8, line, "gui save path: ")) try text.print(a, "{s}\n", .{line});
         }
+        try cwd.writeFile(io, .{ .sub_path = record, .data = text.items });
         return;
     }
     std.debug.print("--- GUI log ({s}) ---\n{s}\n---\n{s}{s}", .{ log_path, out, result.stdout, result.stderr });
