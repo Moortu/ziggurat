@@ -18,6 +18,9 @@ func _initialize() -> void:
 		classes.append(lang.get_class())
 		if lang.get_class() == "ZigLanguage":
 			found = true
+	# A language's name and extension cannot be read from GDScript
+	# (`_get_name (via call)` is a nonexistent function), so the class name is
+	# what this check sees; host_loads_editor.gd checks the name "Zig".
 	report("zig_language_registered", found, "script languages: %s" % [classes])
 	report("single_precision", not OS.has_feature("double"), "Godot is a double-precision build")
 	print("ZTEST DONE")

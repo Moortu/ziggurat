@@ -227,8 +227,9 @@ fn addHostTests(
             }) }},
         }),
     });
-    // The runner's own unit tests.
+    // The runner's own unit tests, and the host's (no Godot needed).
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = runner.root_module })).step);
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.root_module })).step);
 
     const options = b.addOptions();
     options.addOption(bool, "run_integration", true);

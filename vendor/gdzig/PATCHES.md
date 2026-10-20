@@ -4,8 +4,11 @@ This folder is a copy of the gdzig package pinned by Stage 2
 (`git+https://github.com/gdzig/gdzig#c8e0768c9eb768827163f0ac893a5038bda799cb`,
 package hash `godot-0.0.0-dev-q0GYjsfPwgCDsHpBgBeKR6ph6EbtJLqaMCY7waAmKGty`),
 with the two changes below and this file. Everything else is unchanged, but
-the example project's `.godot` cache files are left out of the repository
-by gdzig's own `example/.gitignore`. gdzig's license is in `LICENSE`.
+gdzig's own `example/.gitignore` keeps two ignored items of its example
+project out of the repository: `example/project/.godot/imported/` and
+`example/project/.godot/global_script_class_cache.cfg`
+(`example/project/.godot/extension_list.cfg` is committed). gdzig's license
+is in `LICENSE`.
 
 Both changes raise a comptime branch quota. gdzig builds the virtual method
 table of a user class at compile time: `virtualMethodNames` lists the class's

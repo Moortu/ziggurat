@@ -23,4 +23,18 @@ func _ready() -> void:
 		if lang.get_class() == "ZigLanguage":
 			found = true
 	report("zig_language_registered_in_editor", found, "script languages: %s" % [classes])
+	# GDScript cannot call a language's get_name(); the Create Script dialog
+	# lists every language by the name the engine read from it.
+	var names := script_dialog_languages()
+	report("zig_language_name", names.has("Zig"), "Create Script dialog languages: %s" % [names])
 	print("ZTEST DONE")
+
+
+# The item texts of the language menus of every ScriptCreateDialog.
+func script_dialog_languages() -> Array[String]:
+	var names: Array[String] = []
+	for dialog in get_tree().root.find_children("*", "ScriptCreateDialog", true, false):
+		for menu in dialog.find_children("*", "OptionButton", true, false):
+			for i in menu.item_count:
+				names.append(menu.get_item_text(i))
+	return names
