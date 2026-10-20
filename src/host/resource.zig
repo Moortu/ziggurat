@@ -59,8 +59,10 @@ const max_path_bytes = 4096;
 
 /// Called after every successful save of a script under `res://`, with the
 /// project-relative path (`player.zig`, `sub/folder/enemy.zig`). Null until
-/// the build trigger sets it, once, on the main thread, before any script is
-/// saved. It runs on the thread that saved, usually the main thread.
+/// the build trigger sets it, on the main thread, before any script is
+/// saved (`editor_build.start`; `editor_build.stop` clears it again). It runs
+/// on the thread that saved, usually the main thread, so it may only queue
+/// work.
 pub var on_saved: ?*const fn (path: []const u8) void = null;
 
 /// True when `path` names a `.zig` file. Godot compares extensions without
@@ -146,6 +148,8 @@ pub const ZigLoader = struct {
         };
         s.source.deinit();
         s.source = text;
+        // Lets a later build notice an edit made outside the editor.
+        s.noteDisk(FileAccess.getModifiedTime(path));
         // A load that skips the cache (IGNORE, IGNORE_DEEP) gets no path
         // from Godot, so give it one the way GDScript's loader does:
         // `set_path_cache` only remembers the path and never touches the
@@ -225,6 +229,17 @@ pub const ZigSaver = struct {
                 else => .err_file_cant_write,
             };
         };
+
+        // The file now holds this text (for `ZigScript.refreshFromDisk`),
+        // unless the script was written to some other file.
+        if (Object.upcast(res.?).asInstance(ZigScript)) |zs| {
+            var own = zs.base.getPath();
+            defer own.deinit();
+            var own_buf: [max_path_bytes]u8 = undefined;
+            const own_path = props.stringText(&own, &own_buf) orelse "";
+            if (own_path.len == 0 or std.mem.eql(u8, own_path, res_path))
+                zs.noteDiskText(FileAccess.getModifiedTime(path), bytes);
+        }
 
         var rel_buf: [max_path_bytes]u8 = undefined;
         if (script.relPath(res_path, &rel_buf)) |rel| {

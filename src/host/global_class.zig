@@ -71,6 +71,48 @@ pub fn scan(text: [:0]const u8) ?Info {
     return .{ .name = name orelse return null, .base_type = base_type, .is_tool = is_tool };
 }
 
+/// Most signal names `signalNames` returns.
+pub const max_signals = 256;
+
+/// The names of the signals `text` declares: each `pub const <name> = ...`
+/// directly inside a top-level `pub const signals = struct { ... }`, in
+/// source order, at most `max_signals`. Names only: a script with no
+/// descriptors uses them so `get_signal_list` keeps scene connections to
+/// its own signals (the SDK names a signal after its declaration). The
+/// slices point into `text`; `out` receives them and the count is returned.
+pub fn signalNames(text: [:0]const u8, out: *[max_signals][]const u8) usize {
+    var n: usize = 0;
+    var t: std.zig.Tokenizer = .init(text);
+    var depth: usize = 0;
+    // Depth of the body of `signals` while inside it (it is 1).
+    var inside = false;
+    while (true) {
+        const tok = t.next();
+        switch (tok.tag) {
+            .eof => break,
+            .l_brace => depth +|= 1,
+            .r_brace => {
+                depth -|= 1;
+                if (inside and depth == 0) inside = false;
+            },
+            .keyword_pub => {
+                var ahead = t;
+                const decl = pubConst(&ahead, text) orelse continue;
+                if (depth == 0 and !inside and std.mem.eql(u8, decl.name, "signals")) {
+                    // `struct {`: the main loop counts the brace.
+                    var look = ahead;
+                    if (look.next().tag == .keyword_struct and look.next().tag == .l_brace) inside = true;
+                } else if (inside and depth == 1 and n < max_signals) {
+                    out[n] = decl.name;
+                    n += 1;
+                }
+            },
+            else => {},
+        }
+    }
+    return n;
+}
+
 const Decl = struct { name: []const u8 };
 
 /// After `pub`: `const <name> =`, or null.
@@ -218,6 +260,44 @@ test "garbage text is scanned without failing" {
     try testing.expectEqual(@as(?Info, null), scan("}}}} pub pub const = \"\x00\xff{{ \\\\ '"));
     try testing.expectEqual(@as(?Info, null), scan("pub const class_name = \"Unterminated\n"));
     try testing.expectEqualStrings("Bom", scan("\xEF\xBB\xBFpub const class_name = \"Bom\";").?.name);
+}
+
+fn expectSignals(text: [:0]const u8, want: []const []const u8) !void {
+    var out: [max_signals][]const u8 = undefined;
+    const n = signalNames(text, &out);
+    try testing.expectEqual(want.len, n);
+    for (want, out[0..n]) |w, got| try testing.expectEqualStrings(w, got);
+}
+
+test "signal names come from the top-level signals struct only" {
+    try expectSignals(
+        \\const z = @import("ziggurat");
+        \\// pub const signals = struct { pub const commented = struct {}; };
+        \\const s = "pub const signals = struct { pub const in_string = struct {}; };";
+        \\pub const signals = struct {
+        \\    pub const hit = struct {};
+        \\    pub const moved = struct { x: i32, y: Inner };
+        \\    const Inner = struct { pub const deep = 1; };
+        \\    const private = struct {};
+        \\    pub const last = struct {
+        \\        pub const nested = struct {};
+        \\    };
+        \\};
+        \\pub const Other = struct {
+        \\    pub const signals = struct { pub const not_top = struct {}; };
+        \\};
+        \\const more = struct { pub const nope = struct {}; };
+        \\
+    , &.{ "hit", "moved", "last" });
+}
+
+test "no signals struct, a private one, or garbage gives no names" {
+    try expectSignals("pub const extends = z.godot.Node;\n", &.{});
+    try expectSignals("const signals = struct { pub const hidden = struct {}; };\n", &.{});
+    try expectSignals("pub const signals = 3;\npub const after = struct {};\n", &.{});
+    try expectSignals("pub const signals = struct { pub const open = struct {};", &.{"open"});
+    try expectSignals("}}}} pub const signals = struct { { pub const deep = 1; } pub const ok = 1; }", &.{"ok"});
+    try expectSignals("", &.{});
 }
 
 test "isIdentifier" {

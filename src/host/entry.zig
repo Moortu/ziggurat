@@ -23,6 +23,7 @@ const script = @import("script.zig");
 const instance = @import("instance.zig");
 const placeholder = @import("placeholder.zig");
 const resource = @import("resource.zig");
+const editor_build = @import("editor_build.zig");
 
 const c = godot.c;
 const Registry = godot.extension.Registry;
@@ -151,6 +152,8 @@ const Lifecycle = struct {
         language.registered = lang;
         resource.register();
         log("ziggurat_host {s} ready", .{host_version});
+        // Builds run in the editor only; a game loads what the editor built.
+        if (Engine.isEditorHint()) editor_build.start();
     }
 
     pub fn exit(_: *Lifecycle, level: godot.extension.InitializationLevel) void {
@@ -159,8 +162,12 @@ const Lifecycle = struct {
         // deleted the main loop and its scene tree before this point
         // (main/main.cpp, `Main::cleanup`), so a script instance still alive
         // belongs to a leaked object; it looks names up by text once the
-        // maps are gone (instance.zig). The file loader and saver go before
-        // the language, so no load or save can reach a destroyed language.
+        // maps are gone (instance.zig). The build service stops first: its
+        // threads are joined before the main-thread queue closes (with the
+        // language), so nothing pushes outcomes after that, and before the
+        // process Io ends. The file loader and saver go before the language,
+        // so no load or save can reach a destroyed language.
+        editor_build.stop();
         resource.unregister();
         if (zig_language) |lang| {
             _ = Engine.unregisterScriptLanguage(.upcast(lang.base));
@@ -302,4 +309,7 @@ test {
     _ = @import("template.zig");
     _ = @import("diag_cache.zig");
     _ = @import("main_queue.zig");
+    _ = @import("manifest.zig");
+    _ = @import("load_checks.zig");
+    _ = editor_build;
 }

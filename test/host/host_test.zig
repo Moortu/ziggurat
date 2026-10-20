@@ -28,6 +28,8 @@ const Project = struct {
     arena_state: std.heap.ArenaAllocator,
     tmp: testing.TmpDir,
     path: []const u8,
+    /// The environment Godot runs with; null inherits the test's.
+    env: ?*std.process.Environ.Map = null,
 
     fn init(p: *Project, fixture: []const u8) !void {
         return p.initWith(fixture, opts.host_lib);
@@ -39,6 +41,7 @@ const Project = struct {
     }
 
     fn initWith(p: *Project, fixture: []const u8, host_lib: []const u8) !void {
+        p.env = null;
         p.arena_state = .init(testing.allocator);
         errdefer p.arena_state.deinit();
         const a = p.arena_state.allocator();
@@ -70,6 +73,7 @@ const Project = struct {
     }
 
     fn deinit(p: *Project) void {
+        if (p.env) |e| e.deinit();
         p.tmp.cleanup();
         p.arena_state.deinit();
     }
@@ -123,6 +127,8 @@ const Project = struct {
         expect: []const []const u8 = &.{},
         once: []const []const u8 = &.{},
         reject: []const []const u8 = &.{},
+        /// Seconds for the whole Godot run.
+        deadline: []const u8 = deadline_s,
     };
 
     fn run(p: *Project, mode: []const []const u8, texts: Texts) !void {
@@ -130,11 +136,11 @@ const Project = struct {
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.appendSlice(a, &.{ opts.runner_exe, opts.godot_exe, p.path });
         try argv.appendSlice(a, mode);
-        try argv.append(a, deadline_s);
+        try argv.append(a, texts.deadline);
         for (texts.expect) |text| try argv.appendSlice(a, &.{ "--expect", text });
         for (texts.once) |text| try argv.appendSlice(a, &.{ "--expect-once", text });
         for (texts.reject) |text| try argv.appendSlice(a, &.{ "--reject", text });
-        const result = try std.process.run(a, io, .{ .argv = argv.items });
+        const result = try std.process.run(a, io, .{ .argv = argv.items, .environ_map = p.env });
         if (result.term.success()) return;
         std.debug.print("{s}{s}", .{ result.stdout, result.stderr });
         return error.GodotRunFailed;
@@ -884,4 +890,131 @@ test "loader and saver in the editor: global class scan, file type, save from th
         "ZTEST PASS editor_save_hook",
         "ZTEST PASS editor_save_loads_back",
     } });
+}
+
+// ------------------------------------------------------------ editor builds
+
+/// Seconds for an editor run that builds the project (a cold build of a
+/// module that imports gdzig takes tens of seconds, several of them more).
+const build_deadline_s = "900";
+
+/// Points the project settings `ziggurat/zig_path` and
+/// `ziggurat/dev/sdk_manifest` at the test's Zig and SDK manifest, and gives
+/// Godot a build cache inside the test's folder (`XDG_CACHE_HOME`), so the
+/// editor builds the project at open and on save.
+fn addBuildSettings(p: *Project) !void {
+    const a = p.arena_state.allocator();
+    const manifest = try Io.Dir.cwd().realPathFileAlloc(io, opts.sdk_manifest_path, a);
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+    defer dir.close(io);
+    const old = try dir.readFileAlloc(io, "project.godot", a, .limited(64 * 1024));
+    const new = try std.fmt.allocPrint(a, "{s}\n[ziggurat]\n\nzig_path=\"{s}\"\ndev/sdk_manifest=\"{s}\"\n", .{ old, opts.zig_exe, manifest });
+    try dir.writeFile(io, .{ .sub_path = "project.godot", .data = new });
+
+    try p.tmp.dir.createDirPath(io, "cache");
+    const cache = try p.tmp.dir.realPathFileAlloc(io, "cache", a);
+    const env = try a.create(std.process.Environ.Map);
+    env.* = try testing.environ.createMap(testing.allocator);
+    p.env = env;
+    try env.put("XDG_CACHE_HOME", cache);
+}
+
+/// Process ids whose command line mentions `needle` (Linux `/proc`).
+fn processesMentioning(a: std.mem.Allocator, needle: []const u8) ![]const u32 {
+    var out: std.ArrayList(u32) = .empty;
+    var proc = Io.Dir.cwd().openDir(io, "/proc", .{ .iterate = true }) catch return out.items;
+    defer proc.close(io);
+    var it = proc.iterate();
+    while (try it.next(io)) |entry| {
+        const pid = std.fmt.parseInt(u32, entry.name, 10) catch continue;
+        const path = try std.fmt.allocPrint(a, "{s}/cmdline", .{entry.name});
+        const cmdline = proc.readFileAlloc(io, path, a, .limited(1 << 20)) catch continue;
+        if (std.mem.indexOf(u8, cmdline, needle) != null) try out.append(a, pid);
+    }
+    return out.items;
+}
+
+test "editor builds at open, save triggers a build, broken build keeps the last good" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("editor_build");
+    defer p.deinit();
+    try addBuildSettings(&p);
+    try p.addAutoloadCheck("editor_build.gd");
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS signal_names_without_descriptor",
+            "ZTEST PASS tool_placeholder_before_build",
+            "ZTEST PASS editor_builds_at_open",
+            "ZTEST PASS manifest_written",
+            "ZTEST PASS staged_library_exists",
+            "ZTEST PASS descriptor_cache_written",
+            "ZTEST PASS validate_after_good_build",
+            "ZTEST PASS tool_placeholder_swapped",
+            "ZTEST PASS save_triggers_a_build",
+            "ZTEST PASS save_new_default",
+            "ZTEST PASS external_edit_refreshed",
+            "ZTEST PASS broken_build_keeps_last_good",
+            "ZTEST PASS broken_build_diagnostics",
+            "ZTEST PASS broken_build_other_file_valid",
+            "ZTEST PASS broken_build_fallback",
+            "ZTEST PASS repaired_build",
+            // Each outcome: one line; the broken one prints each diagnostic.
+            "ziggurat: build 1 loaded (open, ",
+            "ziggurat: build 2 loaded (save, ",
+            "ziggurat: build 3 loaded (save, ",
+            "ERROR: walker.zig:9:",
+            "build service stopped (0 threads left)",
+        },
+        .reject = &.{
+            "is not set",
+            "is not usable",
+        },
+        .deadline = build_deadline_s,
+    });
+}
+
+test "load checks" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("load_checks");
+    defer p.deinit();
+    try addBuildSettings(&p);
+    try p.addAutoloadCheck("load_checks_editor.gd");
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS load_checks_build_loaded",
+            "ZTEST PASS load_check_property_hides",
+            "ZTEST PASS load_check_method_hides",
+            "ZTEST PASS load_check_node_field",
+            "ZTEST PASS load_check_clean",
+            "ZTEST PASS load_check_marks_build_failed",
+            "ERROR: named.zig: Property 'name' of res://named.zig hides Node.name; rename it or give it a name override in meta.",
+            "ERROR: holder.zig: res://holder.zig extends Resource, which is not a Node, so field 'target' cannot hold a Node.",
+        },
+        .deadline = build_deadline_s,
+    });
+}
+
+test "shutdown during build" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("editor_build");
+    defer p.deinit();
+    try addBuildSettings(&p);
+    try p.addAutoloadCheck("build_shutdown.gd");
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS build_running_at_quit",
+            "build service stopped (0 threads left)",
+        },
+        .deadline = build_deadline_s,
+    });
+    // The compiler ran with the project's paths on its command line; none
+    // may outlive the editor.
+    const left = try processesMentioning(p.arena_state.allocator(), p.path);
+    if (left.len != 0) {
+        std.debug.print("processes still running for {s}: {any}\n", .{ p.path, left });
+        return error.CompilerOutlivedEditor;
+    }
 }

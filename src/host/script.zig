@@ -43,6 +43,8 @@ const host_io = @import("host_io.zig");
 const language = @import("language.zig");
 const instance = @import("instance.zig");
 const placeholder = @import("placeholder.zig");
+const global_class = @import("global_class.zig");
+const diag_cache = @import("diag_cache.zig");
 
 const Allocator = std.mem.Allocator;
 const Array = godot.builtin.Array;
@@ -55,6 +57,7 @@ const FileAccess = godot.class.FileAccess;
 const Script = godot.class.Script;
 const ScriptExtension = godot.class.ScriptExtension;
 const ScriptLanguage = godot.class.ScriptLanguage;
+const RefCounted = godot.class.RefCounted;
 const Error = godot.global.Error;
 
 /// Godot's `PROPERTY_USAGE_GROUP`, `_CATEGORY` and `_SUBGROUP`
@@ -102,6 +105,49 @@ pub fn loadStartupCache() void {
 pub fn dropStartupCache() void {
     if (startup_cache) |*c| c.deinit();
     startup_cache = null;
+}
+
+// ------------------------------------------------------------ live scripts
+
+/// Every `ZigScript` that exists, so a build can update each one
+/// (`liveScripts`). Scripts are created and freed on any thread (resource
+/// loads run on worker threads), so a mutex guards the list.
+var live_mu: std.Io.Mutex = .init;
+var live: std.ArrayList(*ZigScript) = .empty;
+
+fn track(s: *ZigScript) void {
+    live_mu.lockUncancelable(host_io.get());
+    defer live_mu.unlock(host_io.get());
+    // Out of memory, the script is still usable; builds just do not
+    // update it.
+    live.append(std.heap.c_allocator, s) catch {};
+}
+
+fn untrack(s: *ZigScript) void {
+    live_mu.lockUncancelable(host_io.get());
+    defer live_mu.unlock(host_io.get());
+    const i = std.mem.indexOfScalar(*ZigScript, live.items, s) orelse return;
+    _ = live.swapRemove(i);
+}
+
+/// Every live script, each with a counted reference taken under the lock,
+/// so none is freed while the caller uses it. A script whose last
+/// reference is already gone (being freed on another thread) is left out.
+/// Drop each reference with `release`, then free the slice with `a`.
+pub fn liveScripts(a: Allocator) Allocator.Error![]*ZigScript {
+    live_mu.lockUncancelable(host_io.get());
+    defer live_mu.unlock(host_io.get());
+    var out: std.ArrayList(*ZigScript) = try .initCapacity(a, live.items.len);
+    for (live.items) |s| {
+        if (RefCounted.upcast(s.base).reference()) out.appendAssumeCapacity(s);
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// Drops a reference from `liveScripts`; frees the script when it was the
+/// last one.
+pub fn release(s: *ZigScript) void {
+    if (RefCounted.upcast(s.base).unreference()) godot.raw.objectDestroy(@ptrCast(s.base));
 }
 
 // ------------------------------------------------------------ descriptors
@@ -483,15 +529,33 @@ pub const ZigScript = struct {
     reload_logged: bool = false,
     /// Set once a refused instance has been logged.
     instance_logged: std.atomic.Value(bool) = .init(false),
+    /// The objects that hold a placeholder of this script, so a build that
+    /// makes it a runnable tool script can give them real instances
+    /// (`swapToolPlaceholders`). Guarded by `owners_mu`: placeholders are
+    /// made and erased on any thread.
+    owners_mu: std.Io.Mutex = .init,
+    owners: std.ArrayList(Owner) = .empty,
+    /// What the host last read from or wrote to the script's file: the
+    /// file's modification time (seconds, Godot's `get_modified_time`) and a
+    /// hash of the text. `disk_mtime` 0: the text never came from a file.
+    /// Set by the loader (any thread, before the script is shared), the
+    /// saver and the main thread.
+    disk_mtime: u64 = 0,
+    disk_hash: u64 = 0,
+
+    const Owner = struct { placeholder: *anyopaque, id: u64 };
 
     pub fn create(allocator: *Allocator) !*ZigScript {
         const self = try allocator.create(ZigScript);
         self.* = .{ .base = ScriptExtension.init(), .source = .init() };
         self.base.setInstance(ZigScript, self);
+        track(self);
         return self;
     }
 
     pub fn destroy(self: *ZigScript, allocator: *Allocator) void {
+        untrack(self);
+        self.owners.deinit(std.heap.c_allocator);
         self.placeholders.deinit();
         self.source.deinit();
         self.base.destroy();
@@ -519,9 +583,15 @@ pub const ZigScript = struct {
     }
 
     /// The descriptor placeholders are fed from: null while placeholder
-    /// fallback is on (no descriptor, or the last build failed).
+    /// fallback is on (no descriptor, or the last build failed). A script
+    /// object made after the build (a later load) has no flag set, so the
+    /// diagnostics the build recorded for its file count too.
     fn liveDesc(self: *const ZigScript) ?Desc {
         if (self.build_failed.load(.acquire)) return null;
+        var buf: [max_path_bytes]u8 = undefined;
+        if (self.rel(&buf)) |r| {
+            if (diag_cache.hasErrors(r)) return null;
+        }
         return self.desc();
     }
 
@@ -546,9 +616,174 @@ pub const ZigScript = struct {
             .text => |t| {
                 self.source.deinit();
                 self.source = t;
+                self.noteDisk(FileAccess.getModifiedTime(path));
             },
             .err => {},
         }
+    }
+
+    /// Records that the held text is what the file holds, with the file's
+    /// modification time `mtime`.
+    pub fn noteDisk(self: *ZigScript, mtime: u64) void {
+        const text = props.utf8Alloc(std.heap.c_allocator, &self.source) catch return;
+        defer std.heap.c_allocator.free(text);
+        self.noteDiskText(mtime, text);
+    }
+
+    /// As `noteDisk`, when the caller has the text as UTF-8 already.
+    pub fn noteDiskText(self: *ZigScript, mtime: u64, text: []const u8) void {
+        self.disk_hash = std.hash.Wyhash.hash(0, text);
+        self.disk_mtime = mtime;
+    }
+
+    /// Picks up an edit made outside the editor: when the file's
+    /// modification time is not the one the host last saw and the held text
+    /// has no unsaved edits (it is still what the host last read or wrote),
+    /// the text is read again. A script with unsaved edits keeps them (the
+    /// script editor asks the user about such files). Main thread. True
+    /// when the text was replaced.
+    pub fn refreshFromDisk(self: *ZigScript) bool {
+        if (self.disk_mtime == 0) return false;
+        const path = self.base.getPath();
+        var buf: [max_path_bytes]u8 = undefined;
+        const p = stringText(&path, &buf) orelse return false;
+        if (!std.mem.startsWith(u8, p, "res://") or std.mem.indexOf(u8, p, "::") != null) return false;
+        const mtime = FileAccess.getModifiedTime(path);
+        if (mtime == 0 or mtime == self.disk_mtime) return false;
+        const text = props.utf8Alloc(std.heap.c_allocator, &self.source) catch return false;
+        const unchanged = std.hash.Wyhash.hash(0, text) == self.disk_hash;
+        std.heap.c_allocator.free(text);
+        if (!unchanged) return false;
+        switch (readFileText(path)) {
+            .text => |t| {
+                self.source.deinit();
+                self.source = t;
+                self.noteDisk(mtime);
+                return true;
+            },
+            .err => return false,
+        }
+    }
+
+    /// The project-relative path of the script (see `relPath`), in `buf`.
+    pub fn rel(self: *const ZigScript, buf: []u8) ?[]const u8 {
+        var path = self.base.getPath();
+        defer path.deinit();
+        var res_buf: [max_path_bytes]u8 = undefined;
+        const res_path = stringText(&path, &res_buf) orelse return null;
+        return relPath(res_path, buf);
+    }
+
+    /// Gives every object that holds a placeholder of this script a real
+    /// instance, once a loaded module describes the script as a tool script
+    /// whose build did not fail (a placeholder is made while only the cache,
+    /// or nothing, describes it). As GDScript does on reload
+    /// (modules/gdscript/gdscript.cpp, `reload_scripts`): the exported
+    /// values are read through the placeholder, the script is taken off the
+    /// object and set again, which makes `Object::set_script` ask
+    /// `instance_create`, then the values are set on the instance. `_ready`
+    /// does not run again for a node already in the tree. Main thread.
+    pub fn swapToolPlaceholders(self: *ZigScript) void {
+        if (!editor_hint.load(.acquire) or self.build_failed.load(.acquire)) return;
+        const d = self.desc() orelse return;
+        if (d != .loaded or d.flags() & abi.script_flag_tool == 0) return;
+        const ids = blk: {
+            self.owners_mu.lockUncancelable(host_io.get());
+            defer self.owners_mu.unlock(host_io.get());
+            const list = std.heap.c_allocator.alloc(u64, self.owners.items.len) catch return;
+            for (self.owners.items, list) |o, *id| id.* = o.id;
+            break :blk list;
+        };
+        defer std.heap.c_allocator.free(ids);
+        // Keeps the script alive while objects drop and take it.
+        const keep = Variant.init(*ScriptExtension, self.base);
+        defer keep.deinit();
+        for (ids) |id| {
+            if (!self.hasOwner(id)) continue;
+            const raw = godot.raw.objectGetInstanceFromId(id) orelse continue;
+            const obj: *Object = @ptrCast(@alignCast(raw));
+            var cur = obj.getScript();
+            defer cur.deinit();
+            const cur_obj = cur.as(*Object) orelse continue;
+            if (@intFromPtr(cur_obj) != @intFromPtr(self.base)) continue;
+
+            var saved: std.ArrayList(Saved) = .empty;
+            defer {
+                for (saved.items) |*e| e.deinit();
+                saved.deinit(std.heap.c_allocator);
+            }
+            for (0..d.propertyCount()) |i| {
+                const prop = d.property(@intCast(i));
+                if (prop.label) continue;
+                var sn = StringName.fromUtf8(prop.name);
+                const v = obj.get(sn);
+                // Nothing stored (a placeholder without descriptors knows
+                // only the values set on it): the instance keeps its default.
+                if (v.tag == .nil) {
+                    sn.deinit();
+                    continue;
+                }
+                saved.append(std.heap.c_allocator, .{ .name = sn, .value = v }) catch {
+                    v.deinit();
+                    sn.deinit();
+                };
+            }
+            obj.setScript(.nil);
+            obj.setScript(keep);
+            for (saved.items) |e| obj.set(e.name, e.value);
+        }
+    }
+
+    const Saved = struct {
+        name: StringName,
+        value: Variant,
+
+        fn deinit(e: *Saved) void {
+            e.value.deinit();
+            e.name.deinit();
+        }
+    };
+
+    fn addOwner(self: *ZigScript, p: *anyopaque, id: u64) void {
+        self.owners_mu.lockUncancelable(host_io.get());
+        defer self.owners_mu.unlock(host_io.get());
+        self.owners.append(std.heap.c_allocator, .{ .placeholder = p, .id = id }) catch {};
+    }
+
+    fn removeOwner(self: *ZigScript, p: *anyopaque) void {
+        self.owners_mu.lockUncancelable(host_io.get());
+        defer self.owners_mu.unlock(host_io.get());
+        for (self.owners.items, 0..) |o, i| {
+            if (o.placeholder != p) continue;
+            _ = self.owners.swapRemove(i);
+            return;
+        }
+    }
+
+    fn hasOwner(self: *ZigScript, id: u64) bool {
+        self.owners_mu.lockUncancelable(host_io.get());
+        defer self.owners_mu.unlock(host_io.get());
+        for (self.owners.items) |o| if (o.id == id) return true;
+        return false;
+    }
+
+    /// The source text as UTF-8 with a terminating 0, for the scanners;
+    /// owned by the caller (C allocator).
+    fn sourceZ(self: *const ZigScript) ?[:0]u8 {
+        const n: usize = @intCast(@max(0, godot.raw.stringToUtf8Chars(self.source.constPtr(), null, 0)));
+        const buf = std.heap.c_allocator.allocSentinel(u8, n, 0) catch return null;
+        if (n != 0) _ = godot.raw.stringToUtf8Chars(self.source.constPtr(), buf.ptr, @intCast(n));
+        return buf;
+    }
+
+    /// The signal names the source text declares (`global_class.signalNames`),
+    /// for a script without descriptors. Calls `each(ctx, name)` per name.
+    fn scannedSignals(self: *const ZigScript, ctx: anytype, comptime each: fn (@TypeOf(ctx), []const u8) bool) void {
+        const text = self.sourceZ() orelse return;
+        defer std.heap.c_allocator.free(text);
+        var names: [global_class.max_signals][]const u8 = undefined;
+        const n = global_class.signalNames(text, &names);
+        for (names[0..n]) |name| if (!each(ctx, name)) return;
     }
 
     /// `reloadSourceFromDisk` for any object Godot hands to a reload hook;
@@ -679,6 +914,7 @@ pub const ZigScript = struct {
         const o = owner orelse return null;
         const lang = language.registered orelse return null;
         const p = placeholder.create(lang.base, self.base, o) orelse return null;
+        self.addOwner(p, o.getInstanceId());
         const d = self.liveDesc();
         self.placeholders.add(p, if (d) |x| x.key() else null, Feed{ .d = d });
         return p;
@@ -696,7 +932,9 @@ pub const ZigScript = struct {
 
     /// Godot is deleting placeholder `p` (`~PlaceHolderScriptInstance`).
     pub fn _placeholderErased(self: *ZigScript, p: ?*anyopaque) void {
-        self.placeholders.remove(p orelse return);
+        const ph = p orelse return;
+        self.removeOwner(ph);
+        self.placeholders.remove(ph);
     }
 
     /// Idempotent: Godot calls it once per property while saving a scene.
@@ -789,14 +1027,42 @@ pub const ZigScript = struct {
         return d.propertyList();
     }
 
+    /// Without descriptors, the signals the source text declares (names
+    /// only, `global_class.signalNames`), so Godot keeps scene connections
+    /// to them; `meta` name overrides are not seen there.
     pub fn _hasScriptSignal(self: *ZigScript, signal: StringName) bool {
-        const d = self.desc() orelse return false;
-        return d.hasSignal(signal);
+        if (self.desc()) |d| return d.hasSignal(signal);
+        var buf: [max_name_bytes]u8 = undefined;
+        var want = Want{ .name = nameText(signal, &buf) orelse return false };
+        self.scannedSignals(&want, Want.check);
+        return want.found;
     }
 
     pub fn _getScriptSignalList(self: *ZigScript) Array {
-        const d = self.desc() orelse return .init();
-        return d.signalList();
+        if (self.desc()) |d| return d.signalList();
+        var arr = Array.init();
+        self.scannedSignals(&arr, pushSignal);
+        return arr;
+    }
+
+    const Want = struct {
+        name: []const u8,
+        found: bool = false,
+
+        fn check(w: *Want, name: []const u8) bool {
+            if (!std.mem.eql(u8, w.name, name)) return true;
+            w.found = true;
+            return false;
+        }
+    };
+
+    fn pushSignal(arr: *Array, name: []const u8) bool {
+        var args = Array.init();
+        defer args.deinit();
+        var d = props.signalDict(name, args);
+        defer d.deinit();
+        props.pushDict(arr, d);
+        return true;
     }
 
     /// True for an exported property whose default round-trips through

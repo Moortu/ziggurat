@@ -18,6 +18,7 @@ const language = @import("language.zig");
 const diag_cache = @import("diag_cache.zig");
 const main_queue = @import("main_queue.zig");
 const resource = @import("resource.zig");
+const editor_build = @import("editor_build.zig");
 const PackedStringArray = godot.builtin.PackedStringArray;
 
 const Allocator = std.mem.Allocator;
@@ -458,6 +459,16 @@ pub const ZigguratTestProbe = struct {
         return list;
     }
 
+    /// Build outcomes the editor handled so far (`editor_build.apply`).
+    pub fn editorBuildOutcomes(_: *ZigguratTestProbe) i64 {
+        return editor_build.outcomes_applied.load(.acquire);
+    }
+
+    /// True while the editor's build service runs a requested build.
+    pub fn editorBuildBusy(_: *ZigguratTestProbe) bool {
+        return editor_build.busy();
+    }
+
     pub fn propertyIsGroup(_: *ZigguratTestProbe, script: i64, index: i64) bool {
         const d = scriptDesc(script) orelse return false;
         const i = std.math.cast(u32, index) orelse return false;
@@ -513,7 +524,7 @@ pub const method_names = [_][:0]const u8{
     "language_validate",           "language_global_class",   "language_complete_code",   "language_lookup_code",
     "set_diagnostics",             "has_global_constant",     "queue_push",               "queue_runs",
     "saved_hook_install",          "saved_hook_clear",        "saved_hook_paths",         "language_reload_scripts",
-    "language_reload_tool_script",
+    "language_reload_tool_script", "editor_build_outcomes",   "editor_build_busy",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

@@ -64,6 +64,14 @@ pub fn get(a: Allocator, rel: []const u8) Allocator.Error!?[]Diagnostic {
     return try dupeList(a, list);
 }
 
+/// True when the last build recorded at least one diagnostic for `rel`.
+pub fn hasErrors(rel: []const u8) bool {
+    mu.lockUncancelable(host_io.get());
+    defer mu.unlock(host_io.get());
+    const list = map.get(rel) orelse return false;
+    return list.len != 0;
+}
+
 /// Forgets `rel` (a deleted or renamed file).
 pub fn remove(rel: []const u8) void {
     mu.lockUncancelable(host_io.get());
@@ -117,6 +125,8 @@ test "unknown path, error, clean build" {
     var msg = "expected ';'".*;
     try set("player.zig", &.{.{ .line = 3, .column = 9, .message = &msg }});
     msg[0] = 'X'; // the cache holds its own copy
+    try testing.expect(hasErrors("player.zig"));
+    try testing.expect(!hasErrors("other.zig"));
     {
         const l = (try get(testing.allocator, "player.zig")).?;
         defer freeList(testing.allocator, l);
@@ -127,6 +137,7 @@ test "unknown path, error, clean build" {
     }
 
     try set("player.zig", &.{});
+    try testing.expect(!hasErrors("player.zig"));
     {
         const l = (try get(testing.allocator, "player.zig")).?;
         defer freeList(testing.allocator, l);

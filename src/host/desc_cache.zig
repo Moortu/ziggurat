@@ -388,12 +388,19 @@ pub const project_rel = "ziggurat/descriptors.json";
 /// off (Godot's `ProjectSettings::get_project_data_dir_name`,
 /// core/config/project_settings.cpp:885-886). Main thread.
 pub fn projectPath(buf: []u8) ?[]const u8 {
+    return dataPath(buf, project_rel);
+}
+
+/// The absolute path of `rel` inside the open project's data folder
+/// (`.godot`, see `projectPath`), written into `buf`; null when it does not
+/// fit. Main thread.
+pub fn dataPath(buf: []u8, comptime rel: []const u8) ?[]const u8 {
     var setting = String.fromLatin1("application/config/use_hidden_project_data_directory");
     defer setting.deinit();
     const v = ProjectSettings.getSetting(setting, .{ .default_value = Variant.init(bool, true) });
     defer v.deinit();
     const hidden = v.as(bool) orelse true;
-    var res = String.fromLatin1(if (hidden) "res://.godot/" ++ project_rel else "res://godot/" ++ project_rel);
+    var res = String.fromLatin1(if (hidden) "res://.godot/" ++ rel else "res://godot/" ++ rel);
     defer res.deinit();
     var abs = ProjectSettings.globalizePath(res);
     defer abs.deinit();
