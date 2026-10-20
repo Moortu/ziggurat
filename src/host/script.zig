@@ -613,7 +613,8 @@ pub const ZigScript = struct {
     /// file that cannot be read, keeps its text. Called when the editor
     /// discards edits (`Script::reload_from_file`). Main thread.
     pub fn reloadSourceFromDisk(self: *ZigScript) void {
-        const path = self.base.getPath();
+        var path = self.base.getPath();
+        defer path.deinit();
         var buf: [max_path_bytes]u8 = undefined;
         const p = stringText(&path, &buf) orelse return;
         if (!std.mem.startsWith(u8, p, "res://") or std.mem.indexOf(u8, p, "::") != null) return;
@@ -649,7 +650,8 @@ pub const ZigScript = struct {
     /// when the text was replaced.
     pub fn refreshFromDisk(self: *ZigScript) bool {
         if (self.disk_mtime == 0) return false;
-        const path = self.base.getPath();
+        var path = self.base.getPath();
+        defer path.deinit();
         var buf: [max_path_bytes]u8 = undefined;
         const p = stringText(&path, &buf) orelse return false;
         if (!std.mem.startsWith(u8, p, "res://") or std.mem.indexOf(u8, p, "::") != null) return false;

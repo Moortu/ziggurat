@@ -1040,6 +1040,7 @@ test "load checks" {
             "ZTEST PASS load_check_node_field",
             "ZTEST PASS load_check_clean",
             "ZTEST PASS load_check_generation_not_used",
+            "ZTEST PASS load_check_generation_never_current",
             "ZTEST PASS load_check_marks_build_failed",
             "ERROR: named.zig: Property 'name' of res://named.zig hides Node.name; rename it or give it a name override in meta.",
             "ERROR: holder.zig: res://holder.zig extends Resource, which is not a Node, so field 'target' cannot hold a Node.",

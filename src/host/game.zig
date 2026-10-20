@@ -100,8 +100,8 @@ fn loadFromStore() void {
         stop();
         return;
     };
-    // `load` made it current; new instances use it.
-    runtime.setCurrent(gen);
+    // New instances use it from now on.
+    runtime.publish(gen);
     log("ziggurat: generation {d} loaded", .{gen.n});
 }
 

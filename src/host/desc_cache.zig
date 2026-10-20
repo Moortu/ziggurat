@@ -414,7 +414,7 @@ pub fn dataPath(buf: []u8, comptime rel: []const u8) ?[]const u8 {
 /// no log line. Anything else wrong with it logs one line naming the file
 /// and returns `error.Rejected`.
 pub fn read(a: Allocator, io: std.Io, path: OsPath) ReadError!Cache {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path.bytes, a, .limited(max_file_bytes)) catch |err| switch (err) {
+    const bytes = readBytes(a, io, path) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
         error.OutOfMemory => return error.OutOfMemory,
         else => {
@@ -454,6 +454,21 @@ fn logLine(comptime fmt: []const u8, path: OsPath, extra: anytype) void {
     const line = std.fmt.bufPrint(buf[0 .. buf.len - 1], fmt, .{printable(&pbuf, path.bytes)} ++ extra) catch buf[0..0];
     buf[line.len] = 0;
     godot.raw.printWarning(@ptrCast(&buf), "ziggurat descriptor cache", "", 0, 0);
+}
+
+/// The bytes of the cache file at `path` (at most `max_file_bytes`). The
+/// project may hold anything at that path, so the open never blocks (a
+/// FIFO or device is `error.NotRegular`) and only a regular file is read.
+fn readBytes(a: Allocator, io: std.Io, path: OsPath) ![]u8 {
+    const file = try platform.safe_open.openRegular(io, path.bytes, .{});
+    defer file.close(io);
+    const st = file.stat(io) catch return error.Unreadable;
+    if (st.size > max_file_bytes) return error.FileTooBig;
+    const buf = try a.alloc(u8, @intCast(st.size));
+    errdefer a.free(buf);
+    const n = file.readPositionalAll(io, buf, 0) catch return error.Unreadable;
+    if (n != buf.len) return error.Unreadable;
+    return buf;
 }
 
 fn logRejected(path: OsPath, diag: *const [256]u8) void {
@@ -642,6 +657,22 @@ test "read of a missing file is FileNotFound and logs nothing" {
     defer testing.allocator.free(file);
     try testing.expectError(error.FileNotFound, read(testing.allocator, testing.io, .fromTrusted(file)));
     try testing.expectEqual(before, rejections_logged.load(.acquire));
+}
+
+test "a FIFO in place of the cache file is refused without blocking" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    const file = try std.fs.path.join(testing.allocator, &.{ root, "descriptors.json" });
+    defer testing.allocator.free(file);
+    const r = try std.process.run(testing.allocator, testing.io, .{ .argv = &.{ "mkfifo", file } });
+    defer testing.allocator.free(r.stdout);
+    defer testing.allocator.free(r.stderr);
+    try testing.expect(r.term.success());
+    // A FIFO without a writer: a blocking open would wait forever.
+    try testing.expectError(error.NotRegular, readBytes(testing.allocator, testing.io, .fromTrusted(file)));
 }
 
 /// A one-property cache file whose property has type `type_id` and the raw

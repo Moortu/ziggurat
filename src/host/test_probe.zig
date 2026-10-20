@@ -46,17 +46,18 @@ pub const ZigguratTestProbe = struct {
         allocator.destroy(self);
     }
 
-    /// Loads the library at `path` as generation `gen`: "" on success, the
-    /// refusal sentence otherwise.
+    /// Loads the library at `path` as generation `gen` and publishes it: ""
+    /// on success, the refusal sentence otherwise.
     pub fn loadModule(_: *ZigguratTestProbe, path: String, gen: i64) String {
         var buf: [4096]u8 = undefined;
         const p = path.toUtf8Buf(&buf);
         var diag: [256]u8 = undefined;
         const n = std.math.cast(u32, gen) orelse return .fromLatin1("generation out of range");
-        _ = runtime.load(std.heap.c_allocator, .fromTrusted(p), n, &diag) catch |err| switch (err) {
+        const g = runtime.load(std.heap.c_allocator, .fromTrusted(p), n, &diag) catch |err| switch (err) {
             error.Refused, error.NotMainThread => return String.fromUtf8(std.mem.sliceTo(&diag, 0)) catch .fromLatin1("refused"),
             error.OutOfMemory => return .fromLatin1("out of memory"),
         };
+        runtime.publish(g);
         return .fromLatin1("");
     }
 
@@ -84,6 +85,12 @@ pub const ZigguratTestProbe = struct {
         const n = std.math.cast(u32, gen) orelse return 0;
         const g = runtime.find(n) orelse return 0;
         return g.init_calls;
+    }
+
+    /// True when generation `gen` was ever current, even for a moment.
+    pub fn wasEverCurrent(_: *ZigguratTestProbe, gen: i64) bool {
+        const n = std.math.cast(u32, gen) orelse return false;
+        return runtime.wasEverCurrent(n);
     }
 
     /// Script index of `rel` in the current generation, or -1.
@@ -510,21 +517,21 @@ fn cachedScript(rel: String) ?*const desc_cache.Script {
 }
 
 pub const method_names = [_][:0]const u8{
-    "property_list",               "method_list",             "signal_list",              "default_text",
-    "cache_write",                 "cache_read",              "cache_rejections",         "cached_property_list",
-    "cached_method_list",          "cached_signal_list",      "cached_default_text",      "cached_layout_hash",
-    "layout_hash",                 "cached_generation",       "roundtrip_default",        "stored_default",
-    "cache_drops",                 "load_module",             "current_generation",       "init_calls",
-    "find_script",                 "method_index",            "property_index",           "method_count",
-    "method_name",                 "property_count",          "property_name",            "property_is_group",
-    "api_log",                     "api_request_swap",        "script_is_valid",          "script_fallback_enabled",
-    "script_members",              "script_member_line",      "script_method_info",       "script_has_default",
-    "script_update_exports",       "script_method_arg_count", "live_instances",           "live_bytes",
-    "call_error",                  "property_state",          "script_placeholder_count", "script_set_build_failed",
-    "language_validate",           "language_global_class",   "language_complete_code",   "language_lookup_code",
-    "set_diagnostics",             "has_global_constant",     "queue_push",               "queue_runs",
-    "saved_hook_install",          "saved_hook_clear",        "saved_hook_paths",         "language_reload_scripts",
-    "language_reload_tool_script", "editor_build_outcomes",   "editor_build_busy",
+    "property_list",           "method_list",                 "signal_list",             "default_text",
+    "cache_write",             "cache_read",                  "cache_rejections",        "cached_property_list",
+    "cached_method_list",      "cached_signal_list",          "cached_default_text",     "cached_layout_hash",
+    "layout_hash",             "cached_generation",           "roundtrip_default",       "stored_default",
+    "cache_drops",             "load_module",                 "current_generation",      "was_ever_current",
+    "init_calls",              "find_script",                 "method_index",            "property_index",
+    "method_count",            "method_name",                 "property_count",          "property_name",
+    "property_is_group",       "api_log",                     "api_request_swap",        "script_is_valid",
+    "script_fallback_enabled", "script_members",              "script_member_line",      "script_method_info",
+    "script_has_default",      "script_update_exports",       "script_method_arg_count", "live_instances",
+    "live_bytes",              "call_error",                  "property_state",          "script_placeholder_count",
+    "script_set_build_failed", "language_validate",           "language_global_class",   "language_complete_code",
+    "language_lookup_code",    "set_diagnostics",             "has_global_constant",     "queue_push",
+    "queue_runs",              "saved_hook_install",          "saved_hook_clear",        "saved_hook_paths",
+    "language_reload_scripts", "language_reload_tool_script", "editor_build_outcomes",   "editor_build_busy",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

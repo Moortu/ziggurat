@@ -45,11 +45,12 @@
 //! re-exported types take and return gdzig types, and `@TypeOf` reaches
 //! any of them, the withheld ones included (`Callable.engine()` returns the
 //! gdzig Callable, whose type has `fromClosure`). Every re-exported class
-//! also inherits gdzig's Object helpers, which Stage 3 must rule on:
+//! also inherits gdzig's Object helpers, which scripts must not use:
 //! `setInstance` and `asInstance` (the instance binding belongs to the
 //! host), `connect(comptime S, Callable)` (takes a gdzig Callable) and
 //! `emit`/`emitAlloc` (they convert through gdzig's Variant helpers; scripts
-//! use `z.emit`).
+//! use `z.emit`). Stage 3 leaves them reachable; withholding them (or a
+//! compile error on use) is Stage 4 work, before the SDK surface is frozen.
 const gdzig = @import("gdzig");
 const builtin = gdzig.builtin;
 const global = gdzig.global;

@@ -61,6 +61,9 @@ func _ready() -> void:
 	report("load_check_generation_not_used",
 		probe.current_generation() == 0 and not FileAccess.file_exists("res://.godot/ziggurat/manifest") and not FileAccess.file_exists("res://.godot/ziggurat/descriptors.json"),
 		"generation %d" % probe.current_generation())
+	# Never published: the load checks ran before the generation was made
+	# current, so no other thread could bind to it in between.
+	report("load_check_generation_never_current", not probe.was_ever_current(1), "generation 1 was current")
 	var named_s: Script = load("res://named.zig")
 	report("load_check_marks_build_failed", probe.script_fallback_enabled(named_s), "")
 	print("ZTEST DONE")

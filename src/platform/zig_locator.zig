@@ -22,7 +22,9 @@ pub const ZigInstall = struct {
 
 pub const LocateConfig = struct {
     configured: ?OsPath,
-    toolchain_dir: OsPath,
+    /// The per-user folder of downloaded Zigs, or null when there is none
+    /// (no home folder); then that candidate is skipped.
+    toolchain_dir: ?OsPath,
     env: HostEnv,
 };
 
@@ -57,7 +59,7 @@ fn isVersion(text: []const u8) bool {
 }
 
 const not_usable_head = "Ziggurat needs Zig " ++ pins.zig_version ++ ", but ";
-const not_usable_tail = ". Set the Zig path in Editor Settings > Ziggurat, or use \"Download Zig " ++ pins.zig_version ++ "\".";
+const not_usable_tail = ". Set the project setting ziggurat/zig_path to a Zig " ++ pins.zig_version ++ " executable.";
 
 fn fail(a: std.mem.Allocator, msg: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !ZigInstall {
     msg.clearRetainingCapacity();
@@ -68,7 +70,8 @@ fn fail(a: std.mem.Allocator, msg: *std.ArrayList(u8), comptime fmt: []const u8,
 }
 
 /// Finds a Zig that reports `pins.zig_version`. Search order: the configured
-/// path, `<toolchain_dir>/zig-<pin>/zig`, then each `PATH` entry. The first
+/// path, `<toolchain_dir>/zig-<pin>/zig` (when there is a toolchain folder),
+/// then each `PATH` entry. The first
 /// candidate that exists as a file is run with `zig version`; later
 /// candidates are not tried. Empty and relative `PATH` entries are skipped. On failure `msg` holds one plain sentence for
 /// the user (replacing any old text) and the error is `error.ZigNotUsable`. The caller calls
@@ -82,7 +85,7 @@ pub fn locate(a: std.mem.Allocator, io: std.Io, cfg: LocateConfig, msg: *std.Arr
     var candidates: std.ArrayList(OsPath) = .empty;
     if (cfg.configured) |c| try candidates.append(arena, c);
     const pin_dir = "zig-" ++ pins.zig_version;
-    try candidates.append(arena, try path.joinFor(os, arena, cfg.toolchain_dir, &.{ pin_dir, exeName(os) }));
+    if (cfg.toolchain_dir) |dir| try candidates.append(arena, try path.joinFor(os, arena, dir, &.{ pin_dir, exeName(os) }));
     if (cfg.env.path) |list| {
         const sep: u8 = if (os == .windows) ';' else ':';
         var it = std.mem.splitScalar(u8, list, sep);
@@ -202,7 +205,7 @@ test "locator_rejects_bad_zig: wrong version" {
     try std.testing.expect(!p.ok);
     try std.testing.expect(std.mem.indexOf(u8, p.msg, "is Zig 0.16.0") != null);
     try std.testing.expect(std.mem.startsWith(u8, p.msg, "Ziggurat needs Zig 0.17.0, but "));
-    try std.testing.expect(std.mem.endsWith(u8, p.msg, ". Set the Zig path in Editor Settings > Ziggurat, or use \"Download Zig 0.17.0\"."));
+    try std.testing.expect(std.mem.endsWith(u8, p.msg, ". Set the project setting ziggurat/zig_path to a Zig 0.17.0 executable."));
 }
 
 test "locator_rejects_bad_zig: 300 bytes" {
@@ -370,7 +373,24 @@ test "locator: full message bytes" {
     }, &msg));
     try std.testing.expectEqualStrings(
         "Ziggurat needs Zig 0.17.0, but no zig was found (checked: /nonexistent-tc/zig-0.17.0/zig, /nonexistent-p1/zig, /nonexistent-p2/zig). " ++
-            "Set the Zig path in Editor Settings > Ziggurat, or use \"Download Zig 0.17.0\".",
+            "Set the project setting ziggurat/zig_path to a Zig 0.17.0 executable.",
+        msg.items,
+    );
+}
+
+test "locator: without a toolchain folder only the configured path and PATH are checked" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(a);
+    try std.testing.expectError(error.ZigNotUsable, locate(a, io, .{
+        .configured = OsPath.fromTrusted("/nonexistent-cfg/zig"),
+        .toolchain_dir = null,
+        .env = .{ .os = .linux, .home = null, .path = "/nonexistent-p1" },
+    }, &msg));
+    try std.testing.expectEqualStrings(
+        "Ziggurat needs Zig 0.17.0, but no zig was found (checked: /nonexistent-cfg/zig, /nonexistent-p1/zig). " ++
+            "Set the project setting ziggurat/zig_path to a Zig 0.17.0 executable.",
         msg.items,
     );
 }

@@ -71,6 +71,14 @@ const release = own.release;
 const fieldOwns = own.fieldOwns;
 const releaseField = own.releaseField;
 
+/// `v` as a run-time value. A comptime-known value in a `runtime.log`
+/// argument tuple is a comptime tuple field, which makes the tuple type, and
+/// with it a formatter instance, unique per script (about 5 ms of analysis
+/// each); run-time values share one instance across scripts.
+fn rt(comptime T: type, v: T) T {
+    return v;
+}
+
 /// The wrapper functions of script `S` at `rel`. `method_decls` are the
 /// Zig names of the descriptor's methods in order, `properties` the
 /// descriptor's properties, `defaults` the defaults image. `describe`
@@ -104,15 +112,15 @@ pub fn Wrappers(
             // Without moduleInit there is no allocator and no log.
             const h = runtime.hostApi() orelse return null;
             if (gen != runtime.generation()) {
-                runtime.log(.err, "ziggurat: {s}: create got generation {d}, but this module is generation {d}.", .{ rel, gen, runtime.generation() });
+                runtime.log(.err, "ziggurat: {s}: create got generation {d}, but this module is generation {d}.", .{ rt([]const u8, rel), gen, runtime.generation() });
                 return null;
             }
             const raw = h.alloc(gen, alloc_size, alloc_align) orelse {
-                runtime.log(.err, "ziggurat: {s}: could not allocate {d} bytes for a new instance.", .{ rel, alloc_size });
+                runtime.log(.err, "ziggurat: {s}: could not allocate {d} bytes for a new instance.", .{ rt([]const u8, rel), rt(usize, alloc_size) });
                 return null;
             };
             if (@intFromPtr(raw) % alloc_align != 0) {
-                runtime.log(.err, "ziggurat: {s}: the host returned instance memory that is not aligned to {d} bytes.", .{ rel, alloc_align });
+                runtime.log(.err, "ziggurat: {s}: the host returned instance memory that is not aligned to {d} bytes.", .{ rt([]const u8, rel), rt(u32, alloc_align) });
                 h.free(gen, raw, alloc_size, alloc_align);
                 return null;
             }

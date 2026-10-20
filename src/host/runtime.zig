@@ -80,6 +80,10 @@ var main_thread: ?std.Thread.Id = null;
 /// (script virtuals run on resource-loader threads too) with acquire
 /// ordering, so a reader that sees the pointer also sees its maps.
 var current_gen: std.atomic.Value(?*Generation) = .init(null);
+/// One bit per generation number below 64 that was ever made current (bit
+/// `n` for generation `n`). Only the host tests read it, to check that a
+/// generation was never visible to other threads.
+var ever_current: std.atomic.Value(u64) = .init(0);
 /// Set once `request_swap` has logged.
 var swap_logged: std.atomic.Value(bool) = .init(false);
 
@@ -111,8 +115,10 @@ pub fn setEngine(get_proc_address: ?*const anyopaque, library: ?*anyopaque) void
 pub const LoadError = error{ Refused, NotMainThread, OutOfMemory };
 
 /// Loads the staged library at `path` as generation `n`, which must be
-/// non-zero and not loaded yet, and makes it `current`. Main thread only, at
-/// a time when Godot can construct objects (`ziggurat_init` makes one).
+/// non-zero and not loaded yet. It does not make it `current`: the caller
+/// runs its own checks first and then calls `publish`, so a generation the
+/// checks refuse is never visible to other threads. Main thread only, at a
+/// time when Godot can construct objects (`ziggurat_init` makes one).
 ///
 /// On `error.Refused` nothing was initialised, the library is closed again,
 /// `current` is unchanged and `diag` holds one sentence naming the file and
@@ -196,7 +202,6 @@ pub fn load(a: Allocator, path: OsPath, n: u32, diag: *[256]u8) LoadError!*Gener
     keep = true;
     gen.init_calls += 1;
     init(&host_api, n);
-    current_gen.store(gen, .release);
     return gen;
 }
 
@@ -218,12 +223,23 @@ pub fn current() ?*Generation {
     return current_gen.load(.acquire);
 }
 
-/// Makes `gen` (a loaded generation, or null) the one scripts use again,
-/// after a newer generation was loaded but must not be used (the editor's
-/// load checks refused it). The newer one stays loaded and never runs new
-/// instances. Main thread.
-pub fn setCurrent(gen: ?*Generation) void {
+/// Makes `gen`, a generation `load` returned, the one new instances and
+/// descriptor lookups use. Main thread, after the caller's checks passed.
+pub fn publish(gen: *Generation) void {
+    storeCurrent(gen);
+}
+
+fn storeCurrent(gen: ?*Generation) void {
+    if (gen) |g| {
+        if (g.n < 64) _ = ever_current.fetchOr(@as(u64, 1) << @intCast(g.n), .acq_rel);
+    }
     current_gen.store(gen, .release);
+}
+
+/// True when generation `n` (below 64) was ever current. For the host tests.
+pub fn wasEverCurrent(n: u32) bool {
+    if (n >= 64) return false;
+    return ever_current.load(.acquire) & (@as(u64, 1) << @intCast(n)) != 0;
 }
 
 /// The loaded generation `n`, or null.

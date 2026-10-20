@@ -164,13 +164,10 @@ fn nonInteractiveArg() ?[]const u8 {
     if (@import("builtin").os.tag == .linux) {
         var raw_buf: [64 * 1024]u8 = undefined;
         if (readCmdline(&raw_buf)) |raw| {
-            var it = std.mem.splitScalar(u8, raw, 0);
-            while (it.next()) |arg| {
-                if (nonInteractive(arg)) {
-                    const n = @min(arg.len, S.buf.len);
-                    @memcpy(S.buf[0..n], arg[0..n]);
-                    return S.buf[0..n];
-                }
+            if (nonInteractiveIn(raw)) |arg| {
+                const n = @min(arg.len, S.buf.len);
+                @memcpy(S.buf[0..n], arg[0..n]);
+                return S.buf[0..n];
             }
         }
     }
@@ -182,6 +179,18 @@ fn nonInteractiveArg() ?[]const u8 {
         defer arg.deinit();
         const text = props.stringText(&arg, &S.buf) orelse continue;
         if (nonInteractive(text)) return text;
+    }
+    return null;
+}
+
+/// The first non-interactive argument among the NUL-separated arguments
+/// `raw` (as `/proc/self/cmdline` holds them), or null. The scan stops at
+/// `--` or `++`: Godot hands what follows to the game as user arguments.
+fn nonInteractiveIn(raw: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, raw, 0);
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--") or std.mem.eql(u8, arg, "++")) return null;
+        if (nonInteractive(arg)) return arg;
     }
     return null;
 }
@@ -316,10 +325,12 @@ fn startService() Allocator.Error!void {
 
     const env = try hostEnv(a);
     const paths: platform.path.PathService = .init(.{ .project = .fromTrusted(project) }, env);
-    const toolchain = paths.dir(.toolchain, a) catch |err| switch (err) {
+    const toolchain: ?OsPath = paths.dir(.toolchain, a) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        // No per-user folder: no downloaded Zig to find there.
-        else => OsPath.fromTrusted(store_root),
+        // No per-user folder: no downloaded Zig to find, and no folder
+        // inside the project stands in for it (the project must not name
+        // a program that way).
+        else => null,
     };
 
     var diag: [256]u8 = undefined;
@@ -484,8 +495,8 @@ fn applyMsg(m: *const Msg) Allocator.Error!void {
         if (m.ok) log("ziggurat: {s}", .{text}) else logError("{s}", .{text});
     }
 
-    // A good build becomes the current generation.
-    const previous = runtime.current();
+    // A good build becomes the current generation once its load checks
+    // pass (`runtime.publish` below); until then no other thread sees it.
     var loaded: ?*runtime.Generation = null;
     if (m.ok and m.lib != null) {
         const lib = m.lib.?;
@@ -518,11 +529,12 @@ fn applyMsg(m: *const Msg) Allocator.Error!void {
             try addDiagnostic(a, &files, rel, .{ .line = 0, .column = 0, .message = f.message });
         }
         if (findings.len != 0) {
-            // A load-check finding fails the build: new instances keep the
-            // previous generation and the game keeps the previous manifest.
-            runtime.setCurrent(previous);
+            // A load-check finding fails the build: the generation is never
+            // published, so new instances keep the previous one, and the
+            // game keeps the previous manifest.
             log("ziggurat: build {d} failed the load checks ({t}, {d} ms); the last good build stays in use", .{ g.n, m.trigger, m.ms });
         } else {
+            runtime.publish(g);
             var cache_buf: [max_path_bytes]u8 = undefined;
             if (desc_cache.projectPath(&cache_buf)) |path| {
                 desc_cache.write(gpa, io, .fromTrusted(path), g) catch |err|
@@ -650,4 +662,14 @@ fn log(comptime fmt: []const u8, args: anytype) void {
     var s: String = String.fromUtf8(msg) catch String.fromLatin1(msg);
     defer s.deinit();
     godot.general.print(.init(String, s), .{});
+}
+
+test "nonInteractiveIn stops at the user arguments" {
+    try std.testing.expectEqualStrings("--import", nonInteractiveIn("godot\x00--editor\x00--import\x00").?);
+    try std.testing.expectEqualStrings("--export-release", nonInteractiveIn("godot\x00--export-release\x00x").?);
+    try std.testing.expect(nonInteractiveIn("godot\x00--editor\x00--quit-after\x005") == null);
+    // After `--` or `++` Godot passes the arguments to the game, not the
+    // editor, so they do not make the editor non-interactive.
+    try std.testing.expect(nonInteractiveIn("godot\x00--editor\x00--\x00--quit") == null);
+    try std.testing.expect(nonInteractiveIn("godot\x00-e\x00++\x00-q\x00--import") == null);
 }
