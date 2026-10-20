@@ -206,6 +206,14 @@ pub fn current() ?*Generation {
     return current_gen.load(.acquire);
 }
 
+/// Makes `gen` (a loaded generation, or null) the one scripts use again,
+/// after a newer generation was loaded but must not be used (the editor's
+/// load checks refused it). The newer one stays loaded and never runs new
+/// instances. Main thread.
+pub fn setCurrent(gen: ?*Generation) void {
+    current_gen.store(gen, .release);
+}
+
 /// The loaded generation `n`, or null.
 pub fn find(n: u32) ?*Generation {
     const io = host_io.get();

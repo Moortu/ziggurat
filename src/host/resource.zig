@@ -63,7 +63,8 @@ const max_path_bytes = 4096;
 /// saved (`editor_build.start`; `editor_build.stop` clears it again). It runs
 /// on the thread that saved, usually the main thread, so it may only queue
 /// work.
-pub var on_saved: ?*const fn (path: []const u8) void = null;
+pub const SavedHook = *const fn (path: []const u8) void;
+pub var on_saved: std.atomic.Value(?SavedHook) = .init(null);
 
 /// True when `path` names a `.zig` file. Godot compares extensions without
 /// regard to case.
@@ -243,7 +244,7 @@ pub const ZigSaver = struct {
 
         var rel_buf: [max_path_bytes]u8 = undefined;
         if (script.relPath(res_path, &rel_buf)) |rel| {
-            if (on_saved) |hook| hook(rel);
+            if (on_saved.load(.acquire)) |hook| hook(rel);
         }
         return .ok;
     }

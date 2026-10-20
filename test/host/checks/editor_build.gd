@@ -73,6 +73,8 @@ func run() -> void:
 	var gadget_s: Script = load("res://gadget.zig")
 	var gadget := Node.new()
 	gadget.set_script(gadget_s)
+	# A scene value on the placeholder (not the default 1).
+	gadget.set("power", 9)
 	report("tool_placeholder_before_build", probe.script_placeholder_count(gadget_s) == 1 and probe.live_instances() == 0,
 		"placeholders %d instances %d" % [probe.script_placeholder_count(gadget_s), probe.live_instances()])
 	var ext_s: Script = load("res://ext.zig")
@@ -88,6 +90,7 @@ func run() -> void:
 	report("validate_after_good_build", probe.language_validate("res://walker.zig").valid == true, str(probe.language_validate("res://walker.zig")))
 	report("tool_placeholder_swapped", probe.script_placeholder_count(gadget_s) == 0 and probe.live_instances() == 1 and gadget.get_script() == gadget_s and gadget.get("ready_calls") == 0,
 		"placeholders %d instances %d ready_calls %s" % [probe.script_placeholder_count(gadget_s), probe.live_instances(), gadget.get("ready_calls")])
+	report("tool_swap_keeps_scene_value", gadget.get("power") == 9, "power %s" % gadget.get("power"))
 	gadget.free()
 
 	# ---- an edit outside the editor, picked up with the next build

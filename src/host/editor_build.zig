@@ -77,6 +77,13 @@ const State = struct {
     /// The generation store's folder (`<project>/.godot/ziggurat`).
     store_root: []const u8,
     svc: *BuildService,
+    /// The service's store folder, opened again here for `pin`.
+    store: platform.generation_store.GenerationStore,
+    /// A shared lock on every generation this editor loaded, so the store's
+    /// sweep never deletes one (released at SCENE exit).
+    pins: std.ArrayList(platform.generation_store.FileLock) = .empty,
+    /// Generations loaded in this editor session (`notePinned`).
+    loaded_count: u32 = 0,
 };
 
 var state: ?State = null;
@@ -95,7 +102,11 @@ var diag_files: std.StringHashMapUnmanaged(void) = .empty;
 /// after the language and the loader and saver are registered.
 pub fn start() void {
     registerSettings();
-    resource.on_saved = &onSaved;
+    if (nonInteractiveArg()) |arg| {
+        log("Ziggurat does not build Zig scripts in this run ({s}).", .{arg});
+        return;
+    }
+    resource.on_saved.store(&onSaved, .release);
     startService() catch |err| switch (err) {
         error.OutOfMemory => logError("Ziggurat cannot build Zig scripts: out of memory.", .{}),
     };
@@ -106,10 +117,12 @@ pub fn start() void {
 /// main-thread queue closes and the language is destroyed. Outcomes still
 /// queued are dropped by the queue.
 pub fn stop() void {
-    if (resource.on_saved == &onSaved) resource.on_saved = null;
+    _ = resource.on_saved.cmpxchgStrong(&onSaved, null, .acq_rel, .acquire);
     if (state) |*st| {
         st.svc.deinit();
         log("ziggurat: build service stopped ({d} threads left)", .{zbuild.service.liveThreads()});
+        for (st.pins.items) |*l| l.release();
+        st.pins.deinit(gpa);
         st.sdk.deinit(gpa);
         st.arena.deinit();
         state = null;
@@ -125,6 +138,75 @@ pub fn stop() void {
 pub fn busy() bool {
     const st = state orelse return false;
     return st.svc.stats().updates_active > 0;
+}
+
+/// Command-line arguments of editor runs that are not interactive: an
+/// import, an export, the doc tool, API dumps, and `--quit`/`-q` (which
+/// quits after the first frame). `--quit-after <n>` keeps an interactive
+/// editor (the host tests use it).
+const non_interactive = [_][]const u8{
+    "--import",                 "--doctool",                      "--gdextension-docs",
+    "--dump-extension-api",     "--dump-extension-api-with-docs", "--dump-gdextension-interface",
+    "--validate-extension-api", "--check-only",                   "--quit",
+    "-q",
+};
+
+/// The first argument of this run that makes it non-interactive
+/// (`non_interactive`, or any `--export-*`), or null. Godot consumes
+/// `--import` and `--quit` without keeping them in `OS.get_cmdline_args()`
+/// (main/main.cpp, the argument loop before `set_cmdline`), so on Linux the
+/// process's own command line (`/proc/self/cmdline`) is read too. Main
+/// thread.
+fn nonInteractiveArg() ?[]const u8 {
+    const S = struct {
+        var buf: [256]u8 = undefined;
+    };
+    if (@import("builtin").os.tag == .linux) {
+        var raw_buf: [64 * 1024]u8 = undefined;
+        if (readCmdline(&raw_buf)) |raw| {
+            var it = std.mem.splitScalar(u8, raw, 0);
+            while (it.next()) |arg| {
+                if (nonInteractive(arg)) {
+                    const n = @min(arg.len, S.buf.len);
+                    @memcpy(S.buf[0..n], arg[0..n]);
+                    return S.buf[0..n];
+                }
+            }
+        }
+    }
+    var args = Os.getCmdlineArgs();
+    defer args.deinit();
+    var i: i64 = 0;
+    while (i < args.size()) : (i += 1) {
+        var arg = args.get(i);
+        defer arg.deinit();
+        const text = props.stringText(&arg, &S.buf) orelse continue;
+        if (nonInteractive(text)) return text;
+    }
+    return null;
+}
+
+fn nonInteractive(arg: []const u8) bool {
+    if (std.mem.startsWith(u8, arg, "--export-")) return true;
+    for (non_interactive) |want| if (std.mem.eql(u8, arg, want)) return true;
+    return false;
+}
+
+/// The process's NUL-separated arguments, or null.
+fn readCmdline(buf: []u8) ?[]const u8 {
+    const io = host_io.get();
+    var file = std.Io.Dir.cwd().openFile(io, "/proc/self/cmdline", .{}) catch return null;
+    defer file.close(io);
+    var bufs = [_][]u8{buf};
+    var n: usize = 0;
+    while (n < buf.len) {
+        bufs[0] = buf[n..];
+        n += file.readStreaming(io, &bufs) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return null,
+        };
+    }
+    return buf[0..n];
 }
 
 /// Adds both settings with an empty default, so they show in Project
@@ -262,7 +344,13 @@ fn startService() Allocator.Error!void {
     };
     keep = true;
     sdk_kept = true;
-    state = .{ .arena = arena_state, .sdk = sdk, .store_root = store_root, .svc = svc };
+    state = .{
+        .arena = arena_state,
+        .sdk = sdk,
+        .store_root = store_root,
+        .svc = svc,
+        .store = .init(gpa, io, .fromTrusted(store_root), @import("builtin").os.tag, zbuild.service.lib_stem, .{}),
+    };
     svc.request(.open);
 }
 
@@ -397,12 +485,14 @@ fn applyMsg(m: *const Msg) Allocator.Error!void {
     }
 
     // A good build becomes the current generation.
+    const previous = runtime.current();
     var loaded: ?*runtime.Generation = null;
     if (m.ok and m.lib != null) {
         const lib = m.lib.?;
         var diag: [256]u8 = undefined;
         if (runtime.load(gpa, .fromTrusted(lib), m.gen_n, &diag)) |g| {
             loaded = g;
+            notePinned(st, g.n);
         } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // `load` logged it already.
@@ -412,9 +502,11 @@ fn applyMsg(m: *const Msg) Allocator.Error!void {
     }
 
     var files: Files = .empty;
+    var file_diags = false;
     for (m.diags) |d| {
         printDiagnostic(d.rel, d.line, d.column, d.message);
         const rel = d.rel orelse continue;
+        file_diags = true;
         try addDiagnostic(a, &files, rel, .{ .line = d.line, .column = d.column, .message = d.message });
     }
 
@@ -425,20 +517,49 @@ fn applyMsg(m: *const Msg) Allocator.Error!void {
             printDiagnostic(rel, 0, 0, f.message);
             try addDiagnostic(a, &files, rel, .{ .line = 0, .column = 0, .message = f.message });
         }
-        var cache_buf: [max_path_bytes]u8 = undefined;
-        if (desc_cache.projectPath(&cache_buf)) |path| {
-            desc_cache.write(gpa, io, .fromTrusted(path), g) catch |err|
-                logError("Ziggurat could not write the descriptor cache {s} ({s}).", .{ path, @errorName(err) });
+        if (findings.len != 0) {
+            // A load-check finding fails the build: new instances keep the
+            // previous generation and the game keeps the previous manifest.
+            runtime.setCurrent(previous);
+            log("ziggurat: build {d} failed the load checks ({t}, {d} ms); the last good build stays in use", .{ g.n, m.trigger, m.ms });
+        } else {
+            var cache_buf: [max_path_bytes]u8 = undefined;
+            if (desc_cache.projectPath(&cache_buf)) |path| {
+                desc_cache.write(gpa, io, .fromTrusted(path), g) catch |err|
+                    logError("Ziggurat could not write the descriptor cache {s} ({s}).", .{ path, @errorName(err) });
+            }
+            manifest.write(gpa, io, .fromTrusted(st.store_root), g.n, std.fs.path.basename(m.lib.?)) catch |err|
+                logError("Ziggurat could not write the generation manifest in {s} ({s}).", .{ st.store_root, @errorName(err) });
+            log("ziggurat: build {d} loaded ({t}, {t}, {d} ms)", .{ g.n, m.trigger, m.path, m.ms });
         }
-        manifest.write(gpa, io, .fromTrusted(st.store_root), g.n, std.fs.path.basename(m.lib.?)) catch |err|
-            logError("Ziggurat could not write the generation manifest in {s} ({s}).", .{ st.store_root, @errorName(err) });
-        log("ziggurat: build {d} loaded ({t}, {t}, {d} ms)", .{ g.n, m.trigger, m.path, m.ms });
-    } else if (!m.ok) {
-        log("ziggurat: build failed ({t}, {d} ms); the last good build stays loaded", .{ m.trigger, m.ms });
+    } else {
+        log("ziggurat: build failed ({t}, {d} ms); the last good build stays in use", .{ m.trigger, m.ms });
     }
 
-    try recordDiagnostics(&files);
-    updateScripts(&files);
+    // Only a build that reached the compiler's verdict replaces what is
+    // known about the files: a loaded generation (with or without load-check
+    // findings), or a failed build with errors in files. A failure without
+    // file errors (Zig missing, `build.lock` timeout, compiler death,
+    // invalid table, refused load) keeps the earlier diagnostics and
+    // failed states; its message was printed above.
+    const verdict = loaded != null or (!m.ok and file_diags);
+    if (verdict) try recordDiagnostics(&files);
+    updateScripts(if (verdict) &files else null);
+}
+
+/// Pins generation `n` and counts it (spec section 6: the host counts the
+/// generations it loaded; none is ever unloaded).
+fn notePinned(st: *State, n: u32) void {
+    st.loaded_count += 1;
+    log("ziggurat: {d} generations loaded in this editor session", .{st.loaded_count});
+    const lock = st.store.pin(n) catch |err| {
+        logError("Ziggurat could not pin generation {d} in {s} ({s}); a later sweep may delete its files.", .{ n, st.store_root, @errorName(err) });
+        return;
+    };
+    st.pins.append(gpa, lock) catch {
+        var l = lock;
+        l.release();
+    };
 }
 
 fn addDiagnostic(a: Allocator, files: *Files, rel: []const u8, d: diag_cache.Diagnostic) Allocator.Error!void {
@@ -472,8 +593,10 @@ fn recordDiagnostics(files: *const Files) Allocator.Error!void {
     }
 }
 
-/// Brings every live Zig script up to date with the outcome.
-fn updateScripts(files: *const Files) void {
+/// Brings every live Zig script up to date with the outcome. Without
+/// `files` (a failure that says nothing about files) build-failed states
+/// stay as they are.
+fn updateScripts(files: ?*const Files) void {
     const scripts = script.liveScripts(gpa) catch {
         logError("Ziggurat could not update the Zig scripts after a build: out of memory.", .{});
         return;
@@ -483,7 +606,7 @@ fn updateScripts(files: *const Files) void {
         defer script.release(s);
         var buf: [max_path_bytes]u8 = undefined;
         const rel = s.rel(&buf) orelse continue;
-        s.setBuildFailed(files.contains(rel));
+        if (files) |f| s.setBuildFailed(f.contains(rel));
         _ = s.refreshFromDisk();
         s._updateExports();
         s.swapToolPlaceholders();

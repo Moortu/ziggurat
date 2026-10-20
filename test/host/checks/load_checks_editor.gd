@@ -1,11 +1,12 @@
 @tool
 extends Node
 # Host test "load checks": runs as a tool autoload in the headless editor of
-# test/host/projects/load_checks. After the build at open is loaded, the
-# host's load checks report a property and a method whose Godot names
+# test/host/projects/load_checks. After the build at open, the host's load
+# checks report a property and a method whose Godot names
 # already exist in Node (named.zig) and a Node field in a Resource script
 # (holder.zig), as diagnostics without a line; clean.zig has none. Prints
-# one ZTEST line per case, then ZTEST DONE, and quits the editor.
+# one ZTEST line per case, then ZTEST DONE, and quits the editor. The
+# findings fail the build: its generation is not used.
 
 const WAIT_MS := 600000
 
@@ -31,9 +32,9 @@ func _ready() -> void:
 		return
 	probe = ClassDB.instantiate("ZigguratTestProbe")
 	var end := Time.get_ticks_msec() + WAIT_MS
-	while probe.current_generation() < 1 and Time.get_ticks_msec() < end:
+	while probe.editor_build_outcomes() < 1 and Time.get_ticks_msec() < end:
 		await get_tree().process_frame
-	report("load_checks_build_loaded", probe.current_generation() == 1, "generation %d" % probe.current_generation())
+	report("load_checks_build_done", probe.editor_build_outcomes() == 1, "outcomes %d" % probe.editor_build_outcomes())
 
 	var named := messages("res://named.zig")
 	report("load_check_property_hides",
@@ -44,8 +45,12 @@ func _ready() -> void:
 	report("load_check_node_field",
 		holder == ["res://holder.zig extends Resource, which is not a Node, so field 'target' cannot hold a Node."], str(holder))
 	report("load_check_clean", probe.language_validate("res://clean.zig").valid == true, str(probe.language_validate("res://clean.zig")))
+	# Findings fail the build: the generation is not used, nothing is
+	# written for the game, and the flagged script stays in fallback.
+	report("load_check_generation_not_used",
+		probe.current_generation() == 0 and not FileAccess.file_exists("res://.godot/ziggurat/manifest") and not FileAccess.file_exists("res://.godot/ziggurat/descriptors.json"),
+		"generation %d" % probe.current_generation())
 	var named_s: Script = load("res://named.zig")
-	var clean_s: Script = load("res://clean.zig")
-	report("load_check_marks_build_failed", probe.script_fallback_enabled(named_s) and not probe.script_fallback_enabled(clean_s), "")
+	report("load_check_marks_build_failed", probe.script_fallback_enabled(named_s), "")
 	print("ZTEST DONE")
 	get_tree().quit()

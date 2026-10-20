@@ -435,7 +435,7 @@ pub const ZigguratTestProbe = struct {
 
     /// Sets `resource.on_saved` to a recorder of the paths it is called with.
     pub fn savedHookInstall(_: *ZigguratTestProbe) void {
-        resource.on_saved = &recordSaved;
+        resource.on_saved.store(&recordSaved, .release);
     }
 
     /// Forgets the recorded paths.

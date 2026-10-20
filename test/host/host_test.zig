@@ -903,12 +903,17 @@ const build_deadline_s = "900";
 /// Godot a build cache inside the test's folder (`XDG_CACHE_HOME`), so the
 /// editor builds the project at open and on save.
 fn addBuildSettings(p: *Project) !void {
+    return addBuildSettingsWith(p, opts.zig_exe);
+}
+
+/// As `addBuildSettings`, with `zig` as `ziggurat/zig_path`.
+fn addBuildSettingsWith(p: *Project, zig: []const u8) !void {
     const a = p.arena_state.allocator();
     const manifest = try Io.Dir.cwd().realPathFileAlloc(io, opts.sdk_manifest_path, a);
     var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
     defer dir.close(io);
     const old = try dir.readFileAlloc(io, "project.godot", a, .limited(64 * 1024));
-    const new = try std.fmt.allocPrint(a, "{s}\n[ziggurat]\n\nzig_path=\"{s}\"\ndev/sdk_manifest=\"{s}\"\n", .{ old, opts.zig_exe, manifest });
+    const new = try std.fmt.allocPrint(a, "{s}\n[ziggurat]\n\nzig_path=\"{s}\"\ndev/sdk_manifest=\"{s}\"\n", .{ old, zig, manifest });
     try dir.writeFile(io, .{ .sub_path = "project.godot", .data = new });
 
     try p.tmp.dir.createDirPath(io, "cache");
@@ -917,6 +922,39 @@ fn addBuildSettings(p: *Project) !void {
     env.* = try testing.environ.createMap(testing.allocator);
     p.env = env;
     try env.put("XDG_CACHE_HOME", cache);
+}
+
+/// A Zig for the editor that is a shell script around the real one, made
+/// for tests that need a build to block or to fail (as Stage 1's e2e tests
+/// did). `zig version` always runs. Otherwise it fails while the gate file
+/// `fail` exists, waits while `block` exists, and refuses `-fincremental`
+/// (no warm server, so every build runs the wrapper). The gate folder's path
+/// is written to `res://gate.txt`. Returns the gate folder.
+fn addZigWrapper(p: *Project) ![]const u8 {
+    const a = p.arena_state.allocator();
+    try p.tmp.dir.createDirPath(io, "gate");
+    const gate = try p.tmp.dir.realPathFileAlloc(io, "gate", a);
+    const root = try p.tmp.dir.realPathFileAlloc(io, ".", a);
+    const wrapper = try std.fs.path.join(a, &.{ root, "zig-wrapper.sh" });
+    const script = try std.fmt.allocPrint(a,
+        \\#!/bin/sh
+        \\gate='{s}'
+        \\if [ "$1" != version ]; then
+        \\  case " $* " in *" -fincremental "*) echo "wrapper: no incremental server here" >&2; exit 1;; esac
+        \\  if [ -e "$gate/fail" ]; then echo "wrapper: failing on purpose" >&2; exit 1; fi
+        \\  while [ -e "$gate/block" ]; do sleep 0.05; done
+        \\fi
+        \\exec '{s}' "$@"
+        \\
+    , .{ gate, opts.zig_exe });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = wrapper, .data = script });
+    const chmod = try std.process.run(a, io, .{ .argv = &.{ "chmod", "755", wrapper } });
+    if (!chmod.term.success()) return error.ChmodFailed;
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+    defer dir.close(io);
+    try dir.writeFile(io, .{ .sub_path = "gate.txt", .data = gate });
+    try addBuildSettingsWith(p, wrapper);
+    return gate;
 }
 
 /// Process ids whose command line mentions `needle` (Linux `/proc`).
@@ -983,16 +1021,39 @@ test "load checks" {
     try p.addAutoloadCheck("load_checks_editor.gd");
     try p.runEditorChecked("10000000", .{
         .expect = &.{
-            "ZTEST PASS load_checks_build_loaded",
+            "ZTEST PASS load_checks_build_done",
             "ZTEST PASS load_check_property_hides",
             "ZTEST PASS load_check_method_hides",
             "ZTEST PASS load_check_node_field",
             "ZTEST PASS load_check_clean",
+            "ZTEST PASS load_check_generation_not_used",
             "ZTEST PASS load_check_marks_build_failed",
             "ERROR: named.zig: Property 'name' of res://named.zig hides Node.name; rename it or give it a name override in meta.",
             "ERROR: holder.zig: res://holder.zig extends Resource, which is not a Node, so field 'target' cannot hold a Node.",
+            "ziggurat: build 1 failed the load checks (open, ",
         },
+        .reject = &.{"ziggurat: build 1 loaded"},
         .deadline = build_deadline_s,
+    });
+}
+
+test "a failure without file errors keeps the diagnostics" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("editor_build");
+    defer p.deinit();
+    _ = try addZigWrapper(&p);
+    try p.addAutoloadCheck("build_failures.gd");
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS failures_first_build",
+            "ZTEST PASS failures_compile_error",
+            "ZTEST PASS failure_without_file_errors_keeps_diagnostics",
+            "build service stopped (0 threads left)",
+        },
+        // The outcome's message is printed once.
+        .once = &.{"wrapper: failing on purpose"},
+        .deadline = "300",
     });
 }
 
@@ -1001,20 +1062,55 @@ test "shutdown during build" {
     var p: Project = undefined;
     try p.initProbe("editor_build");
     defer p.deinit();
-    try addBuildSettings(&p);
+    const gate = try addZigWrapper(&p);
+    // The build at open waits at the gate until the editor has quit.
+    var gate_dir = try Io.Dir.cwd().openDir(io, gate, .{});
+    defer gate_dir.close(io);
+    try gate_dir.writeFile(io, .{ .sub_path = "block", .data = "" });
     try p.addAutoloadCheck("build_shutdown.gd");
     try p.runEditorChecked("10000000", .{
         .expect = &.{
             "ZTEST PASS build_running_at_quit",
             "build service stopped (0 threads left)",
         },
-        .deadline = build_deadline_s,
+        .reject = &.{"ziggurat: build 1"},
+        .deadline = "120",
     });
-    // The compiler ran with the project's paths on its command line; none
-    // may outlive the editor.
+    // The compiler wrapper ran with the project's paths on its command
+    // line; none may outlive the editor.
     const left = try processesMentioning(p.arena_state.allocator(), p.path);
     if (left.len != 0) {
         std.debug.print("processes still running for {s}: {any}\n", .{ p.path, left });
         return error.CompilerOutlivedEditor;
+    }
+}
+
+test "no builds in a non-interactive editor run" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("editor_build");
+    defer p.deinit();
+    try addBuildSettings(&p);
+    const a = p.arena_state.allocator();
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+    defer dir.close(io);
+    try dir.createDirPath(io, ".godot");
+    try dir.writeFile(io, .{ .sub_path = ".godot/extension_list.cfg", .data = "res://addon/ziggurat_host.gdextension\n" });
+    const deadline: Io.Clock.Timestamp = .fromNow(io, .{ .raw = .fromSeconds(120), .clock = .awake });
+    const result = try std.process.run(a, io, .{
+        .argv = &.{ opts.godot_exe, "--headless", "--path", p.path, "--import" },
+        .environ_map = p.env,
+        .timeout = .{ .deadline = deadline },
+    });
+    const out = try std.mem.concat(a, u8, &.{ result.stdout, result.stderr });
+    const skipped = std.mem.indexOf(u8, out, "Ziggurat does not build Zig scripts in this run (--import).") != null;
+    const built = std.mem.indexOf(u8, out, "ziggurat: build") != null;
+    var store_exists = true;
+    dir.access(io, ".godot/ziggurat", .{}) catch {
+        store_exists = false;
+    };
+    if (!result.term.success() or !skipped or built or store_exists) {
+        std.debug.print("{s}\nexit {any}, skipped {any}, built {any}, store {any}\n", .{ out, result.term, skipped, built, store_exists });
+        return error.ImportRunBuilt;
     }
 }

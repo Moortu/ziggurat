@@ -1,5 +1,6 @@
 //! Editor build fixture: a tool script. Before the first build its node has
-//! a placeholder; once a build is loaded the node gets a real instance.
+//! a placeholder; once a build is loaded the node gets a real instance that
+//! keeps the scene value of `power`.
 const z = @import("ziggurat");
 const g = z.godot;
 
@@ -8,6 +9,7 @@ pub const tool = true;
 
 base: *g.Node,
 ready_calls: i32 = 0,
+power: i32 = 1,
 
 pub fn _ready(self: *@This()) void {
     self.ready_calls += 1;
