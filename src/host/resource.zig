@@ -6,10 +6,9 @@
 //!
 //! The loader reads the file text and returns a new `ZigScript` that holds
 //! it. It has no side effects: no build, no module call, no global state, no
-//! cache write. It does not set the script's path: Godot does that after the
-//! load (and only when the load uses the resource cache), so a
-//! `CACHE_MODE_IGNORE` load, which the script editor uses to re-read a file,
-//! makes an object that is not registered anywhere. The script is returned
+//! cache write. Godot sets the script's path after a load that uses the
+//! resource cache; for `CACHE_MODE_IGNORE` and `IGNORE_DEEP` the loader sets
+//! it with `set_path_cache` (no cache registration). The script is returned
 //! even when the text does not compile. Godot may call the loader from
 //! worker threads (threaded loads, the scan); it only uses `FileAccess`
 //! and creates one object.
@@ -50,6 +49,10 @@ const String = godot.builtin.String;
 const StringName = godot.builtin.StringName;
 const Variant = godot.builtin.Variant;
 const ZigScript = script.ZigScript;
+
+/// `ResourceFormatLoader.CacheMode` values that skip the resource cache.
+const cache_mode_ignore = 0;
+const cache_mode_ignore_deep = 3;
 
 /// Longest path handled; a longer one is refused as a bad path.
 const max_path_bytes = 4096;
@@ -126,18 +129,15 @@ pub const ZigLoader = struct {
 
     /// A new `ZigScript` holding the file's text, or an `Error` number as
     /// an int Variant (what Godot expects of a loader that fails).
-    pub fn _load(_: *ZigLoader, path: String, _: String, _: bool, _: i64) Variant {
+    pub fn _load(_: *ZigLoader, path: String, original_path: String, _: bool, cache_mode: i64) Variant {
         var buf: [max_path_bytes]u8 = undefined;
         const p = props.stringText(&path, &buf) orelse return errorVariant(.err_file_bad_path);
         if (!isZigPath(p)) return errorVariant(.err_file_unrecognized);
 
-        var text = FileAccess.getFileAsString(path);
-        // The open error is per thread: read it on the thread that opened.
-        const err = FileAccess.getOpenError();
-        if (err != .ok) {
-            text.deinit();
-            return errorVariant(err);
-        }
+        var text = switch (script.readFileText(path)) {
+            .text => |t| t,
+            .err => |e| return errorVariant(e),
+        };
 
         var alloc = godot.engine_allocator;
         const s = ZigScript.create(&alloc) catch {
@@ -146,6 +146,15 @@ pub const ZigLoader = struct {
         };
         s.source.deinit();
         s.source = text;
+        // A load that skips the cache (IGNORE, IGNORE_DEEP) gets no path
+        // from Godot, so give it one the way GDScript's loader does:
+        // `set_path_cache` only remembers the path and never touches the
+        // resource cache. In the other modes Godot's own `set_path` must run
+        // first and register the resource, so nothing is set here.
+        if (cache_mode == cache_mode_ignore or cache_mode == cache_mode_ignore_deep) {
+            const keep = if (original_path.length() > 0) original_path else path;
+            Resource.upcast(s.base).setPathCache(keep);
+        }
 
         // The object starts with one counted reference. The Variant takes
         // its own; dropping the first leaves the Variant as the only owner,

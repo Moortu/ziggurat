@@ -51,6 +51,7 @@ const String = godot.builtin.String;
 const StringName = godot.builtin.StringName;
 const Variant = godot.builtin.Variant;
 const Object = godot.class.Object;
+const FileAccess = godot.class.FileAccess;
 const Script = godot.class.Script;
 const ScriptExtension = godot.class.ScriptExtension;
 const ScriptLanguage = godot.class.ScriptLanguage;
@@ -436,6 +437,38 @@ fn ident(s: []const u8) []const u8 {
     return s[0..i];
 }
 
+// ------------------------------------------------------------ file text
+
+pub const FileText = union(enum) {
+    /// The file's text; the caller owns it.
+    text: String,
+    /// What Godot reports for a file that cannot be read.
+    err: Error,
+};
+
+/// Reads the `.zig` file at `path` the way the loader and the reload hooks
+/// need it. Text that is not valid UTF-8 is refused with `ERR_INVALID_DATA`
+/// and one log line, because Godot's own string read would swap the bad
+/// bytes for U+FFFD and a later save would write those into the file.
+/// Any thread: the open error is per thread and is read on the same one.
+pub fn readFileText(path: String) FileText {
+    var bytes = FileAccess.getFileAsBytes(path);
+    defer bytes.deinit();
+    const open_err = FileAccess.getOpenError();
+    if (open_err != .ok) return .{ .err = open_err };
+    const n: usize = @intCast(@max(0, bytes.size()));
+    const data: []const u8 = if (n == 0) "" else @as([*]const u8, @ptrCast(bytes.indexConst(0)))[0..n];
+    const valid = std.unicode.utf8ValidateSlice(data);
+    var text: String = if (valid) (String.fromUtf8(data) catch return .{ .err = .err_invalid_data }) else .init();
+    if (!valid) {
+        text.deinit();
+        var buf: [max_path_bytes]u8 = undefined;
+        logError("Cannot load {s}: the file is not valid UTF-8.", .{stringText(&path, &buf) orelse "(path too long)"});
+        return .{ .err = .err_invalid_data };
+    }
+    return .{ .text = text };
+}
+
 // ------------------------------------------------------------ the script
 
 pub const ZigScript = struct {
@@ -498,6 +531,33 @@ pub const ZigScript = struct {
     /// them again. Any thread.
     pub fn setBuildFailed(self: *ZigScript, failed: bool) void {
         self.build_failed.store(failed, .release);
+    }
+
+    /// Re-reads the text of a script that is a file under `res://` and
+    /// replaces the held text with it; a script without such a file, or a
+    /// file that cannot be read, keeps its text. Called when the editor
+    /// discards edits (`Script::reload_from_file`). Main thread.
+    pub fn reloadSourceFromDisk(self: *ZigScript) void {
+        const path = self.base.getPath();
+        var buf: [max_path_bytes]u8 = undefined;
+        const p = stringText(&path, &buf) orelse return;
+        if (!std.mem.startsWith(u8, p, "res://") or std.mem.indexOf(u8, p, "::") != null) return;
+        switch (readFileText(path)) {
+            .text => |t| {
+                self.source.deinit();
+                self.source = t;
+            },
+            .err => {},
+        }
+    }
+
+    /// `reloadSourceFromDisk` for any object Godot hands to a reload hook;
+    /// objects that are not Zig scripts are ignored.
+    pub fn reloadObjectFromDisk(obj: ?*Object) void {
+        const o = obj orelse return;
+        if (!o.isClass(.fromComptimeLatin1("ZigScript"))) return;
+        const self = o.asInstance(ZigScript) orelse return;
+        self.reloadSourceFromDisk();
     }
 
     /// Writes `Script <path> <what>` to Godot's output.

@@ -419,6 +419,19 @@ pub const ZigguratTestProbe = struct {
         return queue_runs.load(.monotonic);
     }
 
+    /// Calls the language's `reload_scripts` hook as Godot does when the
+    /// editor discards a script's edits.
+    pub fn languageReloadScripts(_: *ZigguratTestProbe, scripts: Array) void {
+        const lang = language.registered orelse return;
+        lang._reloadScripts(scripts, true);
+    }
+
+    /// Calls the language's `reload_tool_script` hook.
+    pub fn languageReloadToolScript(_: *ZigguratTestProbe, s: ?*ZigScript) void {
+        const lang = language.registered orelse return;
+        lang._reloadToolScript(if (s) |z| .upcast(z.base) else null, true);
+    }
+
     /// Sets `resource.on_saved` to a recorder of the paths it is called with.
     pub fn savedHookInstall(_: *ZigguratTestProbe) void {
         resource.on_saved = &recordSaved;
@@ -486,20 +499,21 @@ fn cachedScript(rel: String) ?*const desc_cache.Script {
 }
 
 pub const method_names = [_][:0]const u8{
-    "property_list",         "method_list",             "signal_list",              "default_text",
-    "cache_write",           "cache_read",              "cache_rejections",         "cached_property_list",
-    "cached_method_list",    "cached_signal_list",      "cached_default_text",      "cached_layout_hash",
-    "layout_hash",           "cached_generation",       "roundtrip_default",        "stored_default",
-    "cache_drops",           "load_module",             "current_generation",       "init_calls",
-    "find_script",           "method_index",            "property_index",           "method_count",
-    "method_name",           "property_count",          "property_name",            "property_is_group",
-    "api_log",               "api_request_swap",        "script_is_valid",          "script_fallback_enabled",
-    "script_members",        "script_member_line",      "script_method_info",       "script_has_default",
-    "script_update_exports", "script_method_arg_count", "live_instances",           "live_bytes",
-    "call_error",            "property_state",          "script_placeholder_count", "script_set_build_failed",
-    "language_validate",     "language_global_class",   "language_complete_code",   "language_lookup_code",
-    "set_diagnostics",       "has_global_constant",     "queue_push",               "queue_runs",
-    "saved_hook_install",    "saved_hook_clear",        "saved_hook_paths",
+    "property_list",               "method_list",             "signal_list",              "default_text",
+    "cache_write",                 "cache_read",              "cache_rejections",         "cached_property_list",
+    "cached_method_list",          "cached_signal_list",      "cached_default_text",      "cached_layout_hash",
+    "layout_hash",                 "cached_generation",       "roundtrip_default",        "stored_default",
+    "cache_drops",                 "load_module",             "current_generation",       "init_calls",
+    "find_script",                 "method_index",            "property_index",           "method_count",
+    "method_name",                 "property_count",          "property_name",            "property_is_group",
+    "api_log",                     "api_request_swap",        "script_is_valid",          "script_fallback_enabled",
+    "script_members",              "script_member_line",      "script_method_info",       "script_has_default",
+    "script_update_exports",       "script_method_arg_count", "live_instances",           "live_bytes",
+    "call_error",                  "property_state",          "script_placeholder_count", "script_set_build_failed",
+    "language_validate",           "language_global_class",   "language_complete_code",   "language_lookup_code",
+    "set_diagnostics",             "has_global_constant",     "queue_push",               "queue_runs",
+    "saved_hook_install",          "saved_hook_clear",        "saved_hook_paths",         "language_reload_scripts",
+    "language_reload_tool_script",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

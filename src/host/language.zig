@@ -359,11 +359,21 @@ pub const ZigLanguage = struct {
     pub fn _reloadAllScripts(self: *ZigLanguage) void {
         self.noteReload(.all);
     }
-    pub fn _reloadScripts(self: *ZigLanguage, _: Array, _: bool) void {
+    /// Godot calls this with this language's own scripts only (for
+    /// example `Script::reload_from_file` when the editor discards edits),
+    /// so each listed script gets its text back from its file.
+    pub fn _reloadScripts(self: *ZigLanguage, scripts: Array, _: bool) void {
         self.noteReload(.scripts);
+        var i: i64 = 0;
+        while (i < scripts.size()) : (i += 1) {
+            var v = scripts.get(i);
+            defer v.deinit();
+            script.ZigScript.reloadObjectFromDisk(v.as(*Object) orelse continue);
+        }
     }
-    pub fn _reloadToolScript(self: *ZigLanguage, _: ?*Script, _: bool) void {
+    pub fn _reloadToolScript(self: *ZigLanguage, s: ?*Script, _: bool) void {
         self.noteReload(.tool);
+        if (s) |sc| script.ZigScript.reloadObjectFromDisk(Object.upcast(sc));
     }
     pub fn _getPublicFunctions(_: *ZigLanguage) Array {
         return .init();

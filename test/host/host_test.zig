@@ -758,7 +758,15 @@ test "loader and saver: extension, load, broken and missing files, side effects,
         "ZTEST PASS load_sets_path",
         "ZTEST PASS load_reuses_cached",
         "ZTEST PASS load_ignore_cache_is_new_object",
+        "ZTEST PASS load_ignore_sets_path",
+        "ZTEST PASS load_ignore_not_in_cache",
         "ZTEST PASS load_type_hint",
+        "ZTEST PASS invalid_utf8_fails_to_load",
+        "ZTEST PASS reload_scripts_rereads_file",
+        "ZTEST PASS reload_tool_script_rereads_file",
+        "ZTEST PASS reload_unsaved_script_keeps_text",
+        "ZTEST PASS reload_unreadable_file_keeps_text",
+        "Cannot load res://bad_utf8.zig: the file is not valid UTF-8.",
         "ZTEST PASS broken_script_loads",
         "ZTEST PASS missing_file_is_null",
         "ZTEST PASS missing_folder_is_null",
@@ -830,12 +838,9 @@ test "tabs compile or are converted" {
     // The finding: does the real SDK build accept tab indentation?
     const accepted = switch (try buildText(a, work, "tabs_in", tab_script, manifest.modules)) {
         .ok => true,
-        .failed => |message| blk: {
-            std.debug.print("tab-indented script: the build refused it: {s}\n", .{message});
-            break :blk false;
-        },
+        .failed => false,
     };
-    std.debug.print("TAB FINDING: Zig 0.17 build {s} tab indentation\n", .{if (accepted) "accepts" else "rejects"});
+    // No stderr output on a pass: the build runner reports any as a failed command.
 
     // Save it through the saver, in Godot.
     var dir = try Io.Dir.cwd().openDir(io, p.path, .{});

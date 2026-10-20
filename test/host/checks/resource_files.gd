@@ -40,8 +40,10 @@ func _initialize() -> void:
 	check_exists()
 	check_load()
 	check_broken()
+	check_invalid_utf8()
 	check_missing()
 	check_side_effect_free()
+	check_reload_from_disk()
 	check_save()
 	check_save_errors()
 	check_atomic()
@@ -81,6 +83,9 @@ func check_load() -> void:
 	report("load_reuses_cached", again == s, "")
 	var fresh: Resource = ResourceLoader.load(GOOD, "", ResourceLoader.CACHE_MODE_IGNORE)
 	report("load_ignore_cache_is_new_object", fresh != null and fresh != s and fresh.source_code == text, str(fresh))
+	var deep: Resource = ResourceLoader.load(GOOD, "", ResourceLoader.CACHE_MODE_IGNORE_DEEP)
+	report("load_ignore_sets_path", fresh != null and fresh.resource_path == GOOD and deep != null and deep.resource_path == GOOD and deep != s and deep != fresh, "ignore %s deep %s" % [fresh.resource_path if fresh else "null", deep.resource_path if deep else "null"])
+	report("load_ignore_not_in_cache", ResourceLoader.load(GOOD) == s, "the cached object changed")
 	var typed: Resource = ResourceLoader.load(GOOD, "ZigScript")
 	report("load_type_hint", typed == s, str(typed))
 
@@ -91,6 +96,38 @@ func check_broken() -> void:
 	f.close()
 	var s: Resource = ResourceLoader.load(BROKEN)
 	report("broken_script_loads", s != null and s.get_class() == "ZigScript" and s.source_code == BROKEN_TEXT, str(s))
+
+
+func check_invalid_utf8() -> void:
+	var f := FileAccess.open("res://bad_utf8.zig", FileAccess.WRITE)
+	var bad := PackedByteArray([0x2f, 0x2f, 0x20, 0xff, 0xfe, 0x0a])
+	f.store_buffer(bad)
+	f.close()
+	var s: Resource = ResourceLoader.load("res://bad_utf8.zig")
+	report("invalid_utf8_fails_to_load", s == null and FileAccess.get_file_as_bytes("res://bad_utf8.zig") == bad, str(s))
+
+
+# Discarding edits: the language's reload hooks give the script its file text.
+func check_reload_from_disk() -> void:
+	var text := FileAccess.get_file_as_string(GOOD)
+	var s: Script = ResourceLoader.load(GOOD, "", ResourceLoader.CACHE_MODE_IGNORE)
+	s.source_code = "// edited, not saved\n"
+	probe.language_reload_scripts([s])
+	report("reload_scripts_rereads_file", s.source_code == text, s.source_code)
+	s.source_code = "// edited again\n"
+	probe.language_reload_tool_script(s)
+	report("reload_tool_script_rereads_file", s.source_code == text, s.source_code)
+	# A script without a file keeps its text.
+	var unsaved: Script = ClassDB.instantiate("ZigScript")
+	unsaved.source_code = "// no file\n"
+	probe.language_reload_scripts([unsaved])
+	report("reload_unsaved_script_keeps_text", unsaved.source_code == "// no file\n", unsaved.source_code)
+	# A file that cannot be read keeps the text.
+	var gone: Script = ResourceLoader.load(BROKEN, "", ResourceLoader.CACHE_MODE_IGNORE)
+	gone.source_code = "// kept\n"
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(BROKEN))
+	probe.language_reload_scripts([gone])
+	report("reload_unreadable_file_keeps_text", gone.source_code == "// kept\n", gone.source_code)
 
 
 func check_missing() -> void:
@@ -177,7 +214,7 @@ func check_save() -> void:
 	report("save_to_own_path", err == OK and FileAccess.get_file_as_string("res://made.zig") == "// via resource path\n", error_string(err))
 
 	# Saving leaves nothing but the files the test made.
-	var expected := PackedStringArray(["broken.zig", "good.zig", "made.zig", "project.godot"])
+	var expected := PackedStringArray(["bad_utf8.zig", "good.zig", "made.zig", "project.godot"])
 	var files := project_files()
 	var extra := []
 	for f in files:
