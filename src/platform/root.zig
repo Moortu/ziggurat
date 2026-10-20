@@ -6,6 +6,7 @@ pub const pins = @import("pins.zig");
 pub const path = @import("path.zig");
 pub const elf = @import("elf.zig");
 pub const loader = @import("loader.zig");
+pub const atomic_file = @import("atomic_file.zig");
 pub const lock = @import("lock.zig");
 pub const generation_store = @import("generation_store.zig");
 pub const process = @import("process.zig");
@@ -16,6 +17,7 @@ test {
     std.testing.refAllDecls(path);
     std.testing.refAllDecls(elf);
     std.testing.refAllDecls(loader);
+    std.testing.refAllDecls(atomic_file);
     std.testing.refAllDecls(lock);
     std.testing.refAllDecls(generation_store);
     std.testing.refAllDecls(process);

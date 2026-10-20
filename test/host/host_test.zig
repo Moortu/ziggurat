@@ -295,3 +295,98 @@ test "runtime: load good module, load refuses bad module, name maps use interned
         "ERROR: [ziggurat] Ziggurat cannot load the module libzmod.1.so from a thread other than the main thread.",
     });
 }
+
+// ------------------------------------------------------------ descriptors
+
+/// Builds the `sdk_project` fixture as the editor would and lists the staged
+/// library in `res://modules.txt` of `p` as `good=<path>`.
+fn buildGoodModule(p: *Project) !void {
+    const a = p.arena_state.allocator();
+    var manifest = try loadManifest(testing.allocator);
+    defer manifest.deinit(testing.allocator);
+    try p.tmp.dir.createDirPath(io, "work");
+    const work = try p.tmp.dir.realPathFileAlloc(io, "work", a);
+    const good = try buildModule(a, work, "good", "sdk_project", manifest.modules, true);
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+    defer dir.close(io);
+    const list = try std.fmt.allocPrint(a, "good={s}\n", .{good});
+    try dir.writeFile(io, .{ .sub_path = "modules.txt", .data = list });
+}
+
+test "property list matches descriptors" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("empty");
+    defer p.deinit();
+    try buildGoodModule(&p);
+    try p.addCheck("descriptor_props.gd");
+    try p.runScript(&.{
+        "ZTEST PASS property_list_player\n",
+        "ZTEST PASS property_list_player_matches_descriptor_indexes",
+        "ZTEST PASS method_list_player",
+        "ZTEST PASS signal_list_player",
+        "ZTEST PASS defaults_player",
+        "ZTEST PASS default_out_of_range",
+        "ZTEST PASS property_list_coin",
+        "ZTEST PASS signal_list_coin",
+        "ZTEST PASS method_list_coin_return_type",
+        "ZTEST PASS method_list_hud_virtual",
+        "ZTEST PASS empty_lists",
+    });
+}
+
+test "cache round trip" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("empty");
+    defer p.deinit();
+    try buildGoodModule(&p);
+    // Run 1 loads the module and writes the cache; run 2 is a fresh Godot
+    // process that only reads it.
+    try p.addCheck("descriptor_cache.gd");
+    try p.runScript(&.{
+        "ZTEST PASS cache_write_load",
+        "ZTEST PASS cache_write\n",
+        "ZTEST PASS cache_write_twice_no_temporary_file",
+        "ZTEST PASS cache_is_json",
+        "ZTEST PASS cache_fields",
+    });
+    try p.runScript(&.{
+        "ZTEST PASS fresh_process_has_no_module",
+        "ZTEST PASS cache_read\n",
+        "ZTEST PASS cache_lists_and_defaults_equal_loaded",
+        "ZTEST PASS cache_unknown_script",
+        "ZTEST PASS cache_missing_file",
+    });
+}
+
+test "cache rejects garbage" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("empty");
+    defer p.deinit();
+    try buildGoodModule(&p);
+    try p.addCheck("descriptor_cache.gd");
+    try p.runScript(&.{"ZTEST PASS cache_write\n"});
+    try p.addCheck("descriptor_garbage.gd");
+    try p.runScript(&.{
+        "ZTEST PASS good_cache_reads",
+        "ZTEST PASS rejects_truncated\n",
+        "ZTEST PASS rejects_truncated_early",
+        "ZTEST PASS rejects_version_2",
+        "ZTEST PASS rejects_version_word",
+        "ZTEST PASS rejects_empty",
+        "ZTEST PASS rejects_not_json",
+        "ZTEST PASS rejects_binary",
+        "ZTEST PASS rejects_wrong_type",
+        "ZTEST PASS rejects_scripts_not_array",
+        "ZTEST PASS rejects_bad_hash",
+        "ZTEST PASS rejects_deep",
+        "ZTEST PASS good_cache_still_reads",
+        "ZTEST PASS missing_file_is_silent",
+        // One line per bad file, naming it and the reason.
+        "truncated.json: the file is not valid JSON",
+        "version_2.json: the file has version 2, but this host reads version 1.",
+        "bad_hash.json: the file has a bad layout hash",
+    });
+}

@@ -8,11 +8,15 @@ const std = @import("std");
 const godot = @import("gdzig");
 const abi = @import("ziggurat_abi");
 const runtime = @import("runtime.zig");
+const props = @import("props.zig");
+const desc_cache = @import("desc_cache.zig");
+const host_io = @import("host_io.zig");
 
 const Allocator = std.mem.Allocator;
 const String = godot.builtin.String;
 const StringName = godot.builtin.StringName;
 const RefCounted = godot.class.RefCounted;
+const Array = godot.builtin.Array;
 
 pub const ZigguratTestProbe = struct {
     base: *RefCounted,
@@ -25,6 +29,7 @@ pub const ZigguratTestProbe = struct {
     }
 
     pub fn destroy(self: *ZigguratTestProbe, allocator: *Allocator) void {
+        cacheClose();
         allocator.destroy(self);
     }
 
@@ -109,6 +114,106 @@ pub const ZigguratTestProbe = struct {
         return text(d.properties[i].name);
     }
 
+    /// The Godot property, method and signal lists of the current
+    /// generation's script `script` (`props`).
+    pub fn propertyList(_: *ZigguratTestProbe, script: i64) Array {
+        const d = scriptDesc(script) orelse return Array.init();
+        return props.propertyList(d);
+    }
+
+    pub fn methodList(_: *ZigguratTestProbe, script: i64) Array {
+        const d = scriptDesc(script) orelse return Array.init();
+        return props.methodList(d);
+    }
+
+    pub fn signalList(_: *ZigguratTestProbe, script: i64) Array {
+        const d = scriptDesc(script) orelse return Array.init();
+        return props.signalList(d);
+    }
+
+    /// `var_to_str` of the default of property `index`, or "<none>".
+    pub fn defaultText(_: *ZigguratTestProbe, script: i64, index: i64) String {
+        const d = scriptDesc(script) orelse return .fromLatin1("<none>");
+        const i = std.math.cast(u32, index) orelse return .fromLatin1("<none>");
+        const v = props.defaultValue(d, i) orelse return .fromLatin1("<none>");
+        defer v.deinit();
+        return godot.general.varToStr(v);
+    }
+
+    /// Writes the descriptor cache of the current generation to `path`:
+    /// "" on success, the error name otherwise.
+    pub fn cacheWrite(_: *ZigguratTestProbe, path: String) String {
+        const g = runtime.current() orelse return .fromLatin1("no module loaded");
+        var buf: [4096]u8 = undefined;
+        const p = path.toUtf8Buf(&buf);
+        desc_cache.write(std.heap.c_allocator, host_io.get(), .fromTrusted(p), g) catch |err| return String.fromLatin1(@errorName(err));
+        return .fromLatin1("");
+    }
+
+    /// Reads the descriptor cache at `path`: the number of scripts in it,
+    /// or -1 when it is missing, -2 when it was rejected (and logged).
+    pub fn cacheRead(_: *ZigguratTestProbe, path: String) i64 {
+        cacheClose();
+        var buf: [4096]u8 = undefined;
+        const p = path.toUtf8Buf(&buf);
+        const c = desc_cache.read(std.heap.c_allocator, host_io.get(), .fromTrusted(p)) catch |err| return switch (err) {
+            error.FileNotFound => -1,
+            else => -2,
+        };
+        cache = c;
+        return @intCast(c.scripts().len);
+    }
+
+    /// How many rejected cache files have been logged.
+    pub fn cacheRejections(_: *ZigguratTestProbe) i64 {
+        return desc_cache.rejections_logged.load(.acquire);
+    }
+
+    pub fn cachedPropertyList(_: *ZigguratTestProbe, rel: String) Array {
+        const s = cachedScript(rel) orelse return Array.init();
+        return s.propertyList();
+    }
+
+    pub fn cachedMethodList(_: *ZigguratTestProbe, rel: String) Array {
+        const s = cachedScript(rel) orelse return Array.init();
+        return s.methodList();
+    }
+
+    pub fn cachedSignalList(_: *ZigguratTestProbe, rel: String) Array {
+        const s = cachedScript(rel) orelse return Array.init();
+        return s.signalList();
+    }
+
+    /// As `default_text`, from the cache.
+    pub fn cachedDefaultText(_: *ZigguratTestProbe, rel: String, index: i64) String {
+        const s = cachedScript(rel) orelse return .fromLatin1("<none>");
+        const i = std.math.cast(u32, index) orelse return .fromLatin1("<none>");
+        const v = s.defaultValue(i) orelse return .fromLatin1("<none>");
+        defer v.deinit();
+        return godot.general.varToStr(v);
+    }
+
+    /// The layout hash the cache holds for `rel`, as decimal text.
+    pub fn cachedLayoutHash(_: *ZigguratTestProbe, rel: String) String {
+        const s = cachedScript(rel) orelse return .fromLatin1("");
+        var buf: [32]u8 = undefined;
+        const t = std.fmt.bufPrint(&buf, "{d}", .{s.layoutHash()}) catch return .fromLatin1("");
+        return .fromLatin1(t);
+    }
+
+    /// The same, for the loaded script.
+    pub fn layoutHash(_: *ZigguratTestProbe, script: i64) String {
+        const d = scriptDesc(script) orelse return .fromLatin1("");
+        var buf: [32]u8 = undefined;
+        const t = std.fmt.bufPrint(&buf, "{d}", .{d.layout_hash}) catch return .fromLatin1("");
+        return .fromLatin1(t);
+    }
+
+    pub fn cachedGeneration(_: *ZigguratTestProbe) i64 {
+        const c = cache orelse return -1;
+        return c.generation();
+    }
+
     pub fn propertyIsGroup(_: *ZigguratTestProbe, script: i64, index: i64) bool {
         const d = scriptDesc(script) orelse return false;
         const i = std.math.cast(u32, index) orelse return false;
@@ -117,11 +222,28 @@ pub const ZigguratTestProbe = struct {
     }
 };
 
+/// The cache `cache_read` loaded.
+var cache: ?desc_cache.Cache = null;
+
+fn cacheClose() void {
+    if (cache) |*c| c.deinit();
+    cache = null;
+}
+
+fn cachedScript(rel: String) ?*const desc_cache.Script {
+    const c = &(cache orelse return null);
+    var buf: [1024]u8 = undefined;
+    return c.find(rel.toUtf8Buf(&buf));
+}
+
 pub const method_names = [_][:0]const u8{
-    "load_module",      "current_generation", "init_calls",        "find_script",
-    "method_index",     "property_index",     "method_count",      "method_name",
-    "property_count",   "property_name",      "property_is_group", "api_log",
-    "api_request_swap",
+    "property_list",      "method_list",        "signal_list",         "default_text",
+    "cache_write",        "cache_read",         "cache_rejections",    "cached_property_list",
+    "cached_method_list", "cached_signal_list", "cached_default_text", "cached_layout_hash",
+    "layout_hash",        "cached_generation",  "load_module",         "current_generation",
+    "init_calls",         "find_script",        "method_index",        "property_index",
+    "method_count",       "method_name",        "property_count",      "property_name",
+    "property_is_group",  "api_log",            "api_request_swap",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

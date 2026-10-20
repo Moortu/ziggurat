@@ -17,6 +17,8 @@ const runtime = @import("runtime.zig");
 const host_io = @import("host_io.zig");
 const host_options = @import("host_options");
 const test_probe = @import("test_probe.zig");
+const props = @import("props.zig");
+const desc_cache = @import("desc_cache.zig");
 
 const c = godot.c;
 const Registry = godot.extension.Registry;
@@ -267,4 +269,6 @@ test "an unreadable precision is refused" {
 test {
     _ = version;
     _ = runtime;
+    _ = props;
+    _ = desc_cache;
 }
