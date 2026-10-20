@@ -2,19 +2,33 @@
 //! temporary file in the target's folder, are flushed to disk (`fsync`), and
 //! then renamed over the target. The cache and manifest writers use this.
 const std = @import("std");
+const builtin = @import("builtin");
 const path = @import("path.zig");
 
 const Io = std.Io;
 
 /// Replaces the file at `file` with `bytes`, creating missing parent folders.
-/// On any error the target keeps its old content (or stays absent) and the
-/// temporary file is removed.
+/// On any error before the rename the target keeps its old content (or stays
+/// absent) and the temporary file is removed. After the rename the folder is
+/// flushed too (best effort).
 pub fn write(io: Io, file: path.OsPath, bytes: []const u8) !void {
     var af = try Io.Dir.cwd().createFileAtomic(io, file.bytes, .{ .make_path = true, .replace = true });
     defer af.deinit(io);
     try af.file.writeStreamingAll(io, bytes);
     try af.file.sync(io);
     try af.replace(io);
+    syncParent(io, file.bytes);
+}
+
+/// Flushes the folder that holds `file`, so the rename itself survives a
+/// power loss. Best effort: a folder that cannot be opened or synced (and
+/// Windows, where a folder is not opened as a file) leaves the write done.
+fn syncParent(io: Io, file: []const u8) void {
+    if (builtin.os.tag == .windows) return;
+    const dir_path = std.fs.path.dirname(file) orelse ".";
+    var dir = Io.Dir.cwd().openFile(io, dir_path, .{}) catch return;
+    defer dir.close(io);
+    dir.sync(io) catch {};
 }
 
 test "write creates folders, replaces content and leaves no temporary file" {

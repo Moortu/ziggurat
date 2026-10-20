@@ -360,6 +360,46 @@ test "cache round trip" {
     });
 }
 
+test "defaults round trip as typed JSON" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("empty");
+    defer p.deinit();
+    try p.addCheck("descriptor_defaults.gd");
+    try p.runScript(&.{
+        "ZTEST PASS roundtrip_bool_true",
+        "ZTEST PASS roundtrip_int_large",
+        "ZTEST PASS roundtrip_int_min",
+        "ZTEST PASS roundtrip_float_tiny",
+        "ZTEST PASS roundtrip_string\n",
+        "ZTEST PASS roundtrip_string_name",
+        "ZTEST PASS roundtrip_node_path",
+        "ZTEST PASS roundtrip_vector2\n",
+        "ZTEST PASS roundtrip_vector2i",
+        "ZTEST PASS roundtrip_rect2\n",
+        "ZTEST PASS roundtrip_rect2i",
+        "ZTEST PASS roundtrip_vector3\n",
+        "ZTEST PASS roundtrip_vector3i",
+        "ZTEST PASS roundtrip_transform2d",
+        "ZTEST PASS roundtrip_vector4\n",
+        "ZTEST PASS roundtrip_vector4i",
+        "ZTEST PASS roundtrip_plane",
+        "ZTEST PASS roundtrip_quaternion",
+        "ZTEST PASS roundtrip_aabb",
+        "ZTEST PASS roundtrip_basis",
+        "ZTEST PASS roundtrip_transform3d",
+        "ZTEST PASS roundtrip_projection",
+        "ZTEST PASS roundtrip_color",
+        "ZTEST PASS roundtrip_float_nan",
+        "ZTEST PASS roundtrip_float_inf",
+        "ZTEST PASS roundtrip_float_minus_inf",
+        "ZTEST PASS roundtrip_object_null",
+        "ZTEST PASS object_is_never_stored_as_data",
+        "ZTEST PASS mismatched_type_has_no_stored_form",
+        "ZTEST PASS non_finite_component_has_no_stored_form",
+    });
+}
+
 test "cache rejects garbage" {
     try requireIntegration();
     var p: Project = undefined;
@@ -381,12 +421,25 @@ test "cache rejects garbage" {
         "ZTEST PASS rejects_wrong_type",
         "ZTEST PASS rejects_scripts_not_array",
         "ZTEST PASS rejects_bad_hash",
-        "ZTEST PASS rejects_deep",
+        "ZTEST PASS rejects_deep\n",
+        "ZTEST PASS rejects_numeric_string_usage",
+        "ZTEST PASS rejects_numeric_string_version",
+        "ZTEST PASS rejects_deep_default\n",
+        "ZTEST PASS rejects_deep_default_closed",
+        "ZTEST PASS drops_drop_comment_attack",
+        "ZTEST PASS drops_drop_object_text",
+        "ZTEST PASS drops_drop_numeric_string",
+        "ZTEST PASS drops_drop_float_for_int",
+        "ZTEST PASS drops_drop_short_vector",
+        "ZTEST PASS drops_drop_int_for_bool",
+        "ZTEST PASS drops_drop_array_for_object",
+        "ZTEST PASS string_default_is_plain_text",
         "ZTEST PASS good_cache_still_reads",
         "ZTEST PASS missing_file_is_silent",
         // One line per bad file, naming it and the reason.
         "truncated.json: the file is not valid JSON",
         "version_2.json: the file has version 2, but this host reads version 1.",
-        "bad_hash.json: the file has a bad layout hash",
+        "bad_hash.json: the file has a script with a bad layout hash.",
+        "drop_comment_attack.json: 1 value(s) did not fit the type of their property.",
     });
 }

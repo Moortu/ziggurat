@@ -10,6 +10,7 @@ const abi = @import("ziggurat_abi");
 const runtime = @import("runtime.zig");
 const props = @import("props.zig");
 const desc_cache = @import("desc_cache.zig");
+const default_value = @import("default_value.zig");
 const host_io = @import("host_io.zig");
 
 const Allocator = std.mem.Allocator;
@@ -209,6 +210,49 @@ pub const ZigguratTestProbe = struct {
         return .fromLatin1(t);
     }
 
+    /// A default of declared type `type_id` through the cache's typed JSON
+    /// and back. `value` is an array holding the one value (gdzig methods
+    /// cannot take a bare Variant); the result is an array holding the
+    /// restored value, or empty when it has no stored form.
+    pub fn roundtripDefault(_: *ZigguratTestProbe, type_id: i64, value: Array) Array {
+        var out = Array.init();
+        const t = std.math.cast(u32, type_id) orelse return out;
+        if (value.size() != 1) return out;
+        const v = value.get(0);
+        defer v.deinit();
+        var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const d = default_value.fromVariant(a, t, v) catch return out;
+        const json = std.json.Stringify.valueAlloc(a, d, .{}) catch return out;
+        const back = std.json.parseFromSlice(default_value.Default, a, json, .{}) catch return out;
+        const r = default_value.toVariant(t, back.value) orelse return out;
+        defer r.deinit();
+        out.pushBack(r);
+        return out;
+    }
+
+    /// The JSON text `roundtrip_default` stores for the value in `value`
+    /// (an array of one), or "".
+    pub fn storedDefault(_: *ZigguratTestProbe, type_id: i64, value: Array) String {
+        const t = std.math.cast(u32, type_id) orelse return .fromLatin1("");
+        if (value.size() != 1) return .fromLatin1("");
+        const v = value.get(0);
+        defer v.deinit();
+        var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const d = default_value.fromVariant(a, t, v) catch return .fromLatin1("");
+        if (d == .absent) return .fromLatin1("");
+        const json = std.json.Stringify.valueAlloc(a, d, .{}) catch return .fromLatin1("");
+        return String.fromUtf8(json) catch .fromLatin1("");
+    }
+
+    /// How many "dropped defaults" lines have been logged.
+    pub fn cacheDrops(_: *ZigguratTestProbe) i64 {
+        return desc_cache.drops_logged.load(.acquire);
+    }
+
     pub fn cachedGeneration(_: *ZigguratTestProbe) i64 {
         const c = cache orelse return -1;
         return c.generation();
@@ -240,10 +284,11 @@ pub const method_names = [_][:0]const u8{
     "property_list",      "method_list",        "signal_list",         "default_text",
     "cache_write",        "cache_read",         "cache_rejections",    "cached_property_list",
     "cached_method_list", "cached_signal_list", "cached_default_text", "cached_layout_hash",
-    "layout_hash",        "cached_generation",  "load_module",         "current_generation",
-    "init_calls",         "find_script",        "method_index",        "property_index",
-    "method_count",       "method_name",        "property_count",      "property_name",
-    "property_is_group",  "api_log",            "api_request_swap",
+    "layout_hash",        "cached_generation",  "roundtrip_default",   "stored_default",
+    "cache_drops",        "load_module",        "current_generation",  "init_calls",
+    "find_script",        "method_index",       "property_index",      "method_count",
+    "method_name",        "property_count",     "property_name",       "property_is_group",
+    "api_log",            "api_request_swap",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

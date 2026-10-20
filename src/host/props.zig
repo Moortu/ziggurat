@@ -217,39 +217,6 @@ pub fn defaultValue(desc: *const abi.ScriptDesc, prop_index: u32) ?Variant {
     return v;
 }
 
-/// `var_to_str` of the default value of property `prop_index`, allocated
-/// with `a`; null when there is no default.
-pub fn defaultText(a: Allocator, desc: *const abi.ScriptDesc, prop_index: u32) Allocator.Error!?[]u8 {
-    const v = defaultValue(desc, prop_index) orelse return null;
-    defer v.deinit();
-    var s = godot.general.varToStr(v);
-    defer s.deinit();
-    return try utf8Alloc(a, &s);
-}
-
-/// True when `s` could make `str_to_var` build an object: Godot's parser
-/// instantiates any class named in `Object(Class, ...)`. Defaults are plain
-/// values, so text that holds the word followed by `(` is not trusted.
-pub fn mentionsObject(s: []const u8) bool {
-    var from: usize = 0;
-    while (std.mem.indexOfPos(u8, s, from, "Object")) |i| {
-        var j = i + "Object".len;
-        while (j < s.len and std.ascii.isWhitespace(s[j])) j += 1;
-        if (j < s.len and s[j] == '(') return true;
-        from = i + 1;
-    }
-    return false;
-}
-
-/// The value `var_to_str` text `s` stands for, or null when it holds no
-/// value we trust (see `mentionsObject`). The caller owns the Variant.
-pub fn valueFromText(s: []const u8) ?Variant {
-    if (mentionsObject(s)) return null;
-    var g = String.fromUtf8(s) catch return null;
-    defer g.deinit();
-    return godot.general.strToVar(g);
-}
-
 // ------------------------------------------------------------- tests
 
 const testing = std.testing;
@@ -257,15 +224,6 @@ const testing = std.testing;
 test "godot method flags" {
     try testing.expectEqual(@as(u32, 1), godotMethodFlags(0));
     try testing.expectEqual(@as(u32, 9), godotMethodFlags(abi.method_flag_virtual));
-}
-
-test "mentionsObject spots object constructors only" {
-    try testing.expect(mentionsObject("Object(Node, \"name\": \"x\")"));
-    try testing.expect(mentionsObject("[1, Object  (Node)]"));
-    try testing.expect(!mentionsObject("Vector2(1, 2)"));
-    try testing.expect(!mentionsObject("\"Objective\""));
-    try testing.expect(!mentionsObject("Object"));
-    try testing.expect(!mentionsObject(""));
 }
 
 test "text of a Str" {

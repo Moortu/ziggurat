@@ -79,8 +79,8 @@ func write_run(probe: Object, cache_path: String) -> void:
 	report("cache_is_json", json is Dictionary and json["version"] == 1 and json["generation"] == 1 and json["scripts"].size() == 3, text.substr(0, 200))
 	var p: Dictionary = json["scripts"][1]
 	report("cache_fields", p["path"] == "player.zig" and p["class_name"] == "Player" and p["base_class"] == "CharacterBody2D" and p["flags"] == 0 \
-			and p["layout_hash"] is String and p["layout_hash"].is_valid_int() and p["properties"][1]["default"] == "300.0" \
-			and not p["properties"][0].has("default") and json["scripts"][2]["flags"] == 1, str(p).substr(0, 300))
+			and p["layout_hash"] is String and p["layout_hash"].length() > 0 and p["layout_hash"].lstrip("0123456789") == "" and p["properties"][1]["default"] == 300.0 and p["properties"][11].has("default") and p["properties"][11]["default"] == null and p["properties"][8]["default"] == [1.0, 2.0] \
+			and not p["properties"][0].has("default") and json["scripts"][2]["flags"] == 1, "%s %s %s" % [p["properties"][1], p["properties"][8], p["properties"][11]])
 
 
 func read_run(probe: Object, cache_path: String) -> void:
