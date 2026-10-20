@@ -72,8 +72,10 @@ pub fn build(b: *std.Build) void {
     }
     test_step.dependOn(godot_step);
 
-    // The host library and its addon folder.
-    const host = addHost(b, target, optimize, godot_path);
+    // The host library and its addon folder. The host computes the layout
+    // stamp it accepts from the SDK's own `sdk_options`.
+    const sdk_options = sdk.import_table.get("sdk_options").?;
+    const host = addHost(b, target, optimize, godot_path, zig_exe, sdk_options, false);
     const gdextension_file = b.path("addon/ziggurat_host.gdextension");
     // `zig build host -p <project>` makes <project>/addon/ a working addon folder.
     const addon_dir: std.Build.InstallDir = .{ .custom = "addon" };
@@ -82,12 +84,20 @@ pub fn build(b: *std.Build) void {
     if (godot_found == null) {
         host_test_step.dependOn(&b.addFail("test-host needs Godot on PATH or -Dgodot-path=<absolute path>").step);
     } else {
-        addHostTests(b, host_test_step, target, optimize, host, gdextension_file, godot_found.?);
+        const probe_host = addHost(b, target, optimize, godot_path, zig_exe, sdk_options, true);
+        addHostTests(b, host_test_step, target, optimize, .{
+            .host = host,
+            .probe_host = probe_host,
+            .gdextension = gdextension_file,
+            .godot_exe = godot_found.?,
+            .zig_exe = zig_exe,
+            .sdk_manifest = test_manifest,
+            .sdk_options = sdk_options,
+        });
     }
     test_step.dependOn(host_test_step);
 
     // Native: integration on for `test`, off for `test-unit`.
-    const sdk_options = sdk.import_table.get("sdk_options").?;
     addTestSet(b, test_step, target, optimize, zig_exe, true, true, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) }, sdk_options, sdk);
     addTestSet(b, unit_step, target, optimize, zig_exe, false, true, null, null, sdk_options, sdk);
 
@@ -172,13 +182,19 @@ fn addSdk(
     });
 }
 
-/// The host library `ziggurat_host` (spec section 3). It imports gdzig and
-/// the ABI module, never the SDK.
+/// The host library `ziggurat_host` (spec section 3). It imports gdzig, the
+/// ABI module, the platform layer and the SDK's `sdk_options` (for the
+/// layout stamp), never the SDK. `test_probe` registers the
+/// `ZigguratTestProbe` class the host tests drive the runtime with; the
+/// installed library never has it.
 fn addHost(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     godot_path: []const u8,
+    zig_exe: []const u8,
+    sdk_options: *std.Build.Module,
+    test_probe: bool,
 ) *std.Build.Step.Compile {
     const gdzig = b.dependency("gdzig", .{
         .target = target,
@@ -186,9 +202,24 @@ fn addHost(
         .@"godot-path" = godot_path,
         .precision = "float",
     });
+    const host_options = b.addOptions();
+    host_options.addOption(bool, "test_probe", test_probe);
+    // The platform layer's test settings: integration off, no test paths.
+    const platform_options = b.addOptions();
+    platform_options.addOption([]const u8, "zig_exe", zig_exe);
+    platform_options.addOption(bool, "run_integration", false);
+    platform_options.addOptionPath("stub_sdk_path", b.path("test/stub_sdk/ziggurat.zig"));
+    platform_options.addOption([]const u8, "sdk_manifest_path", "");
+    const platform = b.createModule(.{
+        .root_source_file = b.path("src/platform/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "build_options", .module = platform_options.createModule() }},
+    });
     return b.addLibrary(.{
         .linkage = .dynamic,
-        .name = "ziggurat_host",
+        .name = if (test_probe) "ziggurat_host_probe" else "ziggurat_host",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/host/entry.zig"),
             .target = target,
@@ -197,22 +228,36 @@ fn addHost(
             .imports = &.{
                 .{ .name = "gdzig", .module = gdzig.module("gdzig") },
                 .{ .name = "ziggurat_abi", .module = addAbi(b, target, optimize) },
+                .{ .name = "ziggurat_platform", .module = platform },
+                .{ .name = "sdk_options", .module = sdk_options },
+                .{ .name = "host_options", .module = host_options.createModule() },
             },
         }),
     });
 }
 
+const HostTestInputs = struct {
+    host: *std.Build.Step.Compile,
+    /// The host built with `test_probe`.
+    probe_host: *std.Build.Step.Compile,
+    gdextension: std.Build.LazyPath,
+    godot_exe: []const u8,
+    zig_exe: []const u8,
+    /// The SDK manifest the tests build fixture modules with.
+    sdk_manifest: std.Build.LazyPath,
+    sdk_options: *std.Build.Module,
+};
+
 /// The host tests (test/host): a Zig test that copies a fixture project,
-/// puts the host into its `addon/` folder and runs Godot through
+/// puts the host into its `addon/` folder, builds fixture modules with the
+/// build service when a test needs them, and runs Godot through
 /// test/host/runner.zig.
 fn addHostTests(
     b: *std.Build,
     step: *std.Build.Step,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    host: *std.Build.Step.Compile,
-    gdextension_file: std.Build.LazyPath,
-    godot_exe: []const u8,
+    in: HostTestInputs,
 ) void {
     const runner = b.addExecutable(.{
         .name = "host_runner",
@@ -229,26 +274,62 @@ fn addHostTests(
     });
     // The runner's own unit tests, and the host's (no Godot needed).
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = runner.root_module })).step);
-    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host.root_module })).step);
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = in.host.root_module })).step);
 
+    // One options module serves as `host_test_options` and as the
+    // `build_options` of the platform and build modules the test uses.
     const options = b.addOptions();
     options.addOption(bool, "run_integration", true);
-    options.addOption([]const u8, "godot_exe", godot_exe);
+    options.addOption([]const u8, "godot_exe", in.godot_exe);
     options.addOptionPath("runner_exe", runner.getEmittedBin());
-    options.addOptionPath("host_lib", host.getEmittedBin());
-    options.addOptionPath("gdextension", gdextension_file);
+    options.addOptionPath("host_lib", in.host.getEmittedBin());
+    options.addOptionPath("probe_host_lib", in.probe_host.getEmittedBin());
+    options.addOptionPath("gdextension", in.gdextension);
     options.addOption([]const u8, "projects_dir", b.root.joinString(b.allocator, "test/host/projects") catch @panic("OOM"));
     options.addOption([]const u8, "checks_dir", b.root.joinString(b.allocator, "test/host/checks") catch @panic("OOM"));
+    options.addOption([]const u8, "fixtures_dir", b.root.joinString(b.allocator, "test/fixtures") catch @panic("OOM"));
+    options.addOption([]const u8, "zig_exe", in.zig_exe);
+    options.addOptionPath("stub_sdk_path", b.path("test/stub_sdk/ziggurat.zig"));
+    options.addOptionPath("sdk_manifest_path", in.sdk_manifest);
+    const options_mod = options.createModule();
+
+    const platform = b.createModule(.{
+        .root_source_file = b.path("src/platform/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "build_options", .module = options_mod }},
+    });
+    const abi = addAbi(b, target, optimize);
+    const build_mod = b.createModule(.{
+        .root_source_file = b.path("src/build/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "build_options", .module = options_mod },
+            .{ .name = "ziggurat_platform", .module = platform },
+            .{ .name = "ziggurat_abi", .module = abi },
+        },
+    });
     const t = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("test/host/host_test.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "host_test_options", .module = options.createModule() }},
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "host_test_options", .module = options_mod },
+            .{ .name = "ziggurat_platform", .module = platform },
+            .{ .name = "ziggurat_build", .module = build_mod },
+            .{ .name = "ziggurat_abi", .module = abi },
+            .{ .name = "sdk_options", .module = in.sdk_options },
+        },
     }) });
     const run = b.addRunArtifact(t);
-    // The fixtures and check scripts are read at run time; Godot is an input too.
-    addSourceInputs(b, run, &.{"test/host"});
-    run.addFileInput(.{ .cwd_relative = godot_exe });
+    // The fixtures and check scripts are read at run time, and the SDK is
+    // compiled from source by a child compiler; Godot is an input too.
+    addSourceInputs(b, run, &.{ "test/host", "test/fixtures", "sdk", "src/abi" });
+    run.addFileInput(.{ .cwd_relative = in.godot_exe });
     step.dependOn(&run.step);
 }
 

@@ -13,6 +13,9 @@ const std = @import("std");
 const godot = @import("gdzig");
 const version = @import("version.zig");
 const language = @import("language.zig");
+const runtime = @import("runtime.zig");
+const host_options = @import("host_options");
+const test_probe = @import("test_probe.zig");
 
 const c = godot.c;
 const Registry = godot.extension.Registry;
@@ -67,8 +70,13 @@ export fn ziggurat_host_init(
     library = p_library;
     godot.raw = .init(gpa, lib);
     godot.raw.getGodotVersion(@ptrCast(&godot.version));
+    runtime.setEngine(@ptrCast(gpa), lib);
 
     registry.addClass(ZigLanguage, registry.allocator, .auto);
+    if (host_options.test_probe) {
+        const probe = registry.createClass(test_probe.ZigguratTestProbe, registry.allocator, .auto);
+        inline for (test_probe.method_names) |name| probe.addMethod(name, .auto);
+    }
     registry.addCallbacks(Lifecycle, .{}, .auto);
 
     init.* = .{
@@ -131,6 +139,8 @@ const Lifecycle = struct {
 
     pub fn exit(_: *Lifecycle, level: godot.extension.InitializationLevel) void {
         if (level != .scene) return;
+        // Module names are engine StringNames; Godot reports any still held.
+        runtime.shutdown();
         const lang = zig_language orelse return;
         _ = Engine.unregisterScriptLanguage(.upcast(lang.base));
         var alloc = godot.engine_allocator;
@@ -252,4 +262,5 @@ test "an unreadable precision is refused" {
 
 test {
     _ = version;
+    _ = runtime;
 }
