@@ -51,6 +51,9 @@ pub const Generation = struct {
     by_path: std.StringHashMapUnmanaged(u32),
     /// Times `ziggurat_init` was called for this generation (always 1).
     init_calls: u32 = 0,
+    /// The library file's identity when it was loaded; null where the
+    /// platform has none (Windows).
+    file: ?platform.safe_open.Identity = null,
     /// Bytes this generation holds from `HostApi.alloc` with its own tag.
     live_bytes: std.atomic.Value(u64) = .init(0),
 
@@ -131,6 +134,15 @@ pub fn load(a: Allocator, path: OsPath, n: u32, diag: *[256]u8) LoadError!*Gener
     const io = host_io.get();
     if (n == 0) return refuse(diag, file, "generation 0 is reserved for the shared user heap.", .{});
     if (find(n) != null) return refuse(diag, file, "generation {d} is already loaded.", .{n});
+    // One file never runs `ziggurat_init` twice: a hard or symbolic link
+    // to a loaded library would get the live module back from the dynamic
+    // loader (glibc matches device and inode).
+    // Without an identity (Windows, or a file that cannot be opened, which
+    // the loader then reports) there is nothing to compare.
+    const ident: ?platform.safe_open.Identity = platform.safe_open.identityOfPath(io, path.bytes, .{}) catch null;
+    if (ident) |id| {
+        if (findFile(id)) |other| return refuse(diag, file, "it is the same file as generation {d}, which is already loaded.", .{other.n});
+    }
 
     var reason: [256]u8 = undefined;
     const lib = loader.open(a, io, path, &reason) catch {
@@ -156,7 +168,7 @@ pub fn load(a: Allocator, path: OsPath, n: u32, diag: *[256]u8) LoadError!*Gener
     // still closes the library.
     const gen = try a.create(Generation);
     errdefer a.destroy(gen);
-    gen.* = .{ .n = n, .lib = lib, .table = table, .names = &.{}, .by_path = .empty };
+    gen.* = .{ .n = n, .lib = lib, .table = table, .names = &.{}, .by_path = .empty, .file = ident };
     errdefer gen.by_path.deinit(a);
     const scripts = gen.scripts();
     try gen.by_path.ensureTotalCapacity(a, @intCast(scripts.len));
@@ -220,6 +232,18 @@ pub fn find(n: u32) ?*Generation {
     mu.lockUncancelable(io);
     defer mu.unlock(io);
     return findLocked(n);
+}
+
+/// The loaded generation whose library is the file `id`, or null.
+fn findFile(id: platform.safe_open.Identity) ?*Generation {
+    const io = host_io.get();
+    mu.lockUncancelable(io);
+    defer mu.unlock(io);
+    for (generations.items) |g| {
+        const f = g.file orelse continue;
+        if (f.sameFile(id)) return g;
+    }
+    return null;
 }
 
 fn findLocked(n: u32) ?*Generation {

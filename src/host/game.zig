@@ -4,7 +4,9 @@
 //! `.godot/ziggurat`, as the trusted reader in manifest.zig allows, and that
 //! generation becomes current, so scripts create real instances (a game has
 //! no placeholders). Anything the reader refuses is one log line, and the
-//! game runs on without Zig scripts.
+//! game runs on without Zig scripts. The game pins its generation (a shared
+//! lock on `gen/<n>/.lock`) from the first check until SCENE exit, so an
+//! editor's sweep never deletes the folder of the generation it runs.
 //!
 //! An export build (`host_options.export_build`) compiles all of this out:
 //! no reader, no file name and no symbol of it remain in the library. Until
@@ -17,11 +19,15 @@ const host_options = @import("host_options");
 const runtime = @import("runtime.zig");
 const host_io = @import("host_io.zig");
 const desc_cache = @import("desc_cache.zig");
+const platform = @import("ziggurat_platform");
 
 const String = godot.builtin.String;
 
 /// Thread-safe and never destroyed, as `runtime.load` requires.
 const gpa = std.heap.c_allocator;
+
+/// The pin on the loaded generation, held until `stop`. Main thread.
+var pin: ?platform.generation_store.FileLock = null;
 
 /// Main thread, SCENE init, in a game process, after the language and the
 /// loader are registered.
@@ -31,6 +37,13 @@ pub fn start() void {
         return;
     }
     loadFromStore();
+}
+
+/// Releases the pin. Main thread, SCENE exit.
+pub fn stop() void {
+    if (comptime host_options.export_build) return;
+    if (pin) |*l| l.release();
+    pin = null;
 }
 
 fn loadFromStore() void {
@@ -57,6 +70,14 @@ fn loadFromStore() void {
             return;
         },
     };
+    // Pinned after the first check and before the re-check, so the
+    // generation the re-check confirms cannot be swept before the load. A
+    // pin that fails is a warning: the game still runs that generation.
+    var store_obj = platform.generation_store.GenerationStore.init(gpa, io, .fromTrusted(store), os, stem, .{});
+    pin = store_obj.pin(trusted.n) catch |err| blk: {
+        logWarning("Ziggurat could not pin generation {d} ({s}); an editor's cleanup may delete its files while this game runs.", .{ trusted.n, @errorName(err) });
+        break :blk null;
+    };
     // The re-check right before the load narrows the window in which the
     // files can change; loading through an open descriptor would close it.
     const changed = manifest.recheck(gpa, io, store, trusted, os, stem) catch {
@@ -65,6 +86,7 @@ fn loadFromStore() void {
     };
     if (changed) |r| {
         logError("{s}", .{r.sentence()});
+        stop();
         return;
     }
     var diag: [256]u8 = undefined;
@@ -75,6 +97,7 @@ fn loadFromStore() void {
             error.NotMainThread => {},
             error.Refused => logError("{s}", .{std.mem.sliceTo(&diag, 0)}),
         }
+        stop();
         return;
     };
     // `load` made it current; new instances use it.
@@ -86,6 +109,12 @@ fn logError(comptime fmt: []const u8, args: anytype) void {
     var buf: [1024]u8 = undefined;
     const msg = std.fmt.bufPrintSentinel(&buf, fmt, args, 0) catch return;
     godot.raw.printError(msg.ptr, "Zig scripts", "src/host/game.zig", @src().line, 1);
+}
+
+fn logWarning(comptime fmt: []const u8, args: anytype) void {
+    var buf: [1024]u8 = undefined;
+    const msg = std.fmt.bufPrintSentinel(&buf, fmt, args, 0) catch return;
+    godot.raw.printWarning(msg.ptr, "Zig scripts", "src/host/game.zig", @src().line, 1);
 }
 
 fn log(comptime fmt: []const u8, args: anytype) void {

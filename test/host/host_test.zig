@@ -327,16 +327,24 @@ test "runtime: load good module, load refuses bad module, name maps use interned
     try Io.Dir.cwd().copyFile(other_staged, Io.Dir.cwd(), other_sdk, io, .{});
     const truncated = try std.fs.path.join(a, &.{ work, "libtruncated.so" });
     try writeTruncated(a, good, truncated);
+    // A hard link and a symbolic link to the good library: one file under
+    // other names, which must never run as a second generation.
+    const hard = try std.fs.path.join(a, &.{ work, "libhard.so" });
+    try Io.Dir.cwd().hardLink(good, Io.Dir.cwd(), hard, io, .{});
+    const soft = try std.fs.path.join(a, &.{ work, "libsoft.so" });
+    try Io.Dir.cwd().symLink(io, good, soft, .{});
 
     var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
     defer dir.close(io);
-    const list = try std.fmt.allocPrint(a, "good={s}\nother_sdk={s}\ntruncated={s}\n", .{ good, other_sdk, truncated });
+    const list = try std.fmt.allocPrint(a, "good={s}\nother_sdk={s}\ntruncated={s}\nhard={s}\nsoft={s}\n", .{ good, other_sdk, truncated, hard, soft });
     try dir.writeFile(io, .{ .sub_path = "modules.txt", .data = list });
 
     try p.addCheck("runtime_load.gd");
     try p.runScript(&.{
         "ZTEST PASS load_good_module",
         "ZTEST PASS load_refuses_bad_module",
+        "ZTEST PASS load_refuses_same_file_hard_link",
+        "ZTEST PASS load_refuses_same_file_symbolic_link",
         "ZTEST PASS name_maps_use_interned_names",
         // HostApi.log and request_swap (runtime_load.gd, host_api).
         "[ziggurat] info from main\n",
@@ -1247,6 +1255,12 @@ test "manifest trust" {
     try store.symLink(io, outside, "gen/3", .{ .is_directory = true });
     try writeGameManifest(&store, try std.fmt.allocPrint(a, "gen=3\npath=gen/3/{s}\n", .{try genLibName(&name_buf, 3)}));
     try expectGameRefused(&p, "linked folder outside", "the library resolves to a file outside .godot/ziggurat");
+    // A link inside the store that points generation 6's path at
+    // generation 1's library: one file would run as two generations.
+    try store.createDirPath(io, "gen/6");
+    try store.symLink(io, try std.fmt.allocPrint(a, "../1/{s}", .{lib1}), try std.fmt.allocPrint(a, "gen/6/{s}", .{try genLibName(&name_buf, 6)}), .{});
+    try writeGameManifest(&store, try std.fmt.allocPrint(a, "gen=6\npath=gen/6/{s}\n", .{try genLibName(&name_buf, 6)}));
+    try expectGameRefused(&p, "linked library inside", "the library resolves to another file than gen/<generation>/<library name> in .godot/ziggurat");
     // The library is a folder.
     try store.createDirPath(io, try std.fmt.allocPrint(a, "gen/4/{s}", .{try genLibName(&name_buf, 4)}));
     try writeGameManifest(&store, try std.fmt.allocPrint(a, "gen=4\npath=gen/4/{s}\n", .{try genLibName(&name_buf, 4)}));
@@ -1257,6 +1271,13 @@ test "manifest trust" {
     try store.deleteFile(io, "manifest");
     try store.symLink(io, outside_manifest, "manifest", .{});
     try expectGameRefused(&p, "linked manifest", "it is a symbolic link");
+    // The manifest is a FIFO: refused, and the game does not wait for a
+    // writer.
+    try store.deleteFile(io, "manifest");
+    const fifo = try std.fs.path.join(a, &.{ store_path, "manifest" });
+    const mk = try std.process.run(a, io, .{ .argv = &.{ "mkfifo", fifo } });
+    if (!mk.term.success()) return error.MkfifoFailed;
+    try expectGameRefused(&p, "manifest is a FIFO", "it is not a regular file");
     // The manifest is a folder.
     try store.deleteFile(io, "manifest");
     try store.createDirPath(io, "manifest");

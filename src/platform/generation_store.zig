@@ -560,6 +560,51 @@ test "pin blocks sweep" {
     try std.testing.expectEqual(@as(u32, 3), rep2.kept);
 }
 
+test "a game's pin keeps its generation from an editor's sweep" {
+    const a = std.testing.allocator;
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    try f.writeElf("built.so", "hello");
+    const built = try f.p(a, &.{"built.so"});
+    defer a.free(built.bytes);
+    // The editor that staged the generations, and a game process with a
+    // store of its own on the same folder (a separate lock description).
+    var editor = f.store(a, .{ .max_count = 1 });
+    for (0..4) |_| _ = try stageOne(a, &editor, built);
+    var game = f.store(a, .{});
+    var pinned = try game.pin(2);
+    const rep = try editor.sweep();
+    try std.testing.expectEqual(@as(u32, 2), rep.deleted);
+    try std.testing.expect(try genExists(a, &f, 2));
+    try std.testing.expect(try genExists(a, &f, 4));
+    try std.testing.expectError(error.Pinned, editor.remove(2));
+    pinned.release();
+    const rep2 = try editor.sweep();
+    try std.testing.expectEqual(@as(u32, 1), rep2.deleted);
+    try std.testing.expect(!try genExists(a, &f, 2));
+}
+
+test "pin never follows a linked lock file" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    try f.writeElf("built.so", "hello");
+    const built = try f.p(a, &.{"built.so"});
+    defer a.free(built.bytes);
+    var s = f.store(a, .{});
+    _ = try stageOne(a, &s, built);
+    const lock_file = try path.join(a, f.root, &.{ "gen", "1", ".lock" });
+    defer a.free(lock_file.bytes);
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, lock_file.bytes);
+    const target = try f.p(a, &.{"elsewhere"});
+    defer a.free(target.bytes);
+    try std.Io.Dir.cwd().symLink(std.testing.io, target.bytes, lock_file.bytes, .{});
+    try std.testing.expectError(error.SymLink, s.pin(1));
+    // Nothing was created at the link's target.
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, target.bytes, .{}));
+}
+
 test "sweep keeps newest" {
     const a = std.testing.allocator;
     var f = try Fixture.init(a);

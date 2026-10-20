@@ -3,6 +3,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const path = @import("path.zig");
 const elf = @import("elf.zig");
+const safe_open = @import("safe_open.zig");
 const testing_support = @import("testing_support.zig");
 
 pub const LoadError = error{ LoadFailed, Unsupported } || elf.ElfError;
@@ -41,8 +42,13 @@ pub fn open(a: std.mem.Allocator, io: std.Io, p: path.OsPath, diag: *[256]u8) Lo
 }
 
 fn checkFile(io: std.Io, p: path.OsPath, diag: *[256]u8) LoadError!void {
-    const file = std.Io.Dir.cwd().openFile(io, p.bytes, .{}) catch |err| {
-        setDiag(diag, "Cannot open {s} to check it: {s}.", .{ p.bytes, @errorName(err) });
+    // Never blocks on a FIFO swapped in for the library; only a regular
+    // file goes on to `dlopen`.
+    const file = safe_open.openRegular(io, p.bytes, .{}) catch |err| {
+        setDiag(diag, "Cannot open {s} to check it: {s}.", .{ p.bytes, switch (err) {
+            error.NotRegular => "it is not a regular file",
+            else => @errorName(err),
+        } });
         return error.LoadFailed;
     };
     defer file.close(io);

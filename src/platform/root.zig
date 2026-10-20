@@ -8,6 +8,7 @@ pub const elf = @import("elf.zig");
 pub const loader = @import("loader.zig");
 pub const atomic_file = @import("atomic_file.zig");
 pub const lock = @import("lock.zig");
+pub const safe_open = @import("safe_open.zig");
 pub const generation_store = @import("generation_store.zig");
 pub const process = @import("process.zig");
 pub const zig_locator = @import("zig_locator.zig");
@@ -19,6 +20,7 @@ test {
     std.testing.refAllDecls(loader);
     std.testing.refAllDecls(atomic_file);
     std.testing.refAllDecls(lock);
+    std.testing.refAllDecls(safe_open);
     std.testing.refAllDecls(generation_store);
     std.testing.refAllDecls(process);
     std.testing.refAllDecls(zig_locator);

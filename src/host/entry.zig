@@ -180,6 +180,7 @@ const Lifecycle = struct {
         // process Io ends. The file loader and saver go before the language,
         // so no load or save can reach a destroyed language.
         if (comptime !host_options.export_build) editor_build.stop();
+        game.stop();
         resource.unregister();
         if (zig_language) |lang| {
             _ = Engine.unregisterScriptLanguage(.upcast(lang.base));

@@ -18,11 +18,18 @@
 //! leading zeros, in 1..`max_generation`; the path is relative, made of
 //! `[A-Za-z0-9._/-]` only, has no empty, `.` or `..` part, starts with
 //! `gen/<n>/` for the same `n` and ends in the library name the store gives
-//! generation `n`. Tying the path to `n` also refuses a path loaded before
-//! under another generation: its name carries that other number. The
-//! manifest must be a regular file, not a symbolic link; the library,
-//! resolved with `realpath`, must be a regular file inside
-//! `realpath(<store>)`. Each refusal has a fixed sentence (`Refusal`) that
+//! generation `n`. The manifest must be a regular file, not a symbolic
+//! link. The library, resolved with `realpath`, must be exactly
+//! `realpath(<store>)/gen/<n>/<library name>`: a link inside the store that
+//! points one generation's path at another generation's library is
+//! refused, so a path ties to one generation. (A hard link has no path of
+//! its own to check; `runtime.load` refuses a file, by device and inode,
+//! that is already loaded.) The library must be a regular file. Files are
+//! opened without blocking, so a FIFO swapped in is refused, not waited on.
+//! The store folder `.godot/ziggurat` itself may be a symbolic link: its
+//! `realpath` is taken, and the library must lie inside that target.
+//! `recheck` compares device, inode, size and modification time with the
+//! first check. Each refusal has a fixed sentence (`Refusal`) that
 //! never quotes the file. This protects against a manifest that points
 //! elsewhere, not against a hostile writer inside the folder; the re-check
 //! narrows the window between check and load but does not close it.
@@ -105,6 +112,7 @@ pub const Refusal = enum {
     library_missing,
     library_outside_store,
     library_not_regular,
+    library_not_at_path,
     changed_before_load,
 
     /// One fixed sentence; it never holds bytes from the file.
@@ -140,6 +148,7 @@ pub const Refusal = enum {
             .library_missing => "the library does not exist or cannot be resolved",
             .library_outside_store => "the library resolves to a file outside .godot/ziggurat",
             .library_not_regular => "the library is not a regular file",
+            .library_not_at_path => "the library resolves to another file than gen/<generation>/<library name> in .godot/ziggurat",
             .changed_before_load => "the manifest or the library changed between the check and the load",
         };
     }
@@ -211,8 +220,9 @@ pub const Trusted = struct {
     /// The library's resolved absolute path (`realpath`), inside the
     /// resolved store folder; the path to load.
     lib: [:0]u8,
-    /// The library's inode when it was checked.
-    inode: std.Io.File.INode,
+    /// The library's device, inode, size and modification time when it was
+    /// checked; null where the platform has none (Windows).
+    ident: ?platform.safe_open.Identity,
 
     pub fn deinit(t: *Trusted, a: std.mem.Allocator) void {
         a.free(t.lib);
@@ -252,15 +262,15 @@ pub fn readTrusted(a: std.mem.Allocator, io: std.Io, store_root: []const u8, os:
     if (st.size > max_file_bytes) return .{ .refused = .too_large };
     var buf: [max_file_bytes + 1]u8 = undefined;
     const len = blk: {
-        const file = cwd.openFile(io, manifest_path, .{ .follow_symlinks = false, .allow_directory = false }) catch |err| switch (err) {
-            error.SymLinkLoop => return .{ .refused = .manifest_symlink },
+        // Without following a link and without blocking: a FIFO swapped
+        // in after the `lstat` is refused here.
+        const file = platform.safe_open.openRegular(io, manifest_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.SymLink => return .{ .refused = .manifest_symlink },
             error.FileNotFound => return .{ .refused = .missing },
-            error.IsDir => return .{ .refused = .manifest_not_regular },
-            else => return .{ .refused = .manifest_unreadable },
+            error.NotRegular => return .{ .refused = .manifest_not_regular },
+            error.AccessDenied, error.Unreadable => return .{ .refused = .manifest_unreadable },
         };
         defer file.close(io);
-        const fst = file.stat(io) catch return .{ .refused = .manifest_unreadable };
-        if (fst.kind != .file) return .{ .refused = .manifest_not_regular };
         break :blk file.readPositionalAll(io, &buf, 0) catch return .{ .refused = .manifest_unreadable };
     };
     const parsed = switch (parse(buf[0..len], os, stem)) {
@@ -268,7 +278,8 @@ pub fn readTrusted(a: std.mem.Allocator, io: std.Io, store_root: []const u8, os:
         .refused => |r| return .{ .refused = r },
     };
 
-    // The library: resolved, inside the resolved store, a regular file.
+    // The library: resolved, inside the resolved store, at exactly the
+    // generation's own path, a regular file.
     const store_real = cwd.realPathFileAlloc(io, store_root, a) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .refused = .store_unresolvable },
@@ -283,10 +294,30 @@ pub fn readTrusted(a: std.mem.Allocator, io: std.Io, store_root: []const u8, os:
     var keep = false;
     defer if (!keep) a.free(lib);
     if (!inside(store_real, lib)) return .{ .refused = .library_outside_store };
-    const lst = cwd.statFile(io, lib, .{ .follow_symlinks = false }) catch return .{ .refused = .library_missing };
-    if (lst.kind != .file) return .{ .refused = .library_not_regular };
+    var n_buf: [16]u8 = undefined;
+    var name_buf: [max_lib_name + 32]u8 = undefined;
+    const expected = try std.fs.path.join(a, &.{
+        store_real,
+        "gen",
+        std.fmt.bufPrint(&n_buf, "{d}", .{parsed.n}) catch unreachable,
+        platform.path.libName(&name_buf, os, stem, parsed.n) catch unreachable,
+    });
+    defer a.free(expected);
+    if (!std.mem.eql(u8, lib, expected)) return .{ .refused = .library_not_at_path };
+    const ident: ?platform.safe_open.Identity = blk: {
+        const file = platform.safe_open.openRegular(io, lib, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.NotRegular => return .{ .refused = .library_not_regular },
+            error.FileNotFound, error.SymLink => return .{ .refused = .library_missing },
+            error.AccessDenied, error.Unreadable => return .{ .refused = .library_missing },
+        };
+        defer file.close(io);
+        break :blk platform.safe_open.identity(file) catch |err| switch (err) {
+            error.Unsupported => null,
+            error.Unreadable => return .{ .refused = .library_missing },
+        };
+    };
     keep = true;
-    return .{ .ok = .{ .n = parsed.n, .lib = lib, .inode = lst.inode } };
+    return .{ .ok = .{ .n = parsed.n, .lib = lib, .ident = ident } };
 }
 
 /// True when the resolved path `path` lies below the resolved folder `root`.
@@ -301,7 +332,8 @@ fn inside(root: []const u8, path: []const u8) bool {
 
 /// Repeats every check right before the load: the manifest must still name
 /// the same generation and the library must still resolve to the same
-/// regular file. Null when nothing changed.
+/// regular file, with the same device, inode, size and modification time.
+/// Null when nothing changed.
 pub fn recheck(a: std.mem.Allocator, io: std.Io, store_root: []const u8, t: *const Trusted, os: std.Target.Os.Tag, stem: []const u8) std.mem.Allocator.Error!?Refusal {
     var again = try readTrusted(a, io, store_root, os, stem);
     defer again.deinit(a);
@@ -309,7 +341,10 @@ pub fn recheck(a: std.mem.Allocator, io: std.Io, store_root: []const u8, t: *con
         .ok => |*n| n,
         .refused => return .changed_before_load,
     };
-    if (now.n != t.n or now.inode != t.inode or !std.mem.eql(u8, now.lib, t.lib)) return .changed_before_load;
+    if (now.n != t.n or !std.mem.eql(u8, now.lib, t.lib)) return .changed_before_load;
+    if (now.ident != null and t.ident != null) {
+        if (!now.ident.?.eql(t.ident.?)) return .changed_before_load;
+    } else if (now.ident != null or t.ident != null) return .changed_before_load;
     return null;
 }
 
@@ -619,16 +654,20 @@ test "readTrusted refuses symbolic links that leave the store, a linked manifest
     try s.writeManifest(3);
     try expectReadRefused(&s, a, .library_outside_store);
 
-    // A link that stays inside the store is followed.
+    // A link inside the store that points generation 4's path at
+    // generation 1's library: one file would run as two generations.
     try s.tmp.dir.createDirPath(io, "store/gen/4");
     var p4: [128]u8 = undefined;
     try s.tmp.dir.symLink(io, try std.fmt.bufPrint(&p2, "../1/{s}", .{libFor(&name_buf, 1)}), try std.fmt.bufPrint(&p4, "store/gen/4/{s}", .{libFor(&name_buf, 4)}), .{});
     try s.writeManifest(4);
-    {
-        var r = try s.read(a);
-        defer r.deinit(a);
-        try testing.expect(std.mem.endsWith(u8, r.ok.lib, libFor(&name_buf, 1)));
-    }
+    try expectReadRefused(&s, a, .library_not_at_path);
+    // A generation folder that is a link to another folder inside the store.
+    var p6: [128]u8 = undefined;
+    try s.tmp.dir.createDirPath(io, "store/other");
+    try s.tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&p6, "store/other/{s}", .{libFor(&name_buf, 6)}), .data = "library" });
+    try s.tmp.dir.symLink(io, "../other", "store/gen/6", .{ .is_directory = true });
+    try s.writeManifest(6);
+    try expectReadRefused(&s, a, .library_not_at_path);
 
     // The library is a folder.
     var p5: [128]u8 = undefined;
@@ -678,4 +717,78 @@ test "recheck refuses a library or manifest that changed after the check" {
         try s.tmp.dir.symLink(io, outside_manifest, "store/manifest", .{});
         try testing.expectEqual(Refusal.changed_before_load, (try recheck(a, io, s.store, &r.ok, lib_os, "zmod")).?);
     }
+}
+
+fn mkfifo(a: std.mem.Allocator, rel_to_root: []const u8, s: *TestStore) !void {
+    const p = try std.fs.path.join(a, &.{ s.root, rel_to_root });
+    defer a.free(p);
+    const r = try std.process.run(a, testing.io, .{ .argv = &.{ "mkfifo", p } });
+    defer a.free(r.stdout);
+    defer a.free(r.stderr);
+    if (!r.term.success()) return error.MkfifoFailed;
+}
+
+test "readTrusted refuses a FIFO manifest or library without blocking" {
+    if (lib_os == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = testing.io;
+    var s = try TestStore.init(a);
+    defer s.deinit(a);
+    try mkfifo(a, "store/manifest", &s);
+    try expectReadRefused(&s, a, .manifest_not_regular);
+    try s.tmp.dir.deleteFile(io, "store/manifest");
+
+    var name_buf: [64]u8 = undefined;
+    var p1: [128]u8 = undefined;
+    try s.tmp.dir.createDirPath(io, "store/gen/1");
+    try mkfifo(a, try std.fmt.bufPrint(&p1, "store/gen/1/{s}", .{libFor(&name_buf, 1)}), &s);
+    try s.writeManifest(1);
+    try expectReadRefused(&s, a, .library_not_regular);
+
+    // A FIFO swapped in for the library after the check: the re-check
+    // refuses instead of waiting for a writer.
+    var p2: [128]u8 = undefined;
+    const rel2 = try s.addLib(&p2, 2);
+    try s.writeManifest(2);
+    var r = try s.read(a);
+    defer r.deinit(a);
+    try s.tmp.dir.deleteFile(io, rel2);
+    try mkfifo(a, rel2, &s);
+    try testing.expectEqual(Refusal.changed_before_load, (try recheck(a, io, s.store, &r.ok, lib_os, "zmod")).?);
+}
+
+test "recheck sees a library rewritten in place" {
+    if (lib_os == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = testing.io;
+    var s = try TestStore.init(a);
+    defer s.deinit(a);
+    var buf: [256]u8 = undefined;
+    const rel = try s.addLib(&buf, 1);
+    try s.writeManifest(1);
+    var r = try s.read(a);
+    defer r.deinit(a);
+    // Same inode, other size.
+    const f = try s.tmp.dir.openFile(io, rel, .{ .mode = .write_only });
+    try f.writePositionalAll(io, "longer library", 0);
+    f.close(io);
+    try testing.expectEqual(Refusal.changed_before_load, (try recheck(a, io, s.store, &r.ok, lib_os, "zmod")).?);
+}
+
+test "a store folder that is a symbolic link is followed" {
+    if (lib_os == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = testing.io;
+    var s = try TestStore.init(a);
+    defer s.deinit(a);
+    var buf: [256]u8 = undefined;
+    _ = try s.addLib(&buf, 1);
+    try s.writeManifest(1);
+    try s.tmp.dir.symLink(io, s.store, "linked", .{ .is_directory = true });
+    const linked = try std.fs.path.join(a, &.{ s.root, "linked" });
+    defer a.free(linked);
+    var r = try readTrusted(a, io, linked, lib_os, "zmod");
+    defer r.deinit(a);
+    // The library resolves inside the link's target.
+    try testing.expect(std.mem.startsWith(u8, r.ok.lib, s.store));
 }

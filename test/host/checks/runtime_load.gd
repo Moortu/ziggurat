@@ -1,8 +1,8 @@
 extends SceneTree
 # Host tests "load good module", "load refuses bad module" and "name maps use
 # interned names". The Zig test built the modules and listed their paths in
-# res://modules.txt (good, other_sdk, truncated). Prints one ZTEST line per
-# case, then ZTEST DONE.
+# res://modules.txt (good, other_sdk, truncated, and hard and soft: links to
+# good). Prints one ZTEST line per case, then ZTEST DONE.
 
 var failed := false
 
@@ -80,6 +80,10 @@ func good_load(probe: Object, m: Dictionary) -> void:
 func refusals_after_load(probe: Object, m: Dictionary) -> void:
 	var why := expect_refused(probe, m["good"], 1, ["already loaded"])
 	report("load_refuses_bad_module_same_generation", why == "", why)
+	why = expect_refused(probe, m["hard"], 5, ["libhard.so", "same file as generation 1"])
+	report("load_refuses_same_file_hard_link", why == "" and probe.init_calls(5) == 0, why)
+	why = expect_refused(probe, m["soft"], 6, ["libsoft.so", "same file as generation 1"])
+	report("load_refuses_same_file_symbolic_link", why == "" and probe.init_calls(6) == 0, why)
 	why = expect_refused(probe, m["truncated"], 4, ["libtruncated.so"])
 	report("load_refuses_bad_module_keeps_current", why == "" and probe.current_generation() == 1 and probe.init_calls(1) == 1,
 		"%s; current %d, init calls %d" % [why, probe.current_generation(), probe.init_calls(1)])

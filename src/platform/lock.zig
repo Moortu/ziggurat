@@ -4,6 +4,7 @@
 //! Windows. The caller retries until its timeout ends.
 const std = @import("std");
 const path = @import("path.zig");
+const safe_open = @import("safe_open.zig");
 
 pub const Mode = enum { shared, exclusive };
 
@@ -12,16 +13,17 @@ pub const FileLock = struct {
     io: std.Io,
 
     pub const Error = error{Timeout} ||
-        std.Io.File.OpenError ||
+        safe_open.OpenError ||
         std.Io.File.LockError ||
         std.Io.Cancelable;
 
-    /// Opens (creating if needed, never truncating) the lock file at `p` and
-    /// takes the lock. The parent folder must exist. Returns `error.Timeout`
+    /// Opens (creating if needed, never truncating, never following a
+    /// symbolic link and never blocking on a FIFO: `safe_open.openLockFile`)
+    /// the regular lock file at `p` and takes the lock. The parent folder must exist. Returns `error.Timeout`
     /// when the lock is still held by someone else after `timeout_ms`.
     /// `timeout_ms = 0` tries exactly once.
     pub fn acquire(io: std.Io, p: path.OsPath, mode: Mode, timeout_ms: u32) Error!FileLock {
-        const file = try std.Io.Dir.cwd().createFile(io, p.bytes, .{ .read = true, .truncate = false });
+        const file = try safe_open.openLockFile(io, p.bytes);
         errdefer file.close(io);
         const kind: std.Io.File.Lock = switch (mode) {
             .shared => .shared,
