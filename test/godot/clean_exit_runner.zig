@@ -76,7 +76,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (std.mem.indexOf(u8, out, module_init_marker) == null) try problems.append(arena, "the moduleInit log line did not reach Godot's output");
     if (std.mem.indexOf(u8, out, "ZTEST NOMEM") != null) try problems.append(arena, "Godot's tracked memory usage reads 0 (a release Godot?), so the heap check measured nothing");
     if (std.mem.indexOf(u8, out, "ZTEST LEAK") != null) try problems.append(arena, "a test leaked Godot heap memory");
-    try scan.checkReports(arena, out, &problems);
+    try scan.checkReports(arena, out, &.{}, &problems);
 
     if (problems.items.len == 0) return 0;
     std.debug.print("--- Godot output (stdout, then stderr) ---\n{s}\n---\n", .{out});

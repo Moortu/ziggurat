@@ -10,11 +10,12 @@
 //! never closed (spec section 6, unload policy): its code may still be on a
 //! stack or in a Godot callback, and its static data backs the table.
 //!
-//! Threads: `load`, `current`, `shutdown` and `ScriptNames` construction run
+//! Threads: `load`, `shutdown` and `ScriptNames` construction run
 //! on the main thread (`load` refuses any other). The `HostApi` functions run
 //! on any thread: `mu` (locked with the process Io, `host_io`) guards the
 //! list of generations; the byte counters are atomics, and memory is
-//! allocated and freed outside the lock.
+//! allocated and freed outside the lock. `current` runs on any thread: the
+//! current-generation pointer is atomic (release on publish, acquire on read).
 const std = @import("std");
 const godot = @import("gdzig");
 const abi = @import("ziggurat_abi");
@@ -71,8 +72,11 @@ var list_allocator: ?Allocator = null;
 var user_heap_bytes: std.atomic.Value(u64) = .init(0);
 /// The thread `setEngine` ran on (Godot's main thread), or null before it.
 var main_thread: ?std.Thread.Id = null;
-/// The generation scripts use now. Main thread only.
-var current_gen: ?*Generation = null;
+/// The generation scripts use now. Written on the main thread with release
+/// ordering after the generation is complete; read from any thread
+/// (script virtuals run on resource-loader threads too) with acquire
+/// ordering, so a reader that sees the pointer also sees its maps.
+var current_gen: std.atomic.Value(?*Generation) = .init(null);
 /// Set once `request_swap` has logged.
 var swap_logged: std.atomic.Value(bool) = .init(false);
 
@@ -180,7 +184,7 @@ pub fn load(a: Allocator, path: OsPath, n: u32, diag: *[256]u8) LoadError!*Gener
     keep = true;
     gen.init_calls += 1;
     init(&host_api, n);
-    current_gen = gen;
+    current_gen.store(gen, .release);
     return gen;
 }
 
@@ -197,9 +201,9 @@ fn onMainThread() bool {
 }
 
 /// The generation scripts use now, or null before the first good load.
-/// Main thread only.
+/// Any thread; the generation it returns is never freed.
 pub fn current() ?*Generation {
-    return current_gen;
+    return current_gen.load(.acquire);
 }
 
 /// The loaded generation `n`, or null.
@@ -235,7 +239,7 @@ pub fn liveBytes(gen: u32) ?u64 {
 /// stay registered, so a late `HostApi` call from module code stays safe.
 /// Main thread, at SCENE exit.
 pub fn shutdown() void {
-    current_gen = null;
+    current_gen.store(null, .release);
     const io = host_io.get();
     const a = list_allocator orelse return;
     mu.lockUncancelable(io);

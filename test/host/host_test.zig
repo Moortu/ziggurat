@@ -99,21 +99,27 @@ const Project = struct {
     /// Runs `res://check.gd` headless; every `expect` text must appear in
     /// Godot's output. Fails the test with the runner's report otherwise.
     fn runScript(p: *Project, expect: []const []const u8) !void {
-        return p.run(&.{ "script", "res://check.gd" }, expect);
+        return p.run(&.{ "script", "res://check.gd" }, expect, &.{});
+    }
+
+    /// As `runScript`; each `once` text must appear exactly once.
+    fn runScriptOnce(p: *Project, expect: []const []const u8, once: []const []const u8) !void {
+        return p.run(&.{ "script", "res://check.gd" }, expect, once);
     }
 
     /// Opens the project in the headless editor for `frames` frames.
     fn runEditor(p: *Project, frames: []const u8, expect: []const []const u8) !void {
-        return p.run(&.{ "editor", frames }, expect);
+        return p.run(&.{ "editor", frames }, expect, &.{});
     }
 
-    fn run(p: *Project, mode: []const []const u8, expect: []const []const u8) !void {
+    fn run(p: *Project, mode: []const []const u8, expect: []const []const u8, once: []const []const u8) !void {
         const a = p.arena_state.allocator();
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.appendSlice(a, &.{ opts.runner_exe, opts.godot_exe, p.path });
         try argv.appendSlice(a, mode);
         try argv.append(a, deadline_s);
         for (expect) |text| try argv.appendSlice(a, &.{ "--expect", text });
+        for (once) |text| try argv.appendSlice(a, &.{ "--expect-once", text });
         const result = try std.process.run(a, io, .{ .argv = argv.items });
         if (result.term.success()) return;
         std.debug.print("{s}{s}", .{ result.stdout, result.stderr });
@@ -467,25 +473,31 @@ test "script reports descriptors, script without descriptors, update_exports is 
     // Run 1 answers from the loaded module and writes the descriptor cache;
     // run 2 is a fresh Godot process whose language reads that cache.
     try p.addCheck("script_descriptors.gd");
-    try p.runScript(&.{
+    try p.runScriptOnce(&.{
         "ZTEST PASS script_without_descriptors\n",
         "ZTEST PASS script_without_descriptors_unknown_path",
         "ZTEST PASS script_reports_descriptors_lists",
         "ZTEST PASS script_reports_descriptors_queries",
+        "ZTEST PASS script_path_normalised",
         "ZTEST PASS script_reports_descriptors_defaults_members",
         "ZTEST PASS script_reports_descriptors_member_lines",
         "ZTEST PASS script_source_code",
         "ZTEST PASS can_instantiate_game",
         "ZTEST PASS instance_create_refused",
-        "Script res://player.zig cannot create instances yet.",
         "ZTEST PASS reload_returns_ok",
         "ZTEST PASS script_cache_write",
+    }, &.{
+        // Two refused instances of the same script, one line; two reloads, one line.
+        "Script res://player.zig cannot create instances yet.",
+        "Script res://player.zig reloads when a new build is loaded",
     });
     try p.runScript(&.{
         "ZTEST PASS second_run_has_no_module",
         "ZTEST PASS script_reports_descriptors_from_cache\n",
         "ZTEST PASS script_reports_descriptors_from_cache_queries",
         "ZTEST PASS update_exports_is_idempotent",
+        "ZTEST PASS has_default_same_from_cache_and_module",
+        "ZTEST PASS cache_ignored_after_load",
         "ZTEST PASS script_reports_loaded_after_cache",
     });
 }
@@ -507,5 +519,7 @@ test "can_instantiate rule in the editor" {
         "ZTEST PASS can_instantiate_editor_tool",
         "ZTEST PASS can_instantiate_editor_no_descriptors",
         "ZTEST PASS editor_placeholder_refused",
+        "ZTEST PASS editor_load_module",
+        "ZTEST PASS editor_rule_after_load",
     });
 }

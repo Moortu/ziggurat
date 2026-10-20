@@ -146,6 +146,8 @@ func first_run(probe: Object) -> void:
 	var info: Dictionary = probe.script_method_info(player, &"leap")
 	if info.get("name") != "leap" or info.get("return", {}).get("type") != TYPE_FLOAT or not probe.script_method_info(player, &"nope").is_empty():
 		why += "method info %s; " % [info]
+	if probe.script_method_arg_count(player, &"take_damage") != 2 or probe.script_method_arg_count(player, &"leap") != 1 or probe.script_method_arg_count(player, &"nope") != -1:
+		why += "argument counts %d %d %d; " % [probe.script_method_arg_count(player, &"take_damage"), probe.script_method_arg_count(player, &"leap"), probe.script_method_arg_count(player, &"nope")]
 	report("script_reports_descriptors_queries", why == "", why)
 
 	why = ""
@@ -159,6 +161,13 @@ func first_run(probe: Object) -> void:
 	if not player.get_script_constant_map().is_empty() or player.get_rpc_config() != {}:
 		why += "constants %s, rpc %s; " % [player.get_script_constant_map(), player.get_rpc_config()]
 	report("script_reports_descriptors_defaults_members", why == "", why)
+
+	# Paths set directly are normalised; case matters.
+	var odd := zig_script("res://./ui//hud_label.zig")
+	var upper := zig_script("res://Player.zig")
+	report("script_path_normalised", probe.script_is_valid(odd) and odd.is_tool() and not probe.script_is_valid(upper), "res://./ui//hud_label.zig valid %s, res://Player.zig valid %s" % [probe.script_is_valid(odd), probe.script_is_valid(upper)])
+	odd = null
+	upper = null
 
 	# Member lines: the first top-level line declaring the member.
 	var text := FileAccess.get_file_as_string("res://player_source.txt")
@@ -192,11 +201,25 @@ func first_run(probe: Object) -> void:
 	node.set_script(player)
 	report("instance_create_refused", node.get_script() == null, "node has a script")
 	node.free()
+	# A second refusal of the same script is not logged again (the Zig test
+	# counts the log line).
+	node = Node.new()
+	node.set_script(player)
+	node.free()
 
 	report("reload_returns_ok", player.reload() == OK and player.reload(true) == OK, "reload failed")
 
 	var err: String = probe.cache_write(ProjectSettings.globalize_path(CACHE))
 	report("script_cache_write", err == "", err)
+	# A cache entry the module does not have: a script deleted since. Added
+	# as text (Godot's JSON.stringify would write integers as floats, which
+	# the cache refuses).
+	var text_cache := FileAccess.get_file_as_string(CACHE)
+	var end := text_cache.rfind("]")
+	text_cache = text_cache.substr(0, end) + ", {\"path\": \"ghost.zig\", \"base_class\": \"Node\", \"layout_hash\": \"1\"}" + text_cache.substr(end)
+	var cf := FileAccess.open(CACHE, FileAccess.WRITE)
+	cf.store_string(text_cache)
+	cf.close()
 	var f := FileAccess.open(LISTS, FileAccess.WRITE)
 	f.store_string(dump(player) + dump(hud))
 	f.close()
@@ -220,7 +243,18 @@ func second_run(probe: Object) -> void:
 		why += "default, method or signal; "
 	if probe.script_members(player).size() != 8 or probe.script_method_info(player, &"leap").get("name") != "leap":
 		why += "members or method info; "
+	if probe.script_method_arg_count(player, &"take_damage") != 2:
+		why += "argument count; "
 	report("script_reports_descriptors_from_cache_queries", why == "", why)
+
+	# Default presence: the same answer from the cache and from the module.
+	var names := ["speed", "health", "alive", "mood", "layers", "spawn_point", "title", "target", "Movement/Fast motion", "nope"]
+	var cached_defaults := []
+	for n in names:
+		cached_defaults.append(probe.script_has_default(player, StringName(n)))
+
+	var ghost := zig_script("res://ghost.zig")
+	var ghost_before: bool = probe.script_is_valid(ghost)
 
 	# Godot calls update_exports once per property during a scene save:
 	# only a new descriptor generation refreshes.
@@ -231,6 +265,13 @@ func second_run(probe: Object) -> void:
 	report("load", diag == "", diag)
 	var c: int = probe.script_update_exports(player, 50)
 	report("update_exports_is_idempotent", a == 1 and b == 0 and c == 2, "refreshes: cache %d, no descriptors %d, after load %d" % [a, b, c])
+	var module_defaults := []
+	for n in names:
+		module_defaults.append(probe.script_has_default(player, StringName(n)))
+	report("has_default_same_from_cache_and_module", cached_defaults == module_defaults and cached_defaults == [true, true, true, true, true, true, true, true, false, false], "cache %s, module %s" % [cached_defaults, module_defaults])
+	# Once a module is loaded, the cache no longer answers.
+	report("cache_ignored_after_load", ghost_before and not probe.script_is_valid(ghost) and ghost.get_script_property_list().is_empty(), "ghost valid before %s, after %s" % [ghost_before, probe.script_is_valid(ghost)])
+	ghost = null
 	report("script_reports_loaded_after_cache", player.get_script_property_list() == probe.property_list(probe.find_script("player.zig")), "property list differs after load")
 	player = null
 	hud = null

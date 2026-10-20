@@ -4,11 +4,12 @@
 //! every script-level question Godot and the editor ask from the script's
 //! descriptor. The descriptor is found by the script's project-relative path
 //! (its resource path without `res://`), in this order:
-//! 1. the current module generation (`runtime.current`), when it has a
-//!    script at that path;
-//! 2. the descriptor cache the language read at startup
-//!    (`.godot/ziggurat/descriptors.json`, `loadStartupCache`), so the
-//!    Inspector works before the first build of the session is done;
+//! 1. once a module generation is loaded (`runtime.current`), that
+//!    generation alone: a script it does not have has no descriptor (it was
+//!    deleted or renamed), whatever the cache says;
+//! 2. before the first load, the descriptor cache the language read at
+//!    startup (`.godot/ziggurat/descriptors.json`, `loadStartupCache`), so
+//!    the Inspector works before the first build of the session is done;
 //! 3. none: the script is not valid, has empty lists and lets Godot keep
 //!    scene values with placeholder fallback.
 //! Nothing is copied: every answer is read from the descriptor in use, so a
@@ -29,6 +30,7 @@ const snake = @import("snake");
 const runtime = @import("runtime.zig");
 const props = @import("props.zig");
 const desc_cache = @import("desc_cache.zig");
+const default_value = @import("default_value.zig");
 const host_io = @import("host_io.zig");
 const language = @import("language.zig");
 
@@ -234,6 +236,37 @@ const Desc = union(enum) {
         return false;
     }
 
+    /// Whether property entry `i` has a default, by one rule for both
+    /// sources: the default exists and has a stored form in the descriptor
+    /// cache (`default_value`), so it survives the cache round trip. A
+    /// module default the cache would drop (a string over
+    /// `default_value.max_text_bytes`, a non-finite vector) has none, as it
+    /// has none when read back from the cache. Calls the module's
+    /// `get_default` for a loaded descriptor.
+    fn hasDefault(d: Desc, i: u32) bool {
+        switch (d) {
+            .loaded => {
+                const desc = d.abiDesc().?;
+                const v = props.defaultValue(desc, i) orelse return false;
+                defer v.deinit();
+                var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
+                defer arena.deinit();
+                const stored = default_value.fromVariant(arena.allocator(), desc.properties[i].variant_type, v) catch return false;
+                return stored != .absent and default_value.fits(desc.properties[i].variant_type, stored);
+            },
+            // `desc_cache.parse` already dropped defaults that do not fit.
+            .cached => |c| return c.script.properties[i].default != .absent,
+        }
+    }
+
+    /// The argument count of method `i`.
+    fn methodArgCount(d: Desc, i: u32) u32 {
+        return switch (d) {
+            .loaded => d.abiDesc().?.methods[i].arg_count,
+            .cached => |c| @intCast(c.script.methods[i].args.len),
+        };
+    }
+
     /// The default value of property entry `i`; the caller owns it.
     fn defaultValue(d: Desc, i: u32) ?Variant {
         return switch (d) {
@@ -271,10 +304,13 @@ const Desc = union(enum) {
     }
 };
 
-/// The descriptor of the script at project-relative path `rel`.
+/// The descriptor of the script at project-relative path `rel`. Once a
+/// generation is loaded the cache is never asked (no stale validity for a
+/// script the module no longer has).
 fn findDesc(rel: []const u8) ?Desc {
     if (runtime.current()) |gen| {
-        if (runtime.findScript(gen, rel)) |i| return .{ .loaded = .{ .gen = gen, .index = i } };
+        const i = runtime.findScript(gen, rel) orelse return null;
+        return .{ .loaded = .{ .gen = gen, .index = i } };
     }
     if (startup_cache) |*c| {
         if (c.find(rel)) |s| return .{ .cached = .{ .script = s, .n = c.generation() } };
@@ -297,12 +333,36 @@ fn nameText(sn: StringName, buf: []u8) ?[]const u8 {
     return stringText(&s, buf);
 }
 
-/// The project-relative path of a `res://` resource path; null for any
-/// other path (an unsaved script has none).
-pub fn relPath(res_path: []const u8) ?[]const u8 {
+/// The project-relative path of a `res://` resource path, normalised into
+/// `buf` like Godot's `String::simplify_path` (core/string/ustring.cpp:4149):
+/// a backslash becomes `/`, empty and `.` segments are dropped and `..` removes the
+/// segment before it. Null for any other path (an unsaved script has none),
+/// for a `..` that would leave the project, for an empty result and when
+/// `buf` is too small. Paths set by the resource loader are already
+/// simplified; paths set directly (`resource_path`, `take_over_path`) may
+/// not be. The result is compared byte for byte with the table's paths:
+/// Godot resource paths are case-sensitive, so `res://Player.zig` is not
+/// `res://player.zig`.
+pub fn relPath(res_path: []const u8, buf: []u8) ?[]const u8 {
     const prefix = "res://";
-    if (!std.mem.startsWith(u8, res_path, prefix) or res_path.len == prefix.len) return null;
-    return res_path[prefix.len..];
+    if (!std.mem.startsWith(u8, res_path, prefix)) return null;
+    var len: usize = 0;
+    var it = std.mem.tokenizeAny(u8, res_path[prefix.len..], "/\\");
+    while (it.next()) |seg| {
+        if (std.mem.eql(u8, seg, ".")) continue;
+        if (std.mem.eql(u8, seg, "..")) {
+            if (len == 0) return null;
+            len = if (std.mem.lastIndexOfScalar(u8, buf[0..len], '/')) |slash| slash else 0;
+            continue;
+        }
+        const sep: usize = if (len == 0) 0 else 1;
+        if (len + sep + seg.len > buf.len) return null;
+        if (sep == 1) buf[len] = '/';
+        @memcpy(buf[len + sep ..][0..seg.len], seg);
+        len += sep + seg.len;
+    }
+    if (len == 0) return null;
+    return buf[0..len];
 }
 
 // ------------------------------------------------------------ member lines
@@ -366,6 +426,8 @@ pub const ZigScript = struct {
     export_refreshes: u32 = 0,
     /// Set once a reload request has been logged.
     reload_logged: bool = false,
+    /// Set once a refused instance has been logged.
+    instance_logged: bool = false,
 
     pub fn create(allocator: *Allocator) !*ZigScript {
         const self = try allocator.create(ZigScript);
@@ -396,7 +458,8 @@ pub const ZigScript = struct {
         defer path.deinit();
         var buf: [max_path_bytes]u8 = undefined;
         const res_path = stringText(&path, &buf) orelse return null;
-        return findDesc(relPath(res_path) orelse return null);
+        var rel_buf: [max_path_bytes]u8 = undefined;
+        return findDesc(relPath(res_path, &rel_buf) orelse return null);
     }
 
     /// Writes `Script <path> <what>` to Godot's output.
@@ -470,14 +533,21 @@ pub const ZigScript = struct {
     // ---------------------------------------------------------- instances
 
     /// Godot keeps the object without a script when this returns null.
+    /// Logged once per script.
     pub fn _instanceCreate(self: *ZigScript, _: ?*Object) ?*anyopaque {
-        self.logScript("cannot create instances yet.");
+        self.logRefusedInstance();
         return null;
     }
 
     pub fn _placeholderInstanceCreate(self: *ZigScript, _: ?*Object) ?*anyopaque {
-        self.logScript("cannot create instances yet.");
+        self.logRefusedInstance();
         return null;
+    }
+
+    fn logRefusedInstance(self: *ZigScript) void {
+        if (self.instance_logged) return;
+        self.instance_logged = true;
+        self.logScript("cannot create instances yet.");
     }
 
     /// The script keeps no list of placeholder instances, so there is
@@ -539,6 +609,14 @@ pub const ZigScript = struct {
         return d.methodIndex(method) != null;
     }
 
+    /// The method's argument count as an int Variant; nil for an unknown
+    /// method, so Godot falls back to its default (unknown count).
+    pub fn _getScriptMethodArgumentCount(self: *ZigScript, method: StringName) Variant {
+        const d = self.desc() orelse return .nil;
+        const i = d.methodIndex(method) orelse return .nil;
+        return Variant.init(i64, d.methodArgCount(i));
+    }
+
     pub fn _hasStaticMethod(_: *ZigScript, _: StringName) bool {
         return false;
     }
@@ -572,14 +650,15 @@ pub const ZigScript = struct {
         return d.signalList();
     }
 
-    /// True for every exported property with a default (all of them: the
-    /// SDK requires one), so scene values survive saving.
+    /// True for an exported property whose default round-trips through
+    /// the descriptor cache (`Desc.hasDefault`), the same answer from a
+    /// loaded module and from the cache. The SDK requires a default for
+    /// every field, so this is false only for defaults with no stored form;
+    /// Godot then saves that property's value in every scene.
     pub fn _hasPropertyDefaultValue(self: *ZigScript, property: StringName) bool {
         const d = self.desc() orelse return false;
         const i = d.propertyIndex(property) orelse return false;
-        const v = d.defaultValue(i) orelse return false;
-        v.deinit();
-        return true;
+        return d.hasDefault(i);
     }
 
     pub fn _getPropertyDefaultValue(self: *ZigScript, property: StringName) Variant {
@@ -686,11 +765,29 @@ test "member line follows the SDK marker rule with Godot names" {
 }
 
 test "relative path of a resource path" {
-    try testing.expectEqualStrings("player.zig", relPath("res://player.zig").?);
-    try testing.expectEqualStrings("ui/hud.zig", relPath("res://ui/hud.zig").?);
-    try testing.expect(relPath("res://") == null);
-    try testing.expect(relPath("") == null);
-    try testing.expect(relPath("user://a.zig") == null);
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("player.zig", relPath("res://player.zig", &buf).?);
+    try testing.expectEqualStrings("ui/hud.zig", relPath("res://ui/hud.zig", &buf).?);
+    try testing.expect(relPath("res://", &buf) == null);
+    try testing.expect(relPath("", &buf) == null);
+    try testing.expect(relPath("user://a.zig", &buf) == null);
+}
+
+test "relative path is normalised like simplify_path" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("a.zig", relPath("res://./a.zig", &buf).?);
+    try testing.expectEqualStrings("a/b.zig", relPath("res://a//b.zig", &buf).?);
+    try testing.expectEqualStrings("a/b.zig", relPath("res:///a/./b.zig", &buf).?);
+    try testing.expectEqualStrings("a/b.zig", relPath("res://a\\b.zig", &buf).?);
+    try testing.expectEqualStrings("b.zig", relPath("res://a/../b.zig", &buf).?);
+    try testing.expectEqualStrings("x/b.zig", relPath("res://x/a/c/../../b.zig", &buf).?);
+    try testing.expect(relPath("res://../a.zig", &buf) == null);
+    try testing.expect(relPath("res://a/../..", &buf) == null);
+    try testing.expect(relPath("res://./", &buf) == null);
+    // Case-sensitive: kept as written.
+    try testing.expectEqualStrings("Player.zig", relPath("res://Player.zig", &buf).?);
+    var small: [4]u8 = undefined;
+    try testing.expect(relPath("res://abcde.zig", &small) == null);
 }
 
 test "descriptor keys tell sources and generations apart" {

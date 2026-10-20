@@ -4,8 +4,9 @@ extends Node
 # the headless editor. An earlier script run wrote the descriptor cache; the
 # language read it at startup, so the scripts have descriptors without a
 # loaded module. Checks that a non-tool Zig script cannot make instances in
-# the editor while a tool script can (GDScript's rule). Prints one ZTEST
-# line per case, then ZTEST DONE; the runner's --quit-after ends the editor.
+# the editor while a tool script can (GDScript's rule), then loads the
+# module and checks again. Prints one ZTEST line per case, then ZTEST DONE;
+# the runner's --quit-after ends the editor.
 
 
 func report(name: String, ok: bool, why: String) -> void:
@@ -37,4 +38,17 @@ func _ready() -> void:
 	node.set_script(player)
 	report("editor_placeholder_refused", node.get_script() == null, "node has a script")
 	node.free()
+	# Loading a module in the editor leaves the module's static StringNames
+	# at exit; the runner accepts them (only non-static references count).
+	var diag: String = probe.load_module(module_path(), 1)
+	report("editor_load_module", diag == "", diag)
+	if diag == "":
+		report("editor_rule_after_load", not player.can_instantiate() and hud.can_instantiate() and probe.current_generation() == 1, "rule changed after load")
 	print("ZTEST DONE")
+
+
+func module_path() -> String:
+	for line in FileAccess.get_file_as_string("res://modules.txt").split("\n", false):
+		if line.begins_with("good="):
+			return line.substr(5)
+	return ""

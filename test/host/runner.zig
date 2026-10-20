@@ -11,28 +11,29 @@
 //! `--editor --quit-after <frames>`) with stdin from /dev/null and one
 //! deadline for the whole run. The run fails when Godot times out or exits
 //! non-zero, the output has no `ZTEST DONE` line, has a `ZTEST FAIL` line,
-//! lacks an `--expect` text, or has one of Godot's leak or crash reports
+//! lacks an `--expect` text, has an `--expect-once` text other than exactly
+//! once, or has one of Godot's leak or crash reports
 //! (`test/godot/output_scan.zig`). Godot's output is printed only on failure.
 //! Exits 0 on success, 1 on failure and 2 on a usage error.
 //!
-//! One exception, editor mode only: Godot 4.7.2's editor itself (headless
-//! or not, with no extension loaded) ends with the exact line in
-//! `stock_editor_lines`; that line, matched whole, is not a failure. Any
-//! other orphan StringName report still is.
+//! Orphan StringName reports fail only on ordinary (non-static) references
+//! beyond what Godot itself leaves: Godot 4.7.2's editor (headless or not,
+//! with no extension loaded) ends with `Orphan StringName: Node (static: 3,
+//! total: 4)`, one ordinary reference (`editor_stock`); script mode leaves
+//! none. Static references, such as a loaded module's comptime names, are
+//! never a failure.
 const std = @import("std");
 const Io = std.Io;
 const scan = @import("godot_output_scan");
 
-/// Exit-time lines the stock Godot 4.7.2 editor prints in an empty project
-/// with no extension (checked with `--editor --quit-after 30`, headless and
-/// under Xvfb).
-const stock_editor_lines = [_][]const u8{
-    "Orphan StringName: Node (static: 3, total: 4)",
-};
+/// StringNames the stock Godot 4.7.2 editor holds at exit in an empty
+/// project with no extension (checked with `--editor --quit-after 30`,
+/// headless and under Xvfb).
+const editor_stock = [_]scan.StockOrphan{.{ .name = "Node", .non_static = 1 }};
 
 const usage =
-    \\usage: runner <godot> <project dir> script <check.gd> <deadline s> [--expect <text>]...
-    \\       runner <godot> <project dir> editor <quit-after frames> <deadline s> [--expect <text>]...
+    \\usage: runner <godot> <project dir> script <check.gd> <deadline s> [--expect[-once] <text>]...
+    \\       runner <godot> <project dir> editor <quit-after frames> <deadline s> [--expect[-once] <text>]...
     \\
 ;
 
@@ -53,13 +54,15 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     };
     var expects: std.ArrayList([]const u8) = .empty;
+    var expects_once: std.ArrayList([]const u8) = .empty;
     var i: usize = 6;
     while (i < args.len) : (i += 2) {
-        if (!std.mem.eql(u8, args[i], "--expect") or i + 1 >= args.len) {
+        const once = std.mem.eql(u8, args[i], "--expect-once");
+        if (!(once or std.mem.eql(u8, args[i], "--expect")) or i + 1 >= args.len) {
             std.debug.print("runner: unexpected argument '{s}'\n{s}", .{ args[i], usage });
             return 2;
         }
-        try expects.append(arena, args[i + 1]);
+        try (if (once) &expects_once else &expects).append(arena, args[i + 1]);
     }
 
     var argv: std.ArrayList([]const u8) = .empty;
@@ -88,20 +91,25 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("runner: running Godot failed: {t} (deadline {d} s)\n", .{ err, deadline_s });
         return 1;
     };
-    const all = try std.mem.concat(arena, u8, &.{ result.stdout, result.stderr });
-    const out = if (std.mem.eql(u8, mode, "editor")) try withoutLines(arena, all, &stock_editor_lines) else all;
+    const out = try std.mem.concat(arena, u8, &.{ result.stdout, result.stderr });
+    const stock: []const scan.StockOrphan = if (std.mem.eql(u8, mode, "editor")) &editor_stock else &.{};
 
     var problems: std.ArrayList([]const u8) = .empty;
     if (!result.term.success()) try problems.append(arena, try std.fmt.allocPrint(arena, "Godot did not exit with status 0 ({any})", .{result.term}));
     try scan.checkTestMarkers(arena, out, &problems);
-    try scan.checkReports(arena, out, &problems);
+    try scan.checkReports(arena, out, stock, &problems);
     for (expects.items) |text| {
         if (std.mem.indexOf(u8, out, text) == null)
             try problems.append(arena, try std.fmt.allocPrint(arena, "missing expected text: {s}", .{text}));
     }
+    for (expects_once.items) |text| {
+        const n = std.mem.count(u8, out, text);
+        if (n != 1)
+            try problems.append(arena, try std.fmt.allocPrint(arena, "expected text {d} times, want once: {s}", .{ n, text }));
+    }
 
     if (problems.items.len == 0) return 0;
-    std.debug.print("--- Godot output (stdout, then stderr) ---\n{s}\n---\n", .{all});
+    std.debug.print("--- Godot output (stdout, then stderr) ---\n{s}\n---\n", .{out});
     for (problems.items) |p| std.debug.print("runner: {s}\n", .{p});
     return 1;
 }
@@ -122,27 +130,4 @@ fn writeExtensionList(arena: std.mem.Allocator, io: Io, project: []const u8) !vo
     }
     try dir.createDirPath(io, ".godot");
     try dir.writeFile(io, .{ .sub_path = ".godot/extension_list.cfg", .data = list.items });
-}
-
-/// `text` without the lines equal to one of `drop` (line ends kept as `\n`).
-fn withoutLines(arena: std.mem.Allocator, text: []const u8, drop: []const []const u8) ![]const u8 {
-    var kept: std.ArrayList(u8) = .empty;
-    var it = std.mem.splitScalar(u8, text, '\n');
-    while (it.next()) |line| {
-        const bare = std.mem.trimEnd(u8, line, "\r");
-        for (drop) |d| {
-            if (std.mem.eql(u8, bare, d)) break;
-        } else {
-            try kept.appendSlice(arena, line);
-            try kept.append(arena, '\n');
-        }
-    }
-    return kept.items;
-}
-
-test withoutLines {
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    const got = try withoutLines(arena_state.allocator(), "a\nOrphan StringName: Node (static: 3, total: 4)\nOrphan StringName: Node (static: 1, total: 2)\n", &stock_editor_lines);
-    try std.testing.expectEqualStrings("a\nOrphan StringName: Node (static: 1, total: 2)\n\n", got);
 }

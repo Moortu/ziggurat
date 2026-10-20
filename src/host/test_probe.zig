@@ -287,6 +287,14 @@ pub const ZigguratTestProbe = struct {
         return (s orelse return false)._hasPropertyDefaultValue(name);
     }
 
+    /// `_get_script_method_argument_count` as an int; -1 when it is nil.
+    pub fn scriptMethodArgCount(_: *ZigguratTestProbe, s: ?*ZigScript, name: StringName) i64 {
+        const v = (s orelse return -1)._getScriptMethodArgumentCount(name);
+        defer v.deinit();
+        if (v.tag != .int) return -1;
+        return v.as(i64) orelse -1;
+    }
+
     /// Calls `_update_exports` `times` times; returns how many refreshes the
     /// script has made in all.
     pub fn scriptUpdateExports(_: *ZigguratTestProbe, s: ?*ZigScript, times: i64) i64 {
@@ -319,16 +327,16 @@ fn cachedScript(rel: String) ?*const desc_cache.Script {
 }
 
 pub const method_names = [_][:0]const u8{
-    "property_list",         "method_list",        "signal_list",         "default_text",
-    "cache_write",           "cache_read",         "cache_rejections",    "cached_property_list",
-    "cached_method_list",    "cached_signal_list", "cached_default_text", "cached_layout_hash",
-    "layout_hash",           "cached_generation",  "roundtrip_default",   "stored_default",
-    "cache_drops",           "load_module",        "current_generation",  "init_calls",
-    "find_script",           "method_index",       "property_index",      "method_count",
-    "method_name",           "property_count",     "property_name",       "property_is_group",
-    "api_log",               "api_request_swap",   "script_is_valid",     "script_fallback_enabled",
-    "script_members",        "script_member_line", "script_method_info",  "script_has_default",
-    "script_update_exports",
+    "property_list",         "method_list",             "signal_list",         "default_text",
+    "cache_write",           "cache_read",              "cache_rejections",    "cached_property_list",
+    "cached_method_list",    "cached_signal_list",      "cached_default_text", "cached_layout_hash",
+    "layout_hash",           "cached_generation",       "roundtrip_default",   "stored_default",
+    "cache_drops",           "load_module",             "current_generation",  "init_calls",
+    "find_script",           "method_index",            "property_index",      "method_count",
+    "method_name",           "property_count",          "property_name",       "property_is_group",
+    "api_log",               "api_request_swap",        "script_is_valid",     "script_fallback_enabled",
+    "script_members",        "script_member_line",      "script_method_info",  "script_has_default",
+    "script_update_exports", "script_method_arg_count",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {
