@@ -6,15 +6,18 @@
 //! deep nesting). The JSON forms, by declared type:
 //! - bool: `true`/`false`; int (also enums and flags): a JSON integer;
 //! - float: a finite JSON number, or the strings "nan", "inf", "-inf";
-//! - String, StringName, NodePath: a JSON string;
+//! - String, StringName, NodePath: a JSON string of at most
+//!   `max_text_bytes` bytes of UTF-8 (a longer default is not stored);
 //! - Vector2/2i/3/3i/4/4i, Color, Rect2/2i, Plane, Quaternion, AABB, Basis,
 //!   Transform2D, Transform3D, Projection: a flat array of exactly the
 //!   right number of numbers (2, 2, 3, 3, 4, 4, 4, 4, 4, 4, 4, 6, 9, 6, 12,
 //!   16), in the field order of the gdzig struct (the same order Godot
 //!   documents for each constructor: for Rect2 position then size, for
-//!   Transform2D the x, y and origin columns, for Basis the x, y, z rows of
-//!   gdzig's struct, for Transform3D the basis then origin, for Projection
-//!   the x, y, z, w columns);
+//!   Transform2D the x, y and origin columns, for Projection the x, y, z, w
+//!   columns). Basis and Transform3D are stored row-major: a Basis is its
+//!   x, y, z rows (Godot's `Basis::rows`, the fields of gdzig's struct), not
+//!   the columns the `Basis(x_axis, y_axis, z_axis)` constructor takes, and
+//!   a Transform3D is those 9 numbers followed by the origin;
 //! - object handles: `null`, which restores as a null object.
 //! Integer components of the `i` vectors and rects must be integral and fit
 //! an i32. Anything else (a wrong shape for the type, a nested array, a
@@ -44,6 +47,9 @@ pub const t_object: u32 = 24;
 
 /// Most numbers an array default may hold (Projection).
 pub const max_components = 16;
+
+/// Longest String, StringName or NodePath default stored, in UTF-8 bytes.
+pub const max_text_bytes = 4096;
 
 pub const Default = union(enum) {
     /// No default stored.
@@ -209,6 +215,7 @@ pub fn fits(type_id: u32, d: Default) bool {
         .text => |t| {
             if (type_id == t_float) return specialFloat(t) != null;
             if (type_id != t_string and type_id != t_string_name and type_id != t_node_path) return false;
+            if (t.len > max_text_bytes) return false;
             return std.unicode.utf8ValidateSlice(t) and std.mem.indexOfScalar(u8, t, 0) == null;
         },
         .nums => |ns| {
@@ -247,7 +254,7 @@ pub fn fromVariant(a: Allocator, type_id: u32, v: Variant) Allocator.Error!Defau
             var s = v.stringify();
             defer s.deinit();
             const bytes = try props.utf8Alloc(a, &s);
-            if (std.mem.indexOfScalar(u8, bytes, 0) != null) return .absent;
+            if (bytes.len > max_text_bytes or std.mem.indexOfScalar(u8, bytes, 0) != null) return .absent;
             return .{ .text = bytes };
         },
         t_object => return .null_,
@@ -371,6 +378,19 @@ test "fits follows the declared type" {
     try testing.expect(!fits(t_int, .null_));
     try testing.expect(!fits(t_bool, .{ .int = 1 }));
     try testing.expect(!fits(0, .{ .int = 1 }));
+}
+
+test "text defaults are capped at max_text_bytes" {
+    const at_cap: [max_text_bytes]u8 = @splat('a');
+    const over: [max_text_bytes + 1]u8 = @splat('a');
+    for ([_]u32{ t_string, t_string_name, t_node_path }) |t| {
+        try testing.expect(fits(t, .{ .text = &at_cap }));
+        try testing.expect(!fits(t, .{ .text = &over }));
+    }
+    // A cache file holding a longer default drops it like any misfit.
+    var p = try parseText(testing.allocator, "\"" ++ over ++ "\"");
+    defer p.deinit();
+    try testing.expect(!fits(t_string, p.value));
 }
 
 test "writing then parsing keeps a default" {

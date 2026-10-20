@@ -9,6 +9,7 @@
 //! StringName.
 const std = @import("std");
 const godot = @import("gdzig");
+const script = @import("script.zig");
 
 const Allocator = std.mem.Allocator;
 const String = godot.builtin.String;
@@ -23,6 +24,10 @@ const ScriptExtension = godot.class.ScriptExtension;
 const ScriptLanguage = godot.class.ScriptLanguage;
 const ScriptLanguageExtension = godot.class.ScriptLanguageExtension;
 const Error = godot.global.Error;
+
+/// The registered language, between SCENE init and SCENE exit (set by the
+/// entry). Scripts return it from `_get_language`.
+pub var registered: ?*ZigLanguage = null;
 
 pub const ZigLanguage = struct {
     base: *ScriptLanguageExtension,
@@ -63,7 +68,12 @@ pub const ZigLanguage = struct {
 
     // ------------------------------------------------------------ lifecycle
 
-    pub fn _init(_: *ZigLanguage) void {}
+    /// Reads the project's descriptor cache, so scripts have descriptors
+    /// before the first build of the session (Godot calls this once, from
+    /// `ScriptServer::init_languages`, main/main.cpp:3867).
+    pub fn _init(_: *ZigLanguage) void {
+        script.loadStartupCache();
+    }
     pub fn _finish(_: *ZigLanguage) void {}
     pub fn _frame(_: *ZigLanguage) void {}
     pub fn _threadEnter(_: *ZigLanguage) void {}
@@ -89,8 +99,12 @@ pub const ZigLanguage = struct {
 
     // ------------------------------------------------------------ scripts and templates
 
+    /// A new empty `ZigScript`; its one counted reference goes to the caller.
     pub fn _createScript(_: *ZigLanguage) ?*Object {
-        return null;
+        var empty: String = .init();
+        defer empty.deinit();
+        const s = script.ZigScript.withSource(empty) orelse return null;
+        return .upcast(s.base);
     }
     pub fn _isUsingTemplates(_: *ZigLanguage) bool {
         return false;
@@ -98,11 +112,13 @@ pub const ZigLanguage = struct {
     pub fn _getBuiltInTemplates(_: *ZigLanguage, _: StringName) Array {
         return .init();
     }
-    /// Never null: the Create Script dialog dereferences the result. Until
-    /// `ZigScript` exists this is a bare `ScriptExtension`; its one counted
-    /// reference goes to the `Ref<Script>` Godot reads the pointer into.
-    pub fn _makeTemplate(_: *ZigLanguage, _: String, _: String, _: String) ?*Script {
-        return .upcast(ScriptExtension.init());
+    /// A `ZigScript` holding the template text. Never null: the Create
+    /// Script dialog dereferences the result, so when the script cannot be
+    /// made a bare `ScriptExtension` stands in. The one counted reference
+    /// goes to the `Ref<Script>` Godot reads the pointer into.
+    pub fn _makeTemplate(_: *ZigLanguage, template: String, _: String, _: String) ?*Script {
+        const s = script.ZigScript.withSource(template) orelse return .upcast(ScriptExtension.init());
+        return .upcast(s.base);
     }
     pub fn _validate(_: *ZigLanguage, _: String, _: String, _: bool, _: bool, _: bool, _: bool) Dictionary {
         var d: Dictionary = .init();

@@ -12,12 +12,15 @@ const props = @import("props.zig");
 const desc_cache = @import("desc_cache.zig");
 const default_value = @import("default_value.zig");
 const host_io = @import("host_io.zig");
+const script_mod = @import("script.zig");
 
 const Allocator = std.mem.Allocator;
 const String = godot.builtin.String;
 const StringName = godot.builtin.StringName;
 const RefCounted = godot.class.RefCounted;
 const Array = godot.builtin.Array;
+const Dictionary = godot.builtin.Dictionary;
+const ZigScript = script_mod.ZigScript;
 
 pub const ZigguratTestProbe = struct {
     base: *RefCounted,
@@ -258,6 +261,41 @@ pub const ZigguratTestProbe = struct {
         return c.generation();
     }
 
+    // ZigScript virtuals that `Script` does not expose to GDScript.
+
+    pub fn scriptIsValid(_: *ZigguratTestProbe, s: ?*ZigScript) bool {
+        return (s orelse return false)._isValid();
+    }
+
+    pub fn scriptFallbackEnabled(_: *ZigguratTestProbe, s: ?*ZigScript) bool {
+        return (s orelse return false)._isPlaceholderFallbackEnabled();
+    }
+
+    pub fn scriptMembers(_: *ZigguratTestProbe, s: ?*ZigScript) Array {
+        return (s orelse return Array.init())._getMembers();
+    }
+
+    pub fn scriptMemberLine(_: *ZigguratTestProbe, s: ?*ZigScript, name: StringName) i64 {
+        return (s orelse return -1)._getMemberLine(name);
+    }
+
+    pub fn scriptMethodInfo(_: *ZigguratTestProbe, s: ?*ZigScript, name: StringName) Dictionary {
+        return (s orelse return Dictionary.init())._getMethodInfo(name);
+    }
+
+    pub fn scriptHasDefault(_: *ZigguratTestProbe, s: ?*ZigScript, name: StringName) bool {
+        return (s orelse return false)._hasPropertyDefaultValue(name);
+    }
+
+    /// Calls `_update_exports` `times` times; returns how many refreshes the
+    /// script has made in all.
+    pub fn scriptUpdateExports(_: *ZigguratTestProbe, s: ?*ZigScript, times: i64) i64 {
+        const zs = s orelse return -1;
+        var i: i64 = 0;
+        while (i < times) : (i += 1) zs._updateExports();
+        return zs.export_refreshes;
+    }
+
     pub fn propertyIsGroup(_: *ZigguratTestProbe, script: i64, index: i64) bool {
         const d = scriptDesc(script) orelse return false;
         const i = std.math.cast(u32, index) orelse return false;
@@ -281,14 +319,16 @@ fn cachedScript(rel: String) ?*const desc_cache.Script {
 }
 
 pub const method_names = [_][:0]const u8{
-    "property_list",      "method_list",        "signal_list",         "default_text",
-    "cache_write",        "cache_read",         "cache_rejections",    "cached_property_list",
-    "cached_method_list", "cached_signal_list", "cached_default_text", "cached_layout_hash",
-    "layout_hash",        "cached_generation",  "roundtrip_default",   "stored_default",
-    "cache_drops",        "load_module",        "current_generation",  "init_calls",
-    "find_script",        "method_index",       "property_index",      "method_count",
-    "method_name",        "property_count",     "property_name",       "property_is_group",
-    "api_log",            "api_request_swap",
+    "property_list",         "method_list",        "signal_list",         "default_text",
+    "cache_write",           "cache_read",         "cache_rejections",    "cached_property_list",
+    "cached_method_list",    "cached_signal_list", "cached_default_text", "cached_layout_hash",
+    "layout_hash",           "cached_generation",  "roundtrip_default",   "stored_default",
+    "cache_drops",           "load_module",        "current_generation",  "init_calls",
+    "find_script",           "method_index",       "property_index",      "method_count",
+    "method_name",           "property_count",     "property_name",       "property_is_group",
+    "api_log",               "api_request_swap",   "script_is_valid",     "script_fallback_enabled",
+    "script_members",        "script_member_line", "script_method_info",  "script_has_default",
+    "script_update_exports",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

@@ -17,9 +17,10 @@
 //!         "methods": [ { "name", "flags", "ret": <arg>, "args": [<arg>] } ],
 //!         "signals": [ { "name", "args": [<arg>] } ] } ] }
 //!
-//! with `<arg>` = `{ "name", "class_name", "type" }`. `default` is Godot's
-//! `var_to_str` text of the property's default value; group entries and
-//! properties without a default have none. `layout_hash` is a decimal
+//! with `<arg>` = `{ "name", "class_name", "type" }`. `default` is the
+//! property's default value as typed JSON (`default_value.zig`; never text
+//! for `str_to_var`); group entries and properties without a default have
+//! none. `layout_hash` is a decimal
 //! string because a JSON number cannot hold every u64 exactly. Method
 //! `flags` are the ABI's (`abi.method_flag_virtual`).
 //!
@@ -38,6 +39,9 @@ const runtime = @import("runtime.zig");
 
 const Allocator = std.mem.Allocator;
 const Array = godot.builtin.Array;
+const Dictionary = godot.builtin.Dictionary;
+const String = godot.builtin.String;
+const ProjectSettings = godot.class.ProjectSettings;
 const Variant = godot.builtin.Variant;
 const OsPath = platform.path.OsPath;
 const Default = default_value.Default;
@@ -156,14 +160,20 @@ pub const Script = struct {
     /// As `props.methodList`.
     pub fn methodList(s: *const Script) Array {
         var arr = Array.init();
-        for (s.methods) |m| {
-            var args = argArray(m.args);
-            defer args.deinit();
-            var d = props.methodDict(m.name, args, props.godotMethodFlags(m.flags.v), m.ret.info());
+        for (0..s.methods.len) |i| {
+            var d = s.methodInfo(@intCast(i));
             defer d.deinit();
             props.pushDict(&arr, d);
         }
         return arr;
+    }
+
+    /// As `props.methodInfo`: method `i`, which must be below `methods.len`.
+    pub fn methodInfo(s: *const Script, i: u32) Dictionary {
+        const m = s.methods[i];
+        var args = argArray(m.args);
+        defer args.deinit();
+        return props.methodDict(m.name, args, props.godotMethodFlags(m.flags.v), m.ret.info());
     }
 
     /// As `props.signalList`.
@@ -367,6 +377,30 @@ fn reject(diag: *[256]u8, comptime fmt: []const u8, a: anytype) error{Rejected} 
     var w: std.Io.Writer = .fixed(diag[0..255]);
     w.print(fmt, a) catch {};
     return error.Rejected;
+}
+
+/// The cache file's path inside the project data folder.
+pub const project_rel = "ziggurat/descriptors.json";
+
+/// The absolute path of the open project's cache file, written into `buf`;
+/// null when it does not fit. The project data folder is `.godot`, or
+/// `godot` when `application/config/use_hidden_project_data_directory` is
+/// off (Godot's `ProjectSettings::get_project_data_dir_name`,
+/// core/config/project_settings.cpp:885-886). Main thread.
+pub fn projectPath(buf: []u8) ?[]const u8 {
+    var setting = String.fromLatin1("application/config/use_hidden_project_data_directory");
+    defer setting.deinit();
+    const v = ProjectSettings.getSetting(setting, .{ .default_value = Variant.init(bool, true) });
+    defer v.deinit();
+    const hidden = v.as(bool) orelse true;
+    var res = String.fromLatin1(if (hidden) "res://.godot/" ++ project_rel else "res://godot/" ++ project_rel);
+    defer res.deinit();
+    var abs = ProjectSettings.globalizePath(res);
+    defer abs.deinit();
+    const n: usize = @intCast(@max(0, godot.raw.stringToUtf8Chars(abs.constPtr(), null, 0)));
+    if (n == 0 or n > buf.len) return null;
+    _ = godot.raw.stringToUtf8Chars(abs.constPtr(), buf.ptr, @intCast(n));
+    return buf[0..n];
 }
 
 /// Reads the cache at `path`. A missing file is `error.FileNotFound`, with

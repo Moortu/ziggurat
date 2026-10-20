@@ -183,14 +183,20 @@ pub fn propertyList(desc: *const abi.ScriptDesc) Array {
 /// The script's methods, in descriptor order (the index is the call index).
 pub fn methodList(desc: *const abi.ScriptDesc) Array {
     var arr = Array.init();
-    for (desc.methods[0..desc.method_count]) |m| {
-        var args = argArray(argSlice(m.args, m.arg_count));
-        defer args.deinit();
-        var d = methodDict(text(m.name), args, godotMethodFlags(m.flags), argInfo(m.ret));
+    for (0..desc.method_count) |i| {
+        var d = methodInfo(desc, @intCast(i));
         defer d.deinit();
         pushDict(&arr, d);
     }
     return arr;
+}
+
+/// The method dictionary of method `i` (which must be below `method_count`).
+pub fn methodInfo(desc: *const abi.ScriptDesc, i: u32) Dictionary {
+    const m = desc.methods[i];
+    var args = argArray(argSlice(m.args, m.arg_count));
+    defer args.deinit();
+    return methodDict(text(m.name), args, godotMethodFlags(m.flags), argInfo(m.ret));
 }
 
 /// The script's signals, in descriptor order.

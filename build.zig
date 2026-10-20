@@ -231,6 +231,12 @@ fn addHost(
                 .{ .name = "ziggurat_platform", .module = platform },
                 .{ .name = "sdk_options", .module = sdk_options },
                 .{ .name = "host_options", .module = host_options.createModule() },
+                // Godot's snake_case rule, shared with the SDK (imports only std).
+                .{ .name = "snake", .module = b.createModule(.{
+                    .root_source_file = b.path("sdk/snake.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }) },
             },
         }),
     });

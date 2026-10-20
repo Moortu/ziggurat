@@ -443,3 +443,69 @@ test "cache rejects garbage" {
         "drop_comment_attack.json: 1 value(s) did not fit the type of their property.",
     });
 }
+
+// ------------------------------------------------------------ ZigScript
+
+/// Copies the fixture's player.zig into `p` as `res://player_source.txt`
+/// (not as a `.zig` file, which the editor would scan).
+fn addPlayerSource(p: *Project) !void {
+    const cwd = Io.Dir.cwd();
+    var fixtures = try cwd.openDir(io, opts.fixtures_dir, .{});
+    defer fixtures.close(io);
+    var dst = try cwd.openDir(io, p.path, .{});
+    defer dst.close(io);
+    try fixtures.copyFile("sdk_project/player.zig", dst, "player_source.txt", io, .{});
+}
+
+test "script reports descriptors, script without descriptors, update_exports is idempotent" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("empty");
+    defer p.deinit();
+    try buildGoodModule(&p);
+    try addPlayerSource(&p);
+    // Run 1 answers from the loaded module and writes the descriptor cache;
+    // run 2 is a fresh Godot process whose language reads that cache.
+    try p.addCheck("script_descriptors.gd");
+    try p.runScript(&.{
+        "ZTEST PASS script_without_descriptors\n",
+        "ZTEST PASS script_without_descriptors_unknown_path",
+        "ZTEST PASS script_reports_descriptors_lists",
+        "ZTEST PASS script_reports_descriptors_queries",
+        "ZTEST PASS script_reports_descriptors_defaults_members",
+        "ZTEST PASS script_reports_descriptors_member_lines",
+        "ZTEST PASS script_source_code",
+        "ZTEST PASS can_instantiate_game",
+        "ZTEST PASS instance_create_refused",
+        "Script res://player.zig cannot create instances yet.",
+        "ZTEST PASS reload_returns_ok",
+        "ZTEST PASS script_cache_write",
+    });
+    try p.runScript(&.{
+        "ZTEST PASS second_run_has_no_module",
+        "ZTEST PASS script_reports_descriptors_from_cache\n",
+        "ZTEST PASS script_reports_descriptors_from_cache_queries",
+        "ZTEST PASS update_exports_is_idempotent",
+        "ZTEST PASS script_reports_loaded_after_cache",
+    });
+}
+
+test "can_instantiate rule in the editor" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("empty");
+    defer p.deinit();
+    try buildGoodModule(&p);
+    // A script run writes the descriptor cache; the editor reads it at
+    // startup and loads no module.
+    try p.addCheck("descriptor_cache.gd");
+    try p.runScript(&.{"ZTEST PASS cache_write\n"});
+    try p.addAutoloadCheck("script_editor.gd");
+    try p.runEditor("30", &.{
+        "ZTEST PASS editor_descriptors_from_cache",
+        "ZTEST PASS can_instantiate_editor_non_tool",
+        "ZTEST PASS can_instantiate_editor_tool",
+        "ZTEST PASS can_instantiate_editor_no_descriptors",
+        "ZTEST PASS editor_placeholder_refused",
+    });
+}

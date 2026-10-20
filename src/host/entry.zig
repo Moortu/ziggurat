@@ -19,6 +19,7 @@ const host_options = @import("host_options");
 const test_probe = @import("test_probe.zig");
 const props = @import("props.zig");
 const desc_cache = @import("desc_cache.zig");
+const script = @import("script.zig");
 
 const c = godot.c;
 const Registry = godot.extension.Registry;
@@ -77,6 +78,7 @@ export fn ziggurat_host_init(
     runtime.setEngine(@ptrCast(gpa), lib);
 
     registry.addClass(ZigLanguage, registry.allocator, .auto);
+    registry.addClass(script.ZigScript, registry.allocator, .auto);
     if (host_options.test_probe) {
         const probe = registry.createClass(test_probe.ZigguratTestProbe, registry.allocator, .auto);
         inline for (test_probe.method_names) |name| probe.addMethod(name, .auto);
@@ -128,6 +130,7 @@ fn ignoreLevel(_: ?*anyopaque, _: c.GDExtensionInitializationLevel) callconv(.c)
 const Lifecycle = struct {
     pub fn enter(_: *Lifecycle, level: godot.extension.InitializationLevel) void {
         if (level != .scene) return;
+        script.setEditorHint(Engine.isEditorHint());
         var alloc = godot.engine_allocator;
         const lang = ZigLanguage.create(&alloc) catch {
             log("ziggurat_host: out of memory creating the Zig language; Zig scripts are unavailable", .{});
@@ -140,6 +143,7 @@ const Lifecycle = struct {
             return;
         }
         zig_language = lang;
+        language.registered = lang;
         log("ziggurat_host {s} ready", .{host_version});
     }
 
@@ -147,9 +151,11 @@ const Lifecycle = struct {
         if (level != .scene) return;
         // Module names are engine StringNames; Godot reports any still held.
         runtime.shutdown();
+        script.dropStartupCache();
         const lang = zig_language orelse return;
         _ = Engine.unregisterScriptLanguage(.upcast(lang.base));
         var alloc = godot.engine_allocator;
+        language.registered = null;
         lang.destroy(&alloc);
         zig_language = null;
     }
@@ -271,4 +277,5 @@ test {
     _ = runtime;
     _ = props;
     _ = desc_cache;
+    _ = script;
 }
