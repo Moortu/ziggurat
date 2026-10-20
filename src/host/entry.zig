@@ -9,6 +9,10 @@
 //! `OS.has_feature("double")` decides precision. Otherwise `ZigLanguage` is
 //! created and registered at SCENE init and unregistered and destroyed at
 //! SCENE exit, which is what keeps Godot's ObjectDB leak check quiet at exit.
+//! In the editor the build service starts at SCENE init (editor_build.zig);
+//! in a game the generation the editor built is loaded (game.zig). An export
+//! build (`host_options.export_build`) has neither: its game runs without a
+//! generation manifest.
 const std = @import("std");
 const godot = @import("gdzig");
 const version = @import("version.zig");
@@ -24,6 +28,7 @@ const instance = @import("instance.zig");
 const placeholder = @import("placeholder.zig");
 const resource = @import("resource.zig");
 const editor_build = @import("editor_build.zig");
+const game = @import("game.zig");
 
 const c = godot.c;
 const Registry = godot.extension.Registry;
@@ -153,7 +158,14 @@ const Lifecycle = struct {
         resource.register();
         log("ziggurat_host {s} ready", .{host_version});
         // Builds run in the editor only; a game loads what the editor built.
-        if (Engine.isEditorHint()) editor_build.start();
+        if (Engine.isEditorHint()) {
+            if (comptime host_options.export_build)
+                log("ziggurat_host: this export build does not build Zig scripts in the editor", .{})
+            else
+                editor_build.start();
+        } else {
+            game.start();
+        }
     }
 
     pub fn exit(_: *Lifecycle, level: godot.extension.InitializationLevel) void {
@@ -167,7 +179,7 @@ const Lifecycle = struct {
         // language), so nothing pushes outcomes after that, and before the
         // process Io ends. The file loader and saver go before the language,
         // so no load or save can reach a destroyed language.
-        editor_build.stop();
+        if (comptime !host_options.export_build) editor_build.stop();
         resource.unregister();
         if (zig_language) |lang| {
             _ = Engine.unregisterScriptLanguage(.upcast(lang.base));
@@ -312,4 +324,5 @@ test {
     _ = @import("manifest.zig");
     _ = @import("load_checks.zig");
     _ = editor_build;
+    _ = game;
 }

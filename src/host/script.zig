@@ -86,6 +86,11 @@ pub fn setEditorHint(on: bool) void {
     editor_hint.store(on, .release);
 }
 
+/// True in the editor, false in a game process (`setEditorHint`).
+pub fn isEditor() bool {
+    return editor_hint.load(.acquire);
+}
+
 /// Reads the project's descriptor cache once. A missing file is silent; a
 /// bad one was logged by `desc_cache.read`. Main thread.
 pub fn loadStartupCache() void {

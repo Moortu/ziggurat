@@ -357,13 +357,16 @@ pub const ZigLanguage = struct {
     }
     /// Also fires when any other extension reloads (spec section 7).
     pub fn _reloadAllScripts(self: *ZigLanguage) void {
-        self.noteReload(.all);
+        self.noteReload(.all, 0);
     }
     /// Godot calls this with this language's own scripts only (for
     /// example `Script::reload_from_file` when the editor discards edits),
-    /// so each listed script gets its text back from its file.
+    /// so each listed script gets its text back from its file. In a game
+    /// the debugger sends it after a save in the editor; the game says once
+    /// how many scripts it named, because swapping a running game's code
+    /// comes in a later version (spec section 6).
     pub fn _reloadScripts(self: *ZigLanguage, scripts: Array, _: bool) void {
-        self.noteReload(.scripts);
+        self.noteReload(.scripts, scripts.size());
         var i: i64 = 0;
         while (i < scripts.size()) : (i += 1) {
             var v = scripts.get(i);
@@ -372,7 +375,7 @@ pub const ZigLanguage = struct {
         }
     }
     pub fn _reloadToolScript(self: *ZigLanguage, s: ?*Script, _: bool) void {
-        self.noteReload(.tool);
+        self.noteReload(.tool, 0);
         if (s) |sc| script.ZigScript.reloadObjectFromDisk(Object.upcast(sc));
     }
     pub fn _getPublicFunctions(_: *ZigLanguage) Array {
@@ -451,9 +454,13 @@ pub const ZigLanguage = struct {
     /// run the last build's module; the build, not this request, makes a
     /// new one, so nothing else happens here (spec section 6: reload
     /// requests only queue).
-    fn noteReload(self: *ZigLanguage, kind: Reload) void {
+    fn noteReload(self: *ZigLanguage, kind: Reload, count: i64) void {
         _ = self.reloads.getPtr(kind).fetchAdd(1, .acq_rel);
         if (self.reload_logged.getPtr(kind).swap(true, .acq_rel)) return;
+        if (kind == .scripts and !script.isEditor()) {
+            log("Ziggurat: reload requested for {d} scripts (swaps arrive in a later version).", .{count});
+            return;
+        }
         const what = switch (kind) {
             .all => "reload all scripts",
             .scripts => "reload scripts",

@@ -24,6 +24,7 @@ pub fn build(b: *std.Build) void {
     const godot_path = godot_found orelse "godot";
     const manifest_out = b.option([]const u8, "manifest-out", "Absolute path the sdk-manifest step writes the SDK module manifest to");
     const host_test_filter = b.option([]const u8, "host-test-filter", "Run only the host tests whose name contains this text");
+    const export_build = b.option(bool, "export_build", "Build the host for an exported game: no generation manifest reader (spec section 6)") orelse false;
 
     const test_step = b.step("test", "Run unit and integration tests");
     const unit_step = b.step("test-unit", "Run unit tests only (spawns no compiler)");
@@ -76,19 +77,22 @@ pub fn build(b: *std.Build) void {
     // The host library and its addon folder. The host computes the layout
     // stamp it accepts from the SDK's own `sdk_options`.
     const sdk_options = sdk.import_table.get("sdk_options").?;
-    const host = addHost(b, target, optimize, godot_path, zig_exe, sdk_options, false);
+    const host = addHost(b, target, optimize, godot_path, zig_exe, sdk_options, .{});
+    const installed_host = if (export_build) addHost(b, target, optimize, godot_path, zig_exe, sdk_options, .{ .export_build = true }) else host;
     const gdextension_file = b.path("addon/ziggurat_host.gdextension");
     // `zig build host -p <project>` makes <project>/addon/ a working addon folder.
     const addon_dir: std.Build.InstallDir = .{ .custom = "addon" };
-    host_step.dependOn(&b.addInstallFileWithDir(host.getEmittedBin(), addon_dir, "libziggurat_host.so").step);
+    host_step.dependOn(&b.addInstallFileWithDir(installed_host.getEmittedBin(), addon_dir, "libziggurat_host.so").step);
     host_step.dependOn(&b.addInstallFileWithDir(gdextension_file, addon_dir, "ziggurat_host.gdextension").step);
     if (godot_found == null) {
         host_test_step.dependOn(&b.addFail("test-host needs Godot on PATH or -Dgodot-path=<absolute path>").step);
     } else {
-        const probe_host = addHost(b, target, optimize, godot_path, zig_exe, sdk_options, true);
+        const probe_host = addHost(b, target, optimize, godot_path, zig_exe, sdk_options, .{ .test_probe = true });
+        const export_host = addHost(b, target, optimize, godot_path, zig_exe, sdk_options, .{ .export_build = true });
         addHostTests(b, host_test_step, target, optimize, .{
             .host = host,
             .probe_host = probe_host,
+            .export_host = export_host,
             .gdextension = gdextension_file,
             .godot_exe = godot_found.?,
             .zig_exe = zig_exe,
@@ -184,11 +188,19 @@ fn addSdk(
     });
 }
 
+/// Which host library `addHost` builds.
+const HostVariant = struct {
+    /// Registers the `ZigguratTestProbe` class the host tests drive the
+    /// runtime with; the installed library never has it.
+    test_probe: bool = false,
+    /// An exported game's host: the generation manifest reader and the
+    /// editor's builds are compiled out (spec section 6).
+    export_build: bool = false,
+};
+
 /// The host library `ziggurat_host` (spec section 3). It imports gdzig, the
 /// ABI module, the platform layer and the SDK's `sdk_options` (for the
-/// layout stamp), never the SDK. `test_probe` registers the
-/// `ZigguratTestProbe` class the host tests drive the runtime with; the
-/// installed library never has it.
+/// layout stamp), never the SDK.
 fn addHost(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -196,8 +208,9 @@ fn addHost(
     godot_path: []const u8,
     zig_exe: []const u8,
     sdk_options: *std.Build.Module,
-    test_probe: bool,
+    variant: HostVariant,
 ) *std.Build.Step.Compile {
+    if (variant.test_probe and variant.export_build) @panic("an export build has no test probe");
     const gdzig = b.dependency("gdzig", .{
         .target = target,
         .optimize = optimize,
@@ -205,7 +218,8 @@ fn addHost(
         .precision = "float",
     });
     const host_options = b.addOptions();
-    host_options.addOption(bool, "test_probe", test_probe);
+    host_options.addOption(bool, "test_probe", variant.test_probe);
+    host_options.addOption(bool, "export_build", variant.export_build);
     // The platform layer's test settings: integration off, no test paths.
     const platform_options = b.addOptions();
     platform_options.addOption([]const u8, "zig_exe", zig_exe);
@@ -235,7 +249,7 @@ fn addHost(
     });
     return b.addLibrary(.{
         .linkage = .dynamic,
-        .name = if (test_probe) "ziggurat_host_probe" else "ziggurat_host",
+        .name = if (variant.test_probe) "ziggurat_host_probe" else if (variant.export_build) "ziggurat_host_export" else "ziggurat_host",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/host/entry.zig"),
             .target = target,
@@ -263,6 +277,8 @@ const HostTestInputs = struct {
     host: *std.Build.Step.Compile,
     /// The host built with `test_probe`.
     probe_host: *std.Build.Step.Compile,
+    /// The host built with `export_build`.
+    export_host: *std.Build.Step.Compile,
     gdextension: std.Build.LazyPath,
     godot_exe: []const u8,
     zig_exe: []const u8,
@@ -309,6 +325,7 @@ fn addHostTests(
     options.addOptionPath("runner_exe", runner.getEmittedBin());
     options.addOptionPath("host_lib", in.host.getEmittedBin());
     options.addOptionPath("probe_host_lib", in.probe_host.getEmittedBin());
+    options.addOptionPath("export_host_lib", in.export_host.getEmittedBin());
     options.addOptionPath("gdextension", in.gdextension);
     options.addOption([]const u8, "projects_dir", b.root.joinString(b.allocator, "test/host/projects") catch @panic("OOM"));
     options.addOption([]const u8, "checks_dir", b.root.joinString(b.allocator, "test/host/checks") catch @panic("OOM"));
@@ -699,7 +716,17 @@ fn addTestSet(
         });
     }
 
-    for ([_]*std.Build.Module{ platform, build_mod, abi, snake, fmtlog, host_version, output_scan, host_std[0], host_std[1], host_std[2], host_std[3] }) |mod| {
+    // The generation manifest's writer and reader import std and the
+    // platform layer only.
+    const host_manifest = b.createModule(.{
+        .root_source_file = b.path("src/host/manifest.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "ziggurat_platform", .module = platform }},
+    });
+
+    for ([_]*std.Build.Module{ platform, build_mod, abi, snake, fmtlog, host_version, output_scan, host_std[0], host_std[1], host_std[2], host_std[3], host_manifest }) |mod| {
         const t = b.addTest(.{ .root_module = mod });
         if (run) {
             step.dependOn(&b.addRunArtifact(t).step);

@@ -1114,3 +1114,231 @@ test "no builds in a non-interactive editor run" {
         return error.ImportRunBuilt;
     }
 }
+
+// ------------------------------------------------------------ game process
+
+/// The library name the editor's store gives generation `n`.
+fn genLibName(buf: []u8, n: u32) ![]const u8 {
+    return platform.path.libName(buf, builtin.os.tag, zbuild.service.lib_stem, n);
+}
+
+/// A project whose store (`.godot/ziggurat`) holds the module built from
+/// test/fixtures/instance_project as generation 1, as the editor stages it,
+/// with the fixture's scripts in the project folder, `res://check.gd` set
+/// to game_ready.gd and no manifest yet. Returns the store's path.
+fn stageGameProject(p: *Project) ![]const u8 {
+    const a = p.arena_state.allocator();
+    var manifest = try loadManifest(testing.allocator);
+    defer manifest.deinit(testing.allocator);
+    try p.tmp.dir.createDirPath(io, "work");
+    const work = try p.tmp.dir.realPathFileAlloc(io, "work", a);
+    const built = try buildModule(a, work, "game", "instance_project", manifest.modules, true);
+
+    const cwd = Io.Dir.cwd();
+    var dir = try cwd.openDir(io, p.path, .{});
+    defer dir.close(io);
+    var name_buf: [64]u8 = undefined;
+    const rel = try std.fmt.allocPrint(a, ".godot/ziggurat/gen/1/{s}", .{try genLibName(&name_buf, 1)});
+    try dir.createDirPath(io, std.fs.path.dirname(rel).?);
+    try cwd.copyFile(built, dir, rel, io, .{});
+    const fixture = try std.fs.path.join(a, &.{ opts.fixtures_dir, "instance_project" });
+    var src = try cwd.openDir(io, fixture, .{ .iterate = true });
+    defer src.close(io);
+    var it = src.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind == .file) try src.copyFile(entry.name, dir, entry.name, io, .{});
+    }
+    try p.addCheck("game_ready.gd");
+    return std.fs.path.join(a, &.{ p.path, ".godot", "ziggurat" });
+}
+
+/// Replaces the store's manifest with `text`.
+fn writeGameManifest(store: *Io.Dir, text: []const u8) !void {
+    store.deleteFile(io, "manifest") catch |err| switch (err) {
+        error.FileNotFound => {},
+        error.IsDir => try store.deleteDir(io, "manifest"),
+        else => return err,
+    };
+    try store.writeFile(io, .{ .sub_path = "manifest", .data = text });
+}
+
+const refused_prefix = "Ziggurat ignores the generation manifest because ";
+const refused_suffix = ", so this game runs without Zig scripts.";
+
+/// Runs the game and checks that the manifest was refused for `reason`,
+/// and that the game ran on without scripts.
+fn expectGameRefused(p: *Project, case: []const u8, reason: []const u8) !void {
+    const a = p.arena_state.allocator();
+    const sentence = try std.mem.concat(a, u8, &.{ refused_prefix, reason, refused_suffix });
+    p.run(&.{ "script", "res://check.gd" }, .{
+        .once = &.{ sentence, "game check: scripts absent" },
+        .reject = &.{ "mover ready", "generation 1 loaded" },
+    }) catch |err| {
+        std.debug.print("trust case '{s}' failed\n", .{case});
+        return err;
+    };
+}
+
+test "manifest trust" {
+    try requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.init("empty");
+    defer p.deinit();
+    const a = p.arena_state.allocator();
+    const store_path = try stageGameProject(&p);
+    var store = try Io.Dir.cwd().openDir(io, store_path, .{});
+    defer store.close(io);
+    try p.tmp.dir.createDirPath(io, "outside");
+    const outside = try p.tmp.dir.realPathFileAlloc(io, "outside", a);
+    var lib1_buf: [64]u8 = undefined;
+    const lib1 = try genLibName(&lib1_buf, 1);
+    const good_rel = try std.fmt.allocPrint(a, "gen/1/{s}", .{lib1});
+    var t: [1024]u8 = undefined;
+
+    // No manifest at all: the game says so once and runs without scripts.
+    try p.run(&.{ "script", "res://check.gd" }, .{
+        .once = &.{ "Ziggurat found no generation manifest, so this game runs without Zig scripts", "game check: scripts absent" },
+        .reject = &.{"mover ready"},
+    });
+
+    // Malformed text, one manifest per rule.
+    const big: [300]u8 = @splat('a');
+    const long_name: [210]u8 = @splat('a');
+    const text_cases = [_]struct { name: []const u8, text: []const u8, reason: []const u8 }{
+        .{ .name = "empty file", .text = "", .reason = "it is not exactly two lines that each end with a line break" },
+        .{ .name = "over the size limit", .text = &big, .reason = "it is larger than 256 bytes" },
+        .{ .name = "line over the length limit", .text = try std.fmt.allocPrint(a, "gen=1\npath=gen/1/{s}\n", .{&long_name}), .reason = "a line is longer than 200 bytes" },
+        .{ .name = "NUL byte", .text = try std.fmt.allocPrint(a, "gen=1\npath={s}\x00\n", .{good_rel}), .reason = "it holds a NUL byte" },
+        .{ .name = "extra line", .text = try std.fmt.allocPrint(a, "gen=1\npath={s}\nmore=1\n", .{good_rel}), .reason = "it is not exactly two lines that each end with a line break" },
+        .{ .name = "leading zero", .text = try std.fmt.allocPrint(a, "gen=01\npath={s}\n", .{good_rel}), .reason = "the generation is not a decimal number without sign or leading zeros" },
+        .{ .name = "sign", .text = try std.fmt.allocPrint(a, "gen=+1\npath={s}\n", .{good_rel}), .reason = "the generation is not a decimal number without sign or leading zeros" },
+        .{ .name = "generation 0", .text = try std.fmt.allocPrint(a, "gen=0\npath={s}\n", .{good_rel}), .reason = "the generation is not between 1 and 4294967294" },
+        .{ .name = "generation out of range", .text = try std.fmt.allocPrint(a, "gen=4294967295\npath={s}\n", .{good_rel}), .reason = "the generation is not between 1 and 4294967294" },
+        .{ .name = "generation does not fit", .text = try std.fmt.allocPrint(a, "gen=99999999999\npath={s}\n", .{good_rel}), .reason = "the generation is not between 1 and 4294967294" },
+        .{ .name = "absolute path", .text = try std.fmt.allocPrint(a, "gen=1\npath={s}/{s}\n", .{ store_path, good_rel }), .reason = "the library path is absolute" },
+        .{ .name = "character set", .text = "gen=1\npath=gen/1/lib zmod.1.so\n", .reason = "the library path has a character other than A-Z, a-z, 0-9, '.', '_', '-' and '/'" },
+        .{ .name = "'..' part", .text = try std.fmt.allocPrint(a, "gen=1\npath=gen/1/../1/{s}\n", .{lib1}), .reason = "the library path has an empty, '.' or '..' part" },
+        .{ .name = "'.' part", .text = try std.fmt.allocPrint(a, "gen=1\npath=gen/1/./{s}\n", .{lib1}), .reason = "the library path has an empty, '.' or '..' part" },
+        .{ .name = "empty part", .text = try std.fmt.allocPrint(a, "gen=1\npath=gen//1/{s}\n", .{lib1}), .reason = "the library path has an empty, '.' or '..' part" },
+        // Stage 4's rule: gen=2 with generation 1's library would run
+        // `ziggurat_init` again on a live module as generation 2.
+        .{ .name = "path of another generation", .text = try std.fmt.allocPrint(a, "gen=2\npath={s}\n", .{good_rel}), .reason = "the library path does not start with gen/<generation>/" },
+        .{ .name = "other library name", .text = "gen=1\npath=gen/1/other.so\n", .reason = "the library file name is not the one the editor writes for that generation" },
+        .{ .name = "missing library", .text = try std.fmt.allocPrint(a, "gen=5\npath=gen/5/{s}\n", .{try genLibName(&t, 5)}), .reason = "the library does not exist or cannot be resolved" },
+    };
+    try store.copyFile(good_rel, store, "gen/1/other.so", io, .{});
+    for (text_cases) |c| {
+        try writeGameManifest(&store, c.text);
+        try expectGameRefused(&p, c.name, c.reason);
+    }
+
+    // Links and file kinds.
+    var name_buf: [64]u8 = undefined;
+    // The library is a link to a copy outside the store.
+    const outside_lib = try std.fs.path.join(a, &.{ outside, "lib.so" });
+    try store.copyFile(good_rel, Io.Dir.cwd(), outside_lib, io, .{});
+    try store.createDirPath(io, "gen/2");
+    try store.symLink(io, outside_lib, try std.fmt.allocPrint(a, "gen/2/{s}", .{try genLibName(&name_buf, 2)}), .{});
+    try writeGameManifest(&store, try std.fmt.allocPrint(a, "gen=2\npath=gen/2/{s}\n", .{try genLibName(&name_buf, 2)}));
+    try expectGameRefused(&p, "linked library outside", "the library resolves to a file outside .godot/ziggurat");
+    // The generation folder is a link to a folder outside the store.
+    try store.copyFile(good_rel, Io.Dir.cwd(), try std.fs.path.join(a, &.{ outside, try genLibName(&name_buf, 3) }), io, .{});
+    try store.symLink(io, outside, "gen/3", .{ .is_directory = true });
+    try writeGameManifest(&store, try std.fmt.allocPrint(a, "gen=3\npath=gen/3/{s}\n", .{try genLibName(&name_buf, 3)}));
+    try expectGameRefused(&p, "linked folder outside", "the library resolves to a file outside .godot/ziggurat");
+    // The library is a folder.
+    try store.createDirPath(io, try std.fmt.allocPrint(a, "gen/4/{s}", .{try genLibName(&name_buf, 4)}));
+    try writeGameManifest(&store, try std.fmt.allocPrint(a, "gen=4\npath=gen/4/{s}\n", .{try genLibName(&name_buf, 4)}));
+    try expectGameRefused(&p, "library is a folder", "the library is not a regular file");
+    // The manifest is a link to a good manifest outside the store.
+    const outside_manifest = try std.fs.path.join(a, &.{ outside, "manifest" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = outside_manifest, .data = try std.fmt.allocPrint(a, "gen=1\npath={s}\n", .{good_rel}) });
+    try store.deleteFile(io, "manifest");
+    try store.symLink(io, outside_manifest, "manifest", .{});
+    try expectGameRefused(&p, "linked manifest", "it is a symbolic link");
+    // The manifest is a folder.
+    try store.deleteFile(io, "manifest");
+    try store.createDirPath(io, "manifest");
+    try expectGameRefused(&p, "manifest is a folder", "it is not a regular file");
+    try store.deleteDir(io, "manifest");
+
+    // The good manifest: generation 1 loads and its script runs.
+    try writeGameManifest(&store, try std.fmt.allocPrint(a, "gen=1\npath={s}\n", .{good_rel}));
+    try p.run(&.{ "script", "res://check.gd" }, .{
+        .once = &.{ "ziggurat: generation 1 loaded", "[ziggurat] mover ready speed=5\n", "game check: scripts running" },
+        .reject = &.{refused_prefix},
+    });
+}
+
+test "game runs ready" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("empty");
+    defer p.deinit();
+    const a = p.arena_state.allocator();
+    const store_path = try stageGameProject(&p);
+    var store = try Io.Dir.cwd().openDir(io, store_path, .{});
+    defer store.close(io);
+    var name_buf: [64]u8 = undefined;
+    try writeGameManifest(&store, try std.fmt.allocPrint(a, "gen=1\npath=gen/1/{s}\n", .{try genLibName(&name_buf, 1)}));
+    try p.run(&.{ "script", "res://check.gd" }, .{
+        .once = &.{
+            "ziggurat: generation 1 loaded",
+            "[ziggurat] mover ready speed=5\n",
+            "game check: scripts running",
+            // The debugger's reload request: one line, no swap yet.
+            "reload requested for 1 scripts (swaps arrive in a later version)",
+        },
+        .reject = &.{ refused_prefix, "placeholder" },
+    });
+}
+
+/// Case-insensitive search.
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    return std.ascii.findIgnoreCase(haystack, needle) != null;
+}
+
+test "export build has no manifest path" {
+    try requireIntegration();
+    const a = testing.allocator;
+    // The reader's names and the manifest's file name. Any text the
+    // library holds counts, the way `strings` finds it: symbol names,
+    // string literals and debug information alike.
+    const needles = [_][]const u8{ "manifest", "readTrusted", "recheck", "loadFromStore" };
+    const export_lib = try Io.Dir.cwd().readFileAlloc(io, opts.export_host_lib, a, .limited(1 << 30));
+    defer a.free(export_lib);
+    for (needles) |n| {
+        if (containsIgnoreCase(export_lib, n)) {
+            std.debug.print("the export build holds '{s}'\n", .{n});
+            return error.ExportBuildHasManifestPath;
+        }
+    }
+    // The ordinary host holds them, so the search can find them.
+    const host_lib = try Io.Dir.cwd().readFileAlloc(io, opts.host_lib, a, .limited(1 << 30));
+    defer a.free(host_lib);
+    for (needles) |n| {
+        if (!containsIgnoreCase(host_lib, n)) {
+            std.debug.print("the ordinary host lacks '{s}'\n", .{n});
+            return error.SearchFindsNothing;
+        }
+    }
+
+    // A game with the export host ignores a good manifest.
+    var p: Project = undefined;
+    try p.initWith("empty", opts.export_host_lib);
+    defer p.deinit();
+    const pa = p.arena_state.allocator();
+    const store_path = try stageGameProject(&p);
+    var store = try Io.Dir.cwd().openDir(io, store_path, .{});
+    defer store.close(io);
+    var name_buf: [64]u8 = undefined;
+    try writeGameManifest(&store, try std.fmt.allocPrint(pa, "gen=1\npath=gen/1/{s}\n", .{try genLibName(&name_buf, 1)}));
+    try p.run(&.{ "script", "res://check.gd" }, .{
+        .once = &.{
+            "This export build of Ziggurat has no module source yet, so this game runs without Zig scripts.",
+            "game check: scripts absent",
+        },
+        .reject = &.{ "mover ready", "generation 1 loaded" },
+    });
+}
