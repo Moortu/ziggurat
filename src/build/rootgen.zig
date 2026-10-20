@@ -18,18 +18,28 @@
 //!     path. It exists for the SDK marker below: `@typeName(S)` cannot give
 //!     the path back (`a b/q/x.y.zig` and `a b/q/x/y.zig` both give
 //!     `a b.q.x.y`).
-//!   - `ziggurat.Table`, built with
-//!     `const table = ziggurat.makeTable(&.{ &s0, &s1, ... }, "<build id>");`.
-//!     The first argument is a pointer to a tuple of `*const ScriptDescriptor`,
-//!     which coerces to a slice `[]const *const ScriptDescriptor`. With no
-//!     scripts it is `&.{}`. The second, `comptime build_id: []const u8`, is
-//!     16 lowercase hex characters (`scan.ScanResult.build_id`: a hash of the
-//!     path, size, times and inode of every scanned file) that the SDK
-//!     stores in `Table.build_id`. After an incremental update the build
-//!     service reads the id back from the staged library to catch a compiler
-//!     that kept stale code. Limit: the id covers only the scanned `.zig`
-//!     files, not `@embedFile` data, helpers outside the script folders or
-//!     SDK edits, so a stale export after only such an edit goes unnoticed.
+//!   - `ziggurat.Table`, built in two steps:
+//!     `const scripts = ziggurat.scriptList(&.{ &s0, &s1, ... });`
+//!     `const table = ziggurat.tableOf(scripts, "<build id>");`.
+//!     `scriptList(comptime descs: []const *const ScriptDescriptor)` takes a
+//!     pointer to a tuple of `*const ScriptDescriptor`, which coerces to a
+//!     slice (with no scripts it is `&.{}`), runs the whole-table checks and
+//!     returns the descriptors as one static array
+//!     (`[]const ScriptDescriptor`). `tableOf(comptime scripts, comptime
+//!     build_id: []const u8)` only fills the table header around that list,
+//!     with no loops. The split matters for speed: the build id changes on
+//!     every build, and under incremental compilation a declaration whose
+//!     inputs changed is analysed again, so with the id among `scriptList`'s
+//!     inputs every edit would re-run the table check over every script.
+//!     The build id is 16 lowercase hex characters
+//!     (`scan.ScanResult.build_id`: a hash of the path, size, times and
+//!     inode of every scanned file) that the SDK stores in `Table.build_id`
+//!     (an id longer than 16 bytes is a compile error). After an
+//!     incremental update the build service reads the id back from the
+//!     staged library to catch a compiler that kept stale code. Limit: the
+//!     id covers only the scanned `.zig` files, not `@embedFile` data,
+//!     helpers outside the script folders or SDK edits, so a stale export
+//!     after only such an edit goes unnoticed.
 //!   - `ziggurat.HostApi` and `ziggurat.moduleInit(api: *const ziggurat.HostApi, gen: u32) void`.
 //!   - `HostApi` and `Table` cross a `dlopen` boundary into a host that is
 //!     compiled separately, so their layout must be `extern` (or `packed`
@@ -76,7 +86,8 @@ pub const root_file_name = ".ziggurat_root.zig";
 
 /// Returns the text of the root file for `scripts`, which the caller frees.
 /// `scripts` must already be sorted by `rel` (as `scan.scan` returns them).
-/// `build_id` goes into the table as a string literal.
+/// `build_id` goes into the table as a string literal (see the root
+/// contract above for why it is kept out of `scriptList`).
 pub fn generateRoot(a: std.mem.Allocator, os: std.Target.Os.Tag, scripts: []const scan.Script, build_id: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
@@ -94,11 +105,15 @@ pub fn generateRoot(a: std.mem.Allocator, os: std.Target.Os.Tag, scripts: []cons
         defer a.free(lit);
         try out.print(a, "pub const s{d} = ziggurat.describe(@import({s}), \"{f}\");\n", .{ i, lit, std.zig.fmtString(s.rel) });
     }
-    try out.appendSlice(a, "\nconst table = ziggurat.makeTable(&.{");
+    // The build id is kept out of `scripts`: the id changes on every build,
+    // and a declaration whose inputs change is analysed again, so the whole
+    // table check would rerun after every edit. `table` only puts the id
+    // next to the already checked list.
+    try out.appendSlice(a, "\nconst scripts = ziggurat.scriptList(&.{");
     for (scripts, 0..) |_, i| {
         try out.print(a, "{s} &s{d}", .{ if (i == 0) "" else ",", i });
     }
-    try out.print(a, "{s}}}, \"{f}\");\n", .{ if (scripts.len == 0) "" else " ", std.zig.fmtString(build_id) });
+    try out.print(a, "{s}}});\nconst table = ziggurat.tableOf(scripts, \"{f}\");\n", .{ if (scripts.len == 0) "" else " ", std.zig.fmtString(build_id) });
     try out.appendSlice(a,
         \\
         \\export fn ziggurat_init(api: *const ziggurat.HostApi, gen: u32) callconv(.c) void {
@@ -130,7 +145,8 @@ test "root golden with build id" {
         \\pub const s0 = ziggurat.describe(@import("a/x.zig"), "a/x.zig");
         \\pub const s1 = ziggurat.describe(@import("b.zig"), "b.zig");
         \\
-        \\const table = ziggurat.makeTable(&.{ &s0, &s1 }, "0123456789abcdef");
+        \\const scripts = ziggurat.scriptList(&.{ &s0, &s1 });
+        \\const table = ziggurat.tableOf(scripts, "0123456789abcdef");
         \\
         \\export fn ziggurat_init(api: *const ziggurat.HostApi, gen: u32) callconv(.c) void {
         \\    ziggurat.moduleInit(api, gen);
@@ -154,7 +170,7 @@ test "generateRoot escapes quotes" {
 test "generateRoot with no scripts" {
     const text = try generateRoot(testing.allocator, .linux, &.{}, "fedcba9876543210");
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.indexOf(u8, text, "const table = ziggurat.makeTable(&.{}, \"fedcba9876543210\");\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "const scripts = ziggurat.scriptList(&.{});\nconst table = ziggurat.tableOf(scripts, \"fedcba9876543210\");\n") != null);
     try testing.expect(std.mem.indexOf(u8, text, "ziggurat.describe(") == null);
 }
 

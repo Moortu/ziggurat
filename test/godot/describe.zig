@@ -283,9 +283,9 @@ test "describe: tool flag, no class name, no base field" {
 const tool_desc = ziggurat.describe(Tool, "ui/tool.zig");
 const coin_desc = ziggurat.describe(coin, "items/coin.zig");
 const hud_desc = ziggurat.describe(hud_label, "ui/hud_label.zig");
-const table = ziggurat.makeTable(&.{ &coin_desc, &player_desc, &hud_desc, &tool_desc }, "0123456789abcdef");
+const table = ziggurat.tableOf(ziggurat.scriptList(&.{ &coin_desc, &player_desc, &hud_desc, &tool_desc }), "0123456789abcdef");
 
-test "makeTable: header, every fixture script, validate" {
+test "tableOf: header, every fixture script, validate" {
     const t = &table;
     try testing.expectEqual(abi.magic, t.magic);
     try testing.expectEqual(abi.abi_version, t.abi_version);
@@ -417,9 +417,9 @@ const Stress = struct {
 };
 
 const stress_desc = ziggurat.describe(Stress, "deep/er/stress test.zig");
-const stress_table = ziggurat.makeTable(&.{ &coin_desc, &stress_desc, &player_desc, &hud_desc, &tool_desc }, "fedcba9876543210");
+const stress_table = ziggurat.tableOf(ziggurat.scriptList(&.{ &coin_desc, &stress_desc, &player_desc, &hud_desc, &tool_desc }), "fedcba9876543210");
 
-test "makeTable: a script at the limits validates" {
+test "tableOf: a script at the limits validates" {
     const d = &stress_desc;
     try testing.expectEqual(@as(u32, 64), d.signals[0].arg_count);
     var wide: ?abi.MethodDesc = null;

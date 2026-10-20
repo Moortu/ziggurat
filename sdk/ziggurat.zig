@@ -83,13 +83,30 @@ pub const describe = describe_mod.describe;
 /// value with `ziggurat_abi.expectedStamp(sdk_options)`.
 pub const layout_stamp: u64 = abi.expectedStamp(sdk_options);
 
-/// The table over `descs`, which the generated root passes sorted by path,
-/// with the build id the build service wrote into the root. After a fast
-/// (incremental) rebuild the service reads the id back from the staged
-/// library: a different id means the compiler kept stale code.
-pub fn makeTable(comptime descs: []const *const ScriptDescriptor, comptime build_id: []const u8) Table {
-    comptime describe_mod.checkTable(descs, version, build_id);
-    const scripts = &Scripts(descs).list;
+/// The longest build id `tableOf` accepts. The build service writes 16
+/// hex characters; `scriptList` counts this many bytes for it in the
+/// table's string budget, so `tableOf` needs no check over the scripts.
+pub const max_build_id_len = 16;
+
+/// The descriptors `descs`, which the generated root passes sorted by
+/// path, checked against the validator's whole-table limits and copied
+/// into one static array, as `Table.scripts` needs. It does not take the
+/// build id, so its result (and its check) stays the same from one build to
+/// the next until a descriptor changes; see the root contract in
+/// `src/build/rootgen.zig`.
+pub fn scriptList(comptime descs: []const *const ScriptDescriptor) []const ScriptDescriptor {
+    comptime describe_mod.checkTable(descs, version, max_build_id_len);
+    return &Scripts(descs).list;
+}
+
+/// The table over `scripts` (from `scriptList`) with the build id the
+/// build service wrote into the root. After a fast (incremental) rebuild
+/// the service reads the id back from the staged library: a different id
+/// means the compiler kept stale code. No loops, so the per-build id costs
+/// almost nothing to analyse.
+pub fn tableOf(comptime scripts: []const ScriptDescriptor, comptime build_id: []const u8) Table {
+    if (build_id.len > max_build_id_len)
+        @compileError(std.fmt.comptimePrint("ziggurat: the build id has {d} bytes; the limit is {d}.", .{ build_id.len, max_build_id_len }));
     return .{
         .magic = abi.magic,
         .abi_version = abi.abi_version,
@@ -97,8 +114,8 @@ pub fn makeTable(comptime descs: []const *const ScriptDescriptor, comptime build
         .layout_stamp = layout_stamp,
         .sdk_version = .{ .ptr = version.ptr, .len = version.len },
         .build_id = .{ .ptr = build_id.ptr, .len = build_id.len },
-        .scripts = scripts,
-        .script_count = descs.len,
+        .scripts = scripts.ptr,
+        .script_count = scripts.len,
     };
 }
 

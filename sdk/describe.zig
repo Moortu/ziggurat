@@ -77,7 +77,7 @@ const not_methods = [_][]const u8{ "init", "deinit", "migrate" };
 /// the decoder then reports the error on line 1.
 const unnamed = "ziggurat_unnamed";
 
-/// The host's validator limits. `describe` and `makeTable` refuse at compile
+/// The host's validator limits. `describe` and `scriptList` refuse at compile
 /// time every table the validator would refuse at load time, except two
 /// scripts with one path (the generated root never makes that) or one
 /// non-empty class name (the build service reports that from the validator).
@@ -781,15 +781,17 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
 /// Refuses at compile time a table over `descs` that is above the
 /// validator's whole-table limits: the script count, the item budget and
 /// the string byte budget (each descriptor already passed its own checks).
-pub fn checkTable(comptime descs: []const *const abi.ScriptDesc, comptime sdk_version: []const u8, comptime build_id: []const u8) void {
+/// The build id is not an input (it changes on every build); the budget
+/// counts `build_id_len` bytes for it, the most the table may hold.
+pub fn checkTable(comptime descs: []const *const abi.ScriptDesc, comptime sdk_version: []const u8, comptime build_id_len: usize) void {
     comptime {
         @setEvalBranchQuota(100_000 + 2_000 * descs.len);
         if (descs.len > limits.max_scripts)
             @compileError(std.fmt.comptimePrint("ziggurat: the project has {d} scripts; the limit is {d}.", .{ descs.len, limits.max_scripts }));
-        if (build_id.len > limits.max_string or sdk_version.len > limits.max_string)
+        if (build_id_len > limits.max_string or sdk_version.len > limits.max_string)
             @compileError("ziggurat: the build id or SDK version is longer than 4096 bytes.");
         var items: u64 = descs.len;
-        var bytes: u64 = sdk_version.len + build_id.len;
+        var bytes: u64 = sdk_version.len + build_id_len;
         for (descs) |d| {
             items += @as(u64, d.field_count) + d.property_count + d.method_count + d.signal_count;
             bytes += d.path.len + d.class_name.len + d.base_class.len;
