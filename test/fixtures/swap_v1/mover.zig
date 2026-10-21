@@ -1,6 +1,8 @@
 //! Swap fixture, version 1 of two (see `../swap_v2/mover.zig`): a changed
 //! layout. `speed`, `title`, `item`, `id` and `inits` keep their name and
-//! type and move; `hp` is removed and `count` changes type in version 2.
+//! type and move; `hp`, `tag` and `junk` are removed and `count`, `kind`
+//! and `skin` change type in version 2, so the old `destroy` releases the
+//! owned ones among them.
 const z = @import("ziggurat");
 const g = z.godot;
 
@@ -13,6 +15,12 @@ title: z.String = .empty,
 item: z.Ref(g.Resource) = .{},
 hp: i32 = 100,
 count: i32 = 0,
+tag: z.String = .empty,
+junk: z.Ref(g.Resource) = .{},
+/// A `z.StringName` in version 2.
+kind: z.String = .empty,
+/// A `z.Ref(g.Texture2D)` in version 2.
+skin: z.Ref(g.Resource) = .{},
 /// Times `init` ran on this instance's data.
 inits: i32 = 0,
 

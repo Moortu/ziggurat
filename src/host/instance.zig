@@ -53,8 +53,11 @@
 //! During a swap (`deferFrees`) a `free` on the swapping thread, from code
 //! the swap runs (`migrate`, an old `deinit`), only takes the record off
 //! the registry; the record and its data are released after the swap ended
-//! (`releaseDeferred`). No record memory is reused during a swap, and the
-//! module's `destroy` never runs on a record the swap is about to rewrite.
+//! (`releaseDeferred`). Record memory is therefore normally not reused
+//! during a swap (should the deferred list not grow, the record is released
+//! at once and its address may be reused; the registry's serial check tells
+//! a new record there from the old one), and the module's `destroy` never
+//! runs on a record the swap is about to rewrite, except in that fallback.
 //!
 //! Name maps: `runtime.shutdown` frees them at SCENE exit, after the entry
 //! has unregistered the language, holding the gate's write side. Godot

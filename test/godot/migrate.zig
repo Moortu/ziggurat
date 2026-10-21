@@ -189,8 +189,14 @@ test "migrate: type identity" {
     try testing.expectEqual(@as(?v1.Stats, .{ .a = 1, .b = 2 }), prev.get(v1.Stats, "_stats"));
     try testing.expectEqual(@as(?f32, 3), prev.get(f32, "speed"));
     try testing.expectEqual(@as(?i32, 100), prev.get(i32, "hp"));
-    // `get` copies: nothing is marked moved.
-    for (v.moved[0..v1_desc.field_count]) |m| try testing.expectEqual(@as(u8, 0), m);
+    // `get` copies: the fields it found are marked read (2), never moved.
+    for (v.moved[0..v1_desc.field_count], 0..) |m, i| {
+        const name = v1_desc.fields[i].name.ptr.?[0..v1_desc.fields[i].name.len];
+        const read = for ([_][]const u8{ "count", "mood", "_stats", "speed", "hp" }) |r| {
+            if (std.mem.eql(u8, r, name)) break true;
+        } else false;
+        try testing.expectEqual(@as(u8, if (read) 2 else 0), m);
+    }
 
     v1_desc.destroy(inst);
     try testing.expectEqual(start, live_bytes);

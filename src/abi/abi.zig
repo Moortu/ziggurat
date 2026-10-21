@@ -301,9 +301,11 @@ pub const ScriptDesc = extern struct {
 };
 
 /// The old instance during a migration: its data and its generation's field
-/// list. `moved` has one byte per old field; 1 means its value now belongs
-/// to the new instance (the host then resets the old field before the old
-/// `destroy`, so the value is not released twice).
+/// list. `moved` has one byte per old field: 0 untouched; 1 its value now
+/// belongs to the new instance (the host then resets the old field before
+/// the old `destroy`, so the value is not released twice); 2 `migrate`
+/// read (copied) it, the old field keeps its value. The host reports a
+/// removed or retyped field as dropped only while its byte is 0.
 pub const PrevView = extern struct {
     data: *const anyopaque,
     fields: [*]const FieldDesc,

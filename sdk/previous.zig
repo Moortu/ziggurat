@@ -12,7 +12,8 @@
 //!
 //! - `get(FT, name)` copies a plain value: bool, integers, floats, enums,
 //!   packed flags, vectors, `z.Obj` handles, and structs, arrays and
-//!   optionals of those. The old field stays as it is.
+//!   optionals of those. The old field stays as it is; it is marked read
+//!   (`moved` 2), so the host does not report it as dropped.
 //! - `take(FT, name)` moves an owning value (`z.String`, `z.StringName`,
 //!   `z.NodePath`, `z.Ref(T)`) out and marks the old field moved, so the
 //!   host resets it before the old instance's destroy and the value is
@@ -48,6 +49,7 @@ pub fn Previous(comptime T: type) type {
             comptime if (own.containsOwning(FT))
                 fail(T, "old.get cannot copy '" ++ name ++ "': its type owns an engine reference; use old.take for z.String, z.StringName, z.NodePath and z.Ref.");
             const i = self.find(FT, name) orelse return null;
+            if (self.view.moved[i] == 0) self.view.moved[i] = 2;
             return self.read(FT, i);
         }
 
@@ -59,7 +61,7 @@ pub fn Previous(comptime T: type) type {
             comptime if (!isTakeable(FT))
                 fail(T, "old.take of '" ++ name ++ "' as " ++ @typeName(FT) ++ ": take moves only z.String, z.StringName, z.NodePath and z.Ref; use old.get for a plain value.");
             const i = self.find(FT, name) orelse return null;
-            if (self.view.moved[i] != 0) return null;
+            if (self.view.moved[i] == 1) return null;
             const v = self.read(FT, i);
             self.view.moved[i] = 1;
             return v;

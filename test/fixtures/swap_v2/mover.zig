@@ -13,6 +13,10 @@ title: z.String = .empty,
 item: z.Ref(g.Resource) = .{},
 /// `i32` in version 1: reset to this default by a swap.
 count: u32 = 3,
+/// A `z.String` in version 1.
+kind: z.StringName = .empty,
+/// A `z.Ref(g.Resource)` in version 1.
+skin: z.Ref(g.Texture2D) = .{},
 inits: i32 = 0,
 
 pub fn init(self: *@This()) void {

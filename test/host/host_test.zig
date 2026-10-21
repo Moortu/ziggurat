@@ -747,6 +747,8 @@ test "swap: rollback on allocation failure, same layout keeps data, changed layo
             "ZTEST PASS same_layout_keeps_data",
             "ZTEST PASS changed_layout_moves_fields",
             "ZTEST PASS migrate_hook_runs",
+            "ZTEST PASS owned_fields_released_once",
+            "ZTEST PASS owned_fields_released_with_instances",
             "ZTEST PASS instance_made_during_swap_on_new_generation",
             "ZTEST PASS script_missing_keeps_old_code",
             "ZTEST PASS old_generation_bytes_released",
@@ -773,6 +775,10 @@ test "swap: rollback on allocation failure, same layout keeps data, changed layo
             // Logged once per script per swap.
             "mover.zig: field 'hp' was dropped (removed)",
             "mover.zig: field 'count' was dropped (type changed)",
+            "mover.zig: field 'tag' was dropped (removed)",
+            "mover.zig: field 'junk' was dropped (removed)",
+            "mover.zig: field 'kind' was dropped (type changed)",
+            "mover.zig: field 'skin' was dropped (type changed)",
             "oldonly.zig is not in build 2; its instances keep the old code",
             "ziggurat: swapped to build 2",
         },
@@ -781,15 +787,22 @@ test "swap: rollback on allocation failure, same layout keeps data, changed layo
             "mover deinit gen=1 hp=7",
             "mover deinit gen=2 id=9\n",
             "keeper.zig: field",
+            // Read with `old.get` or taken by `migrate`: not dropped.
+            "migrator.zig: field",
         },
     });
 
     try p.addCheck("swap_threads.gd");
-    try p.runScript(&.{
+    try p.runScriptOnce(&.{
         "ZTEST PASS load\n",
         "ZTEST PASS threads_across_two_generations",
         "ZTEST PASS registry_matches_live",
         "ZTEST PASS bytes_released",
+    }, &.{
+        // Twenty swaps, two directions: each dropped field is logged once
+        // per (script, old layout, new layout).
+        "ticker.zig: field 'pad' was dropped (removed)",
+        "ticker.zig: field 'pad2' was dropped (removed)",
     });
 
     try p.addAutoloadCheck("swap_editor.gd");

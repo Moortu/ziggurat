@@ -114,9 +114,26 @@ func run() -> void:
 	m1.set("title", "hello")
 	m1.set("item", res)
 	m1.set("count", 4)
+	# Owned fields that version 2 removes or retypes: the old deinit
+	# releases them, once.
+	var res_junk := Resource.new()
+	var res_skin := Resource.new()
+	m1.set("tag", "t")
+	m1.set("junk", res_junk)
+	m1.set("kind", "k")
+	m1.set("skin", res_skin)
 	var mig := Node.new()
 	mig.set_script(migrator_s)
 	mig.set("hp", 55)
+	# Owned fields version 2's migrate takes: into empty fields, and over
+	# `slot`, which the host moved in first.
+	var res_a := Resource.new()
+	var res_slot := Resource.new()
+	var res_alt := Resource.new()
+	mig.set("note", "n1")
+	mig.set("res", res_a)
+	mig.set("slot", res_slot)
+	mig.set("alt_slot", res_alt)
 	# Freed before any swap: its deinit runs once, on generation 1.
 	var gone := make_mover(9)
 	gone.free()
@@ -141,7 +158,8 @@ func run() -> void:
 		outcome == REJECTED and probe.current_generation() == 1 and gens_ok
 		and probe.live_bytes(1) == bytes1 and probe.live_bytes(2) == bytes2
 		and probe.instance_data(keeper) == keeper_data and probe.instance_data(m1) == m1_data
-		and m1.get("speed") == 2.5 and m1.get("title") == "hello" and keeper.call("version") == 1,
+		and m1.get("speed") == 2.5 and m1.get("title") == "hello" and keeper.call("version") == 1
+		and res_junk.get_reference_count() == 2 and res_a.get_reference_count() == 2,
 		"outcome %d, current %d, generations %s, bytes %d/%d (before %d/%d), data %s %s, speed %s" % [
 			outcome, probe.current_generation(), gens_ok, probe.live_bytes(1), probe.live_bytes(2),
 			bytes1, bytes2, probe.instance_data(keeper) == keeper_data, probe.instance_data(m1) == m1_data, m1.get("speed")])
@@ -182,6 +200,19 @@ func run() -> void:
 	report("migrate_hook_runs", mig.get("migrated") == true and mig.get("health") == 55,
 		"migrated %s, health %s" % [mig.get("migrated"), mig.get("health")])
 
+	# Each count is this function's reference plus the instances holding
+	# the resource: a value released twice would be one lower (or freed),
+	# one never released one higher.
+	var counts := [res.get_reference_count(), res_junk.get_reference_count(), res_skin.get_reference_count(),
+		res_a.get_reference_count(), res_slot.get_reference_count(), res_alt.get_reference_count()]
+	report("owned_fields_released_once",
+		counts == [2, 1, 1, 2, 1, 2]
+		and m1.get("tag") == null and m1.get("junk") == null and m1.get("skin") == null
+		and mig.get("memo") == "n1" and mig.get("asset") == res_a and mig.get("slot") == res_alt
+		and mig.get("note") == null and mig.get("res") == null and mig.get("alt_slot") == null,
+		"reference counts [item, junk, skin, res, slot, alt_slot] %s, tag %s, junk %s, skin %s, memo %s, asset %s, slot %s" % [
+			counts, m1.get("tag"), m1.get("junk"), m1.get("skin"), mig.get("memo"), mig.get("asset") == res_a, mig.get("slot") == res_alt])
+
 	report("instance_made_during_swap_on_new_generation",
 		made_during != null and probe.instance_generation(made_during) == 2 and made_during.get("inits") == 1,
 		"generation %d, inits %s" % [probe.instance_generation(made_during) if made_during else -1,
@@ -206,6 +237,8 @@ func run() -> void:
 	m1.set("item", null)
 	for n in [m1, m2, mig, made_during]:
 		n.free()
+	var after := [res.get_reference_count(), res_a.get_reference_count(), res_alt.get_reference_count()]
+	report("owned_fields_released_with_instances", after == [1, 1, 1], "reference counts [item, res, alt_slot] %s" % [after])
 	keeper = null
 	oldonly = null
 	report("instances_released", probe.live_instances() == 0 and probe.live_bytes(2) == bytes2,

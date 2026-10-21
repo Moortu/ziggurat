@@ -22,21 +22,35 @@
 //! 3. Per instance: a same layout retags the block (`runtime.retag`) and
 //!    rewrites the record's generation and index. A changed layout marks the
 //!    instance as migrating (`gate.setMigrating`), byte-copies the moving
-//!    fields and marks them moved, calls the new `migrate(new, prev)` if
-//!    there is one, resets every moved old field from the old defaults
-//!    image, calls the old `destroy` (its `deinit` sees only what did not
-//!    move), then writes generation, index and data of the record as one
-//!    unit and ends the migration.
+//!    fields and marks them moved (`PrevView.moved` 1), calls the new
+//!    `migrate(new, prev)` if there is one (its `take` marks more fields
+//!    moved, its `get` marks fields read: 2), resets every moved old field
+//!    (1 only) from the old defaults image, calls the old `destroy` (its
+//!    `deinit` sees only what did not move), then writes generation, index
+//!    and data of the record as one unit and ends the migration.
 //! 4. Publish the new generation as current (its name maps are complete
 //!    since `runtime.load`), then end the swap.
 //! After the write side is released: the records freed during the swap are
 //! released (`instance.releaseDeferred`), the dropped fields and missing
-//! scripts are logged, and every live script refreshes its placeholders
-//! (`_update_exports`) and tool placeholders; in the editor each migrated
-//! object also emits `property_list_changed` for the Inspector. These Godot
-//! calls can take Godot's own locks, which a thread waiting at the gate may
-//! hold, so they never run under the write side. Script descriptors need no
-//! refresh: every script answer is read from `runtime.current()`.
+//! scripts are logged (once per script path, old layout and new layout for
+//! the process, so repeated swaps between the same layouts stay quiet),
+//! and every live script refreshes its placeholders (`_update_exports`) and
+//! tool placeholders; in the editor each object whose instance was
+//! migrated to a changed layout also emits `property_list_changed` for the
+//! Inspector. These Godot calls can take Godot's own locks, which a thread
+//! waiting at the gate may hold, so the host never makes them under the
+//! write side. Script descriptors need no refresh: every script answer is
+//! read from `runtime.current()`. Module code that runs under the write
+//! side (`create_blank`, `migrate`, an old `deinit`) prints only through
+//! `HostApi.log`, which goes to Godot's print functions; that is accepted
+//! (spec section 6, calls from `migrate` and `deinit`).
+//!
+//! Should `gate.endSwap` refuse (a caller bug: it is called at the depth
+//! `trySwap` saw, 0 from `_frame`), the swap stays open (`swap_open`): none
+//! of the work above runs under the write side, and the next `runPending`
+//! first ends the swap at depth 0, then releases the deferred records and
+//! refreshes the placeholders (the Inspector and the log lines of that
+//! swap are skipped).
 //!
 //! Code the swap runs (`migrate`, an old `deinit`) runs on the swapping
 //! thread, which passes through the gate. A call into the instance being
@@ -86,6 +100,11 @@ var pending: std.atomic.Value(?*Generation) = .init(null);
 var last: struct { outcome: Outcome = .none, n: u32 = 0 } = .{};
 /// Swaps done in this process (main thread).
 var swaps: u32 = 0;
+/// Set when `endSwap` refused after a swap: the write side is still held
+/// by the main thread and the after-swap work waits (main thread).
+var swap_open: bool = false;
+/// Keys of the warnings logged (`warnOnce`), for the process (main thread).
+var warned: std.AutoHashMapUnmanaged(u64, void) = .empty;
 
 /// Code to run once on the swapping thread, after the first instance with
 /// a changed layout was migrated, standing in for user code in `migrate`
@@ -116,6 +135,12 @@ pub fn swapCount() u32 {
 /// Runs the requested swap if it can run now. `ZigLanguage._frame` only,
 /// on the main thread.
 pub fn runPending() Outcome {
+    if (swap_open) {
+        if (gate.depth() != 0 or !gate.endSwap()) return note(.deferred_depth, last.n, null);
+        swap_open = false;
+        _ = instance.releaseDeferred();
+        refreshScripts(&.{});
+    }
     const gen = pending.load(.acquire) orelse return note(.none, 0, null);
     const old = runtime.current();
     if (old == gen) {
@@ -134,7 +159,11 @@ pub fn runPending() Outcome {
     // `run` stopped putting frees off and cleared the swap target.
     if (!gate.endSwap()) {
         // Not reachable from `_frame` (the depth was 0 at `trySwap`);
-        // `endSwap` logged it. The lock stays with this thread.
+        // `endSwap` logged it. The lock stays with this thread until the
+        // next frame ends it; nothing more runs under it now.
+        swap_open = true;
+        if (ok) swaps += 1;
+        return note(if (ok) .swapped else .rejected, gen.n, &w);
     }
     _ = instance.releaseDeferred();
     if (!ok) return note(.rejected, gen.n, &w);
@@ -234,7 +263,8 @@ const Job = struct {
     plan: *Plan,
     /// The new block (`create_blank`) for a changed layout.
     blank: ?*anyopaque = null,
-    /// The owner's object id, for the Inspector refresh (editor only).
+    /// The owner's object id, for the Inspector refresh (editor only, and
+    /// only for a changed layout: a kept block keeps its property list).
     owner_id: u64 = 0,
 };
 
@@ -312,7 +342,7 @@ const Work = struct {
                 };
             }
             // Reads a field of the object; takes no Godot lock.
-            if (editor) jobs[n].owner_id = godot.raw.objectGetInstanceId(@ptrCast(rec.owner));
+            if (editor and !p.same) jobs[n].owner_id = godot.raw.objectGetInstanceId(@ptrCast(rec.owner));
             n += 1;
         }
         w.jobs = jobs[0..n];
@@ -360,15 +390,19 @@ const Work = struct {
         return p;
     }
 
-    /// Logs each field no instance carried over, once per script, and each
-    /// script the new generation lacks. After the swap.
+    /// Logs each field no instance carried over (neither moved nor read),
+    /// and each script the new generation lacks: once per script path, old
+    /// layout and new layout for the process (`warnOnce`). After the swap.
     fn logDropped(w: *const Work) void {
         for (w.plans.keys(), w.plans.values()) |old, plan| {
+            const old_hash = abi.layoutHash(old);
             const p = plan orelse {
-                logWarning("{s} is not in build {d}; its instances keep the old code", .{ text(old.path), w.new.n });
+                if (warnOnce(text(old.path), old_hash, 0))
+                    logWarning("{s} is not in build {d}; its instances keep the old code", .{ text(old.path), w.new.n });
                 continue;
             };
             if (p.same or p.migrated == 0) continue;
+            if (!warnOnce(text(old.path), old_hash, abi.layoutHash(p.new))) continue;
             for (fieldsOf(old), p.fields.fates, p.carried) |f, fate, carried| {
                 if (carried) continue;
                 const why = switch (fate) {
@@ -381,28 +415,49 @@ const Work = struct {
         }
     }
 
-    /// Step 5, after the write side is released: placeholders, tool
-    /// placeholders and the Inspector.
+    /// Step 5, after the write side is released.
     fn refresh(w: *const Work) void {
-        const scripts = script.liveScripts(gpa) catch {
-            logError("Ziggurat could not refresh the Zig scripts after a swap: out of memory.", .{});
-            return;
-        };
-        defer gpa.free(scripts);
-        for (scripts) |s| {
-            defer script.release(s);
-            s._updateExports();
-            s.swapToolPlaceholders();
-        }
-        if (!script.isEditor()) return;
+        var ids: std.ArrayList(u64) = .empty;
         for (w.jobs) |j| {
-            if (j.owner_id == 0) continue;
-            const raw = godot.raw.objectGetInstanceFromId(j.owner_id) orelse continue;
-            const obj: *Object = @ptrCast(@alignCast(raw));
-            obj.notifyPropertyListChanged();
+            if (j.owner_id != 0) ids.append(w.a, j.owner_id) catch break;
         }
+        refreshScripts(ids.items);
     }
 };
+
+/// Refreshes the placeholders and tool placeholders of every live script
+/// and, in the editor, the property lists of the objects `owner_ids` name
+/// (for the Inspector). After the write side is released.
+fn refreshScripts(owner_ids: []const u64) void {
+    const scripts = script.liveScripts(gpa) catch {
+        logError("Ziggurat could not refresh the Zig scripts after a swap: out of memory.", .{});
+        return;
+    };
+    defer gpa.free(scripts);
+    for (scripts) |s| {
+        defer script.release(s);
+        s._updateExports();
+        s.swapToolPlaceholders();
+    }
+    if (!script.isEditor()) return;
+    for (owner_ids) |id| {
+        const raw = godot.raw.objectGetInstanceFromId(id) orelse continue;
+        const obj: *Object = @ptrCast(@alignCast(raw));
+        obj.notifyPropertyListChanged();
+    }
+}
+
+/// True the first time `(path, old_hash, new_hash)` is seen in this
+/// process (also when the set cannot grow: a repeated warning is better
+/// than a lost one). Main thread.
+fn warnOnce(path: []const u8, old_hash: u64, new_hash: u64) bool {
+    var h = std.hash.Wyhash.init(0);
+    h.update(path);
+    h.update(std.mem.asBytes(&old_hash));
+    h.update(std.mem.asBytes(&new_hash));
+    const gop = warned.getOrPut(gpa, h.final()) catch return true;
+    return !gop.found_existing;
+}
 
 /// Moves one instance with a changed layout to `new` (step 3).
 fn migrate(rec: *Instance, p: *Plan, blank: *anyopaque, new: *Generation) void {
@@ -422,10 +477,11 @@ fn migrate(rec: *Instance, p: *Plan, blank: *anyopaque, new: *Generation) void {
     // What moved now belongs to the new instance: the old `destroy` must
     // not release it.
     const defaults: [*]const u8 = @ptrCast(old.defaults);
+    // 1: moved (reset); 2: read by `migrate` (kept for the old `deinit`).
     for (fieldsOf(old), p.moved, p.carried) |f, moved, *carried| {
         if (moved == 0) continue;
         carried.* = true;
-        if (std.mem.eql(u8, text(f.name), "base")) continue;
+        if (moved != 1 or std.mem.eql(u8, text(f.name), "base")) continue;
         @memcpy(old_data[f.offset..][0..f.size], defaults[f.offset..][0..f.size]);
     }
     old.destroy(rec.data);

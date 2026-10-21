@@ -135,7 +135,20 @@ func _worker(i: int, obj: RefCounted) -> Array:
 		# Make and drop one instance on this thread: it lands on whichever
 		# generation is current and is migrated or freed with the others.
 		if (n + i) % 16 == 0:
+			# The instance is on the current generation: made on it, or
+			# migrated with the others. A swap between the reads can make
+			# them disagree, so a few tries; an instance left behind on an
+			# old generation disagrees every time the other one is current.
 			var tmp := make_ticker()
+			var on_current := false
+			for attempt in 3:
+				var cur_before: int = probe.current_generation()
+				var gen: int = probe.instance_generation(tmp)
+				if gen == cur_before and gen == probe.current_generation():
+					on_current = true
+					break
+			if not on_current:
+				errors += 1
 			if tmp.call("bump") != 1:
 				errors += 1
 	return [n, errors, during]
