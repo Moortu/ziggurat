@@ -4,13 +4,18 @@
 //! every script-level question Godot and the editor ask from the script's
 //! descriptor. The descriptor is found by the script's project-relative path
 //! (its resource path without `res://`), in this order:
-//! 1. once a module generation is loaded (`runtime.current`), that
-//!    generation alone: a script it does not have has no descriptor (it was
-//!    deleted or renamed), whatever the cache says;
-//! 2. before the first load, the descriptor cache the language read at
+//! 1. the newest build's table snapshot (`installSnapshot`), when no
+//!    current generation is as new: in the editor a build is loaded only
+//!    when the project has a tool script, so the snapshot describes every
+//!    other build (and the build a swap has not reached yet);
+//! 2. once a module generation is current (`runtime.current`) and at least
+//!    as new as the snapshot, that generation;
+//!    in either case a script the source does not have has no descriptor
+//!    (it was deleted or renamed), whatever the cache says;
+//! 3. before the first build, the descriptor cache the language read at
 //!    startup (`.godot/ziggurat/descriptors.json`, `loadStartupCache`), so
 //!    the Inspector works before the first build of the session is done;
-//! 3. none: the script is not valid, has empty lists and lets Godot keep
+//! 4. none: the script is not valid, has empty lists and lets Godot keep
 //!    scene values with placeholder fallback.
 //! Nothing is copied: every answer is read from the descriptor in use, so a
 //! new generation changes the answers at once. `_update_exports` compares
@@ -28,9 +33,9 @@
 //! holds.
 //!
 //! Threads: Godot calls these virtuals on the main thread and, while loading
-//! resources, on loader threads. Generations are never freed and the
-//! startup cache is freed only at SCENE exit, so the descriptor data read
-//! here stays valid.
+//! resources, on loader threads. Generations are never freed, and the
+//! startup cache and the snapshot caches are freed only at SCENE exit, so
+//! the descriptor data read here stays valid.
 const std = @import("std");
 const godot = @import("gdzig");
 const abi = @import("ziggurat_abi");
@@ -46,6 +51,7 @@ const placeholder = @import("placeholder.zig");
 const gate = @import("gate.zig");
 const global_class = @import("global_class.zig");
 const diag_cache = @import("diag_cache.zig");
+const swap = @import("swap.zig");
 
 const Allocator = std.mem.Allocator;
 const Array = godot.builtin.Array;
@@ -107,10 +113,60 @@ pub fn loadStartupCache() void {
     };
 }
 
-/// Frees the startup cache. Main thread, at SCENE exit.
+/// Frees the startup cache and the snapshot caches. Main thread, at SCENE
+/// exit.
 pub fn dropStartupCache() void {
     if (startup_cache) |*c| c.deinit();
     startup_cache = null;
+    newest_snap.store(null, .release);
+    for (snap_caches.items) |sc| {
+        sc.cache.deinit();
+        std.heap.c_allocator.destroy(sc);
+    }
+    snap_caches.deinit(std.heap.c_allocator);
+    snap_caches = .empty;
+}
+
+/// Descriptors made from one build's table snapshot.
+const SnapCache = struct {
+    cache: desc_cache.Cache,
+    /// The build's generation number.
+    n: u32,
+    /// Hash of the descriptors (the cache file bytes without the number).
+    hash: u64,
+};
+
+/// Every snapshot cache made in this session, kept until SCENE exit,
+/// because a loader thread may still read one an older build installed.
+/// Only builds whose descriptors changed add one. Main thread.
+var snap_caches: std.ArrayList(*SnapCache) = .empty;
+/// The newest snapshot cache, or null. Written on the main thread; read on
+/// any thread.
+var newest_snap: std.atomic.Value(?*SnapCache) = .init(null);
+
+/// Makes `snap`, the table snapshot of build `n` whose checks passed, the
+/// newest descriptors (see the file comment). A build whose descriptors
+/// equal the newest snapshot's keeps that one, with its number, so the
+/// placeholders are not fed again for nothing. Main thread.
+pub fn installSnapshot(n: u32, snap: *const abi.Snapshot) error{ OutOfMemory, Rejected }!void {
+    const a = std.heap.c_allocator;
+    const bytes = desc_cache.fromSnapshot(a, 0, snap) catch return error.OutOfMemory;
+    defer a.free(bytes);
+    const hash = std.hash.Wyhash.hash(0, bytes);
+    if (newest_snap.load(.acquire)) |cur| {
+        if (cur.hash == hash) return;
+    }
+    var diag: [256]u8 = undefined;
+    var cache = desc_cache.parse(a, bytes, &diag) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Rejected, error.FileNotFound => return error.Rejected,
+    };
+    errdefer cache.deinit();
+    const sc = try a.create(SnapCache);
+    errdefer a.destroy(sc);
+    sc.* = .{ .cache = cache, .n = n, .hash = hash };
+    try snap_caches.append(a, sc);
+    newest_snap.store(sc, .release);
 }
 
 // ------------------------------------------------------------ live scripts
@@ -162,7 +218,7 @@ pub fn release(s: *ZigScript) void {
 /// Cache and module numbers are separate spaces (a cache written by
 /// generation 1 of an earlier session is not generation 1 of this one).
 pub const DescKey = struct {
-    source: enum { none, cached, loaded } = .none,
+    source: enum { none, cached, snapshot, loaded } = .none,
     n: u32 = 0,
 
     pub fn eql(a: DescKey, b: DescKey) bool {
@@ -170,15 +226,16 @@ pub const DescKey = struct {
     }
 };
 
-/// The descriptor of one script, from a loaded generation or the cache.
+/// The descriptor of one script, from a loaded generation, or from the
+/// cache format: the startup cache or a build's snapshot (`snap` true).
 const Desc = union(enum) {
     loaded: struct { gen: *runtime.Generation, index: u32 },
-    cached: struct { script: *const desc_cache.Script, n: u32 },
+    cached: struct { script: *const desc_cache.Script, n: u32, snap: bool = false },
 
     fn key(d: Desc) DescKey {
         return switch (d) {
             .loaded => |l| .{ .source = .loaded, .n = l.gen.n },
-            .cached => |c| .{ .source = .cached, .n = c.n },
+            .cached => |c| .{ .source = if (c.snap) .snapshot else .cached, .n = c.n },
         };
     }
 
@@ -391,8 +448,9 @@ const Feed = struct {
     }
 };
 
-/// The descriptor of the script at project-relative path `rel`. Once a
-/// generation is loaded the cache is never asked (no stale validity for a
+/// The descriptor of the script at project-relative path `rel` (order in
+/// the file comment). Once a build is described (a snapshot or a current
+/// generation) the startup cache is never asked (no stale validity for a
 /// script the module no longer has). On the thread running a swap, the
 /// generation it swaps to answers first for the scripts it has
 /// (`runtime.swapTarget`): an instance made by code the swap runs lands on
@@ -401,7 +459,14 @@ fn findDesc(rel: []const u8) ?Desc {
     if (runtime.swapTarget()) |gen| {
         if (runtime.findScript(gen, rel)) |i| return .{ .loaded = .{ .gen = gen, .index = i } };
     }
-    if (runtime.current()) |gen| {
+    const cur = runtime.current();
+    if (newest_snap.load(.acquire)) |sc| {
+        if (cur == null or sc.n > cur.?.n) {
+            const s = sc.cache.find(rel) orelse return null;
+            return .{ .cached = .{ .script = s, .n = sc.n, .snap = true } };
+        }
+    }
+    if (cur) |gen| {
         const i = runtime.findScript(gen, rel) orelse return null;
         return .{ .loaded = .{ .gen = gen, .index = i } };
     }
@@ -994,9 +1059,12 @@ pub const ZigScript = struct {
         self.source = .copy(code);
     }
 
-    /// Returns OK: the code that runs changes only when a new build is
-    /// loaded, so a reload request changes nothing. Logged once per script.
+    /// Returns OK. Queues a swap to the newest good build when it is newer
+    /// than the current one (`swap.requestNewest`; it runs at a later
+    /// frame); nothing is built. Without a newer build the request changes
+    /// nothing, logged once per script.
     pub fn _reload(self: *ZigScript, _: bool) Error {
+        if (swap.requestNewest()) return .ok;
         if (!self.reload_logged) {
             self.reload_logged = true;
             self.logScript("reloads when a new build is loaded; the reload request changed nothing.");

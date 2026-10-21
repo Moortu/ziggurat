@@ -122,6 +122,18 @@ pub fn request(gen: *Generation) void {
     pending.store(gen, .release);
 }
 
+/// Asks for a swap to the newest good generation (`runtime.newestGood`)
+/// when it is newer than the current one. False when there is none. Any
+/// thread (reload hooks, `HostApi.request_swap`).
+pub fn requestNewest() bool {
+    const gen = runtime.newestGood() orelse return false;
+    if (runtime.current()) |cur| {
+        if (cur.n >= gen.n) return false;
+    }
+    request(gen);
+    return true;
+}
+
 /// The outcome of the last `runPending`.
 pub fn lastOutcome() Outcome {
     return last.outcome;

@@ -83,8 +83,77 @@ pub fn run(a: Allocator, gen: *const runtime.Generation) Allocator.Error![]Findi
         for (out.items) |f| a.free(f.message);
         out.deinit(a);
     }
-    for (gen.scripts(), 0..) |*desc, i| try checkScript(a, @intCast(i), desc, &out);
+    for (gen.scripts(), 0..) |*desc, i| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const v = try viewOfDesc(arena.allocator(), desc);
+        try checkScript(a, @intCast(i), &v, &out);
+    }
     return out.toOwnedSlice(a);
+}
+
+/// As `run`, on a build's table snapshot (`abi.Snapshot`), so a build can
+/// be checked without loading it; `Finding.script` indexes
+/// `snap.scripts`. The same findings as `run` on the loaded table.
+pub fn runSnapshot(a: Allocator, snap: *const abi.Snapshot) Allocator.Error![]Finding {
+    var out: std.ArrayList(Finding) = .empty;
+    errdefer {
+        for (out.items) |f| a.free(f.message);
+        out.deinit(a);
+    }
+    for (snap.scripts, 0..) |*sc, i| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const v = try viewOfSnap(arena.allocator(), sc);
+        try checkScript(a, @intCast(i), &v, &out);
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// What the checks read of one script, from a descriptor or a snapshot.
+const View = struct {
+    path: []const u8,
+    base: []const u8,
+    props: []const Prop,
+    methods: []const Method,
+    signals: []const []const u8,
+
+    const Prop = struct { name: []const u8, label: bool, variant_type: u32, hint: u32, class_name: []const u8 };
+    const Method = struct { name: []const u8, virtual: bool };
+};
+
+fn viewOfDesc(a: Allocator, desc: *const abi.ScriptDesc) Allocator.Error!View {
+    const ps = try a.alloc(View.Prop, desc.property_count);
+    for (desc.properties[0..desc.property_count], ps) |p, *o| o.* = .{
+        .name = str(p.name),
+        .label = p.field_index == abi.no_field,
+        .variant_type = p.variant_type,
+        .hint = p.hint,
+        .class_name = str(p.class_name),
+    };
+    const ms = try a.alloc(View.Method, desc.method_count);
+    for (desc.methods[0..desc.method_count], ms) |m, *o| o.* = .{ .name = str(m.name), .virtual = m.flags & abi.method_flag_virtual != 0 };
+    const ss = try a.alloc([]const u8, desc.signal_count);
+    for (desc.signals[0..desc.signal_count], ss) |g, *o| o.* = str(g.name);
+    return .{ .path = str(desc.path), .base = str(desc.base_class), .props = ps, .methods = ms, .signals = ss };
+}
+
+fn viewOfSnap(a: Allocator, sc: *const abi.snapshot.ScriptSnap) Allocator.Error!View {
+    const ps = try a.alloc(View.Prop, sc.properties.len);
+    for (sc.properties, ps) |p, *o| o.* = .{
+        .name = p.name,
+        // The snapshot keeps no field index; group entries carry a label
+        // usage bit, as in the descriptor cache.
+        .label = p.usage & usage_label != 0,
+        .variant_type = p.variant_type,
+        .hint = p.hint,
+        .class_name = p.class_name,
+    };
+    const ms = try a.alloc(View.Method, sc.methods.len);
+    for (sc.methods, ms) |m, *o| o.* = .{ .name = m.name, .virtual = m.flags & abi.method_flag_virtual != 0 };
+    const ss = try a.alloc([]const u8, sc.signals.len);
+    for (sc.signals, ss) |g, *o| o.* = g.name;
+    return .{ .path = sc.path, .base = sc.base_class, .props = ps, .methods = ms, .signals = ss };
 }
 
 fn str(s: abi.Str) []const u8 {
@@ -92,34 +161,33 @@ fn str(s: abi.Str) []const u8 {
     return (s.ptr orelse return "")[0..s.len];
 }
 
-fn checkScript(a: Allocator, index: u32, desc: *const abi.ScriptDesc, out: *std.ArrayList(Finding)) Allocator.Error!void {
-    const base = str(desc.base_class);
+fn checkScript(a: Allocator, index: u32, v: *const View, out: *std.ArrayList(Finding)) Allocator.Error!void {
+    const base = v.base;
     var base_sn = StringName.fromUtf8(base);
     defer base_sn.deinit();
     // An unknown class was refused by the module; nothing to compare with.
     if (base.len == 0 or !ClassDb.classExists(base_sn)) return;
 
-    const script = try std.fmt.allocPrint(a, "res://{s}", .{str(desc.path)});
+    const script = try std.fmt.allocPrint(a, "res://{s}", .{v.path});
     defer a.free(script);
 
     var chain = try Chain.init(a, base);
     defer chain.deinit();
 
     const base_is_node = isNode(base);
-    for (desc.properties[0..desc.property_count]) |p| {
-        if (p.field_index == abi.no_field) continue;
-        const name = str(p.name);
-        try checkName(a, index, script, &chain, .property, name, out);
+    for (v.props) |p| {
+        if (p.label) continue;
+        try checkName(a, index, script, &chain, .property, p.name, out);
         if (!base_is_node and p.variant_type == variant_object and holdsNode(p)) {
-            try out.append(a, .{ .script = index, .message = try nodeField(a, script, base, name) });
+            try out.append(a, .{ .script = index, .message = try nodeField(a, script, base, p.name) });
         }
     }
-    for (desc.methods[0..desc.method_count]) |m| {
-        if (m.flags & abi.method_flag_virtual != 0) continue;
-        try checkName(a, index, script, &chain, .method, str(m.name), out);
+    for (v.methods) |m| {
+        if (m.virtual) continue;
+        try checkName(a, index, script, &chain, .method, m.name, out);
     }
-    for (desc.signals[0..desc.signal_count]) |sig| {
-        try checkName(a, index, script, &chain, .signal, str(sig.name), out);
+    for (v.signals) |name| {
+        try checkName(a, index, script, &chain, .signal, name, out);
     }
 }
 
@@ -139,9 +207,9 @@ fn checkName(a: Allocator, index: u32, script: []const u8, chain: *const Chain, 
 
 /// True when the object property `p` is typed with a Node class: the SDK's
 /// node hint, or a class name that is Node or derives from it.
-fn holdsNode(p: abi.PropertyDesc) bool {
+fn holdsNode(p: View.Prop) bool {
     if (p.hint == hint_node_type) return true;
-    const class = str(p.class_name);
+    const class = p.class_name;
     return class.len != 0 and isNode(class);
 }
 

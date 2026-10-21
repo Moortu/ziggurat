@@ -352,7 +352,7 @@ test "runtime: load good module, load refuses bad module, name maps use interned
         "[ziggurat] warning from main",
         "[ziggurat] error from main",
         "[ziggurat] info from thread 49\n",
-        "[ziggurat] swap requested (swaps arrive in a later version)",
+        "[ziggurat] swap requested, but no newer build is loaded (logged once)",
         "ERROR: [ziggurat] Ziggurat cannot load the module libzmod.1.so from a thread other than the main thread.",
     });
 }
@@ -1220,6 +1220,56 @@ test "load checks" {
             "ziggurat: build 1 failed the load checks (open, ",
         },
         .reject = &.{"ziggurat: build 1 loaded"},
+        .deadline = build_deadline_s,
+    });
+}
+
+test "editor reload: tool node gets new code, rejected build never loads, size warning once" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("editor_reload");
+    defer p.deinit();
+    try addBuildSettings(&p);
+    try p.addAutoloadCheck("editor_reload_tool.gd");
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS tool_build_loaded",
+            "ZTEST PASS tool_node_runs_build_1",
+            "ZTEST PASS tool_node_gets_new_code",
+            "ZTEST PASS tool_build_manifest",
+            "ZTEST PASS rejected_build_never_loads",
+            "ziggurat: build 1 loaded (open, ",
+            "ziggurat: build 2 loaded (save, ",
+            "ziggurat: swapped to build 2 (1 instances kept their data, 0 migrated)",
+            "ziggurat: build 3 failed the load checks (save, ",
+            "Method 'get_name' of res://knob.zig hides Node.get_name",
+        },
+        .once = &.{
+            "Ziggurat has loaded 1 builds (",
+            "in this editor session; restart the editor to free them.",
+        },
+        .reject = &.{"ziggurat: build 3 loaded"},
+        .deadline = build_deadline_s,
+    });
+}
+
+test "editor reload: no tool scripts loads nothing" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("editor_reload_plain");
+    defer p.deinit();
+    try addBuildSettings(&p);
+    try p.addAutoloadCheck("editor_reload_plain.gd");
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS plain_build_1",
+            "ZTEST PASS plain_build_2",
+            "ZTEST PASS plain_build_3",
+            "ziggurat: build 1 ready (open, ",
+            "ziggurat: build 2 ready (save, ",
+            "ziggurat: build 3 ready (save, ",
+        },
+        .reject = &.{ " loaded (", "generations loaded in this editor session", "swapped to build" },
         .deadline = build_deadline_s,
     });
 }

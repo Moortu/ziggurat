@@ -12,10 +12,22 @@
 //!   thread) queues a save request for the main thread.
 //! - The service calls `onOutcome` on its build thread. It copies the
 //!   outcome and pushes it onto the main-thread queue (`main_queue`), which
-//!   `ZigLanguage._frame` drains. `apply` then runs on the main thread:
-//!   a good build is loaded as the new generation (`runtime.load`), the load
-//!   checks run (`load_checks`), the descriptor cache and the generation
-//!   manifest are written; a failed build keeps the last good generation.
+//!   `ZigLanguage._frame` drains. `apply` then runs on the main thread.
+//!   A good build's load checks (`load_checks`) run on the table snapshot
+//!   the service took (`Outcome.snapshot`), before anything is loaded; a
+//!   finding fails the build and nothing is loaded. Then the editor
+//!   generation policy (spec section 6): when the snapshot has a tool
+//!   script, the build is loaded (`runtime.load`), pinned, and handed to
+//!   the swap engine (`swap.request`), which moves the live instances to it
+//!   at a later frame; it is never published here. Without a tool script
+//!   nothing is loaded or pinned: the snapshot alone gives the scripts
+//!   their descriptors (`script.installSnapshot`). Either way the
+//!   descriptor cache and the generation manifest are written. A project
+//!   that gains a tool script loads from that build on; one that loses its
+//!   last tool script stops loading and keeps what it loaded (nothing is
+//!   ever unloaded). The loaded libraries' allocated bytes are summed
+//!   (`runtime.loadedBytes`) and above `size_warning_bytes` one warning per
+//!   session suggests a restart. A failed build keeps the last good one.
 //!   Either way each diagnostic is printed as one line through Godot's error
 //!   printing (`<file>:<line>:<column>: <message>`, or `<file>: <message>`
 //!   without a line) and stored per file for `_validate` (`diag_cache`), and
@@ -42,6 +54,8 @@ const resource = @import("resource.zig");
 const manifest = @import("manifest.zig");
 const load_checks = @import("load_checks.zig");
 const props = @import("props.zig");
+const swap = @import("swap.zig");
+const abi = @import("ziggurat_abi");
 
 const Allocator = std.mem.Allocator;
 const OsPath = platform.path.OsPath;
@@ -84,9 +98,15 @@ const State = struct {
     pins: std.ArrayList(platform.generation_store.FileLock) = .empty,
     /// Generations loaded in this editor session (`notePinned`).
     loaded_count: u32 = 0,
+    /// Set once the loaded-size warning was printed (`warnSize`).
+    size_warned: bool = false,
 };
 
 var state: ?State = null;
+
+/// Above this many bytes of loaded generations (`runtime.loadedBytes`) the
+/// editor warns once per session. The host tests lower it.
+pub var size_warning_bytes: u64 = 2 << 30;
 
 /// Outcomes `apply` has handled (for the host tests). Main thread writes.
 pub var outcomes_applied: std.atomic.Value(u32) = .init(0);
@@ -414,6 +434,8 @@ const Msg = struct {
     lib: ?[]u8 = null,
     message: ?[]u8 = null,
     diags: []Diag = &.{},
+    /// A copy of `Outcome.snapshot`.
+    snap: ?abi.Snapshot = null,
 
     const Diag = struct { rel: ?[]u8, line: u32, column: u32, message: []u8 };
 
@@ -426,6 +448,7 @@ const Msg = struct {
             m.lib = try gpa.dupe(u8, g.lib.bytes);
         }
         if (o.message) |text| m.message = try gpa.dupe(u8, text);
+        if (o.snapshot) |*sn| m.snap = try sn.clone(gpa);
         var list: std.ArrayList(Diag) = try .initCapacity(gpa, o.diagnostics.len);
         errdefer {
             for (list.items) |d| freeDiag(d);
@@ -453,6 +476,7 @@ const Msg = struct {
     fn free(m: *Msg) void {
         if (m.lib) |l| gpa.free(l);
         if (m.message) |t| gpa.free(t);
+        if (m.snap) |sn| sn.deinit(gpa);
         for (m.diags) |d| freeDiag(d);
         gpa.free(m.diags);
         gpa.destroy(m);
@@ -488,28 +512,10 @@ fn applyMsg(m: *const Msg) Allocator.Error!void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const io = host_io.get();
     const st = &state.?;
 
     if (m.message) |text| {
         if (m.ok) log("ziggurat: {s}", .{text}) else logError("{s}", .{text});
-    }
-
-    // A good build becomes the current generation once its load checks
-    // pass (`runtime.publish` below); until then no other thread sees it.
-    var loaded: ?*runtime.Generation = null;
-    if (m.ok and m.lib != null) {
-        const lib = m.lib.?;
-        var diag: [256]u8 = undefined;
-        if (runtime.load(gpa, .fromTrusted(lib), m.gen_n, &diag)) |g| {
-            loaded = g;
-            notePinned(st, g.n);
-        } else |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            // `load` logged it already.
-            error.NotMainThread => {},
-            error.Refused => logError("{s}", .{std.mem.sliceTo(&diag, 0)}),
-        }
     }
 
     var files: Files = .empty;
@@ -521,42 +527,149 @@ fn applyMsg(m: *const Msg) Allocator.Error!void {
         try addDiagnostic(a, &files, rel, .{ .line = d.line, .column = d.column, .message = d.message });
     }
 
-    if (loaded) |g| {
-        const findings = try load_checks.run(a, g);
-        for (findings) |f| {
-            const rel = props.text(g.scripts()[f.script].path);
-            printDiagnostic(rel, 0, 0, f.message);
-            try addDiagnostic(a, &files, rel, .{ .line = 0, .column = 0, .message = f.message });
-        }
-        if (findings.len != 0) {
-            // A load-check finding fails the build: the generation is never
-            // published, so new instances keep the previous one, and the
-            // game keeps the previous manifest.
-            log("ziggurat: build {d} failed the load checks ({t}, {d} ms); the last good build stays in use", .{ g.n, m.trigger, m.ms });
-        } else {
-            runtime.publish(g);
-            var cache_buf: [max_path_bytes]u8 = undefined;
-            if (desc_cache.projectPath(&cache_buf)) |path| {
-                desc_cache.write(gpa, io, .fromTrusted(path), g) catch |err|
-                    logError("Ziggurat could not write the descriptor cache {s} ({s}).", .{ path, @errorName(err) });
-            }
-            manifest.write(gpa, io, .fromTrusted(st.store_root), g.n, std.fs.path.basename(m.lib.?)) catch |err|
-                logError("Ziggurat could not write the generation manifest in {s} ({s}).", .{ st.store_root, @errorName(err) });
-            log("ziggurat: build {d} loaded ({t}, {t}, {d} ms)", .{ g.n, m.trigger, m.path, m.ms });
-        }
+    var checked = false;
+    if (m.ok and m.lib != null) {
+        checked = try applyGood(a, st, m, &files);
     } else {
         log("ziggurat: build failed ({t}, {d} ms); the last good build stays in use", .{ m.trigger, m.ms });
     }
 
     // Only a build that reached the compiler's verdict replaces what is
-    // known about the files: a loaded generation (with or without load-check
-    // findings), or a failed build with errors in files. A failure without
-    // file errors (Zig missing, `build.lock` timeout, compiler death,
-    // invalid table, refused load) keeps the earlier diagnostics and
-    // failed states; its message was printed above.
-    const verdict = loaded != null or (!m.ok and file_diags);
+    // known about the files: a checked good build (with or without
+    // load-check findings), or a failed build with errors in files. A
+    // failure without file errors (Zig missing, `build.lock` timeout,
+    // compiler death, invalid table, refused load) keeps the earlier
+    // diagnostics and failed states; its message was printed above.
+    const verdict = checked or (!m.ok and file_diags);
     if (verdict) try recordDiagnostics(&files);
     updateScripts(if (verdict) &files else null);
+}
+
+/// A good build (see the file comment). True when its checks ran (it was
+/// used, or the load checks failed it); false when its library was refused.
+fn applyGood(a: Allocator, st: *State, m: *const Msg, files: *Files) Allocator.Error!bool {
+    const io = host_io.get();
+    const lib = m.lib.?;
+    const snap: ?*const abi.Snapshot = if (m.snap) |*sn| sn else null;
+
+    // A build the load checks reject is never loaded.
+    if (snap) |sn| {
+        const findings = try load_checks.runSnapshot(a, sn);
+        if (findings.len != 0) {
+            for (findings) |f| try addFinding(a, files, sn.scripts[f.script].path, f.message);
+            logFailedChecks(m);
+            return true;
+        }
+    }
+
+    // The service takes a snapshot whenever it checks tables, which the
+    // editor always asks for; without one the build is loaded and checked
+    // as before snapshots existed.
+    if (snap) |sn| {
+        if (!hasTool(sn)) {
+            installSnapshot(m.gen_n, sn);
+            var cache_buf: [max_path_bytes]u8 = undefined;
+            if (desc_cache.projectPath(&cache_buf)) |path| {
+                desc_cache.writeSnapshot(gpa, io, .fromTrusted(path), m.gen_n, sn) catch |err|
+                    logError("Ziggurat could not write the descriptor cache {s} ({s}).", .{ path, @errorName(err) });
+            }
+            writeManifest(st, m.gen_n, lib);
+            log("ziggurat: build {d} ready ({t}, {t}, {d} ms); the editor did not load it, because the project has no tool scripts", .{ m.gen_n, m.trigger, m.path, m.ms });
+            return true;
+        }
+    }
+
+    var diag: [256]u8 = undefined;
+    const g = runtime.load(gpa, .fromTrusted(lib), m.gen_n, &diag) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // `load` logged it already.
+        error.NotMainThread => return false,
+        error.Refused => {
+            logError("{s}", .{std.mem.sliceTo(&diag, 0)});
+            return false;
+        },
+    };
+    notePinned(st, g.n);
+    if (snap == null) {
+        const findings = try load_checks.run(a, g);
+        if (findings.len != 0) {
+            for (findings) |f| try addFinding(a, files, props.text(g.scripts()[f.script].path), f.message);
+            // Loaded but never handed to the swap engine: new instances
+            // keep the previous generation, the game the previous manifest.
+            logFailedChecks(m);
+            return true;
+        }
+    } else installSnapshot(g.n, snap.?);
+    // The swap runs at a later frame; until then the snapshot describes
+    // the scripts.
+    runtime.noteGood(g);
+    swap.request(g);
+    var cache_buf: [max_path_bytes]u8 = undefined;
+    if (desc_cache.projectPath(&cache_buf)) |path| {
+        desc_cache.write(gpa, io, .fromTrusted(path), g) catch |err|
+            logError("Ziggurat could not write the descriptor cache {s} ({s}).", .{ path, @errorName(err) });
+    }
+    writeManifest(st, g.n, lib);
+    log("ziggurat: build {d} loaded ({t}, {t}, {d} ms)", .{ g.n, m.trigger, m.path, m.ms });
+    warnSize(st);
+    return true;
+}
+
+fn addFinding(a: Allocator, files: *Files, rel: []const u8, message: []const u8) Allocator.Error!void {
+    printDiagnostic(rel, 0, 0, message);
+    try addDiagnostic(a, files, rel, .{ .line = 0, .column = 0, .message = message });
+}
+
+fn logFailedChecks(m: *const Msg) void {
+    log("ziggurat: build {d} failed the load checks ({t}, {d} ms); the last good build stays in use", .{ m.gen_n, m.trigger, m.ms });
+}
+
+/// True when a script of `sn` is a tool script.
+fn hasTool(sn: *const abi.Snapshot) bool {
+    for (sn.scripts) |s| {
+        if (s.flags & abi.script_flag_tool != 0) return true;
+    }
+    return false;
+}
+
+fn installSnapshot(n: u32, sn: *const abi.Snapshot) void {
+    script.installSnapshot(n, sn) catch |err|
+        logError("Ziggurat could not use the descriptors of build {d} ({s}); the scripts keep the earlier ones.", .{ n, @errorName(err) });
+}
+
+fn writeManifest(st: *const State, n: u32, lib: []const u8) void {
+    manifest.write(gpa, host_io.get(), .fromTrusted(st.store_root), n, std.fs.path.basename(lib)) catch |err|
+        logError("Ziggurat could not write the generation manifest in {s} ({s}).", .{ st.store_root, @errorName(err) });
+}
+
+/// Warns once per session when the loaded generations occupy more than
+/// `size_warning_bytes` on disk (spec section 6): none is ever unloaded,
+/// and on Linux a mapped file frees nothing until the editor exits.
+fn warnSize(st: *State) void {
+    if (st.size_warned) return;
+    const bytes = runtime.loadedBytes();
+    if (bytes <= size_warning_bytes) return;
+    st.size_warned = true;
+    var size_buf: [32]u8 = undefined;
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrintSentinel(&buf, "Ziggurat has loaded {d} builds ({s}) in this editor session; restart the editor to free them.", .{ st.loaded_count, sizeText(&size_buf, bytes) }, 0) catch return;
+    godot.raw.printWarning(msg.ptr, "Zig build", "src/host/editor_build.zig", @src().line, 1);
+}
+
+/// `bytes` with one decimal in the largest binary unit it reaches
+/// ("2.1 GiB", "340.0 MiB", "12 bytes").
+fn sizeText(buf: []u8, bytes: u64) []const u8 {
+    const units = [_]struct { name: []const u8, size: u64 }{
+        .{ .name = "GiB", .size = 1 << 30 },
+        .{ .name = "MiB", .size = 1 << 20 },
+        .{ .name = "KiB", .size = 1 << 10 },
+    };
+    for (units) |u| {
+        if (bytes < u.size) continue;
+        const tenths = @as(u128, bytes) * 10 / u.size;
+        return std.fmt.bufPrint(buf, "{d}.{d} {s}", .{ tenths / 10, tenths % 10, u.name }) catch "";
+    }
+    return std.fmt.bufPrint(buf, "{d} bytes", .{bytes}) catch "";
 }
 
 /// Pins generation `n` and counts it (spec section 6: the host counts the
@@ -662,6 +775,14 @@ fn log(comptime fmt: []const u8, args: anytype) void {
     var s: String = String.fromUtf8(msg) catch String.fromLatin1(msg);
     defer s.deinit();
     godot.general.print(.init(String, s), .{});
+}
+
+test "size text" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("12 bytes", sizeText(&buf, 12));
+    try std.testing.expectEqualStrings("1.5 KiB", sizeText(&buf, 1536));
+    try std.testing.expectEqualStrings("2.0 GiB", sizeText(&buf, 2 << 30));
+    try std.testing.expectEqualStrings("2.1 GiB", sizeText(&buf, (2 << 30) + (150 << 20)));
 }
 
 test "nonInteractiveIn stops at the user arguments" {

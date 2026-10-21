@@ -30,14 +30,39 @@ pub const Generation = struct {
     }
 };
 
+/// Generation sizes are allocated bytes (`allocatedBytes`), not apparent
+/// sizes: a staged library keeps the holes of the compiler's sparse output.
 pub const Caps = struct { max_count: u32 = 8, max_bytes: u64 = 1 << 30 };
+
+/// The bytes `file` occupies on disk. On Linux that is the allocated block
+/// count (`statx` blocks, 512 bytes each), so the holes of a sparse file do
+/// not count. Elsewhere, and on a Linux file system whose `statx` reports no
+/// block count, it is the apparent size (`File.stat().size`): the
+/// allocated size on Windows and macOS is not measured yet (planned with
+/// the other platform work).
+pub fn allocatedBytes(io: std.Io, file: std.Io.File) !u64 {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var stx: linux.Statx = undefined;
+        const rc = linux.statx(file.handle, "", linux.AT.EMPTY_PATH, .{ .BLOCKS = true }, &stx);
+        if (linux.errno(rc) == .SUCCESS and stx.mask.BLOCKS) return stx.blocks * 512;
+    }
+    return (try file.stat(io)).size;
+}
+
+/// `allocatedBytes` of the file at `p`.
+pub fn allocatedBytesOfPath(io: std.Io, p: OsPath) !u64 {
+    const file = try Dir.cwd().openFile(io, p.bytes, .{});
+    defer file.close(io);
+    return allocatedBytes(io, file);
+}
 
 pub const SweepReport = struct {
     /// Generations removed by this sweep.
     deleted: u32,
     /// Generations left on disk (newest, pinned, and those within the caps).
     kept: u32,
-    /// Total size of the files in the kept generations.
+    /// Total allocated size of the files in the kept generations.
     bytes_kept: u64,
     /// Unpinned generations whose delete failed; they count as kept.
     failed: u32 = 0,
@@ -173,7 +198,8 @@ pub const GenerationStore = struct {
     }
 
     /// Keeps the newest `caps.max_count` generations, then drops older ones
-    /// (oldest first) while total bytes exceed `caps.max_bytes`. Never deletes
+    /// (oldest first) while their total allocated bytes exceed
+    /// `caps.max_bytes`. Never deletes
     /// the newest generation or a pinned one.
     pub fn sweep(self: *GenerationStore) !SweepReport {
         const a = self.a;
@@ -260,7 +286,8 @@ pub const GenerationStore = struct {
         return out.toOwnedSlice(self.a);
     }
 
-    /// Sum of the sizes of the files directly inside `gen/<n>`.
+    /// Sum of the allocated sizes (`allocatedBytes`) of the files directly
+    /// inside `gen/<n>`.
     fn genBytes(self: *GenerationStore, n: u32) !u64 {
         const dp = try self.genDirPath(n);
         defer self.a.free(dp.bytes);
@@ -270,7 +297,9 @@ pub const GenerationStore = struct {
         var it = d.iterate();
         while (try it.next(self.io)) |entry| {
             if (entry.kind != .file) continue;
-            total += (try d.statFile(self.io, entry.name, .{})).size;
+            const file = try d.openFile(self.io, entry.name, .{});
+            defer file.close(self.io);
+            total += try allocatedBytes(self.io, file);
         }
         return total;
     }
@@ -536,6 +565,42 @@ test "stage keeps holes" {
     var back: [4096]u8 = undefined;
     _ = try file.readPositionalAll(io, &back, 32 << 20);
     try std.testing.expect(std.mem.allEqual(u8, &back, 0xAB));
+}
+
+test "sweep counts allocated bytes" {
+    if (os_tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    // A sparse 64 MiB library with one 4 KiB data block: about 8 KiB on
+    // disk, far below the 32 MiB cap, so a sweep that measures allocated
+    // blocks keeps both generations.
+    try f.writeElf("built.so", "");
+    {
+        var file = try f.tmp.dir.openFile(io, "built.so", .{ .mode = .read_write });
+        defer file.close(io);
+        const block: [4096]u8 = @splat(0xAB);
+        try file.writePositionalAll(io, &block, 32 << 20);
+        try file.setLength(io, 64 << 20);
+    }
+    const built = try f.p(a, &.{"built.so"});
+    defer a.free(built.bytes);
+    var s = f.store(a, .{ .max_bytes = 32 << 20 });
+    _ = try stageOne(a, &s, built);
+    _ = try stageOne(a, &s, built);
+    const rep = try s.sweep();
+    try std.testing.expectEqual(@as(u32, 0), rep.deleted);
+    try std.testing.expectEqual(@as(u32, 2), rep.kept);
+    try std.testing.expect(rep.bytes_kept < (1 << 20));
+    try std.testing.expect(try genExists(a, &f, 1));
+    // The helper itself: allocated bytes of the staged file.
+    const lib = try f.p(a, &.{ "zig-store", "gen", "2", "libdemo.2.so" });
+    defer a.free(lib.bytes);
+    const file = try std.Io.Dir.cwd().openFile(io, lib.bytes, .{});
+    defer file.close(io);
+    const bytes = try allocatedBytes(io, file);
+    try std.testing.expect(bytes > 0 and bytes < (1 << 20));
 }
 
 test "pin blocks sweep" {

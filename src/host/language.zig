@@ -381,8 +381,12 @@ pub const ZigLanguage = struct {
             script.ZigScript.reloadObjectFromDisk(v.as(*Object) orelse continue);
         }
     }
+    /// Also queues a swap to the newest good build when it is newer than
+    /// the current one (`swap.requestNewest`, run at a later `_frame`);
+    /// nothing is built.
     pub fn _reloadToolScript(self: *ZigLanguage, s: ?*Script, _: bool) void {
         self.noteReload(.tool, 0);
+        _ = swap.requestNewest();
         if (s) |sc| script.ZigScript.reloadObjectFromDisk(Object.upcast(sc));
     }
     pub fn _getPublicFunctions(_: *ZigLanguage) Array {
@@ -459,8 +463,8 @@ pub const ZigLanguage = struct {
 
     /// Counts a reload request and logs the first of its kind. Zig scripts
     /// run the last build's module; the build, not this request, makes a
-    /// new one, so nothing else happens here (spec section 6: reload
-    /// requests only queue).
+    /// new one (spec section 6: reload requests only queue; a tool-script
+    /// reload queues a swap to the newest good build).
     fn noteReload(self: *ZigLanguage, kind: Reload, count: i64) void {
         _ = self.reloads.getPtr(kind).fetchAdd(1, .acq_rel);
         if (self.reload_logged.getPtr(kind).swap(true, .acq_rel)) return;
@@ -473,6 +477,10 @@ pub const ZigLanguage = struct {
             .scripts => "reload scripts",
             .tool => "reload a tool script",
         };
+        if (kind == .tool) {
+            log("Ziggurat: Godot asked to {s}; Zig scripts swap to the newest good build, and change when a build finishes (logged once).", .{what});
+            return;
+        }
         log("Ziggurat: Godot asked to {s}; Zig scripts change when a build finishes, not on this request (logged once).", .{what});
     }
 };

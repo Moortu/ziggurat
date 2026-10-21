@@ -678,6 +678,23 @@ pub const ZigguratTestProbe = struct {
         if (i >= d.property_count) return false;
         return d.properties[i].field_index == abi.no_field;
     }
+
+    /// Lowers the threshold of the editor's loaded-size warning to `bytes`
+    /// (`editor_build.size_warning_bytes`).
+    pub fn setSizeWarningBytes(_: *ZigguratTestProbe, bytes: i64) void {
+        editor_build.size_warning_bytes = std.math.cast(u64, bytes) orelse return;
+    }
+
+    /// Generations loaded in this process (`runtime.loadedCount`).
+    pub fn loadedGenerations(_: *ZigguratTestProbe) i64 {
+        return runtime.loadedCount();
+    }
+
+    /// True when generation `gen` is loaded.
+    pub fn generationLoaded(_: *ZigguratTestProbe, gen: i64) bool {
+        const n = std.math.cast(u32, gen) orelse return false;
+        return runtime.find(n) != null;
+    }
 };
 
 var hook_callable: ?Callable = null;
@@ -766,7 +783,7 @@ pub const method_names = [_][:0]const u8{
     "gate_migrate_probe",      "registry_count",              "runtime_shutdown",        "stage_module",
     "gate_swap_begin",         "gate_swap_end",               "instance_generation",     "swap_request",
     "swap_outcome",            "swaps_done",                  "fail_allocation",         "instance_data",
-    "swap_hook",
+    "swap_hook",               "set_size_warning_bytes",      "loaded_generations",      "generation_loaded",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

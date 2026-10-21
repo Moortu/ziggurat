@@ -58,6 +58,9 @@ pub const Generation = struct {
     file: ?platform.safe_open.Identity = null,
     /// Bytes this generation holds from `HostApi.alloc` with its own tag.
     live_bytes: std.atomic.Value(u64) = .init(0),
+    /// The library file's allocated size on disk when it was loaded
+    /// (`generation_store.allocatedBytes`; 0 when it could not be read).
+    disk_bytes: u64 = 0,
 
     /// The scripts of the table.
     pub fn scripts(self: *const Generation) []const abi.ScriptDesc {
@@ -86,8 +89,11 @@ var current_gen: std.atomic.Value(?*Generation) = .init(null);
 /// `n` for generation `n`). Only the host tests read it, to check that a
 /// generation was never visible to other threads.
 var ever_current: std.atomic.Value(u64) = .init(0);
-/// Set once `request_swap` has logged.
+/// Set once `request_swap` has logged that there was nothing to swap to.
 var swap_logged: std.atomic.Value(bool) = .init(false);
+/// The newest generation whose checks passed and that was handed to the
+/// swap engine (`noteGood`), or null. Any thread reads it.
+var newest_good: std.atomic.Value(?*Generation) = .init(null);
 /// On the thread running a swap, the generation it swaps to (null
 /// elsewhere): instances that code run by the swap makes land on it.
 threadlocal var swap_target: ?*Generation = null;
@@ -184,6 +190,7 @@ pub fn load(a: Allocator, path: OsPath, n: u32, diag: *[256]u8) LoadError!*Gener
     const gen = try a.create(Generation);
     errdefer a.destroy(gen);
     gen.* = .{ .n = n, .lib = lib, .table = table, .names = &.{}, .by_path = .empty, .file = ident };
+    gen.disk_bytes = platform.generation_store.allocatedBytesOfPath(io, path) catch 0;
     errdefer gen.by_path.deinit(a);
     const scripts = gen.scripts();
     try gen.by_path.ensureTotalCapacity(a, @intCast(scripts.len));
@@ -278,6 +285,42 @@ fn injectedFailure() bool {
 pub fn wasEverCurrent(n: u32) bool {
     if (n >= 64) return false;
     return ever_current.load(.acquire) & (@as(u64, 1) << @intCast(n)) != 0;
+}
+
+/// The sum of `Generation.disk_bytes` over every loaded generation: what
+/// the loaded libraries occupy on disk (none is ever unloaded, and on Linux
+/// a mapped file frees nothing until the process exits). Any thread.
+pub fn loadedBytes() u64 {
+    const io = host_io.get();
+    mu.lockUncancelable(io);
+    defer mu.unlock(io);
+    var total: u64 = 0;
+    for (generations.items) |g| total +|= g.disk_bytes;
+    return total;
+}
+
+/// Records `gen` as a good generation (loaded, checks passed, handed to
+/// the swap engine); the newest such generation is what reload requests
+/// swap to (`newestGood`). An older one than the recorded is ignored. Main
+/// thread.
+pub fn noteGood(gen: *Generation) void {
+    if (newest_good.load(.acquire)) |g| {
+        if (g.n >= gen.n) return;
+    }
+    newest_good.store(gen, .release);
+}
+
+/// The newest good generation (`noteGood`), or null. Any thread.
+pub fn newestGood() ?*Generation {
+    return newest_good.load(.acquire);
+}
+
+/// The number of generations loaded in this process.
+pub fn loadedCount() u32 {
+    const io = host_io.get();
+    mu.lockUncancelable(io);
+    defer mu.unlock(io);
+    return @intCast(generations.items.len);
 }
 
 /// The loaded generation `n`, or null.
@@ -469,9 +512,13 @@ fn apiLog(level: u32, msg: [*]const u8, len: usize) callconv(.c) void {
     }
 }
 
+/// A module asks for a swap: queues one to the newest good generation
+/// when it is newer than the current one (it runs at a later `_frame`);
+/// otherwise nothing happens, logged once per process. Any thread.
 fn apiRequestSwap() callconv(.c) void {
+    if (@import("swap.zig").requestNewest()) return;
     if (swap_logged.swap(true, .acq_rel)) return;
-    const msg = "swap requested (swaps arrive in a later version)";
+    const msg = "swap requested, but no newer build is loaded (logged once)";
     apiLog(@backingInt(abi.LogLevel.info), msg, msg.len);
 }
 
