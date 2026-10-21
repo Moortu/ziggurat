@@ -41,6 +41,7 @@ const Opts = struct {
     test_stale_build_id: bool = false,
     test_layout_drift: bool = false,
     test_fail_full_after_stale: bool = false,
+    test_fail_full_after_drift: bool = false,
 };
 
 /// A temp project with `files`, the SDK manifest and a `BuildService` on it.
@@ -99,6 +100,7 @@ const Harness = struct {
             .test_stale_build_id = opts.test_stale_build_id,
             .test_layout_drift = opts.test_layout_drift,
             .test_fail_full_after_stale = opts.test_fail_full_after_stale,
+            .test_fail_full_after_drift = opts.test_fail_full_after_drift,
         });
     }
 
@@ -1384,12 +1386,40 @@ test "integration: a layout change without a source change refreshes the build i
     try expectOk(o2);
     try testing.expectEqual(service.BuildPath.full, o2.path);
     const msg = o2.message.?;
-    try testing.expect(std.mem.indexOf(u8, msg, "layout of other.zig changed without a source change; the build was refreshed in full") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "layout of other.zig changed although its file did not; rebuilding in full") != null);
     try testing.expect(std.mem.indexOf(u8, msg, "layout of hero.zig") == null);
     // The incremental output (generation 2) was deleted; the full build is 3.
     try testing.expectEqual(@as(u32, 3), o2.generation.?.n);
     try testing.expectEqual(@as(usize, 2), o2.snapshot.?.scripts.len);
     try testing.expectEqual(@as(u32, 0), h.svc.stats().session_deaths);
+    const store = try std.fs.path.join(a, &.{ try h.tmp.dir.realPathFileAlloc(io, ".", a), "store" });
+    try expectGenGone(store, 2);
+}
+
+test "integration: a failing rebuild after a layout drift keeps the note" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const emit_args = ".hit, .{ .damage = amount, .source = null }";
+
+    var h: Harness = undefined;
+    try h.initOpts(&.{
+        .{ .rel = "hero.zig", .data = try heroScript(a, emit_args, 0) },
+        .{ .rel = "other.zig", .data = try namedScript(a, "Other", 0) },
+    }, .{ .check_tables = true, .test_layout_drift = true, .test_fail_full_after_drift = true });
+    defer h.deinit();
+    try expectOk(try h.build(.open));
+    try h.svc.waitWarm(build_wait_ms);
+
+    try h.write("hero.zig", try heroScript(a, emit_args, 1));
+    const o2 = try h.build(.save);
+    try testing.expect(!o2.ok);
+    try testing.expect(o2.generation == null);
+    try testing.expect(o2.snapshot == null);
+    try testing.expect(std.mem.startsWith(u8, o2.message.?, "layout of other.zig changed although its file did not; rebuilding in full"));
+    try testing.expect(std.mem.indexOf(u8, o2.message.?, "The full build failed") != null);
     const store = try std.fs.path.join(a, &.{ try h.tmp.dir.realPathFileAlloc(io, ".", a), "store" });
     try expectGenGone(store, 2);
 }

@@ -57,8 +57,9 @@
 //!   compiler kept stale layout data: the incremental output is deleted, the
 //!   warm server is dropped (not counted as a death) and the request is
 //!   built in full; the outcome's `message` then starts with `layout of
-//!   <script> changed without a source change; the build was refreshed in
-//!   full`.
+//!   <script> changed although its file did not; rebuilding in full`. If
+//!   that full build fails, the outcome has no generation or snapshot and
+//!   still carries the note.
 //!   Loading each checked build into the editor process has side effects:
 //!   the library's `.init_array` constructors run on every check (Zig code
 //!   has none, but C code a project links in would run its constructors in
@@ -212,6 +213,9 @@ pub const Config = struct {
     /// TEST ONLY, and read only in test builds. The full build that follows
     /// a stale incremental update fails.
     test_fail_full_after_stale: bool = false,
+    /// TEST ONLY, and read only in test builds. The full build that follows
+    /// a layout drift fails.
+    test_fail_full_after_drift: bool = false,
 };
 
 const Timer = struct {
@@ -538,9 +542,18 @@ pub const BuildService = struct {
                     defer self.session_mu.unlock(self.io);
                     self.dropWarm(false);
                 }
-                try self.fullBuild(arena, &ws, zig, &sc.build_id, o);
+                const res: anyerror!void = if (builtin.is_test and self.cfg.test_fail_full_after_drift) blk: {
+                    o.message = try a.dupe(u8, "The full build failed (test fault).");
+                    break :blk error.TestFault;
+                } else self.fullBuild(arena, &ws, zig, &sc.build_id, o);
+                // The note stays when the full build fails, and then so does
+                // nothing else of the incremental build.
+                addNote(a, o, note) catch {};
+                res catch |err| {
+                    if (o.generation != null) self.discardGeneration(o);
+                    return err;
+                };
                 if (o.ok) self.startWarm(&ws, zig);
-                try addNote(a, o, note);
             }
         } else {
             o.path = .full;
@@ -637,7 +650,7 @@ pub const BuildService = struct {
             const was = prev.fingerprint(s.path);
             if (fp == 0 or was == 0 or fp != was) continue;
             if (out.items.len > 0) try out.append(self.a, ' ');
-            try out.print(self.a, "layout of {s} changed without a source change; the build was refreshed in full", .{s.path});
+            try out.print(self.a, "layout of {s} changed although its file did not; rebuilding in full", .{s.path});
         }
         if (out.items.len == 0) {
             out.deinit(self.a);

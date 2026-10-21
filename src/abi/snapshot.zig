@@ -297,10 +297,10 @@ fn decode(d: *const abi.ScriptDesc, f: *const abi.FieldDesc) Default {
         else => {},
     }
     // The bytes of the field, copied (the image has no promised alignment
-    // here, and the copy bounds every read by `size` <= 16 below).
+    // here, and the copy bounds every read by `size` <= 64 below).
     const end = @as(u64, f.offset) + f.size;
-    if (end > d.instance_size or f.size > 16) return .none;
-    var buf: [16]u8 = @splat(0);
+    if (end > d.instance_size or f.size > 64) return .none;
+    var buf: [64]u8 = @splat(0);
     const image: [*]const u8 = @ptrCast(d.defaults);
     if (f.size > 0) @memcpy(buf[0..f.size], image[f.offset..][0..f.size]);
     const bytes = buf[0..f.size];
@@ -484,6 +484,23 @@ test "defaults decode by value kind" {
             return error.TestExpectedEqual;
         }
     }
+}
+
+test "vector_f32 fields up to 64 bytes decode in memory order" {
+    var image: [64]u8 = undefined;
+    for (0..16) |i| std.mem.writeInt(u32, image[4 * i ..][0..4], @bitCast(@as(f32, @floatFromInt(i + 1))), .little);
+    // Sizes of Vector2 up to Projection: 8, 12, 16, 24, 36, 48, 64 bytes.
+    for ([_]u32{ 8, 12, 16, 24, 36, 48, 64 }) |size| {
+        const fs = [_]abi.FieldDesc{field(.vector_f32, 0, size, 0)};
+        const d = descOf(&image, &fs);
+        const got = decode(&d, &fs[0]);
+        try testing.expectEqual(@as(usize, size / 4), got.floats.len);
+        for (got.floats.slice(), 0..) |x, i| try testing.expectEqual(@as(f32, @floatFromInt(i + 1)), x);
+    }
+    // Past 64 bytes there is no default.
+    var big: [68]u8 = @splat(0);
+    const fs = [_]abi.FieldDesc{field(.vector_f32, 0, 68, 0)};
+    try testing.expect(decode(&descOf(&big, &fs), &fs[0]).eql(.none));
 }
 
 test "snapshot copies a table and survives clone" {

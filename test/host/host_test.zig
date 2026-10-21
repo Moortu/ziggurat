@@ -422,6 +422,30 @@ test "cache round trip" {
     });
 }
 
+test "snapshot defaults equal the module's for every vector type" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("empty");
+    defer p.deinit();
+    const a = p.arena_state.allocator();
+    var manifest = try loadManifest(testing.allocator);
+    defer manifest.deinit(testing.allocator);
+    try p.tmp.dir.createDirPath(io, "work");
+    const work = try p.tmp.dir.realPathFileAlloc(io, "work", a);
+    const good = try buildModule(a, work, "vectors", "vector_project", manifest.modules, true);
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+    defer dir.close(io);
+    try dir.writeFile(io, .{ .sub_path = "modules.txt", .data = try std.fmt.allocPrint(a, "good={s}\n", .{good}) });
+    try p.addCheck("snapshot_vectors.gd");
+    try p.runScript(&.{
+        "ZTEST PASS vectors_load",
+        "ZTEST PASS vectors_files_written",
+        "ZTEST PASS vectors_snapshot_equals_live",
+        "ZTEST PASS vectors_all_have_defaults",
+        "ZTEST PASS vectors_component_order",
+    });
+}
+
 test "defaults round trip as typed JSON" {
     try requireIntegration();
     var p: Project = undefined;
