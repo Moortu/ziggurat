@@ -511,6 +511,12 @@ pub const ZigguratTestProbe = struct {
         lang._reloadScripts(scripts, true);
     }
 
+    /// The editor's next defaults check (`editor_build.staleDefaults`)
+    /// finds a mismatch, as a stale incremental build would give.
+    pub fn defaultMismatchOnce(_: *ZigguratTestProbe) void {
+        editor_build.test_default_mismatch = true;
+    }
+
     /// Turns on the game's manifest polling (a game the editor did not
     /// start has it off).
     pub fn gamePolling(_: *ZigguratTestProbe, on: bool) void {
@@ -865,7 +871,7 @@ pub const method_names = [_][:0]const u8{
     "swap_outcome",             "swaps_done",                  "fail_allocation",         "instance_data",
     "swap_hook",                "game_polling",                "set_size_warning_bytes",  "loaded_generations",
     "generation_loaded",        "language_frame",              "language_stack_info",     "queue_pending",
-    "queue_nested_frame_check", "language_nested_frames",      "gate_hold",
+    "queue_nested_frame_check", "language_nested_frames",      "gate_hold",               "default_mismatch_once",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

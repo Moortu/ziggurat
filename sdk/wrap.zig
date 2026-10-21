@@ -288,13 +288,20 @@ pub fn Wrappers(
                 if (comptime p.field_index != abi.no_field) {
                     if (property == i) {
                         const name = info.field_names[p.field_index];
-                        // Read from a copy of the whole image, as `make`
-                        // does. Zig 0.17's incremental mode keeps a stale
-                        // field address for `&@field(defaults, name)` after
-                        // the struct's layout changes, so the next build
-                        // read another field's bytes (host test "editor
-                        // reload: defaults after a layout change").
-                        const image: S = defaults.*;
+                        // Read the field from a run-time copy of the whole
+                        // image. Never take a field address from the
+                        // comptime image (`&@field(defaults, name)`, or
+                        // from a `const` copy, which is comptime-known
+                        // too): such a pointer is a comptime value whose
+                        // identity does not change when the struct's
+                        // layout does, and Zig 0.17's incremental mode
+                        // then keeps this function's old code, which reads
+                        // another field's bytes (host test "editor reload:
+                        // defaults after a layout change"). A `var` copy
+                        // is a run-time value, and `@field` on it uses the
+                        // offsets of the current layout.
+                        var image: S = defaults.*;
+                        _ = &image;
                         convert.write(@FieldType(S, name), &@field(image, name), ret);
                         return 1;
                     }

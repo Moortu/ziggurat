@@ -18,8 +18,11 @@
 //! (`test/godot/output_scan.zig`). An `--allow-report` line is left out of
 //! the report scan when an output line equals it exactly, for a known
 //! engine leak a test cannot avoid (the reload stress test's mesh
-//! previews). Godot's output is printed only on failure, except the lines
-//! that start with an `--echo` prefix, which are printed in every case.
+//! previews); when the run already failed (a test marker or the exit
+//! status), it matches with any count, because a run that stopped early
+//! counts fewer events. Godot's output is printed only on failure, except
+//! the lines that start with an `--echo` prefix, which are printed in every
+//! case. `runner --print <dir> <name>` only prints that file to stderr.
 //! Exits 0 on success, 1 on failure and 2 on a usage error.
 //!
 //! Orphan StringName reports fail only on ordinary (non-static) references
@@ -48,6 +51,7 @@ pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
+    if (args.len == 4 and std.mem.eql(u8, args[1], "--print")) return printFile(arena, io, args[2], args[3]);
     if (args.len < 6) {
         std.debug.print(usage, .{});
         return 2;
@@ -120,7 +124,11 @@ pub fn main(init: std.process.Init) !u8 {
     var problems: std.ArrayList([]const u8) = .empty;
     if (!result.term.success()) try problems.append(arena, try std.fmt.allocPrint(arena, "Godot did not exit with status 0 ({any})", .{result.term}));
     try scan.checkTestMarkers(arena, out, &problems);
-    try scan.checkReports(arena, try withoutLines(arena, out, allowed.items), stock, &problems);
+    // A run that already failed may have stopped early, with fewer of the
+    // events an allowed report counts: an allowed line then matches with
+    // any count, so the earlier problem is the one reported.
+    const stopped = problems.items.len > 0;
+    try scan.checkReports(arena, try withoutLines(arena, out, allowed.items, stopped), stock, &problems);
     for (expects.items) |text| {
         if (std.mem.indexOf(u8, out, text) == null)
             try problems.append(arena, try std.fmt.allocPrint(arena, "missing expected text: {s}", .{text}));
@@ -149,18 +157,33 @@ pub fn main(init: std.process.Init) !u8 {
     if (problems.items.len == 0) return 0;
     std.debug.print("--- Godot output (stdout, then stderr) ---\n{s}\n---\n", .{out});
     for (problems.items) |p| std.debug.print("runner: {s}\n", .{p});
+    for (allowed.items) |l| std.debug.print("runner: allowed report: {s}\n", .{l});
     return 1;
 }
 
-/// `out` without the lines (ignoring a trailing CR) equal to one of `lines`.
-fn withoutLines(arena: std.mem.Allocator, out: []const u8, lines: []const []const u8) ![]const u8 {
+/// `runner --print <dir> <name>`: writes the file to stderr (build.zig's
+/// test-stress prints its report this way, with inherited stdio).
+fn printFile(arena: std.mem.Allocator, io: Io, dir: []const u8, name: []const u8) u8 {
+    const path = std.fs.path.join(arena, &.{ dir, name }) catch return 1;
+    const text = Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited) catch |err| {
+        std.debug.print("runner: cannot read {s}: {t}\n", .{ path, err });
+        return 1;
+    };
+    std.debug.print("{s}", .{text});
+    return 0;
+}
+
+/// `out` without the lines (ignoring a trailing CR) equal to one of `lines`;
+/// with `any_count`, also those that differ from one only in its first
+/// number (`sameExceptCount`).
+fn withoutLines(arena: std.mem.Allocator, out: []const u8, lines: []const []const u8, any_count: bool) ![]const u8 {
     if (lines.len == 0) return out;
     var kept: std.ArrayList(u8) = .empty;
     var it = std.mem.splitScalar(u8, out, '\n');
     next: while (it.next()) |raw| {
         const line = std.mem.trimEnd(u8, raw, "\r");
         for (lines) |l| {
-            if (std.mem.eql(u8, line, l)) continue :next;
+            if (std.mem.eql(u8, line, l) or (any_count and sameExceptCount(line, l))) continue :next;
         }
         try kept.appendSlice(arena, raw);
         try kept.append(arena, '\n');
@@ -168,14 +191,39 @@ fn withoutLines(arena: std.mem.Allocator, out: []const u8, lines: []const []cons
     return kept.items;
 }
 
+/// True when `line` and `want` differ only in the digits of their first
+/// number (both have one).
+fn sameExceptCount(line: []const u8, want: []const u8) bool {
+    const x = digitRun(line) orelse return false;
+    const y = digitRun(want) orelse return false;
+    return std.mem.eql(u8, line[0..x[0]], want[0..y[0]]) and std.mem.eql(u8, line[x[1]..], want[y[1]..]);
+}
+
+/// Start and end of the first run of decimal digits in `s`.
+fn digitRun(s: []const u8) ?[2]usize {
+    const start = std.mem.indexOfAny(u8, s, "0123456789") orelse return null;
+    var end = start;
+    while (end < s.len and std.ascii.isDigit(s[end])) end += 1;
+    return .{ start, end };
+}
+
 test "withoutLines drops only exact lines" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const out = "a\nERROR: 2 RID allocations of type 'X' were leaked at exit.\r\nERROR: 3 RID allocations of type 'X' were leaked at exit.\n";
-    const got = try withoutLines(a, out, &.{"ERROR: 2 RID allocations of type 'X' were leaked at exit."});
+    const got = try withoutLines(a, out, &.{"ERROR: 2 RID allocations of type 'X' were leaked at exit."}, false);
     try std.testing.expectEqualStrings("a\nERROR: 3 RID allocations of type 'X' were leaked at exit.\n\n", got);
-    try std.testing.expectEqualStrings(out, try withoutLines(a, out, &.{}));
+    try std.testing.expectEqualStrings(out, try withoutLines(a, out, &.{}, false));
+}
+
+test "withoutLines with any count drops the same report with another count only" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const out = "ERROR: 7 RID allocations of type 'X' were leaked at exit.\nERROR: 7 RID allocations of type 'Y' were leaked at exit.\nERROR: RID allocations of type 'X' were leaked at exit.\n";
+    const got = try withoutLines(a, out, &.{"ERROR: 280 RID allocations of type 'X' were leaked at exit."}, true);
+    try std.testing.expectEqualStrings("ERROR: 7 RID allocations of type 'Y' were leaked at exit.\nERROR: RID allocations of type 'X' were leaked at exit.\n\n", got);
 }
 
 /// Writes `.godot/extension_list.cfg` naming every `.gdextension` file of the

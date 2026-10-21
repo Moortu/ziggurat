@@ -149,6 +149,10 @@ const Project = struct {
         /// Godot output lines starting with one of these are printed also
         /// when the run passes.
         echo: []const []const u8 = &.{},
+        /// When set, a passing run writes the `echo` lines to this file
+        /// instead of stderr (the build runner labels a passing test that
+        /// wrote to stderr with "failed command"; build.zig prints the file).
+        echo_file: []const u8 = "",
         /// Seconds for the whole Godot run.
         deadline: []const u8 = deadline_s,
     };
@@ -166,7 +170,12 @@ const Project = struct {
         for (texts.echo) |text| try argv.appendSlice(a, &.{ "--echo", text });
         const result = try std.process.run(a, io, .{ .argv = argv.items, .environ_map = p.env });
         if (result.term.success()) {
-            if (texts.echo.len > 0) std.debug.print("{s}", .{result.stderr});
+            if (texts.echo.len == 0) return;
+            if (texts.echo_file.len == 0) {
+                std.debug.print("{s}", .{result.stderr});
+            } else {
+                try Io.Dir.cwd().writeFile(io, .{ .sub_path = texts.echo_file, .data = result.stderr });
+            }
             return;
         }
         std.debug.print("{s}{s}", .{ result.stdout, result.stderr });
@@ -1303,9 +1312,14 @@ test "editor reload: defaults after a layout change" {
             "ZTEST PASS defaults_build_1",
             "ZTEST PASS defaults_after_layout_change",
             "ZTEST PASS new_instance_after_layout_change",
+            "ZTEST PASS stale_defaults_rebuild_in_full",
             "ziggurat: build 2 loaded (save, incremental, ",
             "ziggurat: swapped to build 2 (0 instances kept their data, 1 migrated)",
+            "ziggurat: build 3: the default of '(test)' in shift.zig differs from the build's table, so the fast rebuild kept old code; rebuilding in full",
+            "ziggurat: build 4 loaded (save, full, ",
+            "ziggurat: swapped to build 4 (2 instances kept their data, 0 migrated)",
         },
+        .reject = &.{ "ziggurat: build 3 loaded", "swapped to build 3" },
         .deadline = build_deadline_s,
     });
 }
@@ -1362,6 +1376,7 @@ const stress_cases = [_][]const u8{
     "ZTEST PASS owned_fields_kept",
     "ZTEST PASS new_code_no_invalid_method",
     "ZTEST PASS defaults_match_source",
+    "ZTEST PASS new_instance_after_swap",
     "ZTEST PASS placeholder_default",
     "ZTEST PASS old_generations_released",
     "ZTEST PASS generation_count",
@@ -1413,6 +1428,7 @@ test "reload stress: edits with swaps, threads and nested iteration" {
         .reject = &.{ "Program crashed", "Nonexistent function", "is not usable" },
         .allow_report = &.{leak},
         .echo = if (stress_opts.report_times) &.{"ZTEST INFO stress:"} else &.{},
+        .echo_file = stress_opts.report_file,
         .deadline = stress_opts.deadline_s,
     });
 }

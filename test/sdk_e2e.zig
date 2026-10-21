@@ -1456,6 +1456,41 @@ test "integration: a layout change without a source change refreshes the build i
     try expectGenGone(store, 2);
 }
 
+test "integration: requestFull builds on the full path and warms again" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const emit_args = ".hit, .{ .damage = amount, .source = null }";
+
+    var h: Harness = undefined;
+    try h.initOpts(&.{.{ .rel = "hero.zig", .data = try heroScript(a, emit_args, 0) }}, .{ .check_tables = true });
+    defer h.deinit();
+    try expectOk(try h.build(.open));
+    try h.svc.waitWarm(build_wait_ms);
+    try h.write("hero.zig", try heroScript(a, emit_args, 1));
+    const o2 = try h.build(.save);
+    try expectOk(o2);
+    try testing.expectEqual(service.BuildPath.incremental, o2.path);
+
+    // The same sources again, asked for in full: the warm server is
+    // dropped (no death), the build is full, and warming starts again.
+    h.svc.requestFull(.save);
+    try h.svc.waitIdle(build_wait_ms);
+    const o3 = h.svc.last() orelse return error.NoOutcome;
+    try expectOk(o3);
+    try testing.expectEqual(service.BuildPath.full, o3.path);
+    try testing.expect(o3.snapshot != null);
+    try testing.expectEqual(@as(u32, 0), h.svc.stats().session_deaths);
+    try h.svc.waitWarm(build_wait_ms);
+    // The flag is used once: the next request is incremental again.
+    try h.write("hero.zig", try heroScript(a, emit_args, 2));
+    const o4 = try h.build(.save);
+    try expectOk(o4);
+    try testing.expectEqual(service.BuildPath.incremental, o4.path);
+}
+
 test "integration: a failing rebuild after a layout drift keeps the note" {
     try platform.testing_support.requireIntegration();
     if (builtin.os.tag == .windows) return error.SkipZigTest;

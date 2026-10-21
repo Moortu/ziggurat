@@ -13,6 +13,8 @@
 //!   the full path and warming starts again after the next successful full
 //!   build. After the second death, incremental builds stay off for the rest
 //!   of the service's life.
+//! - `requestFull` asks for a build on the full path: the warm server is
+//!   dropped first (not a death) and warms again after that full build.
 //! - A requested build holds `build.lock` from `Workspace.prepare` until it
 //!   has staged its output, never for the life of the service.
 //! - An incremental server holds `<cache dir>/incremental.lock` (exclusive)
@@ -259,6 +261,8 @@ pub const BuildService = struct {
     /// Broadcast on every change of the fields below.
     cond: std.Io.Condition = .init,
     pending: ?Trigger = null,
+    /// The pending build must take the full path (`requestFull`).
+    pending_full: bool = false,
     building: bool = false,
     stopping: bool = false,
     warm: WarmState = .cold,
@@ -339,6 +343,20 @@ pub const BuildService = struct {
         defer self.mu.unlock(self.io);
         if (self.stopping) return;
         self.pending = t;
+        self.cond.broadcast(self.io);
+    }
+
+    /// As `request`, and that build takes the full path: the incremental
+    /// server is dropped first and warms again after the full build. For a
+    /// caller that found the newest incremental build stale in a way the
+    /// service cannot see (the editor host compares the module's defaults
+    /// with its table). Requests made before the build starts join it.
+    pub fn requestFull(self: *BuildService, t: Trigger) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        if (self.stopping) return;
+        self.pending = t;
+        self.pending_full = true;
         self.cond.broadcast(self.io);
     }
 
@@ -447,6 +465,7 @@ pub const BuildService = struct {
         self.build_tid.store(std.Thread.getCurrentId(), .release);
         const io = self.io;
         while (true) {
+            var full = false;
             const t: Trigger = blk: {
                 self.mu.lockUncancelable(io);
                 defer self.mu.unlock(io);
@@ -454,11 +473,13 @@ pub const BuildService = struct {
                 if (self.stopping) return;
                 const t = self.pending.?;
                 self.pending = null;
+                full = self.pending_full;
+                self.pending_full = false;
                 self.building = true;
                 self.builds += 1;
                 break :blk t;
             };
-            const o = self.runBuild(t);
+            const o = self.runBuild(t, full);
             self.publish(o);
         }
     }
@@ -485,7 +506,7 @@ pub const BuildService = struct {
         self.cond.broadcast(io);
     }
 
-    fn runBuild(self: *BuildService, t: Trigger) Outcome {
+    fn runBuild(self: *BuildService, t: Trigger, full: bool) Outcome {
         const timer = Timer.start(self.io);
         var o: Outcome = .{
             .trigger = t,
@@ -497,7 +518,7 @@ pub const BuildService = struct {
             .ms = 0,
         };
         var stale: Stale = .{};
-        self.buildInner(&o, &stale) catch |err| {
+        self.buildInner(&o, &stale, full) catch |err| {
             o.ok = false;
             if (o.message == null) o.message = std.fmt.allocPrint(self.a, "The build of {s} failed: {t}.", .{
                 self.cfg.paths.roots.project.bytes, err,
@@ -513,7 +534,7 @@ pub const BuildService = struct {
     /// whether `stale_note` is already in the outcome.
     const Stale = struct { found: bool = false, noted: bool = false };
 
-    fn buildInner(self: *BuildService, o: *Outcome, stale: *Stale) !void {
+    fn buildInner(self: *BuildService, o: *Outcome, stale: *Stale, full: bool) !void {
         const a = self.a;
         var arena_state = std.heap.ArenaAllocator.init(a);
         defer arena_state.deinit();
@@ -528,7 +549,13 @@ pub const BuildService = struct {
         var ws = try self.prepareWorkspace(sc, o);
         defer ws.deinit(a);
 
-        if (try self.incrementalBuild(arena, &ws, zig, &sc.build_id, o, &stale.found)) {
+        if (full) {
+            // `requestFull`: the incremental server's state is not trusted.
+            self.session_mu.lockUncancelable(self.io);
+            defer self.session_mu.unlock(self.io);
+            self.dropWarm(false);
+        }
+        if (!full and try self.incrementalBuild(arena, &ws, zig, &sc.build_id, o, &stale.found)) {
             // A script whose layout changed although its source (and every
             // helper) did not: the incremental compiler kept stale layout
             // data. Refresh the build in full.

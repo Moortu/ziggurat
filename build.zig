@@ -381,14 +381,28 @@ fn addHostTests(
         },
     });
     // `test-host` skips the GUI test; `test-gui` runs only that test.
-    const headless = hostTestRun(b, target, optimize, in, options_mod, platform, build_mod, abi, .{ .run_gui = false, .filter = in.filter }, .short);
+    const headless = hostTestRun(b, target, optimize, in, options_mod, platform, build_mod, abi, .{ .run_gui = false, .filter = in.filter }, .short, null);
     step.dependOn(&headless.step);
-    const stress = hostTestRun(b, target, optimize, in, options_mod, platform, build_mod, abi, .{ .run_gui = false, .filter = "reload stress" }, .long);
+    // The long stress run writes its timing lines to a file, and a second
+    // step that inherits stdio prints it: the build runner labels a passing
+    // test that wrote to stderr with "failed command".
+    const report_files = b.addWriteFiles();
+    _ = report_files.add("README", "test-stress writes stress-report.txt here.\n");
+    const report_dir = report_files.getDirectory();
+    const report_name = "stress-report.txt";
+    const stress = hostTestRun(b, target, optimize, in, options_mod, platform, build_mod, abi, .{ .run_gui = false, .filter = "reload stress" }, .long, report_dir.path(b, report_name));
     // Never cached: it reports run times.
     stress.has_side_effects = true;
-    in.stress_step.dependOn(&stress.step);
+    const show = b.addRunArtifact(runner);
+    show.addArg("--print");
+    show.addDirectoryArg(report_dir);
+    show.addArg(report_name);
+    show.stdio = .inherit;
+    show.has_side_effects = true;
+    show.step.dependOn(&stress.step);
+    in.stress_step.dependOn(&show.step);
     if (b.findProgram(.{ .names = &.{"xvfb-run"} })) |xvfb| {
-        const gui = hostTestRun(b, target, optimize, in, options_mod, platform, build_mod, abi, .{ .run_gui = true, .xvfb_run = xvfb, .filter = "gui: " }, .short);
+        const gui = hostTestRun(b, target, optimize, in, options_mod, platform, build_mod, abi, .{ .run_gui = true, .xvfb_run = xvfb, .filter = "gui: " }, .short, null);
         // Never cached: it drives a GUI and reports timing.
         gui.has_side_effects = true;
         in.gui_step.dependOn(&gui.step);
@@ -416,6 +430,8 @@ fn hostTestRun(
     abi: *std.Build.Module,
     gui: GuiChoice,
     stress: Stress,
+    /// Where the stress test writes its timing lines (`report_times`).
+    report: ?std.Build.LazyPath,
 ) *std.Build.Step.Run {
     const stress_options = b.addOptions();
     stress_options.addOption(u32, "edits", stress.edits);
@@ -423,6 +439,7 @@ fn hostTestRun(
     stress_options.addOption(u32, "nested_every", stress.nested_every);
     stress_options.addOption([]const u8, "deadline_s", stress.deadline_s);
     stress_options.addOption(bool, "report_times", stress.report_times);
+    if (report) |r| stress_options.addOptionPathUntracked("report_file", r) else stress_options.addOption([]const u8, "report_file", "");
     stress_options.addOption([]const u8, "stress_dir", b.root.joinString(b.allocator, "test/host/stress") catch @panic("OOM"));
     const gui_options = b.addOptions();
     gui_options.addOption(bool, "run_gui", gui.run_gui);

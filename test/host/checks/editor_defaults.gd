@@ -6,7 +6,10 @@ extends Node
 # i64, so `note` and the fields after it move. The editor builds that save
 # incrementally, writes the descriptor cache (which reads every default)
 # and swaps; every property's default and a new instance's values must be
-# those of the new source. Found by the reload stress test.
+# those of the new source. Found by the reload stress test. Then a probe
+# hook makes the host's defaults check (module defaults against the
+# build's table) fail once: that incremental build 3 is never used, and
+# the save is built again in full as build 4, which swaps in.
 
 const WAIT_MS := 600000
 
@@ -65,3 +68,12 @@ func run() -> void:
 	fresh.set_script(s)
 	report("new_instance_after_layout_change", fresh.get("level") == 5 and fresh.get("extra") == 2 and fresh.get("note") == "",
 		"level %s extra %s note %s" % [fresh.get("level"), fresh.get("extra"), fresh.get("note")])
+
+	probe.default_mismatch_once()
+	s.source_code = s.source_code.replace("return 2;", "return 3;")
+	err = ResourceSaver.save(s, "res://shift.zig")
+	var rebuilt: bool = await wait_for(func(): return probe.current_generation() == 4 and o.call("version") == 3)
+	si = probe.find_script("shift.zig")
+	report("stale_defaults_rebuild_in_full", err == OK and rebuilt and not probe.was_ever_current(3) and defaults(si) == want2,
+		"save %d rebuilt %s gen %d, 3 current %s, defaults %s" % [err, rebuilt, probe.current_generation(),
+			probe.was_ever_current(3), defaults(si)])

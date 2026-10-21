@@ -28,7 +28,8 @@ extends Node
 # (`deferred_depth`); it completes on a later frame.
 #
 # After every swap: moved field values, migrate results, the type-changed
-# field's new default, every property default of the new build, owned
+# field's new default, every property default of mover.zig and holder.zig
+# in the new build, new instances of both at the new values, owned
 # values, every script's new code with no
 # INVALID_METHOD, live bytes 0 in every older generation, one loaded
 # generation per good build, the registry. At the end: threads' results,
@@ -293,7 +294,7 @@ func run() -> void:
 		% [done, run_ms, median, worst, good_builds, broken_builds, nested_cases, nested_frames, results])
 	report("stress_edits_applied", done == edits, "%d of %d edits; first failure: %s" % [done, edits, failures])
 	for name in ["saves", "moved_fields", "migrate_results", "type_change_default", "added_field_default", "owned_fields_kept",
-			"new_code_no_invalid_method", "defaults_match_source", "placeholder_default", "old_generations_released", "generation_count",
+			"new_code_no_invalid_method", "defaults_match_source", "new_instance_after_swap", "placeholder_default", "old_generations_released", "generation_count",
 			"registry_matches_live", "broken_build_keeps_last_good"]:
 		report_checks(name)
 	report("nested_iteration_runs_frame", nested_frames > 0 and not failures.has("nested_iteration_runs_frame"),
@@ -397,8 +398,12 @@ func one_edit(i: int) -> bool:
 			EDIT_WAIT_MS)
 		hold_release = true
 		hold_thread.wait_to_finish()
-		# No thread holds the swap back now except module code on this
-		# thread's stack: previewer.preview -> handler -> nested iterations.
+		# The holding thread has left. The three workers still call module
+		# code, but each call only holds the gate briefly; the nested frames
+		# below run while module code is on this thread's stack
+		# (previewer.preview -> handler -> nested iterations), and `_frame`
+		# checks that depth before it tries the lock, so their outcome is
+		# `deferred_depth`.
 		nested_info = []
 		previewer.call("preview")
 		var after_gen: int = probe.current_generation()
@@ -483,7 +488,28 @@ func after_swap(i: int, type_changed: bool) -> void:
 	var want_defs := {"bumps": "0", st.name: "0", "level": str(st.level_default), "note": "\"\"", "migrations": "0"}
 	if st.extra:
 		want_defs["extra"] = str(st.extra_default)
-	check("defaults_match_source", defs == want_defs, "edit %d: defaults %s want %s" % [i, defs, want_defs])
+	# holder.zig: `pad` moves the owned fields when it comes or goes.
+	var hi: int = probe.find_script("holder.zig")
+	var hdefs := {}
+	for k in probe.property_count(hi):
+		hdefs[probe.property_name(hi, k)] = probe.default_text(hi, k)
+	var want_hdefs := {"label": "\"\"", "tag": "&\"\"", "res": "null"}
+	if st.pad:
+		want_hdefs["pad"] = "5"
+	check("defaults_match_source", defs == want_defs and hdefs == want_hdefs,
+		"edit %d: mover defaults %s want %s; holder defaults %s want %s" % [i, defs, want_defs, hdefs, want_hdefs])
+	# New instances from the new build start at the new source's values.
+	var fm := make("mover")
+	var fh := make("holder")
+	var fm_extra = fm.get("extra")
+	check("new_instance_after_swap", fm.get("bumps") == 0 and fm.get(st.name) == 0 and fm.get(other) == null
+		and fm.get("level") == st.level_default and fm.get("note") == "" and fm.get("migrations") == 0
+		and ((fm_extra == st.extra_default) if st.extra else (fm_extra == null))
+		and probe.call_error(fm, &"version") == 0 and fm.call("version") == st.mover
+		and fh.get("pad") == (5 if st.pad else null) and fh.get("label") == "" and fh.get("res") == null
+		and probe.call_error(fh, &"version") == 0 and fh.call("version") == st.holder,
+		"edit %d: mover level %s extra %s note %s version %s; holder pad %s label %s version %s" % [i, fm.get("level"),
+			fm_extra, fm.get("note"), fm.call("version"), fh.get("pad"), fh.get("label"), fh.call("version")])
 	check("placeholder_default", plain.get("mark") == st.plain and probe.script_placeholder_count(scripts["plain"]) == 1,
 		"edit %d: mark %s want %d" % [i, plain.get("mark"), st.plain])
 	var held := {}

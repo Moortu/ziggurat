@@ -253,6 +253,56 @@ pub const GodotDefaults = struct {
     }
 };
 
+/// A property whose module default differs from its table default.
+pub const DefaultMismatch = struct { script: []const u8, property: []const u8 };
+
+/// The first property of `scripts` whose default from `defaults` (with
+/// `value(a, desc, prop_index) !Default`; `GodotDefaults` calls the module's
+/// `get_default`) differs from the default `snap` decoded from the same
+/// build's defaults image by field offsets, with no module code. The two
+/// are independent: `get_default` is code, the image and offsets are data.
+/// A difference means the compiler kept old code (an incremental build
+/// that went stale). Only properties whose snapshot default has a stored
+/// form are compared; scripts missing from `snap` are skipped. Plain values
+/// come first, so a stale `get_default` is caught on them before it reads
+/// a String or object default (which it could crash on). Allocates in `a`
+/// (an arena).
+pub fn defaultMismatch(a: Allocator, scripts: []const abi.ScriptDesc, snap: *const abi.snapshot.Snapshot, defaults: anytype) Allocator.Error!?DefaultMismatch {
+    for ([_]bool{ true, false }) |plain_pass| {
+        for (scripts) |*d| {
+            const sn = snap.find(props.text(d.path)) orelse continue;
+            if (sn.properties.len != d.property_count) continue;
+            for (sn.properties, 0..) |p, i| {
+                if (!p.has_field) continue;
+                const plain = switch (p.default) {
+                    .none => continue,
+                    .string_empty, .object_null => false,
+                    else => true,
+                };
+                if (plain != plain_pass) continue;
+                const want = try snapshotDefault(a, p.variant_type, p.default);
+                if (want == .absent) continue;
+                const got = try defaults.value(a, d, @intCast(i));
+                if (!sameDefault(want, got)) return .{ .script = sn.path, .property = p.name };
+            }
+        }
+    }
+    return null;
+}
+
+/// Equal tag and value; floats compare bit for bit.
+fn sameDefault(x: Default, y: Default) bool {
+    if (std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
+    return switch (x) {
+        .absent, .null_ => true,
+        .boolean => |b| b == y.boolean,
+        .int => |i| i == y.int,
+        .float => |f| @as(u64, @bitCast(f)) == @as(u64, @bitCast(y.float)),
+        .text => |t| std.mem.eql(u8, t, y.text),
+        .nums => |ns| ns.len == y.nums.len and std.mem.eql(u64, @ptrCast(ns), @ptrCast(y.nums)),
+    };
+}
+
 /// The cache file's bytes for `scripts` as generation `gen`. `defaults` has
 /// `value(a, desc, prop_index) !Default` (allocated with `a`).
 pub fn serialize(a: Allocator, gen: u32, scripts: []const abi.ScriptDesc, defaults: anytype) ![]u8 {
@@ -702,6 +752,87 @@ test "a snapshot makes the same file as the module's defaults" {
     const from_snap = try fromSnapshot(testing.allocator, 3, &snap);
     defer testing.allocator.free(from_snap);
     try testing.expectEqualStrings(live, from_snap);
+}
+
+/// Stub.script with two fields: `note` (a String, property 1) and `speed`
+/// (f32 300.5, property 2), and its table.
+const MismatchFixture = struct {
+    image: [8]u8 = @splat(0),
+    props: [3]abi.PropertyDesc = .{
+        Stub.props_arr[0],
+        .{ .name = Stub.str("note"), .field_index = 0, .variant_type = default_value.t_string, .class_name = Stub.str(""), .hint = 0, .hint_string = Stub.str(""), .usage = 4102 },
+        .{ .name = Stub.str("speed"), .field_index = 1, .variant_type = default_value.t_float, .class_name = Stub.str(""), .hint = 0, .hint_string = Stub.str(""), .usage = 4102 },
+    },
+    fields: [2]abi.FieldDesc = .{
+        .{ .name = Stub.str("note"), .type_name = Stub.str("String"), .shape = 0, .offset = 0, .size = 0, .@"align" = 1, .value_kind = @backingInt(abi.ValueKind.string_empty), .bits = 0 },
+        .{ .name = Stub.str("speed"), .type_name = Stub.str("f32"), .shape = 0, .offset = 0, .size = 4, .@"align" = 4, .value_kind = @backingInt(abi.ValueKind.float), .bits = 0 },
+    },
+    desc: abi.ScriptDesc = Stub.script,
+
+    fn snapshot(f: *MismatchFixture) !abi.snapshot.Snapshot {
+        std.mem.writeInt(u32, f.image[0..4], @bitCast(@as(f32, 300.5)), .little);
+        f.desc.defaults = &f.image;
+        f.desc.fields = &f.fields;
+        f.desc.field_count = 2;
+        f.desc.properties = &f.props;
+        f.desc.property_count = 3;
+        const table: abi.Table = .{ .magic = abi.magic, .abi_version = abi.abi_version, .size = @sizeOf(abi.Table), .layout_stamp = 0, .sdk_version = Stub.str("1"), .build_id = Stub.str("0123456789abcdef"), .scripts = @ptrCast(&f.desc), .script_count = 1 };
+        return abi.snapshot.take(testing.allocator, &table);
+    }
+};
+
+/// Module defaults for MismatchFixture: `speed` is `speed`; records the
+/// order in which properties are asked for.
+const FakeDefaults = struct {
+    speed: f64,
+    asked: *std.ArrayList(u32),
+
+    pub fn value(self: FakeDefaults, a: Allocator, _: *const abi.ScriptDesc, i: u32) Allocator.Error!Default {
+        try self.asked.append(a, i);
+        return switch (i) {
+            1 => .{ .text = "" },
+            2 => .{ .float = self.speed },
+            else => .absent,
+        };
+    }
+};
+
+test "defaultMismatch: equal defaults pass, a stale value is named" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var f: MismatchFixture = .{};
+    const snap = try f.snapshot();
+    defer snap.deinit(testing.allocator);
+
+    var asked: std.ArrayList(u32) = .empty;
+    try testing.expect(try defaultMismatch(a, &.{f.desc}, &snap, FakeDefaults{ .speed = 300.5, .asked = &asked }) == null);
+    // The plain value first, then the String.
+    try testing.expectEqualSlices(u32, &.{ 2, 1 }, asked.items);
+
+    // A stale `get_default` that reads another field's bytes: found on the
+    // plain value, and the String default is never asked for.
+    asked.clearRetainingCapacity();
+    const m = (try defaultMismatch(a, &.{f.desc}, &snap, FakeDefaults{ .speed = 0, .asked = &asked })).?;
+    try testing.expectEqualStrings("a/b.zig", m.script);
+    try testing.expectEqualStrings("speed", m.property);
+    try testing.expectEqualSlices(u32, &.{2}, asked.items);
+
+    // A script the snapshot does not know is skipped.
+    var other = f.desc;
+    other.path = Stub.str("other.zig");
+    asked.clearRetainingCapacity();
+    try testing.expect(try defaultMismatch(a, &.{other}, &snap, FakeDefaults{ .speed = 0, .asked = &asked }) == null);
+    try testing.expectEqual(@as(usize, 0), asked.items.len);
+}
+
+test "sameDefault compares floats bit for bit and texts by bytes" {
+    try testing.expect(sameDefault(.{ .float = std.math.nan(f64) }, .{ .float = std.math.nan(f64) }));
+    try testing.expect(!sameDefault(.{ .float = 0.0 }, .{ .float = -0.0 }));
+    try testing.expect(!sameDefault(.{ .int = 1 }, .{ .float = 1 }));
+    try testing.expect(sameDefault(.{ .text = "ab" }, .{ .text = "ab" }));
+    try testing.expect(!sameDefault(.{ .nums = &.{ 1, 2 } }, .{ .nums = &.{ 1, 3 } }));
+    try testing.expect(sameDefault(.null_, .null_));
 }
 
 test "snapshot defaults keep only what fits the property type" {

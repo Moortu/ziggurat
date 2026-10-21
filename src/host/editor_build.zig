@@ -19,7 +19,10 @@
 //!   generation policy (spec section 6): when the snapshot has a tool
 //!   script, the build is loaded (`runtime.load`), pinned, and handed to
 //!   the swap engine (`swap.request`), which moves the live instances to it
-//!   at a later frame; it is never published here. Without a tool script
+//!   at a later frame; it is never published here. Before that, the
+//!   module's property defaults must equal the snapshot's
+//!   (`staleDefaults`); a stale incremental build is not used and is
+//!   requested again in full. Without a tool script
 //!   nothing is loaded: the snapshot alone gives the scripts their
 //!   descriptors (`script.installSnapshot`). Either way the descriptor
 //!   cache and the generation manifest are written, and the generation the
@@ -560,7 +563,8 @@ fn applyMsg(m: *const Msg) Allocator.Error!void {
 }
 
 /// A good build (see the file comment). True when its checks ran (it was
-/// used, or the load checks failed it); false when its library was refused.
+/// used, or the load checks failed it); false when its library was refused
+/// or its defaults were stale (`staleDefaults`).
 fn applyGood(a: Allocator, st: *State, m: *const Msg, files: *Files) Allocator.Error!bool {
     const io = host_io.get();
     const lib = m.lib.?;
@@ -624,7 +628,10 @@ fn applyGood(a: Allocator, st: *State, m: *const Msg, files: *Files) Allocator.E
             logFailedChecks(m);
             return true;
         }
-    } else installSnapshot(g.n, snap.?);
+    } else {
+        if (try staleDefaults(a, st, m, g, snap.?)) return false;
+        installSnapshot(g.n, snap.?);
+    }
     // The swap runs at a later frame; until then the snapshot describes
     // the scripts.
     runtime.noteGood(g);
@@ -637,6 +644,35 @@ fn applyGood(a: Allocator, st: *State, m: *const Msg, files: *Files) Allocator.E
     writeManifest(st, g.n, lib);
     log("ziggurat: build {d} loaded ({t}, {t}, {d} ms)", .{ g.n, m.trigger, m.path, m.ms });
     warnSize(st);
+    return true;
+}
+
+/// TEST ONLY (probe `default_mismatch_once`): the next `staleDefaults`
+/// check finds a mismatch. Main thread.
+pub var test_default_mismatch: bool = false;
+
+/// After a good build with a snapshot is loaded, before anything reads its
+/// defaults: every property default from the module's `get_default` must
+/// equal the snapshot's, which the host decoded from the defaults image by
+/// field offsets (`desc_cache.defaultMismatch`). A difference means the
+/// compiler kept old code although the table is right (Zig 0.17's
+/// incremental mode did this to `get_default` after a layout change). The
+/// build is then not used: it stays loaded, but it is never handed to the
+/// swap engine, and no descriptor cache or manifest is written for it. An
+/// incremental build is requested again in full; a full build is not (the
+/// same sources would give the same result). True when that happened.
+fn staleDefaults(a: Allocator, st: *State, m: *const Msg, g: *const runtime.Generation, sn: *const abi.Snapshot) Allocator.Error!bool {
+    const found: ?desc_cache.DefaultMismatch = if (test_default_mismatch) blk: {
+        test_default_mismatch = false;
+        break :blk .{ .script = if (sn.scripts.len > 0) sn.scripts[0].path else "", .property = "(test)" };
+    } else try desc_cache.defaultMismatch(a, g.scripts(), sn, desc_cache.GodotDefaults{});
+    const bad = found orelse return false;
+    if (m.path == .incremental) {
+        log("ziggurat: build {d}: the default of '{s}' in {s} differs from the build's table, so the fast rebuild kept old code; rebuilding in full", .{ g.n, bad.property, bad.script });
+        st.svc.requestFull(m.trigger);
+    } else {
+        logError("Ziggurat build {d}: the default of '{s}' in {s} differs from the build's table; the last good build stays in use.", .{ g.n, bad.property, bad.script });
+    }
     return true;
 }
 
