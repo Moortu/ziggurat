@@ -1,7 +1,9 @@
 //! The swap engine (spec section 6, reload steps 4 and 5): moves every live
 //! script instance to a newer generation.
 //!
-//! `request` only records the generation (the newest request wins); the
+//! `request` only records the generation (the request with the highest
+//! generation number wins, and a request older than the current generation
+//! is dropped, so a late request from another thread never swaps back); the
 //! swap runs at `ZigLanguage._frame` (`runPending`), and only when no
 //! module code is on the main thread's stack (`gate.depth` is 0) and the
 //! gate's try-lock succeeds. Otherwise it waits for a later frame. Each
@@ -95,6 +97,9 @@ pub const Outcome = enum(u8) {
 
 /// The generation the newest request named, or null.
 var pending: std.atomic.Value(?*Generation) = .init(null);
+/// The generation `requestExact` named (host tests), which may be older
+/// than the current one; null otherwise.
+var exact: std.atomic.Value(?*Generation) = .init(null);
 /// The last outcome and its generation number (main thread), for logging
 /// once per change.
 var last: struct { outcome: Outcome = .none, n: u32 = 0 } = .{};
@@ -116,15 +121,35 @@ pub const Hook = struct {
 pub var test_hook: ?Hook = null;
 
 /// Asks for a swap to `gen`, a generation `runtime.load` returned whose
-/// checks passed. It runs at a later `_frame`, never here; a later request
-/// replaces this one. Any thread.
+/// checks passed. It runs at a later `_frame`, never here. The waiting
+/// request keeps the higher generation number: a request for an older
+/// generation than the waiting one is ignored, in one atomic step, and
+/// `runPending` drops a request older than the current generation. Any
+/// thread.
 pub fn request(gen: *Generation) void {
+    var cur = pending.load(.acquire);
+    while (true) {
+        if (cur) |p| {
+            if (p.n >= gen.n) return;
+        }
+        cur = pending.cmpxchgWeak(cur, gen, .acq_rel, .acquire) orelse return;
+    }
+}
+
+/// Asks for a swap to `gen` even when it is older than the waiting request
+/// or the current generation. For the host tests
+/// (`ZigguratTestProbe.swapRequest`), which swap back and forth. Any thread.
+pub fn requestExact(gen: *Generation) void {
+    exact.store(gen, .release);
     pending.store(gen, .release);
 }
 
 /// Asks for a swap to the newest good generation (`runtime.newestGood`)
-/// when it is newer than the current one. False when there is none. Any
-/// thread (reload hooks, `HostApi.request_swap`).
+/// when it is newer than the current one. False when there is none. The
+/// read and the store are not one step, but `request` keeps the higher
+/// generation and `runPending` drops one older than the current, so a race
+/// with the main thread never swaps back. Any thread (reload hooks,
+/// `HostApi.request_swap`).
 pub fn requestNewest() bool {
     const gen = runtime.newestGood() orelse return false;
     if (runtime.current()) |cur| {
@@ -155,14 +180,16 @@ pub fn runPending() Outcome {
     }
     const gen = pending.load(.acquire) orelse return note(.none, 0, null);
     const old = runtime.current();
-    if (old == gen) {
+    if (!swapWanted(gen, old, exact.load(.acquire))) {
         _ = pending.cmpxchgStrong(gen, null, .acq_rel, .acquire);
+        _ = exact.cmpxchgStrong(gen, null, .acq_rel, .acquire);
         return note(.none, gen.n, null);
     }
     if (gate.depth() > 0) return note(.deferred_depth, gen.n, null);
     if (!gate.trySwap()) return note(.deferred_lock, gen.n, null);
     // A request that arrived meanwhile stays for a later frame.
     _ = pending.cmpxchgStrong(gen, null, .acq_rel, .acquire);
+    _ = exact.cmpxchgStrong(gen, null, .acq_rel, .acquire);
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -183,6 +210,14 @@ pub fn runPending() Outcome {
     w.logDropped();
     w.refresh();
     return note(.swapped, gen.n, &w);
+}
+
+/// Whether a waiting request for `gen` swaps when `old` is current: only
+/// to a newer generation, or to the one `requestExact` named.
+fn swapWanted(gen: *Generation, old: ?*Generation, exact_gen: ?*Generation) bool {
+    if (old == gen) return false;
+    const o = old orelse return true;
+    return gen.n > o.n or gen == exact_gen;
 }
 
 /// A nested `_frame` (see `ZigLanguage._frame`) runs no swap: records a
@@ -612,4 +647,35 @@ test "type identity needs equal size and alignment too" {
     b = a;
     b.@"align" = 2;
     try testing.expect(!sameType(&a, &b));
+}
+
+fn testGen(n: u32) Generation {
+    return .{ .n = n, .lib = undefined, .table = undefined, .names = &.{}, .by_path = .empty };
+}
+
+test "an older swap request never replaces a newer one" {
+    var g5 = testGen(5);
+    var g6 = testGen(6);
+    var g7 = testGen(7);
+    defer pending.store(null, .release);
+    request(&g6);
+    // A worker thread that read the newest good build before the main
+    // thread asked for a newer one.
+    request(&g5);
+    try testing.expectEqual(@as(?*Generation, &g6), pending.load(.acquire));
+    request(&g7);
+    try testing.expectEqual(@as(?*Generation, &g7), pending.load(.acquire));
+}
+
+test "a request for a generation older than the current one swaps nothing" {
+    var g5 = testGen(5);
+    var g6 = testGen(6);
+    var g7 = testGen(7);
+    try testing.expect(swapWanted(&g5, null, null));
+    try testing.expect(swapWanted(&g7, &g6, null));
+    try testing.expect(!swapWanted(&g6, &g6, null));
+    try testing.expect(!swapWanted(&g5, &g6, null));
+    // The host tests swap back on purpose (`requestExact`).
+    try testing.expect(swapWanted(&g5, &g6, &g5));
+    try testing.expect(!swapWanted(&g6, &g6, &g6));
 }

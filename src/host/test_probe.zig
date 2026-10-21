@@ -703,12 +703,13 @@ pub const ZigguratTestProbe = struct {
         runtime.shutdown();
     }
 
-    /// Requests a swap to the loaded generation `gen` (`swap.request`); it
-    /// runs at a later frame. False when `gen` is not loaded.
+    /// Requests a swap to the loaded generation `gen` (`swap.requestExact`:
+    /// it replaces any waiting request and may name an older generation);
+    /// it runs at a later frame. False when `gen` is not loaded.
     pub fn swapRequest(_: *ZigguratTestProbe, gen: i64) bool {
         const n = std.math.cast(u32, gen) orelse return false;
         const g = runtime.find(n) orelse return false;
-        swap.request(g);
+        swap.requestExact(g);
         return true;
     }
 
@@ -828,7 +829,7 @@ fn nestedFrameCallback(_: ?*anyopaque) void {
     lang._frame();
     nested_result = .{ queue_runs.load(.monotonic) - runs, @as(i64, @backingInt(swap.lastOutcome())), @as(i64, swap.swapCount()) - swaps };
     // Back to the current generation, so the outer frame runs no swap.
-    if (runtime.find(1)) |one| swap.request(one);
+    if (runtime.find(1)) |one| swap.requestExact(one);
 }
 
 fn countRun(_: ?*anyopaque) void {
