@@ -20,14 +20,17 @@
 //!   script, the build is loaded (`runtime.load`), pinned, and handed to
 //!   the swap engine (`swap.request`), which moves the live instances to it
 //!   at a later frame; it is never published here. Without a tool script
-//!   nothing is loaded or pinned: the snapshot alone gives the scripts
-//!   their descriptors (`script.installSnapshot`). Either way the
-//!   descriptor cache and the generation manifest are written. A project
-//!   that gains a tool script loads from that build on; one that loses its
-//!   last tool script stops loading and keeps what it loaded (nothing is
-//!   ever unloaded). The loaded libraries' allocated bytes are summed
-//!   (`runtime.loadedBytes`) and above `size_warning_bytes` one warning per
-//!   session suggests a restart. A failed build keeps the last good one.
+//!   nothing is loaded: the snapshot alone gives the scripts their
+//!   descriptors (`script.installSnapshot`). Either way the descriptor
+//!   cache and the generation manifest are written, and the generation the
+//!   manifest names stays pinned until a newer manifest replaces it. A
+//!   project that gains a tool script loads from that build on; one that
+//!   loses its last tool script keeps loading while instances of the old
+//!   tool scripts are alive (so open tool nodes get the newest code), then
+//!   stops; nothing is ever unloaded. The loaded libraries' allocated bytes
+//!   and the kept snapshot descriptors are summed, and above
+//!   `size_warning_bytes` one warning per session suggests a restart. A
+//!   failed build keeps the last good one.
 //!   Either way each diagnostic is printed as one line through Godot's error
 //!   printing (`<file>:<line>:<column>: <message>`, or `<file>: <message>`
 //!   without a line) and stored per file for `_validate` (`diag_cache`), and
@@ -55,6 +58,7 @@ const manifest = @import("manifest.zig");
 const load_checks = @import("load_checks.zig");
 const props = @import("props.zig");
 const swap = @import("swap.zig");
+const registry = @import("registry.zig");
 const abi = @import("ziggurat_abi");
 
 const Allocator = std.mem.Allocator;
@@ -100,6 +104,15 @@ const State = struct {
     loaded_count: u32 = 0,
     /// Set once the loaded-size warning was printed (`warnSize`).
     size_warned: bool = false,
+    /// A shared lock on the generation the manifest names (`writeManifest`),
+    /// so the store's sweep never deletes the build a game is told to load,
+    /// also when the editor did not load it. Released when a newer manifest
+    /// is written and at SCENE exit.
+    manifest_pin: ?platform.generation_store.FileLock = null,
+    /// Set once a build had a tool script (`applyGood`).
+    had_tool: bool = false,
+    /// Set once the loss of the last tool script was logged.
+    tool_loss_logged: bool = false,
 };
 
 var state: ?State = null;
@@ -143,6 +156,7 @@ pub fn stop() void {
         log("ziggurat: build service stopped ({d} threads left)", .{zbuild.service.liveThreads()});
         for (st.pins.items) |*l| l.release();
         st.pins.deinit(gpa);
+        if (st.manifest_pin) |*l| l.release();
         st.sdk.deinit(gpa);
         st.arena.deinit();
         state = null;
@@ -565,8 +579,18 @@ fn applyGood(a: Allocator, st: *State, m: *const Msg, files: *Files) Allocator.E
     // The service takes a snapshot whenever it checks tables, which the
     // editor always asks for; without one the build is loaded and checked
     // as before snapshots existed.
+    // A build is loaded while the project has a tool script, and also
+    // while instances of an earlier tool script are alive (only tool
+    // scripts get instances in the editor), so open tool nodes leave the
+    // old code with the build that removed the tool flag.
     if (snap) |sn| {
-        if (!hasTool(sn)) {
+        const tool = hasTool(sn);
+        if (tool) st.had_tool = true;
+        if (!tool and st.had_tool and !st.tool_loss_logged) {
+            st.tool_loss_logged = true;
+            log("ziggurat: build {d} has no tool scripts; the editor loads builds only while instances of earlier tool scripts are alive (logged once)", .{m.gen_n});
+        }
+        if (!tool and registry.count() == 0) {
             installSnapshot(m.gen_n, sn);
             var cache_buf: [max_path_bytes]u8 = undefined;
             if (desc_cache.projectPath(&cache_buf)) |path| {
@@ -575,6 +599,7 @@ fn applyGood(a: Allocator, st: *State, m: *const Msg, files: *Files) Allocator.E
             }
             writeManifest(st, m.gen_n, lib);
             log("ziggurat: build {d} ready ({t}, {t}, {d} ms); the editor did not load it, because the project has no tool scripts", .{ m.gen_n, m.trigger, m.path, m.ms });
+            warnSize(st);
             return true;
         }
     }
@@ -637,22 +662,37 @@ fn installSnapshot(n: u32, sn: *const abi.Snapshot) void {
         logError("Ziggurat could not use the descriptors of build {d} ({s}); the scripts keep the earlier ones.", .{ n, @errorName(err) });
 }
 
-fn writeManifest(st: *const State, n: u32, lib: []const u8) void {
-    manifest.write(gpa, host_io.get(), .fromTrusted(st.store_root), n, std.fs.path.basename(lib)) catch |err|
+/// Pins generation `n`, writes the manifest naming it, then releases the
+/// pin of the generation the previous manifest named (`State.manifest_pin`).
+/// A pin that fails is logged; the manifest is still written.
+fn writeManifest(st: *State, n: u32, lib: []const u8) void {
+    var lock: ?platform.generation_store.FileLock = st.store.pin(n) catch |err| blk: {
+        logError("Ziggurat could not pin generation {d} in {s} ({s}); a later sweep may delete the build the manifest names.", .{ n, st.store_root, @errorName(err) });
+        break :blk null;
+    };
+    manifest.write(gpa, host_io.get(), .fromTrusted(st.store_root), n, std.fs.path.basename(lib)) catch |err| {
         logError("Ziggurat could not write the generation manifest in {s} ({s}).", .{ st.store_root, @errorName(err) });
+        if (lock) |*l| l.release();
+        return;
+    };
+    if (st.manifest_pin) |*old| old.release();
+    st.manifest_pin = lock;
 }
 
-/// Warns once per session when the loaded generations occupy more than
-/// `size_warning_bytes` on disk (spec section 6): none is ever unloaded,
-/// and on Linux a mapped file frees nothing until the editor exits.
+/// Warns once per session when what the editor holds of its builds exceeds
+/// `size_warning_bytes` (spec section 6): the loaded generations' bytes on
+/// disk (none is ever unloaded, and on Linux a mapped file frees nothing
+/// until the editor exits) plus the descriptors kept from snapshots
+/// (`script.snapshotsHeld`). `<n>` counts the builds held either way.
 fn warnSize(st: *State) void {
     if (st.size_warned) return;
-    const bytes = runtime.loadedBytes();
+    const held = script.snapshotsHeld();
+    const bytes = runtime.loadedBytes() +| held.bytes;
     if (bytes <= size_warning_bytes) return;
     st.size_warned = true;
     var size_buf: [32]u8 = undefined;
     var buf: [256]u8 = undefined;
-    const msg = std.fmt.bufPrintSentinel(&buf, "Ziggurat has loaded {d} builds ({s}) in this editor session; restart the editor to free them.", .{ st.loaded_count, sizeText(&size_buf, bytes) }, 0) catch return;
+    const msg = std.fmt.bufPrintSentinel(&buf, "Ziggurat has loaded {d} builds ({s}) in this editor session; restart the editor to free them.", .{ st.loaded_count + held.unloaded_builds, sizeText(&size_buf, bytes) }, 0) catch return;
     godot.raw.printWarning(msg.ptr, "Zig build", "src/host/editor_build.zig", @src().line, 1);
 }
 

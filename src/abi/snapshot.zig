@@ -78,6 +78,9 @@ pub const PropertySnap = struct {
     hint: u32 = 0,
     hint_string: []const u8 = "",
     usage: u32 = 0,
+    /// The entry names a field (`field_index` is not `abi.no_field`); a
+    /// group entry has none.
+    has_field: bool = false,
     /// `.none` for group entries.
     default: Default = .none,
 };
@@ -163,7 +166,7 @@ pub const Snapshot = struct {
             dst.properties = try a.alloc(PropertySnap, src.properties.len);
             for (dst.properties) |*p| p.* = .{};
             for (src.properties, dst.properties) |sp, *dp| {
-                dp.* = .{ .variant_type = sp.variant_type, .hint = sp.hint, .usage = sp.usage, .default = sp.default };
+                dp.* = .{ .variant_type = sp.variant_type, .hint = sp.hint, .usage = sp.usage, .has_field = sp.has_field, .default = sp.default };
                 dp.name = try a.dupe(u8, sp.name);
                 dp.class_name = try a.dupe(u8, sp.class_name);
                 dp.hint_string = try a.dupe(u8, sp.hint_string);
@@ -260,6 +263,7 @@ pub fn take(a: Allocator, table: *const abi.Table) Allocator.Error!Snapshot {
             dp.variant_type = sp.variant_type;
             dp.hint = sp.hint;
             dp.usage = sp.usage;
+            dp.has_field = sp.field_index != abi.no_field;
             dp.default = if (sp.field_index < fields.len) decode(d, &fields[sp.field_index]) else .none;
             dp.name = try a.dupe(u8, text(sp.name));
             dp.class_name = try a.dupe(u8, text(sp.class_name));
@@ -532,6 +536,7 @@ test "snapshot copies a table and survives clone" {
     try testing.expect(s.properties[0].default.eql(.{ .int = 9 }));
     try testing.expectEqualStrings("0,9", s.properties[0].hint_string);
     try testing.expect(s.properties[1].default.eql(.none));
+    try testing.expect(s.properties[0].has_field and !s.properties[1].has_field);
     try testing.expectEqualStrings("n", s.methods[0].args[0].name);
     try testing.expectEqualStrings("died", s.signals[0].name);
     try testing.expect(snap.find("a.zig") != null and snap.find("b.zig") == null);
@@ -539,6 +544,7 @@ test "snapshot copies a table and survives clone" {
     const copy = try snap.clone(testing.allocator);
     defer copy.deinit(testing.allocator);
     try testing.expectEqualStrings("hit", copy.scripts[0].methods[0].name);
+    try testing.expect(copy.scripts[0].properties[0].has_field and !copy.scripts[0].properties[1].has_field);
     try testing.expect(copy.scripts[0].properties[0].name.ptr != s.properties[0].name.ptr);
 }
 

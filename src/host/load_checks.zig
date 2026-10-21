@@ -142,9 +142,9 @@ fn viewOfSnap(a: Allocator, sc: *const abi.snapshot.ScriptSnap) Allocator.Error!
     const ps = try a.alloc(View.Prop, sc.properties.len);
     for (sc.properties, ps) |p, *o| o.* = .{
         .name = p.name,
-        // The snapshot keeps no field index; group entries carry a label
-        // usage bit, as in the descriptor cache.
-        .label = p.usage & usage_label != 0,
+        // The same rule as `viewOfDesc`: an entry without a field is a
+        // group entry, whatever its usage bits say.
+        .label = !p.has_field,
         .variant_type = p.variant_type,
         .hint = p.hint,
         .class_name = p.class_name,
@@ -349,6 +349,55 @@ fn nameAlloc(a: Allocator, sn: StringName) Allocator.Error![]u8 {
 // ------------------------------------------------------------- tests
 
 const testing = std.testing;
+
+test "descriptor and snapshot views agree on which properties are checked" {
+    const a = testing.allocator;
+    const s = struct {
+        fn str(t: []const u8) abi.Str {
+            return .{ .ptr = t.ptr, .len = @intCast(t.len) };
+        }
+    }.str;
+    var image: [8]u8 = @splat(0);
+    const fields = [_]abi.FieldDesc{.{ .name = s("hp"), .type_name = s("i32"), .shape = 0, .offset = 0, .size = 4, .@"align" = 4, .value_kind = @backingInt(abi.ValueKind.int_signed), .bits = 32 }};
+    // A field with a category usage bit (checked: it has a field), a
+    // field-less entry without a group usage bit (skipped: no field), and
+    // an ordinary group entry.
+    const props = [_]abi.PropertyDesc{
+        .{ .name = s("hp"), .field_index = 0, .variant_type = 2, .class_name = s(""), .hint = 0, .hint_string = s(""), .usage = 6 | 128 },
+        .{ .name = s("odd"), .field_index = abi.no_field, .variant_type = 0, .class_name = s(""), .hint = 0, .hint_string = s(""), .usage = 6 },
+        .{ .name = s("Group"), .field_index = abi.no_field, .variant_type = 0, .class_name = s(""), .hint = 0, .hint_string = s(""), .usage = abi.usage_group },
+    };
+    // Only what `take` and the views read is set; no module function runs.
+    var d: abi.ScriptDesc = undefined;
+    d.path = s("a.zig");
+    d.class_name = s("");
+    d.base_class = s("Node");
+    d.flags = 0;
+    d.instance_size = 8;
+    d.instance_align = 4;
+    d.defaults = &image;
+    d.fields = &fields;
+    d.field_count = 1;
+    d.properties = &props;
+    d.property_count = 3;
+    d.methods = undefined;
+    d.method_count = 0;
+    d.signals = undefined;
+    d.signal_count = 0;
+    const table: abi.Table = .{ .magic = abi.magic, .abi_version = abi.abi_version, .size = @sizeOf(abi.Table), .layout_stamp = 0, .sdk_version = s("1"), .build_id = s("0123456789abcdef"), .scripts = @ptrCast(&d), .script_count = 1 };
+    const snap = try abi.snapshot.take(a, &table);
+    defer snap.deinit(a);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const from_desc = try viewOfDesc(arena.allocator(), &d);
+    const from_snap = try viewOfSnap(arena.allocator(), &snap.scripts[0]);
+    try testing.expectEqual(from_desc.props.len, from_snap.props.len);
+    for (from_desc.props, from_snap.props) |x, y| {
+        try testing.expectEqualStrings(x.name, y.name);
+        try testing.expectEqual(x.label, y.label);
+    }
+    try testing.expect(!from_desc.props[0].label and from_desc.props[1].label and from_desc.props[2].label);
+}
 
 test "finding sentences" {
     const a = testing.allocator;

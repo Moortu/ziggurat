@@ -5,12 +5,27 @@ extends Node
 # which has no tool script. Each good build updates descriptors,
 # placeholders, the descriptor cache and the manifest from the build's
 # table snapshot; the editor loads no generation. Three builds: at open, a
-# save with a new default, a save with a new property. Prints one ZTEST line
-# per case, then ZTEST DONE, and quits the editor.
+# save with a new default, a save with a new property. Then:
+# - res://saved.tscn, whose Walker has a snapshot-backed placeholder, is
+#   opened and saved through the editor: its value and connection stay;
+# - nine saves whose builds fail the load checks stage nine newer
+#   generations, more than the store keeps: the build the manifest names
+#   (3) is still on disk, because the editor pins it.
+# The size warning's threshold is lowered to 1 byte, so the first build's
+# kept descriptors trigger it; the host test checks it appears once. After
+# this editor run the host test plays saved.tscn as a game from the
+# manifest. Prints one ZTEST line per case, then ZTEST DONE, and quits the
+# editor.
 
 const WAIT_MS := 600000
 const MANIFEST := "res://.godot/ziggurat/manifest"
 const CACHE := "res://.godot/ziggurat/descriptors.json"
+const SCENE := "res://saved.tscn"
+const KEPT := [
+	"script = ExtResource(",
+	"speed = 9.0",
+	"[connection signal=\"arrived\" from=\"Walker\" to=\"Tick\" method=\"start\"]",
+]
 
 var probe: Object
 
@@ -48,8 +63,14 @@ func nothing_loaded() -> bool:
 
 func _ready() -> void:
 	if not Engine.is_editor_hint():
+		# The game run of saved.tscn: its Walker logs from `_ready`.
+		for i in 5:
+			await get_tree().process_frame
+		print("ZTEST DONE")
+		get_tree().quit()
 		return
 	probe = ClassDB.instantiate("ZigguratTestProbe")
+	probe.set_size_warning_bytes(1)
 	await run()
 	print("ZTEST DONE")
 	get_tree().quit()
@@ -86,3 +107,41 @@ func run() -> void:
 		and probe.script_placeholder_count(walker_s) == 1,
 		"loaded %d properties %s grip %s" % [probe.loaded_generations(), names, walker.get("grip")])
 	walker.queue_free()
+
+	# ---- a scene with a snapshot-backed placeholder saves its values
+	var before := FileAccess.get_file_as_string(SCENE)
+	EditorInterface.open_scene_from_path(SCENE)
+	var root := EditorInterface.get_edited_scene_root()
+	var node: Node = root.get_node_or_null("Walker") if root != null else null
+	var why := ""
+	if node == null:
+		why = "scene not open (root %s)" % root
+	elif node.get("speed") != 9.0 or node.get("grip") != 3 or probe.live_instances() != 0:
+		why = "speed %s grip %s instances %d" % [node.get("speed"), node.get("grip"), probe.live_instances()]
+	report("snapshot_scene_opened", why == "", why)
+	err = EditorInterface.save_scene()
+	var after := FileAccess.get_file_as_string(SCENE)
+	why = "" if err == OK else "save_scene returned %s; " % error_string(err)
+	if after == before:
+		why += "the file is unchanged; "
+	for line in KEPT:
+		if not after.contains(line):
+			why += "lost %s; " % line
+	# The default of grip (3) is not stored, as for a loaded script.
+	if after.contains("grip"):
+		why += "stored the default of grip; "
+	report("snapshot_scene_save_keeps_values", why == "", why + "\n" + after)
+
+	# ---- newer staged builds never sweep away the manifest's build
+	for i in 9:
+		var outcomes: int = probe.editor_build_outcomes()
+		walker_s.source_code = text.replace("speed: f32 = 5,", "speed: f32 = 7,\ngrip: i32 = 3,") + "\npub fn getName(self: *const @This()) i32 {\n    _ = self;\n    return %d;\n}\n" % i
+		err = ResourceSaver.save(walker_s, "res://walker.zig")
+		done = await wait_for(func(): return probe.editor_build_outcomes() > outcomes)
+		if err != OK or not done:
+			break
+	report("manifest_build_kept",
+		done and FileAccess.get_file_as_string(MANIFEST) == manifest_for(3)
+		and FileAccess.file_exists("res://.godot/ziggurat/gen/3/libzmod.3.so")
+		and not FileAccess.file_exists("res://.godot/ziggurat/gen/4/libzmod.4.so") and nothing_loaded(),
+		"manifest %s gen3 %s gen4 %s" % [var_to_str(FileAccess.get_file_as_string(MANIFEST)), FileAccess.file_exists("res://.godot/ziggurat/gen/3/libzmod.3.so"), FileAccess.file_exists("res://.godot/ziggurat/gen/4/libzmod.4.so")])

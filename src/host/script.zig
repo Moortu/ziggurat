@@ -134,7 +134,22 @@ const SnapCache = struct {
     n: u32,
     /// Hash of the descriptors (the cache file bytes without the number).
     hash: u64,
+    /// The cache file bytes' length: a measure of what the parsed cache
+    /// holds (the parsed form is of the same order).
+    bytes: u64,
 };
+
+/// What the snapshot caches hold: their `SnapCache.bytes`, and how many
+/// are for builds that are not loaded. Main thread.
+pub fn snapshotsHeld() struct { bytes: u64, unloaded_builds: u32 } {
+    var bytes: u64 = 0;
+    var unloaded: u32 = 0;
+    for (snap_caches.items) |sc| {
+        bytes +|= sc.bytes;
+        if (runtime.find(sc.n) == null) unloaded += 1;
+    }
+    return .{ .bytes = bytes, .unloaded_builds = unloaded };
+}
 
 /// Every snapshot cache made in this session, kept until SCENE exit,
 /// because a loader thread may still read one an older build installed.
@@ -164,7 +179,7 @@ pub fn installSnapshot(n: u32, snap: *const abi.Snapshot) error{ OutOfMemory, Re
     errdefer cache.deinit();
     const sc = try a.create(SnapCache);
     errdefer a.destroy(sc);
-    sc.* = .{ .cache = cache, .n = n, .hash = hash };
+    sc.* = .{ .cache = cache, .n = n, .hash = hash, .bytes = bytes.len };
     try snap_caches.append(a, sc);
     newest_snap.store(sc, .release);
 }

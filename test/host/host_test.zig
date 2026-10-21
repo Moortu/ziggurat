@@ -1238,8 +1238,17 @@ test "editor reload: tool node gets new code, rejected build never loads, size w
             "ZTEST PASS tool_node_gets_new_code",
             "ZTEST PASS tool_build_manifest",
             "ZTEST PASS rejected_build_never_loads",
+            "ZTEST PASS hook_reload_tool_script_swaps",
+            "ZTEST PASS hook_script_reload_swaps",
+            "ZTEST PASS hook_request_swap_swaps",
+            "ZTEST PASS tool_removed_live_node_gets_new_code",
+            "ZTEST PASS tool_removed_loads_nothing",
+            "ZTEST PASS tool_back_loads",
             "ziggurat: build 1 loaded (open, ",
             "ziggurat: build 2 loaded (save, ",
+            "ziggurat: build 4 loaded (save, ",
+            "ziggurat: build 5 ready (save, ",
+            "ziggurat: build 6 loaded (save, ",
             "ziggurat: swapped to build 2 (1 instances kept their data, 0 migrated)",
             "ziggurat: build 3 failed the load checks (save, ",
             "Method 'get_name' of res://knob.zig hides Node.get_name",
@@ -1247,8 +1256,9 @@ test "editor reload: tool node gets new code, rejected build never loads, size w
         .once = &.{
             "Ziggurat has loaded 1 builds (",
             "in this editor session; restart the editor to free them.",
+            "ziggurat: build 4 has no tool scripts; the editor loads builds only while instances of earlier tool scripts are alive (logged once)",
         },
-        .reject = &.{"ziggurat: build 3 loaded"},
+        .reject = &.{ "ziggurat: build 3 loaded", "ziggurat: build 5 loaded" },
         .deadline = build_deadline_s,
     });
 }
@@ -1265,12 +1275,29 @@ test "editor reload: no tool scripts loads nothing" {
             "ZTEST PASS plain_build_1",
             "ZTEST PASS plain_build_2",
             "ZTEST PASS plain_build_3",
+            "ZTEST PASS snapshot_scene_opened",
+            "ZTEST PASS snapshot_scene_save_keeps_values",
+            "ZTEST PASS manifest_build_kept",
             "ziggurat: build 1 ready (open, ",
             "ziggurat: build 2 ready (save, ",
             "ziggurat: build 3 ready (save, ",
+            "ziggurat: build 12 failed the load checks (save, ",
         },
-        .reject = &.{ " loaded (", "generations loaded in this editor session", "swapped to build" },
+        .once = &.{
+            "Ziggurat has loaded 1 builds (",
+            "in this editor session; restart the editor to free them.",
+        },
+        .reject = &.{ " loaded (", "generations loaded in this editor session", "swapped to build", "could not pin" },
         .deadline = build_deadline_s,
+    });
+    // A game from the manifest the editor wrote: build 3, which the editor
+    // never loaded, runs the scene's Walker with its stored value.
+    try p.run(&.{ "game", "res://saved.tscn" }, .{
+        .once = &.{
+            "ziggurat: generation 3 loaded",
+            "[ziggurat] walker ready speed=9\n",
+        },
+        .reject = &.{ refused_prefix, "ziggurat: build" },
     });
 }
 
