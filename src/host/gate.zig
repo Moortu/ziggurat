@@ -50,8 +50,7 @@
 //!   module's `emit` reaches handlers that enter through the same callbacks.
 //!   There is no other path into module code.
 //! - `runtime.load` runs `ziggurat_init` of a new generation on the main
-//!   thread; it touches no instance (the swap engine runs it under the
-//!   write lock, Task 4).
+//!   thread; it touches no instance and runs before a swap is requested.
 //!
 //! Rule for the swap engine: the callbacks that only read descriptors
 //! (`has_method`, the lists, revert, property type, argument count) and the

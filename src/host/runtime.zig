@@ -1,6 +1,7 @@
 //! The host's minimal module runtime (L3, Stage 3): load one generation of
 //! the user module, check its table, initialise it and map names to indexes.
-//! The gate is `gate.zig`; swaps and migration are the swap engine's.
+//! The gate is `gate.zig`; swaps and migration are the swap engine's
+//! (`swap.zig`), which uses `retag`, `setSwapTarget` and `publish` here.
 //!
 //! `load` follows the host contract in `src/abi/abi.zig`: open the staged
 //! library, look up `ziggurat_describe` and `ziggurat_init`, `validate` the
@@ -87,6 +88,13 @@ var current_gen: std.atomic.Value(?*Generation) = .init(null);
 var ever_current: std.atomic.Value(u64) = .init(0);
 /// Set once `request_swap` has logged.
 var swap_logged: std.atomic.Value(bool) = .init(false);
+/// On the thread running a swap, the generation it swaps to (null
+/// elsewhere): instances that code run by the swap makes land on it.
+threadlocal var swap_target: ?*Generation = null;
+/// When not 0, the allocation `HostApi.alloc` fails on: it counts down by
+/// one per call and the call that brings it to 0 returns null. For the
+/// host tests (`failAllocation`).
+var fail_countdown: std.atomic.Value(u32) = .init(0);
 
 /// The memory behind `HostApi.alloc` (malloc: thread-safe, any alignment).
 const heap = std.heap.c_allocator;
@@ -235,6 +243,35 @@ fn storeCurrent(gen: ?*Generation) void {
         if (g.n < 64) _ = ever_current.fetchOr(@as(u64, 1) << @intCast(g.n), .acq_rel);
     }
     current_gen.store(gen, .release);
+}
+
+/// Marks the calling thread as swapping to `gen` (null: no longer). The
+/// swap engine, under the gate's write side. Descriptor lookups on this
+/// thread (`swapTarget`) then use `gen` for the scripts it has, so an
+/// instance that `migrate` or an old `deinit` makes is made on the new
+/// generation and not left behind on the old one.
+pub fn setSwapTarget(gen: ?*Generation) void {
+    swap_target = gen;
+}
+
+/// The generation the calling thread is swapping to, or null.
+pub fn swapTarget() ?*Generation {
+    return swap_target;
+}
+
+/// Makes the `nth` `HostApi.alloc` call from now fail (0: none). For the
+/// host tests.
+pub fn failAllocation(nth: u32) void {
+    fail_countdown.store(nth, .release);
+}
+
+/// True when this allocation is the one `failAllocation` asked to fail.
+fn injectedFailure() bool {
+    var left = fail_countdown.load(.acquire);
+    while (left != 0) {
+        left = fail_countdown.cmpxchgWeak(left, left - 1, .acq_rel, .acquire) orelse return left == 1;
+    }
+    return false;
 }
 
 /// True when generation `n` (below 64) was ever current. For the host tests.
@@ -387,6 +424,7 @@ fn apiAlloc(gen: u32, size: usize, alignment: u32) callconv(.c) ?*anyopaque {
     if (size == 0) return null;
     const al = validAlignment(alignment) orelse return null;
     const counter = counterFor(gen) orelse return null;
+    if (injectedFailure()) return null;
     const p = heap.rawAlloc(size, al, @returnAddress()) orelse return null;
     countAlloc(counter, size);
     return p;
@@ -599,6 +637,21 @@ test "retag moves bytes between generation counters" {
     try testing.expectEqual(@as(?u64, 0), liveBytes(9));
 }
 
+test "an injected allocation failure hits exactly the nth call" {
+    var g: Generation = .{ .n = 11, .lib = undefined, .table = undefined, .names = &.{}, .by_path = .empty };
+    try testRegister(&g);
+    defer testReset();
+    failAllocation(3);
+    defer failAllocation(0);
+    const a = apiAlloc(11, 8, 8) orelse return error.AllocFailed;
+    const b = apiAlloc(11, 8, 8) orelse return error.AllocFailed;
+    try testing.expect(apiAlloc(11, 8, 8) == null);
+    const d = apiAlloc(11, 8, 8) orelse return error.AllocFailed;
+    try testing.expectEqual(@as(?u64, 24), liveBytes(11));
+    for ([_]*anyopaque{ a, b, d }) |p| apiFree(11, p, 8, 8);
+    try testing.expectEqual(@as(?u64, 0), liveBytes(11));
+}
+
 test "refusal sentence names the file and lowers the reason" {
     var diag: [256]u8 = undefined;
     var reason: [256]u8 = @splat(0);
@@ -615,4 +668,5 @@ test {
     _ = host_io;
     _ = gate;
     _ = @import("registry.zig");
+    _ = @import("swap.zig");
 }

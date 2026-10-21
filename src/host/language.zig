@@ -16,7 +16,9 @@
 //! - `_get_global_class_name` runs on the editor's file-scan thread: it
 //!   reads the file with std and scans the text (`global_class.zig`); the
 //!   only engine values it makes are the returned Strings and Dictionary.
-//! - `_frame` drains the main-thread queue (`main_queue.zig`).
+//! - `_frame` drains the main-thread queue (`main_queue.zig`), then runs a
+//!   requested swap when it can (`swap.runPending`): the only place a swap
+//!   runs.
 //! - Reload requests only log (once per kind) and count; global constants
 //!   (autoloads) are remembered by name. Neither reports an error.
 //! - `_debug_get_current_stack_info` takes no lock and creates no
@@ -30,6 +32,7 @@ const props = @import("props.zig");
 const host_io = @import("host_io.zig");
 const diag_cache = @import("diag_cache.zig");
 const main_queue = @import("main_queue.zig");
+const swap = @import("swap.zig");
 const global_class = @import("global_class.zig");
 const template = @import("template.zig");
 
@@ -151,9 +154,13 @@ pub const ZigLanguage = struct {
     pub fn _finish(_: *ZigLanguage) void {}
     /// Runs queued main-thread work, at most `main_queue.per_frame` items.
     /// Godot calls `_frame` also from nested `Main::iteration()` calls; a
-    /// nested call runs nothing (`main_queue.drain`).
+    /// nested call runs nothing (`main_queue.drain`). Then runs a requested
+    /// swap, unless module code is on the main thread's stack (a nested
+    /// iteration from inside a script call) or another thread is inside the
+    /// gate; it then waits for a later frame (`swap.runPending`).
     pub fn _frame(_: *ZigLanguage) void {
         _ = main_queue.drain();
+        _ = swap.runPending();
     }
     pub fn _threadEnter(_: *ZigLanguage) void {}
     pub fn _threadExit(_: *ZigLanguage) void {}

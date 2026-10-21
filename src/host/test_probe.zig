@@ -21,6 +21,8 @@ const resource = @import("resource.zig");
 const editor_build = @import("editor_build.zig");
 const gate = @import("gate.zig");
 const registry = @import("registry.zig");
+const swap = @import("swap.zig");
+const Callable = godot.builtin.Callable;
 const PackedStringArray = godot.builtin.PackedStringArray;
 
 const Allocator = std.mem.Allocator;
@@ -630,6 +632,46 @@ pub const ZigguratTestProbe = struct {
         runtime.shutdown();
     }
 
+    /// Requests a swap to the loaded generation `gen` (`swap.request`); it
+    /// runs at a later frame. False when `gen` is not loaded.
+    pub fn swapRequest(_: *ZigguratTestProbe, gen: i64) bool {
+        const n = std.math.cast(u32, gen) orelse return false;
+        const g = runtime.find(n) orelse return false;
+        swap.request(g);
+        return true;
+    }
+
+    /// The last swap outcome (`swap.Outcome` as a number).
+    pub fn swapOutcome(_: *ZigguratTestProbe) i64 {
+        return @backingInt(swap.lastOutcome());
+    }
+
+    /// Swaps done in this process.
+    pub fn swapsDone(_: *ZigguratTestProbe) i64 {
+        return swap.swapCount();
+    }
+
+    /// Makes the `nth` `HostApi.alloc` call from now fail (0: none).
+    pub fn failAllocation(_: *ZigguratTestProbe, nth: i64) void {
+        runtime.failAllocation(std.math.cast(u32, nth) orelse 0);
+    }
+
+    /// The address of `obj`'s Zig instance data, or -1.
+    pub fn instanceData(_: *ZigguratTestProbe, obj: ?*Object) i64 {
+        const rec = instance.recordOf(obj orelse return -1) orelse return -1;
+        gate.enter();
+        defer gate.leave();
+        return @bitCast(@as(u64, @intFromPtr(rec.data)));
+    }
+
+    /// Calls `callable` once during the next swap, on the swapping thread,
+    /// after the first instance with a changed layout moved (`swap.test_hook`).
+    pub fn swapHook(_: *ZigguratTestProbe, callable: Callable) void {
+        if (hook_callable) |*c| c.deinit();
+        hook_callable = Callable.copy(callable);
+        swap.test_hook = .{ .run = &runHook };
+    }
+
     pub fn propertyIsGroup(_: *ZigguratTestProbe, script: i64, index: i64) bool {
         const d = scriptDesc(script) orelse return false;
         const i = std.math.cast(u32, index) orelse return false;
@@ -637,6 +679,18 @@ pub const ZigguratTestProbe = struct {
         return d.properties[i].field_index == abi.no_field;
     }
 };
+
+var hook_callable: ?Callable = null;
+
+fn runHook(_: ?*anyopaque) void {
+    var c = hook_callable orelse return;
+    hook_callable = null;
+    defer c.deinit();
+    var args = Array.init();
+    defer args.deinit();
+    const r = c.callv(args);
+    r.deinit();
+}
 
 fn fail(out: *Array) Array {
     out.pushBack(Variant.init(i64, -1));
@@ -710,7 +764,9 @@ pub const method_names = [_][:0]const u8{
     "language_reload_scripts", "language_reload_tool_script", "editor_build_outcomes",   "editor_build_busy",
     "cache_write_snapshot",    "gate_depth",                  "gate_try_swap",           "gate_test_swap",
     "gate_migrate_probe",      "registry_count",              "runtime_shutdown",        "stage_module",
-    "gate_swap_begin",         "gate_swap_end",               "instance_generation",
+    "gate_swap_begin",         "gate_swap_end",               "instance_generation",     "swap_request",
+    "swap_outcome",            "swaps_done",                  "fail_allocation",         "instance_data",
+    "swap_hook",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

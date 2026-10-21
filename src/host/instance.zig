@@ -50,6 +50,12 @@
 //! Live records are listed in `registry.zig` (added in `create`, removed
 //! in `free`), so the swap engine can find them.
 //!
+//! During a swap (`deferFrees`) a `free` on the swapping thread, from code
+//! the swap runs (`migrate`, an old `deinit`), only takes the record off
+//! the registry; the record and its data are released after the swap ended
+//! (`releaseDeferred`). No record memory is reused during a swap, and the
+//! module's `destroy` never runs on a record the swap is about to rewrite.
+//!
 //! Name maps: `runtime.shutdown` frees them at SCENE exit, after the entry
 //! has unregistered the language, holding the gate's write side. Godot
 //! deletes the main loop (and with it the scene tree) before it
@@ -211,14 +217,57 @@ pub fn scriptPath(rec: *const Instance) []const u8 {
 }
 
 /// Ends the migration of `rec` (`gate.setMigrating(null)`) and releases it
-/// when Godot freed it meanwhile. The swapper, under the gate's write side;
-/// `rec` is not used afterwards when this returns true.
+/// (or, during a swap, puts its release off) when Godot freed it meanwhile.
+/// The swapper, under the gate's write side; `rec` is not used afterwards
+/// when this returns true.
 pub fn endMigration(rec: *Instance) bool {
     gate.setMigrating(null);
     if (!rec.free_pending) return false;
-    registry.remove(rec);
-    release(rec);
+    retire(rec);
     return true;
+}
+
+/// True on the swapping thread while frees are put off (`deferFrees`).
+threadlocal var defer_frees: bool = false;
+/// Records freed during the swap, released by `releaseDeferred`. Only the
+/// swapping thread touches it.
+var deferred: std.ArrayList(*Instance) = .empty;
+
+/// Puts off (true) or stops putting off (false) the release of records
+/// freed on this thread. The swap engine, on the swapping thread: true
+/// once it holds the gate's write side, false before it releases it.
+pub fn deferFrees(on: bool) void {
+    defer_frees = on;
+}
+
+/// Releases the records freed during the swap (each one's `destroy` runs
+/// on the generation and data its record holds now) and returns how many.
+/// The swap engine, on the swapping thread, after the swap ended.
+pub fn releaseDeferred() usize {
+    std.debug.assert(!defer_frees);
+    const list = deferred;
+    deferred = .empty;
+    defer {
+        var l = list;
+        l.deinit(std.heap.c_allocator);
+    }
+    for (list.items) |rec| {
+        gate.enter();
+        defer gate.leave();
+        release(rec);
+    }
+    return list.items.len;
+}
+
+/// Takes `rec` off the registry and releases it now, or after the swap
+/// when frees are put off. The caller holds the gate.
+fn retire(rec: *Instance) void {
+    registry.remove(rec);
+    if (defer_frees) {
+        if (deferred.append(std.heap.c_allocator, rec)) return else |_| {}
+        // Out of memory: released now, as before the swap engine.
+    }
+    release(rec);
 }
 
 /// The table every instance shares.
@@ -573,8 +622,7 @@ fn free(p: c.GDExtensionScriptInstanceDataPtr) callconv(.c) void {
         rec.free_pending = true;
         return;
     }
-    registry.remove(rec);
-    release(rec);
+    retire(rec);
 }
 
 /// `destroy` in the module, then the script reference and the record.

@@ -265,7 +265,13 @@ pub const ScriptDesc = extern struct {
     /// defaults, sets `base`, then runs the script's `init`.
     create: *const fn (owner: *anyopaque, gen: u32) callconv(.c) ?*anyopaque,
     /// As `create`, without running `init`: for an instance whose fields
-    /// the host is about to move in from an older generation.
+    /// the host is about to move in from an older generation. The block is
+    /// `max(instance_size, 1)` bytes from `HostApi.alloc` with tag `gen`
+    /// and alignment `instance_align`, holding the defaults image and
+    /// `base`. A host that abandons a blank block before any module code
+    /// used it (a swap rolled back) frees it with `HostApi.free` itself,
+    /// with those arguments: the defaults hold no engine value, so there is
+    /// nothing to release and no `deinit` to run.
     create_blank: *const fn (owner: *anyopaque, gen: u32) callconv(.c) ?*anyopaque,
     /// Runs the script's `deinit`, releases its engine values and frees
     /// `inst`, which must not be used afterwards.

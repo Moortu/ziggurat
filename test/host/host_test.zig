@@ -713,6 +713,93 @@ test "gate: depth counts nested entries, try-lock fails while a reader holds, th
     });
 }
 
+// ------------------------------------------------------------ swaps
+
+/// Builds test/fixtures/swap_v1 and swap_v2 (two builds of one project)
+/// and lists them in the project's `modules.txt` as `v1=` and `v2=`.
+fn buildSwapModules(p: *Project) !void {
+    const a = p.arena_state.allocator();
+    var manifest = try loadManifest(testing.allocator);
+    defer manifest.deinit(testing.allocator);
+    try p.tmp.dir.createDirPath(io, "work");
+    const work = try p.tmp.dir.realPathFileAlloc(io, "work", a);
+    const v1 = try buildModule(a, work, "v1", "swap_v1", manifest.modules, true);
+    const v2 = try buildModule(a, work, "v2", "swap_v2", manifest.modules, true);
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+    defer dir.close(io);
+    try dir.writeFile(io, .{ .sub_path = "modules.txt", .data = try std.fmt.allocPrint(a, "v1={s}\nv2={s}\n", .{ v1, v2 }) });
+}
+
+test "swap: rollback on allocation failure, same layout keeps data, changed layout moves fields, migrate hook runs, freed instance gets one deinit, threads across two generations, placeholders refresh" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("empty");
+    defer p.deinit();
+    try buildSwapModules(&p);
+
+    try p.addCheck("swap.gd");
+    try p.run(&.{ "script", "res://check.gd" }, .{
+        .expect = &.{
+            "ZTEST PASS load\n",
+            "ZTEST PASS stage\n",
+            "ZTEST PASS rollback_on_allocation_failure",
+            "ZTEST PASS swapped",
+            "ZTEST PASS same_layout_keeps_data",
+            "ZTEST PASS changed_layout_moves_fields",
+            "ZTEST PASS migrate_hook_runs",
+            "ZTEST PASS instance_made_during_swap_on_new_generation",
+            "ZTEST PASS script_missing_keeps_old_code",
+            "ZTEST PASS old_generation_bytes_released",
+            "ZTEST PASS registry_matches_live",
+            "ZTEST PASS request_for_current_does_nothing",
+            "ZTEST PASS instances_released",
+        },
+        .once = &.{
+            // The old deinit ran exactly once per instance: on generation 1
+            // for each migrated instance (after its moved `id` was reset),
+            // for the one freed before the swap and for the one freed during
+            // the swap before it was reached.
+            "mover deinit gen=1 hp=1 id=0\n",
+            "mover deinit gen=1 hp=2 id=0\n",
+            "mover deinit gen=1 hp=5 id=0\n",
+            "mover deinit gen=1 hp=6 id=6\n",
+            "mover deinit gen=1 hp=9 id=9\n",
+            // Freed during the swap after its migration: the new deinit.
+            "mover deinit gen=2 id=5\n",
+            // Freed at the end, on generation 2.
+            "mover deinit gen=2 id=1\n",
+            "mover deinit gen=2 id=2\n",
+            "mover deinit gen=2 id=7\n",
+            // Logged once per script per swap.
+            "mover.zig: field 'hp' was dropped (removed)",
+            "mover.zig: field 'count' was dropped (type changed)",
+            "oldonly.zig is not in build 2; its instances keep the old code",
+            "ziggurat: swapped to build 2",
+        },
+        .reject = &.{
+            "mover deinit gen=2 id=6\n",
+            "mover deinit gen=1 hp=7",
+            "mover deinit gen=2 id=9\n",
+            "keeper.zig: field",
+        },
+    });
+
+    try p.addCheck("swap_threads.gd");
+    try p.runScript(&.{
+        "ZTEST PASS load\n",
+        "ZTEST PASS threads_across_two_generations",
+        "ZTEST PASS registry_matches_live",
+        "ZTEST PASS bytes_released",
+    });
+
+    try p.addAutoloadCheck("swap_editor.gd");
+    try p.runEditorChecked("300", .{ .expect = &.{
+        "ZTEST PASS editor_load",
+        "ZTEST PASS placeholder_before_swap",
+        "ZTEST PASS placeholders_refresh_after_swap",
+    } });
+}
+
 // ------------------------------------------------------------ placeholders
 
 /// Copies test/host/checks/<name> into `p` as `res://<as>`.

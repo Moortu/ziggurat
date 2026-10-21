@@ -393,8 +393,14 @@ const Feed = struct {
 
 /// The descriptor of the script at project-relative path `rel`. Once a
 /// generation is loaded the cache is never asked (no stale validity for a
-/// script the module no longer has).
+/// script the module no longer has). On the thread running a swap, the
+/// generation it swaps to answers first for the scripts it has
+/// (`runtime.swapTarget`): an instance made by code the swap runs lands on
+/// the new generation.
 fn findDesc(rel: []const u8) ?Desc {
+    if (runtime.swapTarget()) |gen| {
+        if (runtime.findScript(gen, rel)) |i| return .{ .loaded = .{ .gen = gen, .index = i } };
+    }
     if (runtime.current()) |gen| {
         const i = runtime.findScript(gen, rel) orelse return null;
         return .{ .loaded = .{ .gen = gen, .index = i } };
