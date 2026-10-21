@@ -474,7 +474,8 @@ test "cache rejects garbage" {
         "ZTEST PASS good_cache_reads",
         "ZTEST PASS rejects_truncated\n",
         "ZTEST PASS rejects_truncated_early",
-        "ZTEST PASS rejects_version_2",
+        "ZTEST PASS rejects_version_1",
+        "ZTEST PASS rejects_version_3",
         "ZTEST PASS rejects_version_word",
         "ZTEST PASS rejects_empty",
         "ZTEST PASS rejects_not_json",
@@ -499,7 +500,7 @@ test "cache rejects garbage" {
         "ZTEST PASS missing_file_is_silent",
         // One line per bad file, naming it and the reason.
         "truncated.json: the file is not valid JSON",
-        "version_2.json: the file has version 2, but this host reads version 1.",
+        "version_1.json: the file has version 1, but this host reads version 2.",
         "bad_hash.json: the file has a script with a bad layout hash.",
         "drop_comment_attack.json: 1 value(s) did not fit the type of their property.",
     });

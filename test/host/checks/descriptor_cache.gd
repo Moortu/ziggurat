@@ -76,7 +76,7 @@ func write_run(probe: Object, cache_path: String) -> void:
 	f.close()
 	var text := FileAccess.get_file_as_string(CACHE)
 	var json = JSON.parse_string(text)
-	report("cache_is_json", json is Dictionary and json["version"] == 1 and json["generation"] == 1 and json["scripts"].size() == 3, text.substr(0, 200))
+	report("cache_is_json", json is Dictionary and json["version"] == 2 and json["generation"] == 1 and json["scripts"].size() == 3, text.substr(0, 200))
 	var p: Dictionary = json["scripts"][1]
 	report("cache_fields", p["path"] == "player.zig" and p["class_name"] == "Player" and p["base_class"] == "CharacterBody2D" and p["flags"] == 0 \
 			and p["layout_hash"] is String and p["layout_hash"].length() > 0 and p["layout_hash"].lstrip("0123456789") == "" and p["properties"][1]["default"] == 300.0 and p["properties"][11].has("default") and p["properties"][11]["default"] == null and p["properties"][8]["default"] == [1.0, 2.0] \

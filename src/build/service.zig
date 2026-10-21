@@ -499,8 +499,9 @@ pub const BuildService = struct {
         defer ws.deinit(a);
 
         if (try self.incrementalBuild(arena, &ws, zig, &sc.build_id, o, &stale.found)) {
-            // TODO(Stage 4): compare each script's layout hash in the table
-            // with the previous generation's (spec section 5).
+            // TODO(Stage 4): compare each script's layout hash
+            // (`ziggurat_abi.layoutHash` over the table's fields) with the
+            // previous generation's (spec section 5).
         } else {
             o.path = .full;
             try self.fullBuild(arena, &ws, zig, &sc.build_id, o);

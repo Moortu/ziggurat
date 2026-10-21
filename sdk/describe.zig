@@ -1,10 +1,18 @@
 //! Compile-time script descriptors (spec section 8).
 //!
 //! `describe(S, rel)` reads the script struct `S` and builds its
-//! `abi.ScriptDesc`: every field, the exported properties (with groups and
-//! hints from `meta`), the methods, the signals, the layout hash and the
-//! defaults image. Every string and array the descriptor points to is a
-//! comptime constant with static lifetime.
+//! `abi.ScriptDesc`: every field (with its type name, shape and value kind),
+//! the exported properties (with groups and hints from `meta`), the
+//! methods, the signals and the defaults image. Every string and array the
+//! descriptor points to is a comptime constant with static lifetime. The
+//! layout hash is not computed here: the host derives it from the fields
+//! (`ziggurat_abi.layoutHash`).
+//!
+//! Compile time matters (each script's `describe` runs on every warm-up):
+//! declarations are found with `@hasDecl`/`@hasField`, never by scanning
+//! name lists, lists are built in one pass into fixed arrays, and nothing
+//! is hashed except the shape of struct, array, union, enum and packed
+//! field types.
 //!
 //! A mistake in a script is a compile error of one sentence followed by the
 //! SDK marker `[ziggurat:<rel>#<name>]` (see `src/build/rootgen.zig`), so the
@@ -106,18 +114,10 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                 (if (isIdentifier(name)) name else unnamed) ++ "]");
         }
 
+        /// A `pub` declaration of `S`. `@hasDecl` from this file sees only
+        /// `pub` ones, as `decl_names` lists them.
         fn isPub(comptime name: []const u8) bool {
-            for (info.decl_names) |d| {
-                if (eql(d, name)) return true;
-            }
-            return false;
-        }
-
-        fn fieldIndex(comptime name: []const u8) ?usize {
-            for (info.field_names, 0..) |f, i| {
-                if (eql(f, name)) return i;
-            }
-            return null;
+            return @hasDecl(S, name);
         }
 
         fn exported(comptime name: []const u8) bool {
@@ -235,10 +235,7 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
         }
 
         fn isMethodName(comptime name: []const u8) bool {
-            for (method_decls) |d| {
-                if (eql(d, name)) return true;
-            }
-            return false;
+            return isPub(name) and isMethod(name);
         }
 
         // ---- meta ----
@@ -257,7 +254,7 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                 fail("meta", "meta must be a struct literal such as .{ .speed = .{ .range = .{ 0, 10 } } }.");
             for (@typeInfo(Meta).@"struct".field_names) |k| {
                 const E = @TypeOf(@field(meta, k));
-                if (fieldIndex(k) != null) {
+                if (@hasField(S, k)) {
                     if (!exported(k)) fail("meta", "meta names '" ++ k ++ "', which is not an exported field.");
                     checkEntryKeys(k, E, &field_meta_keys, field_meta_list);
                 } else if (isMethodName(k)) {
@@ -293,6 +290,8 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             for (info.field_names, info.field_types, info.field_attrs) |name, FT, attrs| {
                 checkName(name, "Field '" ++ clip(name) ++ "'", name);
                 if (attrs.@"comptime") fail(name, "Field '" ++ name ++ "' must not be comptime.");
+                if (@typeName(FT).len > limits.max_string)
+                    fail(name, std.fmt.comptimePrint("Field '{s}' has a type whose name is {d} bytes long; the limit is {d}.", .{ name, @typeName(FT).len, limits.max_string }));
                 if (eql(name, "base")) {
                     if (FT != *Extends)
                         fail("base", "Field 'base' must have type *" ++ shortName(Extends) ++ ".");
@@ -411,7 +410,7 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             return .{ .hint = hint_none, .string = "" };
         }
 
-        fn property(comptime name: []const u8) abi.PropertyDesc {
+        fn property(comptime name: []const u8, comptime index: usize) abi.PropertyDesc {
             const FT = @FieldType(S, name);
             const th = typeHint(FT);
             var hint: u32 = th.hint;
@@ -436,7 +435,7 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                 fail(name, "The hint string of '" ++ name ++ "' must be UTF-8 text without NUL bytes.");
             return .{
                 .name = str(godotFieldName(name)),
-                .field_index = fieldIndex(name).?,
+                .field_index = index,
                 .variant_type = convert.variantType(FT),
                 .class_name = str(classNameOf(FT)),
                 .hint = hint,
@@ -460,24 +459,30 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
         /// Exported fields in source order. A group entry starts each run of
         /// fields with the same group; an empty-name entry ends a group
         /// before the next field without one.
+        /// Built in one pass into a fixed array: each exported field adds
+        /// itself and at most one group entry before it.
         const properties: []const abi.PropertyDesc = blk: {
             @setEvalBranchQuota(quota);
-            var list: []const abi.PropertyDesc = &.{};
+            var out: [2 * info.field_names.len]abi.PropertyDesc = undefined;
+            var k: usize = 0;
             var current: ?[]const u8 = null;
-            for (info.field_names) |name| {
+            for (info.field_names, 0..) |name, i| {
                 if (!exported(name)) continue;
                 if (groupOf(name)) |g| {
                     if (current == null or !eql(current.?, g)) {
-                        list = list ++ [_]abi.PropertyDesc{groupEntry(g)};
+                        out[k] = groupEntry(g);
+                        k += 1;
                         current = g;
                     }
                 } else if (current != null) {
-                    list = list ++ [_]abi.PropertyDesc{groupEntry("")};
+                    out[k] = groupEntry("");
+                    k += 1;
                     current = null;
                 }
-                list = list ++ [_]abi.PropertyDesc{property(name)};
+                out[k] = property(name, i);
+                k += 1;
             }
-            const final = list[0..list.len].*;
+            const final = out[0..k].*;
             break :blk &final;
         };
 
@@ -487,28 +492,16 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             for (info.field_names, info.field_types, 0..) |name, FT, i| {
                 out[i] = .{
                     .name = str(name),
-                    .type_id = typeId(FT),
+                    .type_name = str(@typeName(FT)),
+                    .shape = shapeOf(FT),
                     .offset = @offsetOf(S, name),
                     .size = @sizeOf(FT),
+                    .@"align" = @alignOf(FT),
+                    .value_kind = @backingInt(if (exported(name)) valueKind(FT) else abi.ValueKind.none),
                 };
             }
             const final = out;
             break :blk &final;
-        };
-
-        /// Wyhash over the size and alignment of `S`, then each field's
-        /// name, type id and offset, in declaration order.
-        const layout_hash: u64 = blk: {
-            @setEvalBranchQuota(quota);
-            var h = std.hash.Wyhash.init(0);
-            hashInt(&h, @sizeOf(S));
-            hashInt(&h, @alignOf(S));
-            for (fields) |f| {
-                h.update(f.name.ptr.?[0..f.name.len]);
-                hashInt(&h, f.type_id);
-                hashInt(&h, f.offset);
-            }
-            break :blk h.final();
         };
 
         /// Every field at its default; `base` stays undefined (the host sets
@@ -656,22 +649,76 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
 
         // ---- name collisions ----
 
-        const Named = struct { zig: []const u8, godot: []const u8, marker: []const u8 };
+        /// A Godot name and where it comes from. `pos` orders the names as
+        /// the error reports them: fields, then methods, then signals, each
+        /// in declaration order; the later one of a pair carries the marker.
+        const Named = struct { zig: []const u8, godot: []const u8, marker: []const u8, pos: usize };
 
+        fn clash(comptime x: Named, comptime y: Named) noreturn {
+            const a, const b = if (x.pos < y.pos) .{ x, y } else .{ y, x };
+            fail(b.marker, "'" ++ a.zig ++ "' and '" ++ b.zig ++ "' both map to the Godot name '" ++ b.godot ++ "'; give one a name override in meta.");
+        }
+
+        fn indexIn(comptime list: []const [:0]const u8, comptime name: []const u8) usize {
+            for (list, 0..) |x, i| {
+                if (eql(x, name)) return i;
+            }
+            unreachable;
+        }
+
+        /// The exported field, method or signal whose Godot name is its own
+        /// Zig name `g`, if there is one. Lookups only; the positions are
+        /// found by a scan, which runs only on a clash.
+        fn keptName(comptime g: []const u8) ?Named {
+            if (@hasField(S, g) and exported(g) and eql(godotFieldName(g), g))
+                return .{ .zig = g, .godot = g, .marker = g, .pos = indexIn(info.field_names, g) };
+            if (isMethodName(g) and eql(godotMethodName(g), g))
+                return .{ .zig = g, .godot = g, .marker = g, .pos = info.field_names.len + indexIn(method_decls, g) };
+            if (@hasDecl(Signals, g))
+                return .{ .zig = g, .godot = g, .marker = "signals", .pos = info.field_names.len + method_decls.len + indexIn(@typeInfo(Signals).@"struct".decl_names, g) };
+            return null;
+        }
+
+        /// Godot names are distinct. Zig already keeps field and declaration
+        /// names apart, so two names can only meet when one of them was
+        /// changed (a meta `.name` or snake_case) or when a signal (a
+        /// declaration of `signals`, not of `S`) shares a name with a field
+        /// or method. Only those are compared: the changed names pairwise,
+        /// and each changed name and each signal against the kept names by
+        /// lookup.
         fn checkCollisions() void {
-            var list: []const Named = &.{};
-            for (info.field_names) |name| {
-                if (exported(name)) list = list ++ [_]Named{.{ .zig = name, .godot = godotFieldName(name), .marker = name }};
-            }
-            for (method_decls) |d| list = list ++ [_]Named{.{ .zig = d, .godot = godotMethodName(d), .marker = d }};
-            for (@typeInfo(Signals).@"struct".decl_names) |sname| {
-                list = list ++ [_]Named{.{ .zig = sname, .godot = sname, .marker = "signals" }};
-            }
-            for (list, 0..) |b, j| {
-                for (list[0..j]) |a| {
-                    if (eql(a.godot, b.godot))
-                        fail(b.marker, "'" ++ a.zig ++ "' and '" ++ b.zig ++ "' both map to the Godot name '" ++ b.godot ++ "'; give one a name override in meta.");
+            var buf: [info.field_names.len + method_decls.len]Named = undefined;
+            var k: usize = 0;
+            for (info.field_names, 0..) |name, i| {
+                if (!exported(name)) continue;
+                const g = godotFieldName(name);
+                if (!eql(g, name)) {
+                    buf[k] = .{ .zig = name, .godot = g, .marker = name, .pos = i };
+                    k += 1;
                 }
+            }
+            for (method_decls, 0..) |d, j| {
+                const g = godotMethodName(d);
+                if (!eql(g, d)) {
+                    buf[k] = .{ .zig = d, .godot = g, .marker = d, .pos = info.field_names.len + j };
+                    k += 1;
+                }
+            }
+            const changed = buf[0..k];
+            for (changed, 0..) |b, j| {
+                for (changed[0..j]) |a| {
+                    if (eql(a.godot, b.godot)) clash(a, b);
+                }
+            }
+            for (changed) |c| {
+                if (keptName(c.godot)) |o| clash(o, c);
+            }
+            for (@typeInfo(Signals).@"struct".decl_names, 0..) |sname, j| {
+                const sig: Named = .{ .zig = sname, .godot = sname, .marker = "signals", .pos = info.field_names.len + method_decls.len + j };
+                if (@hasField(S, sname) and exported(sname) and eql(godotFieldName(sname), sname))
+                    clash(.{ .zig = sname, .godot = sname, .marker = sname, .pos = indexIn(info.field_names, sname) }, sig);
+                if (isMethodName(sname) and eql(godotMethodName(sname), sname))
+                    clash(.{ .zig = sname, .godot = sname, .marker = sname, .pos = info.field_names.len + indexIn(method_decls, sname) }, sig);
             }
         }
 
@@ -753,7 +800,6 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                 .class_name = str(class_name),
                 .base_class = str(object.engineClassName(Extends)),
                 .flags = if (tool) abi.script_flag_tool else 0,
-                .layout_hash = layout_hash,
                 .instance_size = @sizeOf(S),
                 .instance_align = @alignOf(S),
                 .defaults = @ptrCast(&defaults),
@@ -766,6 +812,7 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                 .signals = signals.ptr,
                 .signal_count = signals.len,
                 .create = W.create,
+                .create_blank = W.createBlank,
                 .destroy = W.destroy,
                 .call = W.call,
                 .get = W.get,
@@ -795,7 +842,7 @@ pub fn checkTable(comptime descs: []const *const abi.ScriptDesc, comptime sdk_ve
         for (descs) |d| {
             items += @as(u64, d.field_count) + d.property_count + d.method_count + d.signal_count;
             bytes += d.path.len + d.class_name.len + d.base_class.len;
-            for (d.fields[0..d.field_count]) |f| bytes += f.name.len;
+            for (d.fields[0..d.field_count]) |f| bytes += f.name.len + f.type_name.len;
             for (d.properties[0..d.property_count]) |p| bytes += p.name.len + p.class_name.len + p.hint_string.len;
             for (d.methods[0..d.method_count]) |m| {
                 items += m.arg_count;
@@ -914,14 +961,101 @@ fn shortName(comptime T: type) []const u8 {
     return if (std.mem.lastIndexOfScalar(u8, full, '.')) |i| full[i + 1 ..] else full;
 }
 
-/// Wyhash of the type's name, seeded with its size (as Stage 0).
-fn typeId(comptime T: type) u64 {
-    return std.hash.Wyhash.hash(@sizeOf(T), @typeName(T));
+/// How the host may read a field of type `T` (an exported field's type,
+/// which `checkFields` accepted). See `abi.ValueKind`.
+fn valueKind(comptime T: type) abi.ValueKind {
+    const b = godot.builtin;
+    if (T == bool) return .bool;
+    if (own.isText(T)) return .string_empty;
+    if (handleKind(T) != null or engineOptionalPtr(T) != null) return .object_null;
+    if (T == b.Color) return .color;
+    inline for (.{ b.Vector2i, b.Vector3i, b.Vector4i, b.Rect2i }) |V| {
+        if (T == V) return .vector_i32;
+    }
+    inline for (.{ b.Vector2, b.Vector3, b.Vector4, b.Rect2, b.Transform2d, b.Plane, b.Quaternion, b.Aabb, b.Basis, b.Transform3d, b.Projection }) |V| {
+        // Double-precision builds hold f64: the host must not decode those.
+        if (T == V) return if (@sizeOf(b.Vector2) == 8) .vector_f32 else .other;
+    }
+    return switch (@typeInfo(T)) {
+        .int => |i| if (i.signedness == .signed) .int_signed else .int_unsigned,
+        .float => .float,
+        .@"enum" => |e| if (@typeInfo(e.tag_type).int.signedness == .signed) .enum_signed else .enum_unsigned,
+        .@"struct" => |s| if (s.backing_integer != null) .flags else .other,
+        else => .other,
+    };
+}
+
+/// `FieldDesc.shape` of a field type: 0 when the type name fixes the
+/// layout (scalars, pointers, engine values, SDK handles and text), else a
+/// hash of the inner layout (`shapeHash`), never 0.
+fn shapeOf(comptime T: type) u64 {
+    return switch (@typeInfo(T)) {
+        .@"struct" => if (convert.isBuiltin(T) or own.isText(T) or handleKind(T) != null) 0 else shapeHash(T),
+        .array, .@"union", .@"enum" => shapeHash(T),
+        .optional => |o| shapeOf(o.child),
+        else => 0,
+    };
+}
+
+/// Wyhash over the kind and inner layout of `T`: for a struct its layout
+/// and each field's name, type name, (bit) offset and shape; for an array
+/// its length and the element's shape (the element's name is in the
+/// array's own type name); for a union its layout, tag type and each
+/// field's name, type name and shape; for an enum its tag type and each
+/// tag's name and value.
+fn shapeHash(comptime T: type) u64 {
+    @setEvalBranchQuota(100_000);
+    var h = std.hash.Wyhash.init(0);
+    switch (@typeInfo(T)) {
+        .@"struct" => |s| {
+            hashInt(&h, 1);
+            hashInt(&h, @backingInt(s.layout));
+            for (s.field_names, s.field_types, s.field_attrs) |name, FT, attrs| {
+                if (attrs.@"comptime") continue;
+                hashStr(&h, name);
+                hashStr(&h, @typeName(FT));
+                hashInt(&h, if (s.layout == .@"packed") @bitOffsetOf(T, name) else @offsetOf(T, name));
+                hashInt(&h, shapeOf(FT));
+            }
+        },
+        .array => |a| {
+            hashInt(&h, 2);
+            hashInt(&h, a.len);
+            hashInt(&h, shapeOf(a.child));
+        },
+        .@"union" => |u| {
+            hashInt(&h, 3);
+            hashInt(&h, @backingInt(u.layout));
+            hashStr(&h, if (u.tag_type) |Tag| @typeName(Tag) else "");
+            for (u.field_names, u.field_types) |name, FT| {
+                hashStr(&h, name);
+                hashStr(&h, @typeName(FT));
+                hashInt(&h, shapeOf(FT));
+            }
+        },
+        .@"enum" => |e| {
+            hashInt(&h, 4);
+            hashStr(&h, @typeName(e.tag_type));
+            hashInt(&h, @backingInt(e.mode));
+            for (e.field_names, e.field_values) |name, value| {
+                hashStr(&h, name);
+                hashInt(&h, @mod(value, 1 << 64));
+            }
+        },
+        else => unreachable,
+    }
+    const v = h.final();
+    return if (v == 0) 1 else v;
 }
 
 fn hashInt(h: *std.hash.Wyhash, v: u64) void {
     const le = std.mem.nativeToLittle(u64, v);
     h.update(std.mem.asBytes(&le));
+}
+
+fn hashStr(h: *std.hash.Wyhash, s: []const u8) void {
+    hashInt(h, s.len);
+    h.update(s);
 }
 
 fn str(comptime s: []const u8) abi.Str {

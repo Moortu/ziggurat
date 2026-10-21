@@ -166,6 +166,8 @@ fn dropCreation(r: *Resource) void {
 const player_desc = ziggurat.describe(player, "player.zig");
 
 /// A script with every hook the wrappers call.
+var init_count: usize = 0;
+
 const Probe = struct {
     pub const extends = Node;
 
@@ -180,6 +182,7 @@ const Probe = struct {
 
     pub fn init(self: *Probe) void {
         self._inited = true;
+        init_count += 1;
     }
 
     pub fn deinit(self: *Probe) void {
@@ -377,6 +380,36 @@ test "wrap create and destroy" {
     d.notification(pl.inst, 13, 0);
     pl.deinit(d);
     q.deinit(&probe_desc);
+    try testing.expectEqual(start, live_bytes);
+}
+
+test "create_blank skips init" {
+    setup();
+    const start = live_bytes;
+    const owner = Node.init();
+    defer godot.raw.objectDestroy(@ptrCast(owner));
+    const before = init_count;
+    const inst = probe_desc.create_blank(@ptrCast(owner), test_gen) orelse return error.CreateFailed;
+    try testing.expectEqual(start + @sizeOf(Probe), live_bytes);
+    const p: *Probe = @ptrCast(@alignCast(inst));
+    // `init` did not run; every field holds its default; `base` is the owner.
+    try testing.expectEqual(before, init_count);
+    try testing.expect(!p._inited);
+    try testing.expectEqual(@as(i32, 1), p.level);
+    try testing.expectEqual(@as(i32, -1), p._last_what);
+    try testing.expect(p.item.get() == null);
+    try testing.expectEqual(@as(*anyopaque, @ptrCast(owner)), @as(*anyopaque, @ptrCast(p.base)));
+    probe_desc.destroy(inst);
+    try testing.expectEqual(start, live_bytes);
+    // `create` still runs it.
+    const q = try Instance(Node).init(&probe_desc);
+    try testing.expectEqual(before + 1, init_count);
+    q.deinit(&probe_desc);
+    // The same refusals as `create`: another generation, no memory.
+    try testing.expect(probe_desc.create_blank(@ptrCast(owner), test_gen + 1) == null);
+    refuse_alloc = true;
+    defer refuse_alloc = false;
+    try testing.expect(probe_desc.create_blank(@ptrCast(owner), test_gen) == null);
     try testing.expectEqual(start, live_bytes);
 }
 

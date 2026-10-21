@@ -53,6 +53,7 @@ test "describe player: script facts" {
     try testing.expectEqual(@as(u32, @sizeOf(player)), d.instance_size);
     try testing.expectEqual(@as(u32, @alignOf(player)), d.instance_align);
     try testing.expect(d.migrate == null);
+    try testing.expect(@intFromPtr(d.create_blank) != @intFromPtr(d.create));
 }
 
 test "describe player: fields" {
@@ -66,8 +67,15 @@ test "describe player: fields" {
     try testing.expectEqual(@as(u32, @offsetOf(player, "speed")), d.fields[1].offset);
     try testing.expectEqual(@as(u32, @sizeOf(f32)), d.fields[1].size);
     try testing.expectEqual(@as(u32, @offsetOf(player, "target")), d.fields[8].offset);
-    try testing.expect(d.fields[1].type_id != d.fields[2].type_id);
-    try testing.expectEqual(d.fields[1].type_id, d.fields[9].type_id); // both f32
+    try testing.expectEqualStrings("f32", str(d.fields[1].type_name));
+    try testing.expectEqualStrings("i32", str(d.fields[2].type_name));
+    try testing.expectEqualStrings(@typeName(player.Mood), str(d.fields[4].type_name));
+    try testing.expectEqualStrings(str(d.fields[1].type_name), str(d.fields[9].type_name)); // both f32
+    try testing.expectEqual(@as(u32, @alignOf(f32)), d.fields[1].@"align");
+    try testing.expectEqual(@as(u32, @alignOf(player.Layers)), d.fields[5].@"align");
+    // Scalars, engine values and handles have no shape; the enum and the
+    // flag struct have one (their tags and bits).
+    for (d.fields[0..d.field_count], 0..) |f, i| try testing.expectEqual(i == 4 or i == 5, f.shape != 0);
 }
 
 test "describe player: properties in source order, groups, hints" {
@@ -203,10 +211,15 @@ const E2 = struct {
     base: *Node,
 };
 
+fn layoutHashOf(comptime S: type) u64 {
+    const d = ziggurat.describe(S, "a.zig");
+    return abi.layoutHash(&d);
+}
+
 test "describe: layout hash ignores defaults, follows field order" {
-    const ha = ziggurat.describe(A, "a.zig").layout_hash;
-    try testing.expectEqual(ha, ziggurat.describe(E1, "a.zig").layout_hash);
-    try testing.expect(ha != ziggurat.describe(E2, "a.zig").layout_hash);
+    const ha = layoutHashOf(A);
+    try testing.expectEqual(ha, layoutHashOf(E1));
+    try testing.expect(ha != layoutHashOf(E2));
 }
 
 test "describe coin: resource handle hint" {
@@ -259,10 +272,188 @@ test "flags hint" {
 }
 
 test "describe: layout hash follows fields, not method bodies" {
-    const ha = ziggurat.describe(A, "a.zig").layout_hash;
-    try testing.expect(ha != ziggurat.describe(B, "a.zig").layout_hash);
-    try testing.expectEqual(ha, ziggurat.describe(C, "a.zig").layout_hash);
-    try testing.expect(ha != ziggurat.describe(D, "a.zig").layout_hash);
+    const ha = layoutHashOf(A);
+    try testing.expect(ha != layoutHashOf(B));
+    try testing.expectEqual(ha, layoutHashOf(C));
+    try testing.expect(ha != layoutHashOf(D));
+}
+
+// ---- value kinds, type names and shapes (ABI v2) ----
+
+const gb = godot.builtin;
+
+/// One field of each v1 field type, plus `base` and private fields.
+const Kinds = struct {
+    pub const extends = Node;
+    pub const Signed = enum(i8) { low = -1, high = 1 };
+    pub const Unsigned = enum(u16) { a, b };
+
+    base: *Node,
+    t_bool: bool = false,
+    t_i8: i8 = 0,
+    t_i16: i16 = 0,
+    t_i32: i32 = 0,
+    t_i64: i64 = 0,
+    t_u8: u8 = 0,
+    t_u16: u16 = 0,
+    t_u32: u32 = 0,
+    t_f32: f32 = 0,
+    t_f64: f64 = 0,
+    t_enum_signed: Signed = .low,
+    t_enum_unsigned: Unsigned = .a,
+    t_flags: packed struct { x: bool = false, y: bool = true } = .{},
+    t_vector2: gb.Vector2 = std.mem.zeroes(gb.Vector2),
+    t_vector2i: gb.Vector2i = std.mem.zeroes(gb.Vector2i),
+    t_rect2: gb.Rect2 = std.mem.zeroes(gb.Rect2),
+    t_rect2i: gb.Rect2i = std.mem.zeroes(gb.Rect2i),
+    t_vector3: gb.Vector3 = std.mem.zeroes(gb.Vector3),
+    t_vector3i: gb.Vector3i = std.mem.zeroes(gb.Vector3i),
+    t_transform2d: gb.Transform2d = std.mem.zeroes(gb.Transform2d),
+    t_vector4: gb.Vector4 = std.mem.zeroes(gb.Vector4),
+    t_vector4i: gb.Vector4i = std.mem.zeroes(gb.Vector4i),
+    t_plane: gb.Plane = std.mem.zeroes(gb.Plane),
+    t_quaternion: gb.Quaternion = std.mem.zeroes(gb.Quaternion),
+    t_aabb: gb.Aabb = std.mem.zeroes(gb.Aabb),
+    t_basis: gb.Basis = std.mem.zeroes(gb.Basis),
+    t_transform3d: gb.Transform3d = std.mem.zeroes(gb.Transform3d),
+    t_projection: gb.Projection = std.mem.zeroes(gb.Projection),
+    t_color: gb.Color = std.mem.zeroes(gb.Color),
+    t_string: ziggurat.String = .empty,
+    t_string_name: ziggurat.StringName = .empty,
+    t_node_path: ziggurat.NodePath = .empty,
+    t_obj: ziggurat.Obj(Node) = .{},
+    t_ref: ziggurat.Ref(godot.class.Resource) = .{},
+    _private: i32 = 0,
+    _inner: Inner = .{},
+    _list: [2]Inner = .{ .{}, .{} },
+    _either: Either = .{ .a = 0 },
+
+    const Inner = struct { p: i32 = 0, q: f32 = 0 };
+    const Either = union { a: i32, b: f32 };
+};
+
+test "value kinds" {
+    const K = abi.ValueKind;
+    const d = ziggurat.describe(Kinds, "kinds.zig");
+    const want = [_]struct { []const u8, K }{
+        .{ "base", .none },
+        .{ "t_bool", .bool },
+        .{ "t_i8", .int_signed },
+        .{ "t_i16", .int_signed },
+        .{ "t_i32", .int_signed },
+        .{ "t_i64", .int_signed },
+        .{ "t_u8", .int_unsigned },
+        .{ "t_u16", .int_unsigned },
+        .{ "t_u32", .int_unsigned },
+        .{ "t_f32", .float },
+        .{ "t_f64", .float },
+        .{ "t_enum_signed", .enum_signed },
+        .{ "t_enum_unsigned", .enum_unsigned },
+        .{ "t_flags", .flags },
+        .{ "t_vector2", .vector_f32 },
+        .{ "t_vector2i", .vector_i32 },
+        .{ "t_rect2", .vector_f32 },
+        .{ "t_rect2i", .vector_i32 },
+        .{ "t_vector3", .vector_f32 },
+        .{ "t_vector3i", .vector_i32 },
+        .{ "t_transform2d", .vector_f32 },
+        .{ "t_vector4", .vector_f32 },
+        .{ "t_vector4i", .vector_i32 },
+        .{ "t_plane", .vector_f32 },
+        .{ "t_quaternion", .vector_f32 },
+        .{ "t_aabb", .vector_f32 },
+        .{ "t_basis", .vector_f32 },
+        .{ "t_transform3d", .vector_f32 },
+        .{ "t_projection", .vector_f32 },
+        .{ "t_color", .color },
+        .{ "t_string", .string_empty },
+        .{ "t_string_name", .string_empty },
+        .{ "t_node_path", .string_empty },
+        .{ "t_obj", .object_null },
+        .{ "t_ref", .object_null },
+        .{ "_private", .none },
+        .{ "_inner", .none },
+        .{ "_list", .none },
+        .{ "_either", .none },
+    };
+    try testing.expectEqual(@as(u32, want.len), d.field_count);
+    inline for (want, 0..) |w, i| {
+        const f = d.fields[i];
+        errdefer std.debug.print("field {d} ({s})\n", .{ i, w[0] });
+        try testing.expectEqualStrings(w[0], str(f.name));
+        try testing.expectEqual(@as(u32, @backingInt(w[1])), f.value_kind);
+        const FT = @FieldType(Kinds, w[0]);
+        try testing.expectEqualStrings(@typeName(FT), str(f.type_name));
+        try testing.expectEqual(@as(u32, @sizeOf(FT)), f.size);
+        try testing.expectEqual(@as(u32, @alignOf(FT)), f.@"align");
+        try testing.expectEqual(@as(u32, @offsetOf(Kinds, w[0])), f.offset);
+        // Only struct, array, union, enum and flag types get a shape.
+        const has_shape = comptime for ([_][]const u8{ "_inner", "_list", "_either", "t_enum_signed", "t_enum_unsigned", "t_flags" }) |n| {
+            if (std.mem.eql(u8, w[0], n)) break true;
+        } else false;
+        try testing.expectEqual(has_shape, f.shape != 0);
+    }
+    // The defaults image decodes by kind: the bool, the enum's i8 tag, the flags bits.
+    const v: *const Kinds = @ptrCast(@alignCast(d.defaults));
+    try testing.expectEqual(@as(i8, -1), @backingInt(v.t_enum_signed));
+    try testing.expectEqual(@as(u2, 2), @as(u2, @bitCast(v.t_flags)));
+}
+
+/// Versions of a nested struct, of an array of it and of an enum. In a real rebuild the
+/// type names stay equal (`script.Inner`); here they differ, so only the
+/// shapes are compared.
+const Shape1 = struct {
+    pub const extends = Node;
+    _inner: Inner = .{},
+    _list: [2]Inner = .{ .{}, .{} },
+    plain: i32 = 0,
+    _mood: Mood = .a,
+    pub const Inner = struct { p: i32 = 0, q: f32 = 0 };
+    pub const Mood = enum { a, b };
+};
+const Shape2 = struct {
+    pub const extends = Node;
+    _inner: Inner = .{},
+    _list: [2]Inner = .{ .{}, .{} },
+    plain: i32 = 0,
+    _mood: Mood = .a,
+    pub const Inner = struct { q: f32 = 0, p: i32 = 0 };
+    pub const Mood = enum { b, a };
+};
+const Shape3 = struct {
+    pub const extends = Node;
+    _inner: Inner = .{},
+    _list: [2]Inner = .{ .{}, .{} },
+    plain: i32 = 0,
+    _mood: Mood = .a,
+    pub const Inner = struct { p: i32 = 0, r: f32 = 0 };
+    pub const Mood = enum { a, c };
+};
+const Shape4 = struct {
+    pub const extends = Node;
+    _inner: Inner = .{},
+    _list: [2]Inner = .{ .{}, .{} },
+    plain: i32 = 0,
+    _mood: Mood = .a,
+    pub const Inner = struct { p: i32 = 0, q: f32 = 5 };
+    pub const Mood = enum { a, b };
+};
+
+test "describe: shapes follow inner layout, not defaults" {
+    const d1 = ziggurat.describe(Shape1, "s.zig");
+    const d2 = ziggurat.describe(Shape2, "s.zig");
+    const d3 = ziggurat.describe(Shape3, "s.zig");
+    const d4 = ziggurat.describe(Shape4, "s.zig");
+    for ([_]*const abi.ScriptDesc{ &d2, &d3 }) |d| {
+        try testing.expect(d.fields[0].shape != d1.fields[0].shape); // order or a name changed
+        try testing.expect(d.fields[1].shape != d1.fields[1].shape); // the array of it, too
+        try testing.expectEqual(@as(u64, 0), d.fields[2].shape);
+        try testing.expect(d.fields[3].shape != d1.fields[3].shape); // enum tags changed
+    }
+    // Only a default changed: same shapes.
+    try testing.expectEqual(d1.fields[0].shape, d4.fields[0].shape);
+    try testing.expectEqual(d1.fields[1].shape, d4.fields[1].shape);
+    try testing.expectEqual(d1.fields[3].shape, d4.fields[3].shape);
 }
 
 const Tool = struct {

@@ -6,10 +6,11 @@
 //! (what a host imports); keep the two in step.
 //!
 //! Host guarantees: `inst` is always a pointer that this descriptor's
-//! `create` returned and `destroy` has not freed; `create` gets the
-//! generation number the host gave `moduleInit`; calls on one instance do
-//! not overlap. Everything else from the host (indexes, argument counts,
-//! Variant contents) is checked, and a wrapper never panics on it.
+//! `create` or `create_blank` returned and `destroy` has not freed;
+//! `create` and `create_blank` get the generation number the host gave
+//! `moduleInit`; calls on one instance do not overlap. Everything else
+//! from the host (indexes, argument counts, Variant contents) is checked,
+//! and a wrapper never panics on it.
 //!
 //! Variant storage: `call` always writes `ret` (NIL on every error), so
 //! the host destroys it afterwards in every case. `get` and `get_default`
@@ -97,11 +98,10 @@ pub fn Wrappers(
         const alloc_size: usize = @max(@sizeOf(S), 1);
         const alloc_align: u32 = @alignOf(S);
 
+        /// A `pub` declaration of `S` (`@hasDecl` from this file sees only
+        /// those).
         fn hasPub(comptime name: []const u8) bool {
-            for (info.decl_names) |d| {
-                if (std.mem.eql(u8, d, name)) return true;
-            }
-            return false;
+            return @hasDecl(S, name);
         }
 
         fn instance(inst: *anyopaque) *S {
@@ -109,6 +109,19 @@ pub fn Wrappers(
         }
 
         pub fn create(owner: *anyopaque, gen: u32) callconv(.c) ?*anyopaque {
+            const raw = make(owner, gen) orelse return null;
+            if (comptime hasPub("init")) S.init(@ptrCast(@alignCast(raw)));
+            return raw;
+        }
+
+        /// `create` without `init`: the host moves the fields of an older
+        /// generation's instance in next.
+        pub fn createBlank(owner: *anyopaque, gen: u32) callconv(.c) ?*anyopaque {
+            return make(owner, gen);
+        }
+
+        /// A new instance at its defaults with `base` set, or null (logged).
+        fn make(owner: *anyopaque, gen: u32) ?*anyopaque {
             // Without moduleInit there is no allocator and no log.
             const h = runtime.hostApi() orelse return null;
             if (gen != runtime.generation()) {
@@ -131,7 +144,6 @@ pub fn Wrappers(
             self.* = defaults.*;
             // `base` in the image is undefined; it is always set here.
             if (@hasField(S, "base")) self.base = @ptrCast(owner);
-            if (comptime hasPub("init")) S.init(self);
             return raw;
         }
 

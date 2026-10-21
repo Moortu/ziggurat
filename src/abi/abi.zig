@@ -26,12 +26,14 @@
 //!    already have ruled out. The module warms its lazy caches here.
 //!
 //! Instances and calls (see `ScriptDesc` for each function):
-//! - `create` must get the same generation number `ziggurat_init` got; it
-//!   returns null on refusal (no init yet, another generation, the
-//!   allocation failed or was misaligned) and logs why.
-//! - `destroy`, `call`, `get`, `set` and `notification` take only a pointer
-//!   that this descriptor's `create` returned and `destroy` has not freed.
-//!   Calls on one instance must not overlap.
+//! - `create` and `create_blank` must get the same generation number
+//!   `ziggurat_init` got; they return null on refusal (no init yet, another
+//!   generation, the allocation failed or was misaligned) and log why.
+//! - `destroy`, `call`, `get`, `set`, `notification` and `migrate` take only
+//!   a pointer that this descriptor's `create` or `create_blank` returned
+//!   and `destroy` has not freed. Calls on one instance must not overlap.
+//! - The layout hash of a script is `layoutHash(desc)`, computed by the host
+//!   from the validated field list; the module does not carry one.
 //! - Methods and properties are addressed by index into the descriptor's
 //!   arrays, never by name; property indexes count group entries too.
 //! - Everything else the host passes (indexes, argument counts, Variant
@@ -51,7 +53,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const magic: u32 = 0x5A494747; // "ZIGG"
-pub const abi_version: u32 = 1;
+pub const abi_version: u32 = 2;
 
 pub const Str = extern struct {
     ptr: ?[*]const u8,
@@ -111,11 +113,60 @@ pub const CallError = extern struct {
     expected: i32,
 };
 
+/// How the host may read a field's bytes in the defaults image (and in an
+/// instance), for the Inspector's defaults without running module code.
+/// Integers and floats are little-endian of the field's `size`; the
+/// validator checks that the size fits the kind.
+pub const ValueKind = enum(u32) {
+    /// The host never reads it: `base` and private (`_`-prefixed) fields.
+    none = 0,
+    /// One byte, 0 or 1.
+    bool = 1,
+    /// A two's-complement integer of 1, 2, 4 or 8 bytes.
+    int_signed = 2,
+    /// An unsigned integer of 1, 2, 4 or 8 bytes.
+    int_unsigned = 3,
+    /// An IEEE float of 4 or 8 bytes.
+    float = 4,
+    /// 2 to 16 `f32` (Vector2/3/4, Rect2, Transform2D, Plane, Quaternion,
+    /// AABB, Basis, Transform3D, Projection in single precision).
+    vector_f32 = 5,
+    /// 2 to 4 `i32` (Vector2i/3i/4i, Rect2i).
+    vector_i32 = 6,
+    /// Four `f32`: r, g, b, a.
+    color = 7,
+    /// A String, StringName or NodePath field; its default is always empty.
+    string_empty = 8,
+    /// An object handle; its default is always null.
+    object_null = 9,
+    /// An enum tag, signed, of 1, 2, 4 or 8 bytes.
+    enum_signed = 10,
+    /// An enum tag, unsigned, of 1, 2, 4 or 8 bytes.
+    enum_unsigned = 11,
+    /// A packed struct's backing integer (unsigned) of 1, 2, 4 or 8 bytes.
+    flags = 12,
+    /// The host must not decode it.
+    other = 13,
+};
+
+/// One field of the instance struct, `base` and private fields included.
+/// Exact type identity (for moving a field between generations) is equal
+/// `type_name`, `shape`, `size` and `align`.
 pub const FieldDesc = extern struct {
     name: Str,
-    type_id: u64,
+    /// The Zig type name (`@typeName`), for example `i32` or `player.Mood`.
+    type_name: Str,
+    /// 0 for types whose name fixes their layout (scalars, pointers, engine
+    /// values, SDK handles). For struct, array, union, enum and packed
+    /// types, a hash of the inner layout (field or tag names, type names,
+    /// offsets or values, recursively), so a type that kept its name but
+    /// changed inside is not the same type.
+    shape: u64,
     offset: u32,
     size: u32,
+    @"align": u32,
+    /// A `ValueKind`.
+    value_kind: u32,
 };
 
 pub const ArgDesc = extern struct {
@@ -173,8 +224,6 @@ pub const ScriptDesc = extern struct {
     base_class: Str,
     /// `script_flag_tool` when the script runs in the editor.
     flags: u32,
-    /// Changes when the instance layout changes (not when defaults do).
-    layout_hash: u64,
     instance_size: u32,
     instance_align: u32,
     /// An instance with every field at its default value. `base` in it is
@@ -197,8 +246,12 @@ pub const ScriptDesc = extern struct {
     signals: [*]const SignalDesc,
     signal_count: u32,
     /// A new instance owned by the engine object `owner`, or null on
-    /// refusal. `gen` must be the generation `ziggurat_init` got.
+    /// refusal. `gen` must be the generation `ziggurat_init` got. Copies the
+    /// defaults, sets `base`, then runs the script's `init`.
     create: *const fn (owner: *anyopaque, gen: u32) callconv(.c) ?*anyopaque,
+    /// As `create`, without running `init`: for an instance whose fields
+    /// the host is about to move in from an older generation.
+    create_blank: *const fn (owner: *anyopaque, gen: u32) callconv(.c) ?*anyopaque,
     /// Runs the script's `deinit`, releases its engine values and frees
     /// `inst`, which must not be used afterwards.
     destroy: *const fn (inst: *anyopaque) callconv(.c) void,
@@ -218,9 +271,49 @@ pub const ScriptDesc = extern struct {
     /// Passes a Godot notification. `reversed` is ignored: a script is one
     /// class.
     notification: *const fn (inst: *anyopaque, what: i32, reversed: u8) callconv(.c) void,
-    /// Always null in ABI version 1.
-    migrate: ?*const anyopaque,
+    /// The script's `migrate` hook, or null. Runs on a new instance (from
+    /// `create_blank`, with the fields that kept their exact type already
+    /// moved in) with a view of the old instance; it may take more from it
+    /// and marks what it took in `prev.moved`. The host cannot check that a
+    /// non-null value is a function.
+    migrate: ?*const fn (new_inst: *anyopaque, prev: *const PrevView) callconv(.c) void,
 };
+
+/// The old instance during a migration: its data and its generation's field
+/// list. `moved` has one byte per old field; 1 means its value now belongs
+/// to the new instance (the host then resets the old field before the old
+/// `destroy`, so the value is not released twice).
+pub const PrevView = extern struct {
+    data: *const anyopaque,
+    fields: [*]const FieldDesc,
+    field_count: u32,
+    moved: [*]u8,
+};
+
+/// The layout hash of a script: Wyhash (seed 0) over `instance_size`,
+/// `instance_align`, then for each field in order its name, type name (each
+/// preceded by its length), shape and offset. Defaults do not enter it.
+/// Equal hashes mean the host may keep an instance's data as it is.
+/// Call only on a descriptor that passed `validate`.
+pub fn layoutHash(desc: *const ScriptDesc) u64 {
+    var h = std.hash.Wyhash.init(0);
+    hashInt(&h, desc.instance_size);
+    hashInt(&h, desc.instance_align);
+    if (desc.field_count > 0) {
+        for (desc.fields[0..desc.field_count]) |*f| {
+            hashStr(&h, f.name);
+            hashStr(&h, f.type_name);
+            hashInt(&h, f.shape);
+            hashInt(&h, f.offset);
+        }
+    }
+    return h.final();
+}
+
+fn hashStr(h: *std.hash.Wyhash, s: Str) void {
+    hashInt(h, s.len);
+    if (s.len > 0) h.update(s.ptr.?[0..s.len]);
+}
 
 /// What `ziggurat_describe` returns: static data, valid until the library
 /// is unloaded. Validate it (`validate`) before reading anything else.
@@ -291,7 +384,7 @@ pub fn layoutStamp(comptime in: StampInputs) u64 {
     return comptime blk: {
         @setEvalBranchQuota(1_000_000);
         var h = std.hash.Wyhash.init(0);
-        for (.{ Str, HostApi, CallError, FieldDesc, ArgDesc, PropertyDesc, MethodDesc, SignalDesc, ScriptDesc, Table }) |T| {
+        for (.{ Str, HostApi, CallError, FieldDesc, ArgDesc, PropertyDesc, MethodDesc, SignalDesc, ScriptDesc, PrevView, Table }) |T| {
             hashStruct(&h, T);
         }
         for ([_][]const u8{ in.api_json_sha256, in.interface_h_sha256, in.zig_version, in.target, in.precision, in.sdk_version }) |s| {
@@ -393,6 +486,102 @@ test "expectedStamp matches layoutStamp with this build's facts" {
     }));
 }
 
+const HashTest = struct {
+    fn create(_: *anyopaque, _: u32) callconv(.c) ?*anyopaque {
+        return null;
+    }
+    fn destroy(_: *anyopaque) callconv(.c) void {}
+    fn call(_: *anyopaque, _: u32, _: ?[*]const *const anyopaque, _: i64, _: *anyopaque, _: *CallError) callconv(.c) void {}
+    fn get(_: *anyopaque, _: u32, _: *anyopaque) callconv(.c) u8 {
+        return 0;
+    }
+    fn set(_: *anyopaque, _: u32, _: *const anyopaque) callconv(.c) u8 {
+        return 0;
+    }
+    fn getDefault(_: u32, _: *anyopaque) callconv(.c) u8 {
+        return 0;
+    }
+    fn notification(_: *anyopaque, _: i32, _: u8) callconv(.c) void {}
+    var defaults_a: [16]u8 = @splat(0);
+    var defaults_b: [16]u8 = @splat(7);
+
+    fn str(s: []const u8) Str {
+        return .{ .ptr = s.ptr, .len = @intCast(s.len) };
+    }
+
+    fn field(name: []const u8, type_name: []const u8, shape: u64, offset: u32) FieldDesc {
+        return .{ .name = str(name), .type_name = str(type_name), .shape = shape, .offset = offset, .size = 4, .@"align" = 4, .value_kind = @backingInt(ValueKind.int_signed) };
+    }
+
+    fn desc(fields: []const FieldDesc, defaults: *const anyopaque) ScriptDesc {
+        return .{
+            .path = str("a.zig"),
+            .class_name = str(""),
+            .base_class = str("Node"),
+            .flags = 0,
+            .instance_size = 16,
+            .instance_align = 8,
+            .defaults = defaults,
+            .fields = fields.ptr,
+            .field_count = @intCast(fields.len),
+            .properties = undefined,
+            .property_count = 0,
+            .methods = undefined,
+            .method_count = 0,
+            .signals = undefined,
+            .signal_count = 0,
+            .create = &create,
+            .create_blank = &create,
+            .destroy = &destroy,
+            .call = &call,
+            .get = &get,
+            .set = &set,
+            .get_default = &getDefault,
+            .notification = &notification,
+            .migrate = null,
+        };
+    }
+};
+
+test "layout hash in abi" {
+    const T = HashTest;
+    const base = [_]FieldDesc{ T.field("hp", "i32", 0, 0), T.field("pos", "script.Pos", 99, 4) };
+    // Equal for identical descriptors, also when they live apart and their
+    // defaults differ.
+    const same = base;
+    const h = layoutHash(&T.desc(&base, &T.defaults_a));
+    try std.testing.expectEqual(h, layoutHash(&T.desc(&same, &T.defaults_a)));
+    try std.testing.expectEqual(h, layoutHash(&T.desc(&same, &T.defaults_b)));
+
+    // A field's type name, shape, order or offset changes it.
+    const changed = [_][2]FieldDesc{
+        .{ T.field("hp", "u32", 0, 0), base[1] },
+        .{ base[0], T.field("pos", "script.Pos", 98, 4) },
+        .{ base[1], base[0] },
+        .{ base[0], T.field("pos", "script.Pos", 99, 8) },
+        .{ T.field("hq", "i32", 0, 0), base[1] },
+    };
+    for (&changed) |*c| try std.testing.expect(layoutHash(&T.desc(c, &T.defaults_a)) != h);
+    // So do the instance size and alignment, and a dropped field.
+    var d = T.desc(&base, &T.defaults_a);
+    d.instance_size = 24;
+    try std.testing.expect(layoutHash(&d) != h);
+    d = T.desc(&base, &T.defaults_a);
+    d.instance_align = 16;
+    try std.testing.expect(layoutHash(&d) != h);
+    try std.testing.expect(layoutHash(&T.desc(base[0..1], &T.defaults_a)) != h);
+    // Bytes moving between a name and a type name change it.
+    const x = [_]FieldDesc{T.field("ab", "c", 0, 0)};
+    const y = [_]FieldDesc{T.field("a", "bc", 0, 0)};
+    try std.testing.expect(layoutHash(&T.desc(&x, &T.defaults_a)) != layoutHash(&T.desc(&y, &T.defaults_a)));
+}
+
+test "value kinds are numbered as the ABI fixes them" {
+    try std.testing.expectEqual(@as(u32, 0), @backingInt(ValueKind.none));
+    try std.testing.expectEqual(@as(u32, 13), @backingInt(ValueKind.other));
+    try std.testing.expectEqual(@as(usize, 14), @typeInfo(ValueKind).@"enum".field_names.len);
+}
+
 test "layout pinned" {
     // A change to any number below is an ABI change: bump `abi_version` by one
     // and update the numbers together. Pinned for x86_64 only; other targets
@@ -400,5 +589,8 @@ test "layout pinned" {
     if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
     try std.testing.expectEqual(@as(usize, 72), @sizeOf(Table));
     try std.testing.expectEqual(@as(usize, 208), @sizeOf(ScriptDesc));
-    try std.testing.expectEqual(@as(usize, 144), @offsetOf(ScriptDesc, "create"));
+    try std.testing.expectEqual(@as(usize, 136), @offsetOf(ScriptDesc, "create"));
+    try std.testing.expectEqual(@as(usize, 144), @offsetOf(ScriptDesc, "create_blank"));
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(FieldDesc));
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(PrevView));
 }

@@ -73,18 +73,20 @@ func _initialize() -> void:
 
 	rejected(probe, "truncated.json", good.substr(0, good.length() / 2))
 	rejected(probe, "truncated_early.json", good.substr(0, 12))
-	rejected(probe, "version_2.json", good.replace("\"version\": 1", "\"version\": 2"))
-	rejected(probe, "version_word.json", good.replace("\"version\": 1", "\"version\": \"one\""))
+	# Version 1 is the format before ABI version 2: ignored, like any other.
+	rejected(probe, "version_1.json", good.replace("\"version\": 2", "\"version\": 1"))
+	rejected(probe, "version_3.json", good.replace("\"version\": 2", "\"version\": 3"))
+	rejected(probe, "version_word.json", good.replace("\"version\": 2", "\"version\": \"one\""))
 	rejected(probe, "empty.json", "")
 	rejected(probe, "not_json.json", "ziggurat")
 	rejected(probe, "binary.json", String.chr(0) + String.chr(255))
 	rejected(probe, "wrong_type.json", good.replace("\"usage\": 4102", "\"usage\": \"x\""))
-	rejected(probe, "scripts_not_array.json", "{\"version\": 1, \"generation\": 1, \"scripts\": {}}")
+	rejected(probe, "scripts_not_array.json", "{\"version\": 2, \"generation\": 1, \"scripts\": {}}")
 	rejected(probe, "bad_hash.json", good.replace("\"layout_hash\": \"", "\"layout_hash\": \"z"))
-	rejected(probe, "deep.json", "{\"version\": 1, \"generation\": 1, \"x\": " + "[".repeat(200000))
+	rejected(probe, "deep.json", "{\"version\": 2, \"generation\": 1, \"x\": " + "[".repeat(200000))
 
 	rejected(probe, "numeric_string_usage.json", good.replace("\"usage\": 4102", "\"usage\": \"4102\""))
-	rejected(probe, "numeric_string_version.json", good.replace("\"version\": 1", "\"version\": \"1\""))
+	rejected(probe, "numeric_string_version.json", good.replace("\"version\": 2", "\"version\": \"2\""))
 	rejected(probe, "deep_default.json", with_default(good, "speed", "[".repeat(200000)))
 	rejected(probe, "deep_default_closed.json", with_default(good, "speed", "[".repeat(200000) + "]".repeat(200000)))
 

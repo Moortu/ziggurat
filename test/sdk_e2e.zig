@@ -389,7 +389,7 @@ test "integration: fixture project end to end" {
         defer l.close();
         try expectFixtureTable(l);
         @memcpy(&first_id, str(l.table.build_id));
-        first_hash = l.scripts()[1].layout_hash;
+        first_hash = abi.layoutHash(&l.scripts()[1]);
     }
 
     // Warm up, then one body edit on the incremental path with the table check.
@@ -415,7 +415,7 @@ test "integration: fixture project end to end" {
         try expectFixtureTable(l);
         // The edit changed the build id and not the layout.
         try testing.expect(!std.mem.eql(u8, &first_id, str(l.table.build_id)));
-        try testing.expectEqual(first_hash, l.scripts()[1].layout_hash);
+        try testing.expectEqual(first_hash, abi.layoutHash(&l.scripts()[1]));
     }
 
     if (timingOn()) std.debug.print(

@@ -9,7 +9,7 @@
 //!
 //! The file is one JSON object:
 //!
-//!     { "version": 1, "generation": <n>, "scripts": [ {
+//!     { "version": 2, "generation": <n>, "scripts": [ {
 //!         "path", "class_name", "base_class", "flags",
 //!         "layout_hash": "<decimal>",
 //!         "properties": [ { "name", "class_name", "type", "hint",
@@ -20,8 +20,10 @@
 //! with `<arg>` = `{ "name", "class_name", "type" }`. `default` is the
 //! property's default value as typed JSON (`default_value.zig`; never text
 //! for `str_to_var`); group entries and properties without a default have
-//! none. `layout_hash` is a decimal
-//! string because a JSON number cannot hold every u64 exactly. Method
+//! none. `layout_hash` is `ziggurat_abi.layoutHash` of the descriptor, as a
+//! decimal string because a JSON number cannot hold every u64 exactly.
+//! Version 2 came with ABI version 2, which changed how the layout hash is
+//! made; a version 1 file is ignored with the usual one log line. Method
 //! `flags` are the ABI's (`abi.method_flag_virtual`).
 //!
 //! Writing is atomic (temporary file, `fsync`, rename). Reading never
@@ -47,7 +49,7 @@ const OsPath = platform.path.OsPath;
 const Default = default_value.Default;
 
 /// The `version` this host writes and reads.
-pub const format_version: u32 = 1;
+pub const format_version: u32 = 2;
 
 /// Largest cache file read; a bigger file is rejected.
 pub const max_file_bytes = 16 * 1024 * 1024;
@@ -313,7 +315,7 @@ fn scriptJson(arena: Allocator, d: *const abi.ScriptDesc, defaults: anytype) !Sc
         .class_name = props.text(d.class_name),
         .base_class = props.text(d.base_class),
         .flags = .{ .v = d.flags },
-        .layout_hash = try std.fmt.allocPrint(arena, "{d}", .{d.layout_hash}),
+        .layout_hash = try std.fmt.allocPrint(arena, "{d}", .{abi.layoutHash(d)}),
         .properties = ps,
         .methods = ms,
         .signals = ss,
@@ -525,7 +527,6 @@ const Stub = struct {
         .class_name = str("Bee"),
         .base_class = str("Node2D"),
         .flags = abi.script_flag_tool,
-        .layout_hash = std.math.maxInt(u64),
         .instance_size = 8,
         .instance_align = 8,
         .defaults = &field_dummy,
@@ -538,6 +539,7 @@ const Stub = struct {
         .signals = &signal_arr,
         .signal_count = 1,
         .create = &create,
+        .create_blank = &create,
         .destroy = &destroy,
         .call = &call,
         .get = &get,
@@ -568,7 +570,7 @@ test "serialize then parse keeps every field" {
     try testing.expectEqualStrings("Bee", s.class_name);
     try testing.expectEqualStrings("Node2D", s.base_class);
     try testing.expectEqual(abi.script_flag_tool, s.flags.v);
-    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), s.layoutHash());
+    try testing.expectEqual(abi.layoutHash(&Stub.script), s.layoutHash());
     try testing.expectEqual(@as(usize, 2), s.properties.len);
     try testing.expectEqual(abi.usage_group, s.properties[0].usage.v);
     try testing.expect(s.properties[0].default == .absent);
@@ -602,20 +604,21 @@ test "parse rejects unknown versions, truncation and wrong types" {
         .{ .name = "not json", .text = "hello", .reason = "version" },
         .{ .name = "an array", .text = "[1,2]", .reason = "version" },
         .{ .name = "no version", .text = "{\"generation\":1,\"scripts\":[]}", .reason = "version" },
-        .{ .name = "version 2", .text = "{\"version\":2,\"generation\":1,\"scripts\":[]}", .reason = "version 2" },
+        .{ .name = "version 1", .text = "{\"version\":1,\"generation\":1,\"scripts\":[]}", .reason = "has version 1, but this host reads version 2" },
+        .{ .name = "version 3", .text = "{\"version\":3,\"generation\":1,\"scripts\":[]}", .reason = "version 3" },
         .{ .name = "version as numeric string", .text = "{\"version\":\"1\",\"generation\":1,\"scripts\":[]}", .reason = "version" },
-        .{ .name = "usage as numeric string", .text = "{\"version\":1,\"generation\":1,\"scripts\":[{\"path\":\"a\",\"layout_hash\":\"5\",\"properties\":[{\"name\":\"x\",\"type\":2,\"usage\":\"4102\"}]}]}", .reason = "expected shape" },
-        .{ .name = "generation as numeric string", .text = "{\"version\":1,\"generation\":\"1\",\"scripts\":[]}", .reason = "expected shape" },
-        .{ .name = "fractional type", .text = "{\"version\":1,\"generation\":1,\"scripts\":[{\"path\":\"a\",\"layout_hash\":\"5\",\"properties\":[{\"name\":\"x\",\"type\":2.5,\"usage\":1}]}]}", .reason = "expected shape" },
+        .{ .name = "usage as numeric string", .text = "{\"version\":2,\"generation\":1,\"scripts\":[{\"path\":\"a\",\"layout_hash\":\"5\",\"properties\":[{\"name\":\"x\",\"type\":2,\"usage\":\"4102\"}]}]}", .reason = "expected shape" },
+        .{ .name = "generation as numeric string", .text = "{\"version\":2,\"generation\":\"1\",\"scripts\":[]}", .reason = "expected shape" },
+        .{ .name = "fractional type", .text = "{\"version\":2,\"generation\":1,\"scripts\":[{\"path\":\"a\",\"layout_hash\":\"5\",\"properties\":[{\"name\":\"x\",\"type\":2.5,\"usage\":1}]}]}", .reason = "expected shape" },
         .{ .name = "version word", .text = "{\"version\":\"one\",\"generation\":1,\"scripts\":[]}", .reason = "version" },
         .{ .name = "negative version", .text = "{\"version\":-1}", .reason = "version" },
-        .{ .name = "scripts not an array", .text = "{\"version\":1,\"generation\":1,\"scripts\":5}", .reason = "expected shape" },
-        .{ .name = "script not an object", .text = "{\"version\":1,\"generation\":1,\"scripts\":[1]}", .reason = "expected shape" },
-        .{ .name = "no generation", .text = "{\"version\":1,\"scripts\":[]}", .reason = "expected shape" },
-        .{ .name = "bad hash", .text = "{\"version\":1,\"generation\":1,\"scripts\":[{\"path\":\"a.zig\",\"layout_hash\":\"x1\"}]}", .reason = "layout hash" },
-        .{ .name = "hash as number", .text = "{\"version\":1,\"generation\":1,\"scripts\":[{\"path\":\"a.zig\",\"layout_hash\":5}]}", .reason = "expected shape" },
-        .{ .name = "empty path", .text = "{\"version\":1,\"generation\":1,\"scripts\":[{\"path\":\"\",\"layout_hash\":\"5\"}]}", .reason = "without a path" },
-        .{ .name = "type too big", .text = "{\"version\":1,\"generation\":1,\"scripts\":[{\"path\":\"a\",\"layout_hash\":\"5\",\"properties\":[{\"name\":\"x\",\"type\":99999999999,\"usage\":1}]}]}", .reason = "expected shape" },
+        .{ .name = "scripts not an array", .text = "{\"version\":2,\"generation\":1,\"scripts\":5}", .reason = "expected shape" },
+        .{ .name = "script not an object", .text = "{\"version\":2,\"generation\":1,\"scripts\":[1]}", .reason = "expected shape" },
+        .{ .name = "no generation", .text = "{\"version\":2,\"scripts\":[]}", .reason = "expected shape" },
+        .{ .name = "bad hash", .text = "{\"version\":2,\"generation\":1,\"scripts\":[{\"path\":\"a.zig\",\"layout_hash\":\"x1\"}]}", .reason = "layout hash" },
+        .{ .name = "hash as number", .text = "{\"version\":2,\"generation\":1,\"scripts\":[{\"path\":\"a.zig\",\"layout_hash\":5}]}", .reason = "expected shape" },
+        .{ .name = "empty path", .text = "{\"version\":2,\"generation\":1,\"scripts\":[{\"path\":\"\",\"layout_hash\":\"5\"}]}", .reason = "without a path" },
+        .{ .name = "type too big", .text = "{\"version\":2,\"generation\":1,\"scripts\":[{\"path\":\"a\",\"layout_hash\":\"5\",\"properties\":[{\"name\":\"x\",\"type\":99999999999,\"usage\":1}]}]}", .reason = "expected shape" },
     };
     for (cases) |c| {
         testing.expectError(error.Rejected, parse(testing.allocator, c.text, &diag)) catch |err| {
@@ -633,7 +636,7 @@ test "parse rejects unknown versions, truncation and wrong types" {
 test "parse survives deep nesting" {
     var deep: std.ArrayList(u8) = .empty;
     defer deep.deinit(testing.allocator);
-    try deep.appendSlice(testing.allocator, "{\"version\":1,\"generation\":1,\"x\":");
+    try deep.appendSlice(testing.allocator, "{\"version\":2,\"generation\":1,\"x\":");
     try deep.appendNTimes(testing.allocator, '[', 100_000);
     var diag: [256]u8 = undefined;
     try testing.expectError(error.Rejected, parse(testing.allocator, deep.items, &diag));
@@ -641,7 +644,7 @@ test "parse survives deep nesting" {
 
 test "unknown fields are ignored" {
     var diag: [256]u8 = undefined;
-    var c = try parse(testing.allocator, "{\"version\":1,\"generation\":3,\"extra\":{\"a\":[1,2]},\"scripts\":[]}", &diag);
+    var c = try parse(testing.allocator, "{\"version\":2,\"generation\":3,\"extra\":{\"a\":[1,2]},\"scripts\":[]}", &diag);
     defer c.deinit();
     try testing.expectEqual(@as(u32, 3), c.generation());
     try testing.expectEqual(@as(usize, 0), c.scripts().len);
@@ -678,7 +681,7 @@ test "a FIFO in place of the cache file is refused without blocking" {
 /// A one-property cache file whose property has type `type_id` and the raw
 /// JSON default `raw`.
 fn withDefault(a: Allocator, type_id: u32, raw: []const u8) ![]u8 {
-    return std.fmt.allocPrint(a, "{{\"version\":1,\"generation\":1,\"scripts\":[{{\"path\":\"a.zig\",\"layout_hash\":\"5\",\"properties\":[{{\"name\":\"x\",\"type\":{d},\"usage\":4102,\"default\":{s}}}]}}]}}", .{ type_id, raw });
+    return std.fmt.allocPrint(a, "{{\"version\":2,\"generation\":1,\"scripts\":[{{\"path\":\"a.zig\",\"layout_hash\":\"5\",\"properties\":[{{\"name\":\"x\",\"type\":{d},\"usage\":4102,\"default\":{s}}}]}}]}}", .{ type_id, raw });
 }
 
 test "a default that does not fit its type is dropped, the rest of the file stays" {

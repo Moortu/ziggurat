@@ -372,6 +372,7 @@ const Ctx = struct {
 
         if (isNull(&s.defaults)) return c.fail(error.NullPointer, "has a null defaults pointer.", .{});
         try c.fnPtr(&s.create, "create");
+        try c.fnPtr(&s.create_blank, "create_blank");
         try c.fnPtr(&s.destroy, "destroy");
         try c.fnPtr(&s.call, "call");
         try c.fnPtr(&s.get, "get");
@@ -381,10 +382,22 @@ const Ctx = struct {
 
         const fields = try c.array(FieldDesc, &s.fields, s.field_count, "fields");
         for (fields, 0..) |*f, i| {
-            const name = try c.identifier(&f.name, .{ .kind = "field", .index = @intCast(i), .what = "name" }, false);
+            const i32_: u32 = @intCast(i);
+            const name = try c.identifier(&f.name, .{ .kind = "field", .index = i32_, .what = "name" }, false);
+            const type_name = try c.str(&f.type_name, .{ .kind = "field", .index = i32_, .what = "type name" });
+            if (type_name.len == 0) return c.fail(error.BadName, "has an empty {f}.", .{Where{ .kind = "field", .index = i32_, .what = "type name" }});
             const end = @as(u64, f.offset) + f.size;
             if (end > s.instance_size) {
                 return c.fail(error.BadLayout, "has field {d} \"{f}\" ending at byte {d}, past the instance size {d}.", .{ i, Clip{ .s = name }, end, s.instance_size });
+            }
+            if (f.@"align" == 0 or f.@"align" > 4096 or !std.math.isPowerOfTwo(f.@"align")) {
+                return c.fail(error.BadLayout, "has field {d} \"{f}\" with alignment {d}, which is not a power of two up to 4096.", .{ i, Clip{ .s = name }, f.@"align" });
+            }
+            if (f.value_kind >= value_kind_count) {
+                return c.fail(error.BadType, "has field {d} \"{f}\" with value kind {d}, above the maximum {d}.", .{ i, Clip{ .s = name }, f.value_kind, value_kind_count - 1 });
+            }
+            if (!kindSizeOk(f.value_kind, f.size)) {
+                return c.fail(error.BadType, "has field {d} \"{f}\" of value kind {s} with size {d}, which that kind cannot have.", .{ i, Clip{ .s = name }, @tagName(@as(abi.ValueKind, @fromBackingInt(@intCast(f.value_kind)))), f.size });
             }
         }
 
@@ -425,6 +438,25 @@ const Ctx = struct {
         try c.unique(SignalDesc, sigs, "signals", null);
     }
 };
+
+const value_kind_count: u32 = @typeInfo(abi.ValueKind).@"enum".field_names.len;
+
+/// Whether a field of `size` bytes can hold a value of kind `kind` (see
+/// `abi.ValueKind`). An unknown kind never can.
+fn kindSizeOk(kind: u32, size: u32) bool {
+    if (kind >= value_kind_count) return false;
+    const int_size = size == 1 or size == 2 or size == 4 or size == 8;
+    return switch (@as(abi.ValueKind, @fromBackingInt(@intCast(kind)))) {
+        .none, .other => true,
+        .bool => size == 1,
+        .int_signed, .int_unsigned, .enum_signed, .enum_unsigned, .flags => int_size,
+        .float => size == 4 or size == 8,
+        .vector_f32 => size % 4 == 0 and size >= 8 and size <= 64,
+        .vector_i32 => size % 4 == 0 and size >= 8 and size <= 16,
+        .color => size == 16,
+        .string_empty, .object_null => size >= 1,
+    };
+}
 
 /// A group entry: usage GROUP and no backing field. Godot shows its name as a
 /// section label and never looks it up, so any text is allowed, the empty
@@ -478,7 +510,7 @@ const fuzz_limits: Limits = .{
     .max_instance_size = 1 << 16,
 };
 
-const text = "a/x.zig b/y.zig X Node Node2D hp name amount _ready hit died ab_c Ünï";
+const text = "a/x.zig b/y.zig X Node Node2D hp name amount _ready hit died ab_c Ünï i32 own.String";
 
 fn lit(comptime needle: []const u8) Str {
     const at = comptime std.mem.indexOf(u8, text, needle).?;
@@ -538,7 +570,6 @@ const Fixture = struct {
                 .class_name = if (i == 0) lit("X") else no_str,
                 .base_class = if (i == 0) lit("Node") else lit("Node2D"),
                 .flags = 0,
-                .layout_hash = 7,
                 .instance_size = 32,
                 .instance_align = 8,
                 .defaults = &defaults_byte,
@@ -551,6 +582,7 @@ const Fixture = struct {
                 .signals = &f.signals[i],
                 .signal_count = 0,
                 .create = &dummyCreate,
+                .create_blank = &dummyCreate,
                 .destroy = &dummyDestroy,
                 .call = &dummyCall,
                 .get = &dummyGet,
@@ -563,8 +595,8 @@ const Fixture = struct {
         // Script 0 has content; script 1 is bare.
         var x = &f.scripts[0];
         x.field_count = 2;
-        f.fields[0][0] = .{ .name = lit("hp"), .type_id = 1, .offset = 0, .size = 4 };
-        f.fields[0][1] = .{ .name = lit("name"), .type_id = 2, .offset = 8, .size = 16 };
+        f.fields[0][0] = .{ .name = lit("hp"), .type_name = lit("i32"), .shape = 0, .offset = 0, .size = 4, .@"align" = 4, .value_kind = @backingInt(abi.ValueKind.int_signed) };
+        f.fields[0][1] = .{ .name = lit("name"), .type_name = lit("own.String"), .shape = 0, .offset = 8, .size = 16, .@"align" = 8, .value_kind = @backingInt(abi.ValueKind.string_empty) };
         x.property_count = 2;
         f.props[0][0] = .{ .name = lit("hp"), .field_index = 0, .variant_type = 2, .class_name = no_str, .hint = 0, .hint_string = no_str, .usage = 6 };
         f.props[0][1] = .{ .name = lit("name"), .field_index = abi.no_field, .variant_type = 0, .class_name = no_str, .hint = 0, .hint_string = lit("Ünï"), .usage = 6 };
@@ -949,14 +981,90 @@ test "validate group entries" {
     }.m, error.Duplicate, "two properties named \"hp\"");
 }
 
-test "validate allows a null migrate and an empty class name" {
+fn dummyMigrate(_: *anyopaque, _: *const abi.PrevView) callconv(.c) void {}
+
+test "validate allows a null or a set migrate and an empty class name" {
     var f = Fixture.init();
     f.link();
     try testing.expect(f.scripts[0].migrate == null);
     try testing.expectEqual(@as(u32, 0), f.scripts[1].class_name.len);
-    f.scripts[0].migrate = &defaults_byte;
     var diag: [256]u8 = undefined;
     try f.check(.{}, &diag);
+    f.scripts[0].migrate = &dummyMigrate;
+    try f.check(.{}, &diag);
+}
+
+test "validate v2 field rules" {
+    // type_name: non-empty UTF-8 without NUL, at most max_string bytes.
+    try expectRule(struct {
+        fn m(f: *Fixture) void {
+            f.fields[0][1].type_name = .{ .ptr = null, .len = 0 };
+        }
+    }.m, error.BadName, "Script \"a/x.zig\" has an empty field 1 type name.");
+    try expectRule(struct {
+        fn m(f: *Fixture) void {
+            setStr(&f.fields[0][0].type_name, "i\x0032");
+        }
+    }.m, error.BadString, "field 0 type name contains a NUL byte at position 1");
+    try expectRule(struct {
+        fn m(f: *Fixture) void {
+            setStr(&f.fields[0][0].type_name, "\xc3");
+        }
+    }.m, error.BadString, "field 0 type name is not valid UTF-8");
+    try expectRule(struct {
+        fn m(f: *Fixture) void {
+            f.fields[0][0].type_name.len = 4097;
+        }
+    }.m, error.BadString, "field 0 type name is 4097 bytes long, above the limit 4096");
+    // align: a power of two up to 4096.
+    inline for (.{ 0, 3, 8192 }) |al| {
+        try expectRule(struct {
+            fn m(f: *Fixture) void {
+                f.fields[0][1].@"align" = al;
+            }
+        }.m, error.BadLayout, std.fmt.comptimePrint("has field 1 \"name\" with alignment {d}, which is not a power of two up to 4096.", .{al}));
+    }
+    // value_kind: inside ValueKind, with a size that kind can have.
+    try expectRule(struct {
+        fn m(f: *Fixture) void {
+            f.fields[0][0].value_kind = 14;
+        }
+    }.m, error.BadType, "has field 0 \"hp\" with value kind 14, above the maximum 13.");
+    try expectRule(struct {
+        fn m(f: *Fixture) void {
+            f.fields[0][0].value_kind = @backingInt(abi.ValueKind.bool);
+        }
+    }.m, error.BadType, "has field 0 \"hp\" of value kind bool with size 4, which that kind cannot have.");
+    try expectRule(struct {
+        fn m(f: *Fixture) void {
+            f.fields[0][0].value_kind = @backingInt(abi.ValueKind.color);
+        }
+    }.m, error.BadType, "of value kind color with size 4");
+    // create_blank: never null.
+    try expectRule(struct {
+        fn m(f: *Fixture) void {
+            @memset(std.mem.asBytes(&f.scripts[0].create_blank), 0);
+        }
+    }.m, error.NullPointer, "Script \"a/x.zig\" has a null create_blank function pointer.");
+}
+
+test "validate value kind sizes" {
+    const K = abi.ValueKind;
+    const ok = [_]struct { K, u32 }{
+        .{ .none, 0 },          .{ .none, 77 },        .{ .other, 3 },        .{ .bool, 1 },
+        .{ .int_signed, 1 },    .{ .int_signed, 8 },   .{ .int_unsigned, 2 }, .{ .float, 4 },
+        .{ .float, 8 },         .{ .vector_f32, 8 },   .{ .vector_f32, 64 },  .{ .vector_i32, 16 },
+        .{ .color, 16 },        .{ .string_empty, 8 }, .{ .object_null, 8 },  .{ .enum_signed, 1 },
+        .{ .enum_unsigned, 4 }, .{ .flags, 8 },
+    };
+    for (ok) |c| try testing.expect(kindSizeOk(@backingInt(c[0]), c[1]));
+    const bad = [_]struct { K, u32 }{
+        .{ .bool, 4 },        .{ .int_signed, 3 },  .{ .int_unsigned, 16 }, .{ .float, 2 },
+        .{ .vector_f32, 4 },  .{ .vector_f32, 68 }, .{ .vector_f32, 10 },   .{ .vector_i32, 20 },
+        .{ .color, 32 },      .{ .enum_signed, 0 }, .{ .flags, 5 },         .{ .string_empty, 0 },
+        .{ .object_null, 0 },
+    };
+    for (bad) |c| try testing.expect(!kindSizeOk(@backingInt(c[0]), c[1]));
 }
 
 test "validate diag is clipped and printable" {
@@ -1261,13 +1369,15 @@ fn mustReject(f: *const Fixture) bool {
         if (sc.instance_align == 0 or sc.instance_align > 4096 or !std.math.isPowerOfTwo(sc.instance_align)) return true;
         if (sc.field_count > n or sc.property_count > n or sc.method_count > n or sc.signal_count > n) return true;
         if (addr(&sc.defaults) == 0) return true;
-        inline for (.{ "create", "destroy", "call", "get", "set", "get_default", "notification" }) |name| {
+        inline for (.{ "create", "create_blank", "destroy", "call", "get", "set", "get_default", "notification" }) |name| {
             if (addr(&@field(sc, name)) == 0) return true;
         }
         if (sc.field_count > 0) {
             if (addr(&sc.fields) != @intFromPtr(&f.fields[i])) return true;
             for (f.fields[i][0..sc.field_count]) |fd| {
                 if (nameBad(fd.name) or @as(u64, fd.offset) + fd.size > sc.instance_size) return true;
+                if (nameBad(fd.type_name) or !kindSizeOk(fd.value_kind, fd.size)) return true;
+                if (fd.@"align" == 0 or fd.@"align" > 4096 or !std.math.isPowerOfTwo(fd.@"align")) return true;
             }
         }
         if (sc.property_count > 0) {
@@ -1299,16 +1409,19 @@ fn mustReject(f: *const Fixture) bool {
 
 const FuzzStats = struct { accepted: usize = 0, oracle_rejects: usize = 0 };
 
-/// Runs `rounds` rounds of 1 to 3 mutations on copies of the good table.
-/// `validate` must return, and must reject whenever `mustReject` says so.
-fn fuzzRun(r: std.Random, rounds: usize) !FuzzStats {
+/// Runs `rounds` rounds of 1 to 3 mutations on copies of the good table
+/// (only of script 0's two fields when `fields_only`). `validate` must
+/// return, and must reject whenever `mustReject` says so.
+fn fuzzRun(r: std.Random, rounds: usize, fields_only: bool) !FuzzStats {
     const pristine = Fixture.init();
     var stats: FuzzStats = .{};
     var diag: [256]u8 = undefined;
     for (0..rounds) |_| {
         var work = pristine;
         work.link();
-        for (0..1 + r.uintLessThan(usize, 3)) |_| mutateOnce(&work, r);
+        for (0..1 + r.uintLessThan(usize, 3)) |_| {
+            if (fields_only) mutateStruct(FieldDesc, &work.fields[0][r.uintLessThan(usize, 2)], r) else mutateOnce(&work, r);
+        }
         const must = mustReject(&work);
         if (must) stats.oracle_rejects += 1;
         if (work.check(fuzz_limits, &diag)) |_| {
@@ -1328,16 +1441,26 @@ fn fuzzRun(r: std.Random, rounds: usize) !FuzzStats {
 
 test "fuzz validate" {
     var prng = std.Random.DefaultPrng.init(0x5A49_4747);
-    const stats = try fuzzRun(prng.random(), 20000);
+    const stats = try fuzzRun(prng.random(), 20000, false);
     // Many mutations are harmless (a changed `hint`, `usage`, `flags`), so
     // some pass; most must be caught, and the oracle must have been busy.
     try testing.expect(stats.accepted < 20000);
     try testing.expect(stats.oracle_rejects > 5000);
 }
 
+test "fuzz validate field descriptors" {
+    // Mutations of the v2 field entries only (type name, shape, offset,
+    // size, alignment, value kind): the oracle and the validator agree, a
+    // changed shape or offset inside the instance passes, most others fail.
+    var prng = std.Random.DefaultPrng.init(0x4649_454C);
+    const stats = try fuzzRun(prng.random(), 5000, true);
+    try testing.expect(stats.accepted > 100);
+    try testing.expect(stats.oracle_rejects > 2500);
+}
+
 fn fuzzOne(_: void, smith: *testing.Smith) anyerror!void {
     var prng = std.Random.DefaultPrng.init(smith.value(u64));
-    _ = try fuzzRun(prng.random(), 64);
+    _ = try fuzzRun(prng.random(), 64, smith.value(bool));
 }
 
 test "fuzz validate with std.testing.fuzz" {

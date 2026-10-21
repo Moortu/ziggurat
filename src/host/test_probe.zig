@@ -225,7 +225,7 @@ pub const ZigguratTestProbe = struct {
     pub fn layoutHash(_: *ZigguratTestProbe, script: i64) String {
         const d = scriptDesc(script) orelse return .fromLatin1("");
         var buf: [32]u8 = undefined;
-        const t = std.fmt.bufPrint(&buf, "{d}", .{d.layout_hash}) catch return .fromLatin1("");
+        const t = std.fmt.bufPrint(&buf, "{d}", .{abi.layoutHash(d)}) catch return .fromLatin1("");
         return .fromLatin1(t);
     }
 

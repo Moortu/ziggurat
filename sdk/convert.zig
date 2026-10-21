@@ -58,6 +58,11 @@ fn builtinType(comptime T: type) ?u32 {
     return null;
 }
 
+/// True when `T` is one of the gdzig builtin value types above.
+pub fn isBuiltin(comptime T: type) bool {
+    return builtinType(T) != null;
+}
+
 /// True when every value of the integer type `I` fits in an `i64`.
 fn fitsI64(comptime I: type) bool {
     const info = @typeInfo(I).int;
