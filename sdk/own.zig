@@ -226,3 +226,45 @@ pub fn Access(comptime T: type) type {
 pub fn access(comptime T: type, p: *const T) Access(T) {
     return if (comptime isText(T)) p._raw else p.*;
 }
+
+/// The first type inside `T` (not `T` itself: struct and union fields,
+/// array elements, optional children, recursively) whose value owns an
+/// engine reference, or null. `describe` refuses a field type that has one:
+/// `destroy` releases only top-level fields, and only those can move in a
+/// migration.
+pub fn NestedOwning(comptime T: type) ?type {
+    // An owning type is itself the unit that is released and moved.
+    if (fieldOwns(T)) return null;
+    return switch (@typeInfo(T)) {
+        .@"struct" => |s| for (s.field_types) |C| {
+            if (OwningIn(C)) |found| break found;
+        } else null,
+        .array => |a| OwningIn(a.child),
+        .optional => |o| OwningIn(o.child),
+        .@"union" => |u| for (u.field_types) |C| {
+            if (OwningIn(C)) |found| break found;
+        } else null,
+        else => null,
+    };
+}
+
+/// `T` itself when it owns an engine reference, else `NestedOwning(T)`.
+fn OwningIn(comptime T: type) ?type {
+    if (fieldOwns(T)) return T;
+    return NestedOwning(T);
+}
+
+/// True when a value of `T` holds an engine reference anywhere.
+pub fn containsOwning(comptime T: type) bool {
+    return OwningIn(T) != null;
+}
+
+/// How a script spells the owning type `T`, for messages: `z.String`,
+/// `z.StringName`, `z.NodePath`, `z.Ref(<Class>)`, or the engine type's
+/// name (`String`).
+pub fn owningName(comptime T: type) []const u8 {
+    if (isText(T)) return textName(T);
+    if (@typeInfo(T) == .@"struct" and @hasDecl(T, object.handle_decl)) return "z.Ref(" ++ object.engineClassName(T.Class) ++ ")";
+    const full = @typeName(T);
+    return if (std.mem.lastIndexOfScalar(u8, full, '.')) |i| full[i + 1 ..] else full;
+}

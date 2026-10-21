@@ -25,3 +25,11 @@ title: z.String = .empty,
 note: z.String = .empty,
 /// Unchanged; version 2's `migrate` takes nothing from it.
 item: z.Ref(g.Resource) = .{},
+/// Unchanged, so the host fills version 2's `label`; version 2's
+/// `migrate` then replaces it with `alt_label`.
+label: z.String = .empty,
+/// Gone in version 2 (moved into `label` by `migrate`).
+alt_label: z.String = .empty,
+/// Gone in version 2; the tests take them by hand.
+tag: z.StringName = .empty,
+path: z.NodePath = .empty,

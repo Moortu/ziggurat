@@ -300,6 +300,10 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                 }
                 if (borrowedTextName(FT)) |t|
                     fail(name, "Field '" ++ name ++ "' has type " ++ t ++ "; use z." ++ t ++ " for a field, so stored text is owned.");
+                // `destroy` releases top-level fields only, and only they
+                // move in a migration.
+                if (own.NestedOwning(FT)) |O|
+                    fail(name, "Field '" ++ name ++ "' holds " ++ own.owningName(O) ++ " inside " ++ spelledType(FT) ++ "; owned values may only be top-level fields.");
                 if (exported(name)) {
                     if (engineOptionalPtr(FT)) |C|
                         fail(name, "Field '" ++ name ++ "' has type ?*" ++ shortName(C) ++ ", which Godot cannot hold; use z.Obj(" ++ shortName(C) ++ ").");
@@ -978,6 +982,18 @@ fn engineOptionalPtr(comptime T: type) ?type {
 /// The name a script spells the type with: the Godot name of an engine
 /// class (`Node2D`, as `ziggurat.godot` declares it), otherwise the last part
 /// of the type's name.
+/// `T` as a script writes it, for messages: arrays and optionals spelled
+/// around their child, owning types as `z.String` or `z.Ref(Class)`,
+/// other types by their stable name.
+fn spelledType(comptime T: type) []const u8 {
+    if (own.fieldOwns(T)) return own.owningName(T);
+    return switch (@typeInfo(T)) {
+        .array => |a| std.fmt.comptimePrint("[{d}]", .{a.len}) ++ spelledType(a.child),
+        .optional => |o| "?" ++ spelledType(o.child),
+        else => stableTypeName(T),
+    };
+}
+
 fn shortName(comptime T: type) []const u8 {
     if (comptime object.isEngineClass(T)) return object.engineClassName(T);
     const full = @typeName(T);

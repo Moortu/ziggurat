@@ -19,7 +19,7 @@
 //!     pub fn migrate(self: *@This(), old: z.Previous(@This())) void {
 //!         if (old.get(i32, "hp")) |hp| self.health = hp; // renamed
 //!         if (old.get(i32, "count")) |c| self.count = @intCast(@max(c, 0)); // i32 -> u32
-//!         if (old.take(z.String, "note")) |text| self.memo = text; // renamed text
+//!         _ = old.takeInto(z.String, &self.memo, "note"); // renamed text
 //!     }
 //!
 //! `old.get(T, "name")` copies a plain value (bool, numbers, enums, packed
@@ -28,9 +28,15 @@
 //! or `z.Ref` out of the old instance. Both give null unless the old field
 //! exists with exactly the type `T` (same name, same layout inside), and
 //! `take` gives null for a value already moved (by the host or an earlier
-//! `take`). A taken value belongs to `migrate`: store it in an empty field
-//! as above (a field the host did not fill; release a filled one first) or
-//! release it. The host resets every moved old field before the old
+//! `take`). `old.takeInto(T, &self.field, "name")` moves the value straight
+//! into a field and releases what the field held first: use it whenever
+//! the field may already hold a value (the host fills a field whose name
+//! and type the old instance shared). A value from `take` belongs to
+//! `migrate`: store it in a field known to be empty, or release it;
+//! `self.f.set(v.get())` copies it, so `v` must still be released.
+//! Owned values (`z.String`, `z.StringName`, `z.NodePath`, `z.Ref`) may
+//! only be top-level fields, never inside a struct, array, optional or
+//! union field. The host resets every moved old field before the old
 //! instance's `deinit`, so each value is released once. When the
 //! script's layout did not change, the data stays in place and `migrate`
 //! does not run. Calls from `migrate` back into script instances are not

@@ -223,13 +223,42 @@ test "migrate: take moves ownership" {
         var item = prev.take(ziggurat.Ref(Resource), "item") orelse return error.NothingTaken;
         try testing.expectEqual(@as(u8, 1), v.moved[try fieldIndex(&v1_desc, "item")]);
 
+        // StringName and NodePath move the same way.
+        {
+            var name = b.StringName.fromUtf8("ziggurat_migrate_tag");
+            defer name.deinit();
+            old.tag.set(name);
+            var np = try b.String.fromUtf8("a/b");
+            defer np.deinit();
+            var p = b.NodePath.fromString(np);
+            defer p.deinit();
+            old.path.set(p);
+        }
+        var tag = prev.take(ziggurat.StringName, "tag") orelse return error.NothingTaken;
+        var path = prev.take(ziggurat.NodePath, "path") orelse return error.NothingTaken;
+        try testing.expectEqual(@as(u8, 1), v.moved[try fieldIndex(&v1_desc, "tag")]);
+        try testing.expectEqual(@as(u8, 1), v.moved[try fieldIndex(&v1_desc, "path")]);
+        try testing.expect(prev.take(ziggurat.StringName, "tag") == null);
+        try testing.expect(prev.take(ziggurat.NodePath, "path") == null);
+
+        // `takeInto` with nothing to take leaves the destination alone.
+        var dst: ziggurat.String = .empty;
+        try setText(&dst, "kept");
+        try testing.expect(!prev.takeInto(ziggurat.String, &dst, "note"));
+        try expectText("kept", &dst);
+        dst._raw.deinit();
+
         // The host resets the moved fields, then destroys the old instance:
         // the taken values survive it.
         resetMoved(&v1_desc, inst, v.moved[0..v1_desc.field_count]);
         v1_desc.destroy(inst);
         try expectText("taken by hand", &text);
         try testing.expect(alive(res_id));
+        try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&tag._raw), 0));
+        try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&path._raw), 0));
         text._raw.deinit();
+        tag._raw.deinit();
+        path._raw.deinit();
         item.release();
         try testing.expect(!alive(res_id));
     }
@@ -242,6 +271,8 @@ test "migrate: take moves ownership" {
         const old: *v1 = @ptrCast(@alignCast(inst));
         try setText(&old.title, "the title");
         try setText(&old.note, "the note");
+        try setText(&old.label, "old label");
+        try setText(&old.alt_label, "new label");
         const res_id = holdResource(&old.item);
 
         const new_inst = try hostMigrate(&v1_desc, inst, &v2_desc, @ptrCast(owner));
@@ -249,6 +280,9 @@ test "migrate: take moves ownership" {
         try testing.expect(new._migrated);
         try expectText("the title", &new.title);
         try expectText("the note", &new.memo);
+        // The host filled `label`; `takeInto` released that text before
+        // storing `alt_label` (the clean-exit heap check sees a leak).
+        try expectText("new label", &new.label);
         try testing.expect(!new._note_twice);
         try testing.expect(!new._title_taken);
         try testing.expect(alive(res_id));

@@ -681,6 +681,27 @@ const bad_scripts = [_]BadScript{
         .decl = "pub fn migrate",
     },
     .{
+        .rel = "nested_text.zig",
+        .data = prelude ++
+            \\pub const extends = g.Node;
+            \\pub const Inner = struct { s: z.String = .empty };
+            \\_inner: Inner = .{},
+            \\
+        ,
+        .sentence = "Field '_inner' holds z.String inside nested_text.Inner; owned values may only be top-level fields.",
+        .decl = "_inner:",
+    },
+    .{
+        .rel = "nested_ref.zig",
+        .data = prelude ++
+            \\pub const extends = g.Node;
+            \\_items: [2]z.Ref(g.Resource) = .{ .{}, .{} },
+            \\
+        ,
+        .sentence = "Field '_items' holds z.Ref(Resource) inside [2]z.Ref(Resource); owned values may only be top-level fields.",
+        .decl = "_items:",
+    },
+    .{
         .rel = "migrate_get_text.zig",
         .data = prelude ++
             \\pub const extends = g.Node;

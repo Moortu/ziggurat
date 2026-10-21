@@ -18,6 +18,9 @@
 //!   host resets it before the old instance's destroy and the value is
 //!   released once, by whoever holds it now. A field already moved (by the
 //!   host or by an earlier `take`) gives null.
+//! - `takeInto(FT, &self.field, name)` is `take` into a field: it releases
+//!   what the field holds first, so it is safe whether the field is empty
+//!   or the host already filled it.
 //!
 //! Using `get` on an owning type, or `take` on a plain one, is a compile
 //! error with the SDK marker `[ziggurat:<rel>#migrate]` when the script's
@@ -42,7 +45,7 @@ pub fn Previous(comptime T: type) type {
         /// A copy of the old field `name` when it exists with the exact type
         /// `FT`, else null. For plain values only; see `take`.
         pub fn get(self: @This(), comptime FT: type, comptime name: []const u8) ?FT {
-            comptime if (containsOwning(FT))
+            comptime if (own.containsOwning(FT))
                 fail(T, "old.get cannot copy '" ++ name ++ "': its type owns an engine reference; use old.take for z.String, z.StringName, z.NodePath and z.Ref.");
             const i = self.find(FT, name) orelse return null;
             return self.read(FT, i);
@@ -60,6 +63,21 @@ pub fn Previous(comptime T: type) type {
             const v = self.read(FT, i);
             self.view.moved[i] = 1;
             return v;
+        }
+
+        /// As `take`, storing the value in `dst.*`: true when the old field
+        /// `name` existed with the exact type `FT` and was not moved yet;
+        /// `dst` then held its value released first and now holds the old
+        /// one. False leaves `dst` alone. The form to use when `dst` may
+        /// already hold a value (a field the host filled because the old
+        /// instance had one of the same name and type).
+        pub fn takeInto(self: @This(), comptime FT: type, dst: *FT, comptime name: []const u8) bool {
+            comptime if (!isTakeable(FT))
+                fail(T, "old.takeInto of '" ++ name ++ "' as " ++ @typeName(FT) ++ ": it moves only z.String, z.StringName, z.NodePath and z.Ref; use old.get for a plain value.");
+            const v = self.take(FT, name) orelse return false;
+            own.releaseField(FT, dst);
+            dst.* = v;
+            return true;
         }
 
         /// The index of the old field `name` when its type identity is that
@@ -100,22 +118,6 @@ fn eqlStr(s: abi.Str, want: []const u8) bool {
 /// String, StringName or NodePath).
 fn isTakeable(comptime FT: type) bool {
     return own.isText(FT) or (own.ownsEngineValue(FT) and @typeInfo(FT) == .@"struct" and @hasDecl(FT, object.handle_decl));
-}
-
-/// True when a value of `FT` holds an engine reference anywhere inside.
-fn containsOwning(comptime FT: type) bool {
-    if (own.fieldOwns(FT)) return true;
-    return switch (@typeInfo(FT)) {
-        .@"struct" => |s| for (s.field_types) |C| {
-            if (containsOwning(C)) break true;
-        } else false,
-        .array => |a| containsOwning(a.child),
-        .optional => |o| containsOwning(o.child),
-        .@"union" => |u| for (u.field_types) |C| {
-            if (containsOwning(C)) break true;
-        } else false,
-        else => false,
-    };
 }
 
 fn fail(comptime T: type, comptime sentence: []const u8) noreturn {
