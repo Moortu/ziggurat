@@ -31,9 +31,11 @@
 //!   `get_property_list`, `get_method_list`, `has_method`,
 //!   `get_method_argument_count`, `call`, `notification`, `to_string`,
 //!   `free` (the module's `destroy`).
-//! - instance.zig `create` (the module's `create`), which every
-//!   `ZigScript._instance_create` reaches, including the tool-placeholder
-//!   swap (`ZigScript.swapToolPlaceholders` sets the script again).
+//! - `ZigScript._instance_create`, from before it chooses the generation
+//!   until `instance.create` (the module's `create`) has registered the
+//!   record, so a swap never misses an instance made meanwhile. The
+//!   tool-placeholder swap (`ZigScript.swapToolPlaceholders` sets the
+//!   script again) goes through it too.
 //! - script.zig placeholder updates: `_placeholder_instance_create` (feeds
 //!   a new placeholder) and `_update_exports` (refreshes placeholders); both
 //!   read descriptors of a generation.
@@ -51,6 +53,12 @@
 //!   thread; it touches no instance (the swap engine runs it under the
 //!   write lock, Task 4).
 //!
+//! Rule for the swap engine: the callbacks that only read descriptors
+//! (`has_method`, the lists, revert, property type, argument count) and the
+//! refusal log answer for the migrating instance too, reading its `gen` and
+//! `index`. The engine therefore writes `gen`, `index` and `data` of a
+//! record as one unit, with no module code run between those writes.
+//!
 //! Threads: any. The Io is `host_io.get()`; its mutexes and futexes work
 //! across threads before and after `host_io.init`.
 const std = @import("std");
@@ -64,8 +72,11 @@ var lock: std.Io.RwLock = .init;
 /// Entries of the calling thread, the pass-through ones of the swapper
 /// included.
 threadlocal var depth_count: u32 = 0;
-/// True on the thread that holds the write lock (`trySwap`).
+/// True on the thread that holds the write lock (`trySwap` or
+/// `lockForShutdown`): its entries pass through.
 threadlocal var swapping: bool = false;
+/// `depth_count` when `trySwap` took the lock; `endSwap` must see it again.
+threadlocal var swap_depth: u32 = 0;
 /// The instance being migrated now, or null.
 var migrating: std.atomic.Value(?*Instance) = .init(null);
 /// The migrating instance whose refusal was logged, so it is logged once.
@@ -83,6 +94,7 @@ pub fn enter() void {
 }
 
 pub fn leave() void {
+    std.debug.assert(depth_count > 0);
     depth_count -= 1;
     if (!swapping) lock.unlockShared(io());
 }
@@ -100,16 +112,29 @@ pub fn trySwap() bool {
     if (swapping) return false;
     if (!lock.tryLock(io())) return false;
     swapping = true;
+    swap_depth = depth_count;
     return true;
 }
 
-/// Releases the write side `trySwap` took. The swapper's thread, outside
-/// any pass-through entry.
-pub fn endSwap() void {
+/// Releases the write side `trySwap` took. The swapper's thread, at the
+/// entry depth it had at `trySwap`: inside a pass-through entry that
+/// began during the swap, the matching `leave` would release a shared
+/// hold it never took. Such a call is a bug in the caller: Debug builds
+/// stop on the assertion; other builds log, keep the lock and return
+/// false (the caller retries once it left its entries).
+pub fn endSwap() bool {
     std.debug.assert(swapping);
+    std.debug.assert(depth_count == swap_depth);
+    if (!swapping) return false;
+    if (depth_count != swap_depth) {
+        const msg = "Ziggurat refused to end a swap from inside a script call; the swap stays open until the call returns.";
+        godot.raw.printError(msg, "ZigScript", "src/host/gate.zig", @src().line, 1);
+        return false;
+    }
     setMigrating(null);
     swapping = false;
     lock.unlock(io());
+    return true;
 }
 
 /// True on the thread that holds the write lock.
@@ -162,13 +187,20 @@ pub fn lockForShutdown() bool {
     if (depth_count != 0 or swapping) return false;
     var i: u32 = 0;
     while (i < shutdown_attempts) : (i += 1) {
-        if (lock.tryLock(io())) return true;
+        if (lock.tryLock(io())) {
+            // The main thread passes through while it holds the lock: an
+            // entry would otherwise wait for its own write side.
+            swapping = true;
+            swap_depth = depth_count;
+            return true;
+        }
         io().sleep(.fromMilliseconds(1), .awake) catch {};
     }
     return false;
 }
 
 pub fn unlockShutdown() void {
+    swapping = false;
     lock.unlock(io());
 }
 
@@ -191,7 +223,7 @@ test "try-swap fails while this thread is inside" {
     try testing.expect(!trySwap());
     leave();
     try testing.expect(trySwap());
-    endSwap();
+    try testing.expect(endSwap());
 }
 
 test "try-swap fails while another thread is inside, a nested entry there never blocks" {
@@ -219,7 +251,7 @@ test "try-swap fails while another thread is inside, a nested entry there never 
     // Keep trying while the worker re-enters: it must get through.
     while (!trySwap()) std.atomic.spinLoopHint();
     try testing.expect(w.nested_done.load(.acquire));
-    endSwap();
+    try testing.expect(endSwap());
     t.join();
 }
 
@@ -243,7 +275,7 @@ test "the swapper passes through and other threads wait" {
         try testing.expect(!done.load(.acquire));
         io().sleep(.fromMilliseconds(1), .awake) catch {};
     }
-    endSwap();
+    try testing.expect(endSwap());
     t.join();
     try testing.expect(done.load(.acquire));
     try testing.expect(!isSwapper());
@@ -258,7 +290,7 @@ test "migrating marks one instance" {
     try testing.expect(!isMigrating(&b));
     // The swap's end clears it.
     try testing.expect(trySwap());
-    endSwap();
+    try testing.expect(endSwap());
     try testing.expect(!isMigrating(&a));
 }
 
@@ -277,7 +309,12 @@ test "shutdown lock waits for a thread inside" {
     try testing.expect(lockForShutdown());
     // The worker has left: it holds nothing now.
     t.join();
+    // The holder passes through.
+    enter();
+    try testing.expectEqual(@as(u32, 1), depth());
+    leave();
     unlockShutdown();
+    try testing.expect(!isSwapper());
     enter();
     try testing.expect(!lockForShutdown());
     leave();

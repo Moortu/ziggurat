@@ -501,8 +501,47 @@ pub const ZigguratTestProbe = struct {
     /// inside the gate.
     pub fn gateTrySwap(_: *ZigguratTestProbe) bool {
         if (!gate.trySwap()) return false;
-        gate.endSwap();
-        return true;
+        return gate.endSwap();
+    }
+
+    /// Loads the library at `path` as generation `gen` without publishing
+    /// it: "" on success, the refusal sentence otherwise.
+    pub fn stageModule(_: *ZigguratTestProbe, path: String, gen: i64) String {
+        var buf: [4096]u8 = undefined;
+        const p = path.toUtf8Buf(&buf);
+        var diag: [256]u8 = undefined;
+        const n = std.math.cast(u32, gen) orelse return .fromLatin1("generation out of range");
+        _ = runtime.load(std.heap.c_allocator, .fromTrusted(p), n, &diag) catch |err| switch (err) {
+            error.Refused, error.NotMainThread => return String.fromUtf8(std.mem.sliceTo(&diag, 0)) catch .fromLatin1("refused"),
+            error.OutOfMemory => return .fromLatin1("out of memory"),
+        };
+        return .fromLatin1("");
+    }
+
+    /// Takes the swap lock and keeps it (the main thread is the swapper
+    /// until `gate_swap_end`).
+    pub fn gateSwapBegin(_: *ZigguratTestProbe) bool {
+        return gate.trySwap();
+    }
+
+    /// Publishes generation `gen` (when it is loaded and not 0) under the
+    /// swap lock `gate_swap_begin` took, then releases the lock.
+    pub fn gateSwapEnd(_: *ZigguratTestProbe, gen: i64) bool {
+        if (!gate.isSwapper()) return false;
+        if (std.math.cast(u32, gen)) |n| {
+            if (n != 0) {
+                if (runtime.find(n)) |g| runtime.publish(g);
+            }
+        }
+        return gate.endSwap();
+    }
+
+    /// The generation number of `obj`'s Zig script instance, or -1.
+    pub fn instanceGeneration(_: *ZigguratTestProbe, obj: ?*Object) i64 {
+        const rec = instance.recordOf(obj orelse return -1) orelse return -1;
+        gate.enter();
+        defer gate.leave();
+        return rec.gen.n;
     }
 
     /// A test-only swap within one generation, standing in for the swap
@@ -515,18 +554,22 @@ pub const ZigguratTestProbe = struct {
     /// move, ownership with them). False when the swap lock was not free.
     pub fn gateTestSwap(_: *ZigguratTestProbe, mode: i64) bool {
         if (!gate.trySwap()) return false;
-        defer gate.endSwap();
-        const recs = registry.all(std.heap.c_allocator) catch return true;
-        defer std.heap.c_allocator.free(recs);
+        defer _ = gate.endSwap();
+        const entries = registry.all(std.heap.c_allocator) catch return true;
+        defer std.heap.c_allocator.free(entries);
         const api = runtime.hostApi();
-        for (recs) |rec| {
+        for (entries) |e| {
+            // As the swap engine does after module code ran: skip a record
+            // freed meanwhile, or a new one at a freed record's address.
+            if (!registry.contains(e)) continue;
+            const rec = e.rec;
             gate.setMigrating(rec);
             const d = &rec.gen.scripts()[rec.index];
             const size: usize = @max(d.instance_size, 1);
             const old = rec.data;
             if (mode == 0) {
                 _ = runtime.retag(old, size, rec.gen.n, rec.gen.n);
-                rec.* = .{ .owner = rec.owner, .script = rec.script, .gen = rec.gen, .index = rec.index, .data = old, .slot = rec.slot };
+                rec.* = .{ .owner = rec.owner, .script = rec.script, .gen = rec.gen, .index = rec.index, .data = old, .slot = rec.slot, .serial = rec.serial };
             } else if (api.alloc(rec.gen.n, size, d.instance_align)) |new| {
                 @memcpy(@as([*]u8, @ptrCast(new))[0..size], @as([*]const u8, @ptrCast(old))[0..size]);
                 rec.data = new;
@@ -548,7 +591,7 @@ pub const ZigguratTestProbe = struct {
         const o = obj orelse return fail(&out);
         const rec = instance.recordOf(o) orelse return fail(&out);
         if (!gate.trySwap()) return fail(&out);
-        defer gate.endSwap();
+        defer _ = gate.endSwap();
         gate.setMigrating(rec);
         // What the script instance answers (Godot's
         // `ScriptInstanceExtension::callp` calls this callback) ...
@@ -666,7 +709,8 @@ pub const method_names = [_][:0]const u8{
     "queue_runs",              "saved_hook_install",          "saved_hook_clear",        "saved_hook_paths",
     "language_reload_scripts", "language_reload_tool_script", "editor_build_outcomes",   "editor_build_busy",
     "cache_write_snapshot",    "gate_depth",                  "gate_try_swap",           "gate_test_swap",
-    "gate_migrate_probe",      "registry_count",              "runtime_shutdown",
+    "gate_migrate_probe",      "registry_count",              "runtime_shutdown",        "stage_module",
+    "gate_swap_begin",         "gate_swap_end",               "instance_generation",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

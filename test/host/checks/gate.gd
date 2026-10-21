@@ -24,6 +24,11 @@ var release := false
 
 # threads during swap.
 var stop := false
+# True while the main thread performs the swaps.
+var in_window := false
+
+# create racing a swap.
+var race_ready := false
 
 
 func report(name: String, ok: bool, why: String) -> void:
@@ -35,9 +40,13 @@ func report(name: String, ok: bool, why: String) -> void:
 
 
 func module_path() -> String:
+	return module_path_named("good")
+
+
+func module_path_named(key: String) -> String:
 	for line in FileAccess.get_file_as_string("res://modules.txt").split("\n", false):
-		if line.begins_with("good="):
-			return line.substr(5)
+		if line.begins_with(key + "="):
+			return line.substr(key.length() + 1)
 	return ""
 
 
@@ -85,6 +94,8 @@ func _initialize() -> void:
 		"%d instances, %d before" % [probe.live_instances(), instances_before])
 	report("bytes_released", probe.live_bytes(1) == bytes_before,
 		"%d bytes, %d before" % [probe.live_bytes(1), bytes_before])
+	# Last: it makes generation 2 current.
+	check_create_race()
 	finish()
 
 
@@ -152,6 +163,7 @@ func check_threads() -> void:
 	OS.delay_msec(50)
 	var swaps := 0
 	var attempts := 0
+	in_window = true
 	for k in SWAPS:
 		while attempts < 200000:
 			attempts += 1
@@ -160,37 +172,44 @@ func check_threads() -> void:
 				break
 			OS.delay_usec(20)
 		OS.delay_msec(2)
+	in_window = false
 	stop = true
 	var results := []
 	for t in threads:
 		results.append(t.wait_to_finish())
-	var ok := swaps == SWAPS
+	# Some swap found a worker inside (the try-lock failed at least once).
+	var ok := swaps == SWAPS and attempts > SWAPS
 	for i in WORKERS:
 		var calls: int = results[i][0]
-		ok = ok and results[i][1] == 0 and calls >= MIN_CALLS
+		# Calls made entirely while the swaps ran.
+		ok = ok and results[i][1] == 0 and results[i][2] >= MIN_CALLS
 		# The count survived every move of the data block.
 		ok = ok and objs[i].call("bump") == calls + 1
-	print("ZTEST INFO threads_during_swap: swaps %d, attempts %d, [calls, errors] per thread %s" % [swaps, attempts, results])
-	report("threads_during_swap", ok, "swaps %d (attempts %d), [calls, errors] per thread %s" % [swaps, attempts, results])
+	print("ZTEST INFO threads_during_swap: swaps %d, attempts %d, [calls, errors, calls during swaps] per thread %s" % [swaps, attempts, results])
+	report("threads_during_swap", ok, "swaps %d (attempts %d), [calls, errors, calls during swaps] per thread %s" % [swaps, attempts, results])
 
 
-# Returns [calls, errors].
+# Returns [calls, errors, calls made while the swaps ran].
 func _worker(i: int, obj: RefCounted) -> Array:
 	var n := 0
 	var errors := 0
+	var during := 0
 	while not stop:
 		n += 1
+		var before := in_window
 		if obj.call("bump") != n:
 			errors += 1
 		if obj.call("answer") != 42:
 			errors += 1
+		if before and in_window:
+			during += 1
 		# Make and drop one instance on this thread (registry add and
 		# remove from any thread).
 		if (n + i) % 16 == 0:
 			var tmp := make_counter()
 			if tmp.call("answer") != 42:
 				errors += 1
-	return [n, errors]
+	return [n, errors, during]
 
 
 # Calls into the instance being migrated are refused with one log line;
@@ -214,3 +233,35 @@ func check_migrating() -> void:
 	report("migrating_instance_freed_after_migration",
 		r2.size() == 3 and r2[0] == 5 and probe.live_instances() == before - 1,
 		"probe %s, live %d, before %d" % [r2, probe.live_instances(), before])
+
+
+# A worker makes an instance while the main thread holds the swap lock and
+# publishes generation 2 under it: the worker waits at the gate before it
+# chooses a generation, so the instance lands on generation 2.
+func check_create_race() -> void:
+	var diag: String = probe.stage_module(module_path_named("good2"), 2)
+	if diag != "":
+		report("create_racing_swap_lands_on_current", false, diag)
+		return
+	if not probe.gate_swap_begin():
+		report("create_racing_swap_lands_on_current", false, "swap lock busy")
+		return
+	var t := Thread.new()
+	t.start(_race_create)
+	var waited := 0
+	while not race_ready and waited < 10000:
+		OS.delay_msec(1)
+		waited += 1
+	# The worker is now in set_script, waiting at the gate.
+	OS.delay_msec(100)
+	var ended: bool = probe.gate_swap_end(2)
+	var gen: int = t.wait_to_finish()
+	report("create_racing_swap_lands_on_current", race_ready and ended and gen == 2 and probe.current_generation() == 2,
+		"ready %s, ended %s, instance generation %d, current %d" % [race_ready, ended, gen, probe.current_generation()])
+
+
+func _race_create() -> int:
+	var o := RefCounted.new()
+	race_ready = true
+	o.set_script(counter_script)
+	return probe.instance_generation(o)

@@ -668,7 +668,7 @@ test "ready runs, properties through the object, call falls through, strong refe
 
 // ------------------------------------------------------------ gate
 
-test "gate: depth counts nested entries, try-lock fails while a reader holds, threads during swap, migrating instance refuses calls, shutdown race closed" {
+test "gate: depth counts nested entries, try-lock fails while a reader holds, threads during swap, migrating instance refuses calls, create racing a swap, shutdown race closed" {
     try requireIntegration();
     var p: Project = undefined;
     try p.initProbe("empty");
@@ -679,9 +679,12 @@ test "gate: depth counts nested entries, try-lock fails while a reader holds, th
     try p.tmp.dir.createDirPath(io, "work");
     const work = try p.tmp.dir.realPathFileAlloc(io, "work", a);
     const good = try buildModule(a, work, "good", "gate_project", manifest.modules, true);
+    // A copy (another file) loads as a second generation of the same code.
+    const good2 = try std.fs.path.join(a, &.{ work, "libgate2.so" });
+    try Io.Dir.cwd().copyFile(good, Io.Dir.cwd(), good2, io, .{});
     var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
     defer dir.close(io);
-    try dir.writeFile(io, .{ .sub_path = "modules.txt", .data = try std.fmt.allocPrint(a, "good={s}\n", .{good}) });
+    try dir.writeFile(io, .{ .sub_path = "modules.txt", .data = try std.fmt.allocPrint(a, "good={s}\ngood2={s}\n", .{ good, good2 }) });
 
     try p.addCheck("gate.gd");
     try p.runScriptOnce(&.{
@@ -694,6 +697,7 @@ test "gate: depth counts nested entries, try-lock fails while a reader holds, th
         "ZTEST PASS registry_matches_live",
         "ZTEST PASS instances_released",
         "ZTEST PASS bytes_released",
+        "ZTEST PASS create_racing_swap_lands_on_current",
     }, &.{
         // Two refused calls (and a refused get and set) on one instance in
         // one migration: one line.

@@ -294,6 +294,8 @@ pub fn retag(ptr: *const anyopaque, size: usize, from: u32, to: u32) bool {
     const src = counterFor(from) orelse return false;
     const dst = counterFor(to) orelse return false;
     if (src == dst) return true;
+    // A size other than the block's would skew both counters silently.
+    std.debug.assert(src.load(.acquire) >= size);
     countFree(src, size);
     countAlloc(dst, size);
     return true;
@@ -314,7 +316,7 @@ pub fn shutdown() void {
     const locked = gate.lockForShutdown();
     defer if (locked) gate.unlockShutdown();
     if (!locked) {
-        const msg = "Ziggurat shuts down while a script call is still running on another thread.";
+        const msg = "Ziggurat shuts down while a script call is still running (on another thread, or on the main thread below this shutdown).";
         apiLog(@backingInt(abi.LogLevel.warning), msg, msg.len);
     }
     current_gen.store(null, .release);

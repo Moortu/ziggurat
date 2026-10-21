@@ -43,6 +43,10 @@
 //! group can be called from its group's thread and from the main thread at
 //! once. The gate does not serialise them (both hold the shared side).
 //!
+//! The callbacks that only read descriptors answer for the migrating
+//! instance too, so the swap engine rewrites `gen`, `index` and `data` as
+//! one unit with no module code in between (`gate.zig`).
+//!
 //! Live records are listed in `registry.zig` (added in `create`, removed
 //! in `free`), so the swap engine can find them.
 //!
@@ -93,6 +97,9 @@ pub const Instance = struct {
     data: *anyopaque,
     /// Position in the registry (`registry.zig`).
     slot: u32 = 0,
+    /// Unique per record for the process (`registry.nextSerial`), so a
+    /// record made at a freed record's address is never taken for it.
+    serial: u64 = 0,
     /// Set when Godot freed the instance while it was being migrated:
     /// `endMigration` releases it.
     free_pending: bool = false,
@@ -160,27 +167,29 @@ pub fn ownerFits(owner: *Object, base_class: []const u8) bool {
 /// Makes the instance of script `index` of `gen` for `owner` and returns
 /// Godot's script instance pointer (what `_instance_create` returns), or
 /// null. The caller has checked the owner (`ownerFits`). A refusal by the
-/// module's `create` was logged by the module. Holds the gate.
+/// module's `create` was logged by the module.
+///
+/// The caller holds the gate (`gate.enter`) since before it chose `gen`
+/// and `index` (`ZigScript._instanceCreate`): a swap then either finished
+/// before the choice, so `gen` is the new current generation, or waits
+/// until this instance is in the registry, so the swap migrates it.
 pub fn create(script: *ScriptExtension, owner: *Object, gen: *runtime.Generation, index: u32) ?*anyopaque {
+    std.debug.assert(gate.depth() > 0);
     if (index >= gen.table.script_count) return null;
     const make = godot.raw.scriptInstanceCreate3 orelse return null;
     const rec = std.heap.c_allocator.create(Instance) catch return null;
-    gate.enter();
     const d = &gen.scripts()[index];
     const data = d.create(@ptrCast(owner), gen.n) orelse {
-        gate.leave();
         std.heap.c_allocator.destroy(rec);
         return null;
     };
     _ = RefCounted.upcast(script).reference();
-    rec.* = .{ .owner = owner, .script = script, .gen = gen, .index = index, .data = data };
+    rec.* = .{ .owner = owner, .script = script, .gen = gen, .index = index, .data = data, .serial = registry.nextSerial() };
     _ = live.fetchAdd(1, .monotonic);
     registry.add(rec) catch {
         release(rec);
-        gate.leave();
         return null;
     };
-    gate.leave();
     // Godot's `script_instance_create3` only allocates; null is out of memory.
     return make(&info, rec) orelse {
         free(rec);

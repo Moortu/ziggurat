@@ -881,8 +881,14 @@ pub const ZigScript = struct {
     /// run; logged once per script). In the editor a tool script that no
     /// loaded module describes gets a placeholder instead, so the scene
     /// keeps its values until a module runs it.
+    ///
+    /// The gate is held from before the generation is chosen until the
+    /// instance is registered (`instance.create`), so a swap never misses
+    /// an instance made on another thread meanwhile.
     pub fn _instanceCreate(self: *ZigScript, owner: ?*Object) ?*anyopaque {
         const o = owner orelse return null;
+        gate.enter();
+        defer gate.leave();
         const loaded = if (self.desc()) |d| d == .loaded else false;
         if (!loaded and editor_hint.load(.acquire)) return self._placeholderInstanceCreate(o);
         const d = self.desc() orelse {
