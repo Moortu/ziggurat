@@ -185,6 +185,13 @@ pub fn runPending() Outcome {
     return note(.swapped, gen.n, &w);
 }
 
+/// A nested `_frame` (see `ZigLanguage._frame`) runs no swap: records a
+/// waiting request as `deferred_depth` and returns the outcome.
+pub fn deferNested() Outcome {
+    const gen = pending.load(.acquire) orelse return note(.none, 0, null);
+    return note(.deferred_depth, gen.n, null);
+}
+
 /// Records `o` and logs it when it differs from the last outcome.
 fn note(o: Outcome, n: u32, w: ?*const Work) Outcome {
     const changed = o != last.outcome or n != last.n;

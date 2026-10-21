@@ -694,6 +694,7 @@ test "gate: depth counts nested entries, try-lock fails while a reader holds, th
         "ZTEST PASS threads_during_swap",
         "ZTEST PASS migrating_instance_refuses_calls",
         "ZTEST PASS migrating_instance_freed_after_migration",
+        "ZTEST PASS nested_frame_runs_no_queue_and_no_swap",
         "ZTEST PASS registry_matches_live",
         "ZTEST PASS instances_released",
         "ZTEST PASS bytes_released",
@@ -795,6 +796,7 @@ test "swap: rollback on allocation failure, same layout keeps data, changed layo
     try p.addCheck("swap_threads.gd");
     try p.runScriptOnce(&.{
         "ZTEST PASS load\n",
+        "ZTEST PASS stack_info_from_threads",
         "ZTEST PASS threads_across_two_generations",
         "ZTEST PASS registry_matches_live",
         "ZTEST PASS bytes_released",

@@ -34,6 +34,7 @@ const diag_cache = @import("diag_cache.zig");
 const main_queue = @import("main_queue.zig");
 const swap = @import("swap.zig");
 const game = @import("game.zig");
+const gate = @import("gate.zig");
 const host_options = @import("host_options");
 const global_class = @import("global_class.zig");
 const template = @import("template.zig");
@@ -69,6 +70,8 @@ pub var registered: ?*ZigLanguage = null;
 /// `_get_global_class_name` on the scan thread. Empty when unknown.
 var project_root_buf: [max_path_bytes]u8 = undefined;
 var project_root: std.atomic.Value(usize) = .init(0);
+/// Main thread only: set while `_frame` runs its work.
+var in_frame = false;
 
 /// The reload requests Godot can make; each is logged once and counted.
 pub const Reload = enum { all, scripts, tool };
@@ -154,13 +157,21 @@ pub const ZigLanguage = struct {
         warmScanPath();
     }
     pub fn _finish(_: *ZigLanguage) void {}
-    /// Runs queued main-thread work, at most `main_queue.per_frame` items.
-    /// Godot calls `_frame` also from nested `Main::iteration()` calls; a
-    /// nested call runs nothing (`main_queue.drain`). Then runs a requested
-    /// swap, unless module code is on the main thread's stack (a nested
-    /// iteration from inside a script call) or another thread is inside the
-    /// gate; it then waits for a later frame (`swap.runPending`).
+    /// Runs queued main-thread work, at most `main_queue.per_frame` items,
+    /// then a requested swap (`swap.runPending`). `_frame` is not a safe
+    /// point (spec section 2): Godot calls it also from nested
+    /// `Main::iteration()` calls. A nested call is one made while another
+    /// `_frame` is running or while module code is on the main thread's
+    /// stack; it runs no queued callback, no manifest poll and no swap, and
+    /// records the swap as waiting (`swap.deferNested`). This is the only
+    /// place that rule lives.
     pub fn _frame(_: *ZigLanguage) void {
+        if (in_frame or gate.depth() > 0) {
+            _ = swap.deferNested();
+            return;
+        }
+        in_frame = true;
+        defer in_frame = false;
         _ = main_queue.drain();
         game.frame();
         _ = swap.runPending();

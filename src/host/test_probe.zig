@@ -442,6 +442,41 @@ pub const ZigguratTestProbe = struct {
         return pushed;
     }
 
+    /// Callbacks waiting in the main queue.
+    pub fn queuePending(_: *ZigguratTestProbe) i64 {
+        return @intCast(main_queue.pending());
+    }
+
+    /// The language's `_frame`, as Godot calls it.
+    pub fn languageFrame(_: *ZigguratTestProbe) void {
+        const lang = language.registered orelse return;
+        lang._frame();
+    }
+
+    /// The number of entries `_debug_get_current_stack_info` returns. Any
+    /// thread.
+    pub fn languageStackInfo(_: *ZigguratTestProbe) i64 {
+        const lang = language.registered orelse return -1;
+        var stack = lang._debugGetCurrentStackInfo();
+        defer stack.deinit();
+        return @intCast(stack.size());
+    }
+
+    /// Runs the language's `_frame` (outside any script call) with a queued
+    /// callback that requests a swap to generation 2, calls `_frame` again
+    /// and records what that nested call did. Returns [queued callbacks the
+    /// nested call ran, swap outcome after it, swaps it did]; a nested call
+    /// runs nothing, so [0, 1 (deferred_depth), 0].
+    pub fn queueNestedFrameCheck(_: *ZigguratTestProbe) Array {
+        var out = Array.init();
+        const lang = language.registered orelse return out;
+        nested_result = .{ -1, -1, -1 };
+        main_queue.push(nestedFrameCallback, null, null) catch return out;
+        lang._frame();
+        for (nested_result) |v| out.pushBack(Variant.init(i64, v));
+        return out;
+    }
+
     pub fn queueRuns(_: *ZigguratTestProbe) i64 {
         return queue_runs.load(.monotonic);
     }
@@ -752,6 +787,21 @@ fn recordSaved(path: []const u8) void {
 /// Callbacks of `queue_push` that ran.
 var queue_runs: std.atomic.Value(i64) = .init(0);
 
+var nested_result: [3]i64 = .{ -1, -1, -1 };
+
+fn nestedFrameCallback(_: ?*anyopaque) void {
+    const lang = language.registered orelse return;
+    const g = runtime.find(2) orelse return;
+    swap.request(g);
+    main_queue.push(countRun, null, null) catch return;
+    const runs = queue_runs.load(.monotonic);
+    const swaps: i64 = swap.swapCount();
+    lang._frame();
+    nested_result = .{ queue_runs.load(.monotonic) - runs, @as(i64, @backingInt(swap.lastOutcome())), @as(i64, swap.swapCount()) - swaps };
+    // Back to the current generation, so the outer frame runs no swap.
+    if (runtime.find(1)) |one| swap.request(one);
+}
+
 fn countRun(_: ?*anyopaque) void {
     _ = queue_runs.fetchAdd(1, .monotonic);
 }
@@ -771,27 +821,28 @@ fn cachedScript(rel: String) ?*const desc_cache.Script {
 }
 
 pub const method_names = [_][:0]const u8{
-    "property_list",           "method_list",                 "signal_list",             "default_text",
-    "cache_write",             "cache_read",                  "cache_rejections",        "cached_property_list",
-    "cached_method_list",      "cached_signal_list",          "cached_default_text",     "cached_layout_hash",
-    "layout_hash",             "cached_generation",           "roundtrip_default",       "stored_default",
-    "cache_drops",             "load_module",                 "current_generation",      "was_ever_current",
-    "init_calls",              "find_script",                 "method_index",            "property_index",
-    "method_count",            "method_name",                 "property_count",          "property_name",
-    "property_is_group",       "api_log",                     "api_request_swap",        "script_is_valid",
-    "script_fallback_enabled", "script_members",              "script_member_line",      "script_method_info",
-    "script_has_default",      "script_update_exports",       "script_method_arg_count", "live_instances",
-    "live_bytes",              "call_error",                  "property_state",          "script_placeholder_count",
-    "script_set_build_failed", "language_validate",           "language_global_class",   "language_complete_code",
-    "language_lookup_code",    "set_diagnostics",             "has_global_constant",     "queue_push",
-    "queue_runs",              "saved_hook_install",          "saved_hook_clear",        "saved_hook_paths",
-    "language_reload_scripts", "language_reload_tool_script", "editor_build_outcomes",   "editor_build_busy",
-    "cache_write_snapshot",    "gate_depth",                  "gate_try_swap",           "gate_test_swap",
-    "gate_migrate_probe",      "registry_count",              "runtime_shutdown",        "stage_module",
-    "gate_swap_begin",         "gate_swap_end",               "instance_generation",     "swap_request",
-    "swap_outcome",            "swaps_done",                  "fail_allocation",         "instance_data",
-    "swap_hook",               "game_polling",                "set_size_warning_bytes",  "loaded_generations",
-    "generation_loaded",
+    "property_list",            "method_list",                 "signal_list",             "default_text",
+    "cache_write",              "cache_read",                  "cache_rejections",        "cached_property_list",
+    "cached_method_list",       "cached_signal_list",          "cached_default_text",     "cached_layout_hash",
+    "layout_hash",              "cached_generation",           "roundtrip_default",       "stored_default",
+    "cache_drops",              "load_module",                 "current_generation",      "was_ever_current",
+    "init_calls",               "find_script",                 "method_index",            "property_index",
+    "method_count",             "method_name",                 "property_count",          "property_name",
+    "property_is_group",        "api_log",                     "api_request_swap",        "script_is_valid",
+    "script_fallback_enabled",  "script_members",              "script_member_line",      "script_method_info",
+    "script_has_default",       "script_update_exports",       "script_method_arg_count", "live_instances",
+    "live_bytes",               "call_error",                  "property_state",          "script_placeholder_count",
+    "script_set_build_failed",  "language_validate",           "language_global_class",   "language_complete_code",
+    "language_lookup_code",     "set_diagnostics",             "has_global_constant",     "queue_push",
+    "queue_runs",               "saved_hook_install",          "saved_hook_clear",        "saved_hook_paths",
+    "language_reload_scripts",  "language_reload_tool_script", "editor_build_outcomes",   "editor_build_busy",
+    "cache_write_snapshot",     "gate_depth",                  "gate_try_swap",           "gate_test_swap",
+    "gate_migrate_probe",       "registry_count",              "runtime_shutdown",        "stage_module",
+    "gate_swap_begin",          "gate_swap_end",               "instance_generation",     "swap_request",
+    "swap_outcome",             "swaps_done",                  "fail_allocation",         "instance_data",
+    "swap_hook",                "game_polling",                "set_size_warning_bytes",  "loaded_generations",
+    "generation_loaded",        "language_frame",              "language_stack_info",     "queue_pending",
+    "queue_nested_frame_check",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

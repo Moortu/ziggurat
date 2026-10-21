@@ -87,6 +87,7 @@ func _initialize() -> void:
 	check_try_lock()
 	check_threads()
 	check_migrating()
+	check_nested_frame()
 
 	report("registry_matches_live", probe.registry_count() == probe.live_instances(),
 		"registry %d, live %d" % [probe.registry_count(), probe.live_instances()])
@@ -119,6 +120,49 @@ func _a_pinged() -> void:
 
 func _b_pinged() -> void:
 	depth_seen = probe.gate_depth()
+
+
+# Nested `_frame` (inside a script call, and inside a queued callback) runs
+# no queued callback and no swap: the outcome is deferred_depth. Stages
+# generation 2 for the swaps the nested frames must not run.
+var nested_info := []
+var nested_a: Object
+
+
+func check_nested_frame() -> void:
+	var diag: String = probe.stage_module(module_path_named("good2"), 2)
+	if diag != "":
+		report("nested_frame_runs_no_queue_and_no_swap", false, diag)
+		return
+	nested_a = make_counter()
+	nested_a.connect("ping", _a_framed)
+	var depth_ok: bool = nested_a.call("fire") == 41
+	nested_a = null
+	# The queued callback the nested frame skipped runs at the next frame
+	# outside any script call; the pending swap is replaced by one to the
+	# current generation, so no swap runs here.
+	var runs_before: int = probe.queue_runs()
+	probe.swap_request(1)
+	probe.language_frame()
+	var after: int = probe.queue_runs() - runs_before
+	var swaps_after: int = probe.swaps_done()
+	# A nested frame from inside a queued callback: [callbacks run, outcome, swaps].
+	var cb: Array = probe.queue_nested_frame_check()
+	report("nested_frame_runs_no_queue_and_no_swap",
+		depth_ok and nested_info.size() == 4 and nested_info[0] == 0 and nested_info[1] == 1 and nested_info[2] == 1
+		and nested_info[3] == 0 and after == 1 and swaps_after == 0 and probe.current_generation() == 1
+		and cb.size() == 3 and cb[0] == 0 and cb[1] == 1 and cb[2] == 0,
+		"script call %s, queued run at next frame %d, swaps %d, in callback %s" % [nested_info, after, swaps_after, cb])
+
+
+func _a_framed() -> void:
+	probe.queue_push(1)
+	probe.swap_request(2)
+	var runs0: int = probe.queue_runs()
+	var swaps0: int = probe.swaps_done()
+	probe.language_frame()
+	# [callbacks run, outcome (deferred_depth = 1), callbacks waiting, swaps]
+	nested_info = [probe.queue_runs() - runs0, probe.swap_outcome(), probe.queue_pending(), probe.swaps_done() - swaps0]
 
 
 # A worker thread sits inside a slow script method (its signal handler
@@ -239,10 +283,7 @@ func check_migrating() -> void:
 # publishes generation 2 under it: the worker waits at the gate before it
 # chooses a generation, so the instance lands on generation 2.
 func check_create_race() -> void:
-	var diag: String = probe.stage_module(module_path_named("good2"), 2)
-	if diag != "":
-		report("create_racing_swap_lands_on_current", false, diag)
-		return
+	# Generation 2 was staged by check_nested_frame.
 	if not probe.gate_swap_begin():
 		report("create_racing_swap_lands_on_current", false, "swap lock busy")
 		return

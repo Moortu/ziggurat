@@ -82,6 +82,11 @@ func swap_during_calls() -> void:
 	for i in WORKERS:
 		threads.append(Thread.new())
 		threads[i].start(_worker.bind(i, objs[i]))
+	# Three more call `_debug_get_current_stack_info` the whole time.
+	var stack_threads: Array[Thread] = []
+	for i in WORKERS:
+		stack_threads.append(Thread.new())
+		stack_threads[i].start(_stack_worker)
 	OS.delay_msec(50)
 	in_window = true
 	var swaps := 0
@@ -100,6 +105,15 @@ func swap_during_calls() -> void:
 	var results := []
 	for i in WORKERS:
 		results.append(threads[i].wait_to_finish())
+	var stack_calls := 0
+	var stack_bad := 0
+	for t in stack_threads:
+		var r: Array = t.wait_to_finish()
+		stack_calls += r[0]
+		stack_bad += r[1]
+	stack_threads.clear()
+	report("stack_info_from_threads", swaps == SWAPS and stack_calls >= 1000 and stack_bad == 0,
+		"swaps %d, calls %d, bad %d" % [swaps, stack_calls, stack_bad])
 	var ok := swaps == SWAPS
 	for i in WORKERS:
 		var calls: int = results[i][0]
@@ -115,6 +129,18 @@ func swap_during_calls() -> void:
 		"registry %d, live %d" % [probe.registry_count(), probe.live_instances()])
 	threads.clear()
 	objs.clear()
+
+
+# Returns [calls, calls that returned a non-empty stack]. The stack info is
+# empty: Ziggurat has no frames to report.
+func _stack_worker() -> Array:
+	var n := 0
+	var bad := 0
+	while not stop:
+		n += 1
+		if probe.language_stack_info() != 0:
+			bad += 1
+	return [n, bad]
 
 
 # Returns [calls, errors, calls made while the swaps ran].
