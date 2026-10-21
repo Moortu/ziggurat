@@ -13,8 +13,15 @@ extends Node
 # 4. change one line in the script editor (the default of `speed`) and save
 #    with ScriptEditor.save_all_scripts(), the script editor's File > Save
 #    All;
-# 5. within 10 s the game logs the host's `_reload_scripts` line;
-# 6. the save also builds a new generation in the editor.
+#    The same edit changes the body of `score` (adds 100 to its result);
+# 5. the save reaches the game as `_reload_scripts`, which cannot find the
+#    build yet (the editor stages it a few seconds later: the game logs
+#    that and keeps running the old code);
+# 6. the save also builds a new generation in the editor;
+# 7. a second save (a comment edit) sends another reload, as the editor
+#    plugin will after staging (Stage 5); the game now finds the first
+#    build, swaps to it at its next frame and prints the new `score` with
+#    `speed` unchanged (the running node's field value is kept).
 # Play itself saves open scripts first (EditorNode saves external data before
 # a run, and the script editor's indent conversion on save marks the file
 # changed), which builds another generation before the game starts; the
@@ -26,7 +33,8 @@ const GAME_WAIT_MS := 120000
 const RELOAD_WAIT_MS := 10000
 const OPEN_WAIT_MS := 30000
 const MANIFEST := "res://.godot/ziggurat/manifest"
-const RELOAD_LINE := "Ziggurat: reload requested for 1 scripts (swaps arrive in a later version)."
+const OLD_SCORE_LINE := "e2e game: hero score=26 speed=12.5"
+const NEW_SCORE_LINE := "e2e game: hero score=126 speed=12.5"
 const GAME_READY_LINE := "e2e game: checks done"
 
 var log_path := ""
@@ -104,29 +112,45 @@ func run() -> void:
 	print("gui save path: after Play, res://hero.zig has tab indentation: %s; manifest generation %d" % [FileAccess.get_file_as_string("res://hero.zig").contains("\n\t"), manifest_gen()])
 	if not running:
 		return
-	# The game asks for nothing yet.
-	report("gui_no_reload_before_save", not log_text().contains(RELOAD_LINE), "")
+	# The game runs the code of the scene's build until the reload.
+	var started: bool = await wait_for(func(): return log_text().contains(OLD_SCORE_LINE), OPEN_WAIT_MS)
+	report("gui_game_runs_old_code", started and not log_text().contains(NEW_SCORE_LINE), "log has the old line: %s" % started)
 
-	# 4. Edit one line in the script editor, then save all scripts.
+	# 4. Edit the default of `speed` and the body of `score`, then save all
+	# scripts.
 	var line := -1
+	var score_line := -1
 	for i in code.get_line_count():
 		if code.get_line(i).contains("speed: f32 = 5,"):
 			line = i
+		if code.get_line(i).contains("self.speed * 2));"):
+			score_line = i
 	code.set_line(line, code.get_line(line).replace("speed: f32 = 5,", "speed: f32 = 6,"))
-	report("gui_script_edited", line >= 0 and se.get_unsaved_files().size() > 0, "line %d unsaved %s" % [line, se.get_unsaved_files()])
-	var before := log_text().length()
+	code.set_line(score_line, code.get_line(score_line).replace("self.speed * 2));", "self.speed * 2)) + 100;"))
+	report("gui_script_edited", line >= 0 and score_line >= 0 and se.get_unsaved_files().size() > 0, "lines %d %d unsaved %s" % [line, score_line, se.get_unsaved_files()])
 	var gen_before := manifest_gen()
-	var t0 := Time.get_ticks_msec()
 	se.save_all_scripts()
 	report("gui_script_saved", FileAccess.get_file_as_string("res://hero.zig").contains("speed: f32 = 6,") and se.get_unsaved_files().is_empty(),
 		"unsaved %s" % [se.get_unsaved_files()])
 
-	# 5. The game's `_reload_scripts` line within 10 s of the save.
-	var reloaded: bool = await wait_for(func(): return log_text().substr(before).contains(RELOAD_LINE), RELOAD_WAIT_MS)
-	var ms := Time.get_ticks_msec() - t0
-	print("gui save path: reload line after %d ms" % ms)
-	report("gui_save_reaches_game", reloaded and ms <= RELOAD_WAIT_MS, "after %d ms" % ms)
-
-	# 6. The save built a new generation in the editor.
+	# 5. The save built a new generation in the editor.
 	built = await wait_for(func(): return manifest_gen() > gen_before, BUILD_WAIT_MS)
 	report("gui_save_builds", built, "generation %d, before the save %d" % [manifest_gen(), gen_before])
+	if not built:
+		return
+	report("gui_game_still_old_code", not log_text().contains(NEW_SCORE_LINE), "the game swapped before a reload found the build")
+
+	# 6. A second save: the game reads the manifest again, finds the build,
+	# swaps and shows the new code with the field value kept.
+	var t0 := Time.get_ticks_msec()
+	line = -1
+	for i in code.get_line_count():
+		if code.get_line(i).contains("pub fn score("):
+			line = i
+	code.set_line(line, code.get_line(line) + " // saved again")
+	se.save_all_scripts()
+	var swapped: bool = await wait_for(func(): return log_text().contains(NEW_SCORE_LINE), RELOAD_WAIT_MS)
+	var ms := Time.get_ticks_msec() - t0
+	print("gui save path: new code in the game after %d ms" % ms)
+	report("gui_game_runs_new_code", swapped, "after %d ms; the log has the old line: %s" % [ms, log_text().contains(OLD_SCORE_LINE)])
+	report("gui_game_swapped_line", log_text().contains("ziggurat: swapped to build "), "no swap line in the log")

@@ -125,6 +125,15 @@ pub const Refusal = enum {
         };
     }
 
+    /// The reason alone, without the start-up sentence around it (for the
+    /// reload log lines).
+    pub fn because(r: Refusal) []const u8 {
+        return switch (r) {
+            .missing => "there is no manifest",
+            inline else => |t| comptime reason(t),
+        };
+    }
+
     fn reason(comptime r: Refusal) []const u8 {
         return switch (r) {
             .missing => unreachable,

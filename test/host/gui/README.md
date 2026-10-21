@@ -14,9 +14,11 @@ Files:
 
 - `save_path.gd`: the editor-side test, a tool autoload. It waits for the
   build at project open, opens `res://hero.zig` in the script editor, plays
-  the main scene, changes one line in the script editor, saves with
-  `ScriptEditor.save_all_scripts()` and waits up to 10 s for the game's line
-  `Ziggurat: reload requested for 1 scripts (swaps arrive in a later version).`
+  the main scene, changes two lines (the default of `speed` and the body of
+  `score`), saves with `ScriptEditor.save_all_scripts()`, waits for the new
+  build, saves once more (so the game reads the manifest again) and waits up
+  to 10 s for the game's line `e2e game: hero score=126 speed=12.5` (the
+  running game's new code, the field value kept; before: `score=26`).
 - `run-gui.sh`: starts the editor under `xvfb-run` in its own session with a
   deadline, writes the editor's and the game's output to one log file, and
   kills whatever of the run is left at the end, also when it is interrupted.
@@ -62,11 +64,15 @@ nix shell 'github:silversquirl/zig-flake/compat#"0.17.0"' nixpkgs#godot
 5. Press **Run Project** (F5). The game runs `main.tscn`; the Output panel
    shows its lines: `ZTEST PASS ...` for each check (no `ZTEST FAIL`), then
    `e2e game: checks done`.
-6. With the game running, change `speed: f32 = 5,` to `speed: f32 = 6,` in
-   the script editor and save with **File > Save** (Ctrl+S).
-7. Expected within 10 s in the Output panel, from the game:
-   `Ziggurat: reload requested for 1 scripts (swaps arrive in a later version).`
-   Then, from the editor: `ziggurat: build N loaded (save, ...)`.
+6. With the game running (its Output shows `e2e game: hero score=26
+   speed=12.5`), change `speed: f32 = 5,` to `speed: f32 = 6,` and add
+   ` + 100` before the `;` in the `return` of `score`, then save with
+   **File > Save** (Ctrl+S).
+7. The game logs `the build may not be staged yet; keeping gen N` (the
+   build is not done yet). When the editor logs `ziggurat: build M loaded
+   (save, ...)`, save once more (add a space and save). Expected within 10 s
+   from the game: `ziggurat: swapped to build M ...` and `e2e game: hero
+   score=126 speed=12.5`.
 8. Stop the game and close the editor. Delete `/tmp/ziggurat-e2e` and
    `/tmp/ziggurat-e2e-sdk.json`.
 

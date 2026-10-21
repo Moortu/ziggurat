@@ -1564,10 +1564,81 @@ test "game runs ready" {
             "ziggurat: generation 1 loaded",
             "[ziggurat] mover ready speed=5\n",
             "game check: scripts running",
-            // The debugger's reload request: one line, no swap yet.
-            "reload requested for 1 scripts (swaps arrive in a later version)",
+            // The debugger's reload requests: the manifest names the build
+            // the game runs, so one line says there is nothing to do.
+            "ziggurat: reload: nothing to do (gen 1)",
         },
-        .reject = &.{ refused_prefix, "placeholder" },
+        .reject = &.{ refused_prefix, "placeholder", "swaps arrive in a later version" },
+    });
+}
+
+test "game reload: swaps on reload, keeps old on bad build, reload before staging" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("empty");
+    defer p.deinit();
+    const a = p.arena_state.allocator();
+    var manifest = try loadManifest(testing.allocator);
+    defer manifest.deinit(testing.allocator);
+    try p.tmp.dir.createDirPath(io, "work");
+    const work = try p.tmp.dir.realPathFileAlloc(io, "work", a);
+    const v1 = try buildModule(a, work, "v1", "swap_v1", manifest.modules, true);
+    const v2 = try buildModule(a, work, "v2", "swap_v2", manifest.modules, true);
+
+    // The editor's store: generation 1 and 2 staged, generation 4 a cut
+    // copy of 2 (it fails to load), generation 3 never staged.
+    const cwd = Io.Dir.cwd();
+    var dir = try cwd.openDir(io, p.path, .{});
+    defer dir.close(io);
+    var names: [5][64]u8 = undefined;
+    var list: std.ArrayList(u8) = .empty;
+    for ([_]u32{ 1, 2, 3, 4 }) |n| {
+        const name = try genLibName(&names[n], n);
+        try list.print(a, "lib{d}={s}\n", .{ n, name });
+    }
+    try dir.writeFile(io, .{ .sub_path = "modules.txt", .data = list.items });
+    try dir.createDirPath(io, ".godot/ziggurat/gen/1");
+    try dir.createDirPath(io, ".godot/ziggurat/gen/2");
+    try dir.createDirPath(io, ".godot/ziggurat/gen/4");
+    try cwd.copyFile(v1, dir, try std.fmt.allocPrint(a, ".godot/ziggurat/gen/1/{s}", .{try genLibName(&names[1], 1)}), io, .{});
+    try cwd.copyFile(v2, dir, try std.fmt.allocPrint(a, ".godot/ziggurat/gen/2/{s}", .{try genLibName(&names[2], 2)}), io, .{});
+    const bytes = try cwd.readFileAlloc(io, v2, a, .limited(256 << 20));
+    try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, ".godot/ziggurat/gen/4/{s}", .{try genLibName(&names[4], 4)}), .data = bytes[0 .. bytes.len / 2] });
+    var store = try dir.openDir(io, ".godot/ziggurat", .{});
+    defer store.close(io);
+    try writeGameManifest(&store, try std.fmt.allocPrint(a, "gen=1\npath=gen/1/{s}\n", .{try genLibName(&names[1], 1)}));
+    // The scripts' sources, as the game's project has them.
+    const fixture = try std.fs.path.join(a, &.{ opts.fixtures_dir, "swap_v1" });
+    var src = try cwd.openDir(io, fixture, .{ .iterate = true });
+    defer src.close(io);
+    var it = src.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind == .file) try src.copyFile(entry.name, dir, entry.name, io, .{});
+    }
+
+    try p.addCheck("game_reload.gd");
+    try p.run(&.{ "script", "res://check.gd" }, .{
+        .expect = &.{
+            "ZTEST PASS game_runs_gen_1",
+            "ZTEST PASS reload_before_staging",
+            "ZTEST PASS reload_same_gen_does_nothing",
+            "ZTEST PASS bad_build_keeps_old",
+            "ZTEST PASS game_swaps_on_reload",
+            "ZTEST PASS method_returns_new_value",
+            "ZTEST PASS field_values_kept",
+            "ZTEST PASS new_instance_runs_gen_2",
+            "ZTEST PASS repeat_does_nothing",
+            "ZTEST DONE",
+        },
+        .once = &.{
+            "ziggurat: reload: the build may not be staged yet; keeping gen 1",
+            "ziggurat: reload: nothing to do (gen 1)",
+            "Ziggurat refused generation 4: ",
+            "ziggurat: generation 2 loaded",
+            "ziggurat: swapped to build 2",
+            "ziggurat: reload: nothing to do (gen 2)",
+        },
+        .reject = &.{ "ZTEST FAIL", "swaps arrive in a later version" },
     });
 }
 
@@ -1631,18 +1702,21 @@ const gui_cases = [_][]const u8{
     "ZTEST PASS gui_build_at_open",
     "ZTEST PASS gui_script_open",
     "ZTEST PASS gui_game_running",
-    "ZTEST PASS gui_no_reload_before_save",
+    "ZTEST PASS gui_game_runs_old_code",
     "ZTEST PASS gui_script_edited",
     "ZTEST PASS gui_script_saved",
-    "ZTEST PASS gui_save_reaches_game",
     "ZTEST PASS gui_save_builds",
+    "ZTEST PASS gui_game_still_old_code",
+    "ZTEST PASS gui_game_runs_new_code",
+    "ZTEST PASS gui_game_swapped_line",
 };
 
 // Run by `zig build test-gui` only (spec section 12, check 6): the GUI
 // editor under Xvfb plays the e2e project's main scene, a tool autoload
 // edits res://hero.zig in the script editor and saves it with
-// ScriptEditor.save_all_scripts(), and the running game logs the host's
-// `_reload_scripts` line within 10 s. The manual desktop run of the same
+// ScriptEditor.save_all_scripts(); a second save sends the game another
+// reload, and the running game swaps to the new build and returns the new
+// value of a changed method with its field values kept. The manual desktop run of the same
 // steps is in test/host/gui/README.md.
 test "gui: save in the script editor reaches the running game" {
     if (!gui_opts.run_gui) return error.SkipZigTest;
@@ -1703,9 +1777,8 @@ test "gui: save in the script editor reaches the running game" {
         if (std.mem.indexOf(u8, out, text) != null)
             try problems.append(a, try std.fmt.allocPrint(a, "rejected text present: {s}", .{text}));
     }
-    // The game asks for a reload once per process (src/host/language.zig).
-    if (std.mem.count(u8, out, "Ziggurat: reload requested for 1 scripts") != 1)
-        try problems.append(a, "the game's reload line is not there exactly once");
+    if (std.mem.indexOf(u8, out, "swaps arrive in a later version") != null)
+        try problems.append(a, "the game still logs that swaps come later");
     if (problems.items.len == 0) {
         // The timing and what Play did go to the file named by
         // ZTEST_GUI_RECORD, when set. Nothing is printed: output on success

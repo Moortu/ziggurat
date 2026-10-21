@@ -33,6 +33,8 @@ const host_io = @import("host_io.zig");
 const diag_cache = @import("diag_cache.zig");
 const main_queue = @import("main_queue.zig");
 const swap = @import("swap.zig");
+const game = @import("game.zig");
+const host_options = @import("host_options");
 const global_class = @import("global_class.zig");
 const template = @import("template.zig");
 
@@ -160,6 +162,7 @@ pub const ZigLanguage = struct {
     /// gate; it then waits for a later frame (`swap.runPending`).
     pub fn _frame(_: *ZigLanguage) void {
         _ = main_queue.drain();
+        game.frame();
         _ = swap.runPending();
     }
     pub fn _threadEnter(_: *ZigLanguage) void {}
@@ -364,16 +367,17 @@ pub const ZigLanguage = struct {
     }
     /// Also fires when any other extension reloads (spec section 7).
     pub fn _reloadAllScripts(self: *ZigLanguage) void {
-        self.noteReload(.all, 0);
+        self.noteReload(.all);
+        if (!script.isEditor()) game.requestReload();
     }
     /// Godot calls this with this language's own scripts only (for
     /// example `Script::reload_from_file` when the editor discards edits),
     /// so each listed script gets its text back from its file. In a game
-    /// the debugger sends it after a save in the editor; the game says once
-    /// how many scripts it named, because swapping a running game's code
-    /// comes in a later version (spec section 6).
+    /// the debugger sends it after a save in the editor; the game only sets
+    /// a flag, and its next `_frame` reads the manifest (`game.frame`).
     pub fn _reloadScripts(self: *ZigLanguage, scripts: Array, _: bool) void {
-        self.noteReload(.scripts, scripts.size());
+        self.noteReload(.scripts);
+        if (!script.isEditor()) game.requestReload();
         var i: i64 = 0;
         while (i < scripts.size()) : (i += 1) {
             var v = scripts.get(i);
@@ -385,7 +389,7 @@ pub const ZigLanguage = struct {
     /// the current one (`swap.requestNewest`, run at a later `_frame`);
     /// nothing is built.
     pub fn _reloadToolScript(self: *ZigLanguage, s: ?*Script, _: bool) void {
-        self.noteReload(.tool, 0);
+        self.noteReload(.tool);
         _ = swap.requestNewest();
         if (s) |sc| script.ZigScript.reloadObjectFromDisk(Object.upcast(sc));
     }
@@ -465,11 +469,13 @@ pub const ZigLanguage = struct {
     /// run the last build's module; the build, not this request, makes a
     /// new one (spec section 6: reload requests only queue; a tool-script
     /// reload queues a swap to the newest good build).
-    fn noteReload(self: *ZigLanguage, kind: Reload, count: i64) void {
+    fn noteReload(self: *ZigLanguage, kind: Reload) void {
         _ = self.reloads.getPtr(kind).fetchAdd(1, .acq_rel);
         if (self.reload_logged.getPtr(kind).swap(true, .acq_rel)) return;
-        if (kind == .scripts and !script.isEditor()) {
-            log("Ziggurat: reload requested for {d} scripts (swaps arrive in a later version).", .{count});
+        if (!script.isEditor()) {
+            // A game reads the manifest at its next frame (game.zig); an
+            // export build has no manifest path.
+            if (comptime host_options.export_build) log("Ziggurat: reloads are not available in exported games (logged once).", .{});
             return;
         }
         const what = switch (kind) {

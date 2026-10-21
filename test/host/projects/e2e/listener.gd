@@ -21,6 +21,11 @@ var signal_hits := []
 var scene_hits := []
 var seen_strikes := []
 var target: Node
+# GUI test only: the game keeps running and prints what `hero.score(1)` and
+# `hero.speed` return, each time the pair changes, so the test can see that
+# a reload swapped the running code and kept the field values.
+var watch_hero: Node
+var last_watch := ""
 
 
 func report(name: String, ok: bool, why: String) -> void:
@@ -114,6 +119,16 @@ func _ready() -> void:
 
 	print("e2e game: checks done")
 	if OS.get_environment("ZTEST_GUI") != "":
+		watch_hero = hero
 		return
 	print("ZTEST DONE")
 	get_tree().quit()
+
+
+func _process(_delta: float) -> void:
+	if watch_hero == null:
+		return
+	var text := "e2e game: hero score=%d speed=%s" % [watch_hero.score(1), watch_hero.get("speed")]
+	if text != last_watch:
+		last_watch = text
+		print(text)
