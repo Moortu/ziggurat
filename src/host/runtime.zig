@@ -1,6 +1,6 @@
 //! The host's minimal module runtime (L3, Stage 3): load one generation of
 //! the user module, check its table, initialise it and map names to indexes.
-//! Swaps, the gate and migration are Stage 4.
+//! The gate is `gate.zig`; swaps and migration are the swap engine's.
 //!
 //! `load` follows the host contract in `src/abi/abi.zig`: open the staged
 //! library, look up `ziggurat_describe` and `ziggurat_init`, `validate` the
@@ -23,6 +23,7 @@ const platform = @import("ziggurat_platform");
 const sdk_options = @import("sdk_options");
 const names = @import("names.zig");
 const host_io = @import("host_io.zig");
+const gate = @import("gate.zig");
 
 const Allocator = std.mem.Allocator;
 const OsPath = platform.path.OsPath;
@@ -282,14 +283,40 @@ pub fn liveBytes(gen: u32) ?u64 {
     return counter.load(.acquire);
 }
 
+/// Moves `size` bytes of the block at `ptr` from tag `from` to tag `to` in
+/// the byte counters: a same-layout swap keeps an instance's data block
+/// and hands it to the new generation, whose `destroy` later frees it with
+/// its own tag. The memory itself does not change (`ptr` is not touched).
+/// False, with nothing changed, when either tag is not a loaded generation
+/// (0 is the shared user heap).
+pub fn retag(ptr: *const anyopaque, size: usize, from: u32, to: u32) bool {
+    _ = ptr;
+    const src = counterFor(from) orelse return false;
+    const dst = counterFor(to) orelse return false;
+    if (src == dst) return true;
+    countFree(src, size);
+    countAlloc(dst, size);
+    return true;
+}
+
 /// Releases the engine names of every generation (Godot reports names still
 /// held at exit) and clears `current`. Libraries stay open and generations
 /// stay registered, so a late `HostApi` call from module code stays safe.
-/// Main thread, at SCENE exit, after the language is unregistered. No other
-/// thread may call into script instances then: `names` is replaced without
-/// synchronisation, and readers (instance.zig) check its length first and
-/// fall back to text lookup once it is empty.
+/// Main thread, at SCENE exit, after the language is unregistered and the
+/// main loop has stopped. It holds the gate's write side
+/// (`gate.lockForShutdown`) while it replaces `names`, so no instance
+/// callback on another thread (a leaked object freed on a worker) reads
+/// them meanwhile; such a callback afterwards sees the empty list and looks
+/// names up by text. Should the gate not come free within about 5 s (a
+/// thread stuck in module code) it logs and proceeds without it, as before
+/// the gate.
 pub fn shutdown() void {
+    const locked = gate.lockForShutdown();
+    defer if (locked) gate.unlockShutdown();
+    if (!locked) {
+        const msg = "Ziggurat shuts down while a script call is still running on another thread.";
+        apiLog(@backingInt(abi.LogLevel.warning), msg, msg.len);
+    }
     current_gen.store(null, .release);
     const io = host_io.get();
     const a = list_allocator orelse return;
@@ -548,6 +575,28 @@ test "HostApi alloc and free from many threads" {
     try testing.expectEqual(@as(?u64, 0), liveBytes(0));
 }
 
+test "retag moves bytes between generation counters" {
+    var g1: Generation = .{ .n = 8, .lib = undefined, .table = undefined, .names = &.{}, .by_path = .empty };
+    var g2: Generation = .{ .n = 9, .lib = undefined, .table = undefined, .names = &.{}, .by_path = .empty };
+    try testRegister(&g1);
+    try testRegister(&g2);
+    defer testReset();
+
+    const p = apiAlloc(8, 64, 16) orelse return error.AllocFailed;
+    try testing.expect(retag(p, 64, 8, 9));
+    try testing.expectEqual(@as(?u64, 0), liveBytes(8));
+    try testing.expectEqual(@as(?u64, 64), liveBytes(9));
+    // Same tag: nothing moves.
+    try testing.expect(retag(p, 64, 9, 9));
+    try testing.expectEqual(@as(?u64, 64), liveBytes(9));
+    // Unknown tag: refused, nothing changed.
+    try testing.expect(!retag(p, 64, 9, 10));
+    try testing.expectEqual(@as(?u64, 64), liveBytes(9));
+    // The new owner frees it with its own tag.
+    apiFree(9, p, 64, 16);
+    try testing.expectEqual(@as(?u64, 0), liveBytes(9));
+}
+
 test "refusal sentence names the file and lowers the reason" {
     var diag: [256]u8 = undefined;
     var reason: [256]u8 = @splat(0);
@@ -562,4 +611,6 @@ test "refusal sentence names the file and lowers the reason" {
 test {
     _ = names;
     _ = host_io;
+    _ = gate;
+    _ = @import("registry.zig");
 }

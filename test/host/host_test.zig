@@ -666,6 +666,49 @@ test "ready runs, properties through the object, call falls through, strong refe
     });
 }
 
+// ------------------------------------------------------------ gate
+
+test "gate: depth counts nested entries, try-lock fails while a reader holds, threads during swap, migrating instance refuses calls, shutdown race closed" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("empty");
+    defer p.deinit();
+    const a = p.arena_state.allocator();
+    var manifest = try loadManifest(testing.allocator);
+    defer manifest.deinit(testing.allocator);
+    try p.tmp.dir.createDirPath(io, "work");
+    const work = try p.tmp.dir.realPathFileAlloc(io, "work", a);
+    const good = try buildModule(a, work, "good", "gate_project", manifest.modules, true);
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+    defer dir.close(io);
+    try dir.writeFile(io, .{ .sub_path = "modules.txt", .data = try std.fmt.allocPrint(a, "good={s}\n", .{good}) });
+
+    try p.addCheck("gate.gd");
+    try p.runScriptOnce(&.{
+        "ZTEST PASS load\n",
+        "ZTEST PASS depth_counts_nested_entries",
+        "ZTEST PASS try_lock_fails_while_reader_holds",
+        "ZTEST PASS threads_during_swap",
+        "ZTEST PASS migrating_instance_refuses_calls",
+        "ZTEST PASS migrating_instance_freed_after_migration",
+        "ZTEST PASS registry_matches_live",
+        "ZTEST PASS instances_released",
+        "ZTEST PASS bytes_released",
+    }, &.{
+        // Two refused calls (and a refused get and set) on one instance in
+        // one migration: one line.
+        "Ziggurat refused an entry into an instance of res://counter.zig while it is being migrated to new code.",
+        "Ziggurat refused an entry into an instance of res://holder.zig while it is being migrated to new code.",
+    });
+
+    try p.addCheck("gate_shutdown.gd");
+    try p.runScript(&.{
+        "ZTEST PASS load\n",
+        "ZTEST PASS shutdown_race_closed",
+        "ZTEST PASS call_after_shutdown",
+    });
+}
+
 // ------------------------------------------------------------ placeholders
 
 /// Copies test/host/checks/<name> into `p` as `res://<as>`.

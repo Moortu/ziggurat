@@ -31,24 +31,35 @@
 //!   (720-730), so `get_class_category_func` stays null.
 //! - The fallback callbacks serve placeholder instances only and stay null.
 //!
-//! Threads: Godot calls these on the thread that uses the object. The
-//! record is only read after `create`. The host contract asks that calls on
-//! one instance do not overlap, but Godot does not guarantee it: a node in a
-//! thread group can be called from its group's thread and from the main
-//! thread at once. The host does not enforce it yet; the Stage 4 gate (spec
-//! section 6) is where it will be enforced.
+//! Threads: Godot calls these on the thread that uses the object. Every
+//! callback that reads the record's generation, index or data, or runs
+//! module code, holds the gate (`gate.zig`, which lists them), because a
+//! swap rewrites `gen`, `index` and `data` under the gate's write side.
+//! A callback into the instance being migrated is refused
+//! (`gate.enterInstance`): a call returns INSTANCE_IS_NULL, `get`/`set`
+//! fail, a notification is dropped; `free` is put off until the migration
+//! ends (`endMigration`). The host contract asks that calls on one instance
+//! do not overlap, but Godot does not guarantee it: a node in a thread
+//! group can be called from its group's thread and from the main thread at
+//! once. The gate does not serialise them (both hold the shared side).
+//!
+//! Live records are listed in `registry.zig` (added in `create`, removed
+//! in `free`), so the swap engine can find them.
 //!
 //! Name maps: `runtime.shutdown` frees them at SCENE exit, after the entry
-//! has unregistered the language. Godot deletes the main loop (and with it
-//! the scene tree) before it deinitialises extensions at SCENE level
-//! (main/main.cpp, `Main::cleanup`), so only objects that leaked can still
-//! hold an instance then; those look names up by text.
+//! has unregistered the language, holding the gate's write side. Godot
+//! deletes the main loop (and with it the scene tree) before it
+//! deinitialises extensions at SCENE level (main/main.cpp, `Main::cleanup`),
+//! so only objects that leaked can still hold an instance then; those look
+//! names up by text.
 const std = @import("std");
 const godot = @import("gdzig");
 const abi = @import("ziggurat_abi");
 const runtime = @import("runtime.zig");
 const props = @import("props.zig");
 const language = @import("language.zig");
+const gate = @import("gate.zig");
+const registry = @import("registry.zig");
 
 const c = godot.c;
 const String = godot.builtin.String;
@@ -80,6 +91,11 @@ pub const Instance = struct {
     index: u32,
     /// What the descriptor's `create` returned.
     data: *anyopaque,
+    /// Position in the registry (`registry.zig`).
+    slot: u32 = 0,
+    /// Set when Godot freed the instance while it was being migrated:
+    /// `endMigration` releases it.
+    free_pending: bool = false,
 
     fn desc(self: *const Instance) *const abi.ScriptDesc {
         return &self.gen.scripts()[self.index];
@@ -144,24 +160,56 @@ pub fn ownerFits(owner: *Object, base_class: []const u8) bool {
 /// Makes the instance of script `index` of `gen` for `owner` and returns
 /// Godot's script instance pointer (what `_instance_create` returns), or
 /// null. The caller has checked the owner (`ownerFits`). A refusal by the
-/// module's `create` was logged by the module.
+/// module's `create` was logged by the module. Holds the gate.
 pub fn create(script: *ScriptExtension, owner: *Object, gen: *runtime.Generation, index: u32) ?*anyopaque {
     if (index >= gen.table.script_count) return null;
     const make = godot.raw.scriptInstanceCreate3 orelse return null;
     const rec = std.heap.c_allocator.create(Instance) catch return null;
+    gate.enter();
     const d = &gen.scripts()[index];
     const data = d.create(@ptrCast(owner), gen.n) orelse {
+        gate.leave();
         std.heap.c_allocator.destroy(rec);
         return null;
     };
     _ = RefCounted.upcast(script).reference();
     rec.* = .{ .owner = owner, .script = script, .gen = gen, .index = index, .data = data };
     _ = live.fetchAdd(1, .monotonic);
+    registry.add(rec) catch {
+        release(rec);
+        gate.leave();
+        return null;
+    };
+    gate.leave();
     // Godot's `script_instance_create3` only allocates; null is out of memory.
     return make(&info, rec) orelse {
         free(rec);
         return null;
     };
+}
+
+/// The script instance record of `owner`'s Zig script, or null.
+pub fn recordOf(owner: *Object) ?*Instance {
+    const lang = language.registered orelse return null;
+    const get_inst = godot.raw.objectGetScriptInstance orelse return null;
+    return record(get_inst(@ptrCast(owner), @ptrCast(lang.base)));
+}
+
+/// The project-relative path of the script `rec` runs (as in the table).
+/// Read under the gate.
+pub fn scriptPath(rec: *const Instance) []const u8 {
+    return props.text(rec.desc().path);
+}
+
+/// Ends the migration of `rec` (`gate.setMigrating(null)`) and releases it
+/// when Godot freed it meanwhile. The swapper, under the gate's write side;
+/// `rec` is not used afterwards when this returns true.
+pub fn endMigration(rec: *Instance) bool {
+    gate.setMigrating(null);
+    if (!rec.free_pending) return false;
+    registry.remove(rec);
+    release(rec);
+    return true;
 }
 
 /// The table every instance shares.
@@ -215,6 +263,8 @@ fn moveInto(out: c.GDExtensionVariantPtr, v: *Variant) void {
 fn set(p: c.GDExtensionScriptInstanceDataPtr, name: c.GDExtensionConstStringNamePtr, value: c.GDExtensionConstVariantPtr) callconv(.c) c.GDExtensionBool {
     const rec = record(p) orelse return 0;
     const v = value orelse return 0;
+    if (!gate.enterInstance(rec)) return 0;
+    defer gate.leave();
     const i = rec.propertyIndex(nameOf(name) orelse return 0) orelse return 0;
     return @intFromBool(rec.desc().set(rec.data, i, v) != 0);
 }
@@ -230,6 +280,8 @@ fn get(p: c.GDExtensionScriptInstanceDataPtr, name: c.GDExtensionConstStringName
     const rec = record(p) orelse return 0;
     if (r_ret == null) return 0;
     const sn = nameOf(name) orelse return 0;
+    if (!gate.enterInstance(rec)) return 0;
+    defer gate.leave();
     if (rec.propertyIndex(sn)) |i| {
         var v: Variant = .nil;
         if (rec.desc().get(rec.data, i, @ptrCast(&v)) == 0) return 0;
@@ -272,6 +324,8 @@ pub fn warm(obj: *Object) void {
 
 fn propertyCanRevert(p: c.GDExtensionScriptInstanceDataPtr, name: c.GDExtensionConstStringNamePtr) callconv(.c) c.GDExtensionBool {
     const rec = record(p) orelse return 0;
+    gate.enter();
+    defer gate.leave();
     const i = rec.propertyIndex(nameOf(name) orelse return 0) orelse return 0;
     const v = props.defaultValue(rec.desc(), i) orelse return 0;
     v.deinit();
@@ -281,6 +335,8 @@ fn propertyCanRevert(p: c.GDExtensionScriptInstanceDataPtr, name: c.GDExtensionC
 fn propertyGetRevert(p: c.GDExtensionScriptInstanceDataPtr, name: c.GDExtensionConstStringNamePtr, r_ret: c.GDExtensionVariantPtr) callconv(.c) c.GDExtensionBool {
     const rec = record(p) orelse return 0;
     if (r_ret == null) return 0;
+    gate.enter();
+    defer gate.leave();
     const i = rec.propertyIndex(nameOf(name) orelse return 0) orelse return 0;
     var v = props.defaultValue(rec.desc(), i) orelse return 0;
     moveInto(r_ret, &v);
@@ -290,6 +346,8 @@ fn propertyGetRevert(p: c.GDExtensionScriptInstanceDataPtr, name: c.GDExtensionC
 fn getPropertyType(p: c.GDExtensionScriptInstanceDataPtr, name: c.GDExtensionConstStringNamePtr, r_is_valid: [*c]c.GDExtensionBool) callconv(.c) c.GDExtensionVariantType {
     if (r_is_valid != null) r_is_valid.* = 0;
     const rec = record(p) orelse return 0;
+    gate.enter();
+    defer gate.leave();
     const i = rec.propertyIndex(nameOf(name) orelse return 0) orelse return 0;
     if (r_is_valid != null) r_is_valid.* = 1;
     return @intCast(rec.desc().properties[i].variant_type);
@@ -305,6 +363,8 @@ fn validateProperty(_: c.GDExtensionScriptInstanceDataPtr, _: [*c]c.GDExtensionP
 fn getPropertyState(p: c.GDExtensionScriptInstanceDataPtr, add: c.GDExtensionScriptInstancePropertyStateAdd, userdata: ?*anyopaque) callconv(.c) void {
     const rec = record(p) orelse return;
     const add_fn = add orelse return;
+    if (!gate.enterInstance(rec)) return;
+    defer gate.leave();
     const d = rec.desc();
     for (d.properties[0..d.property_count], 0..) |prop, i| {
         if (prop.field_index == abi.no_field or prop.usage & usage_storage == 0) continue;
@@ -323,6 +383,8 @@ fn getPropertyList(p: c.GDExtensionScriptInstanceDataPtr, r_count: [*c]u32) call
     if (r_count != null) r_count.* = 0;
     const rec = record(p) orelse return null;
     if (r_count == null) return null;
+    gate.enter();
+    defer gate.leave();
     const d = rec.desc();
     const n = d.property_count;
     if (n == 0) return null;
@@ -341,12 +403,16 @@ fn freePropertyList(_: c.GDExtensionScriptInstanceDataPtr, list: [*c]const c.GDE
 
 fn hasMethod(p: c.GDExtensionScriptInstanceDataPtr, name: c.GDExtensionConstStringNamePtr) callconv(.c) c.GDExtensionBool {
     const rec = record(p) orelse return 0;
+    gate.enter();
+    defer gate.leave();
     return @intFromBool(rec.methodIndex(nameOf(name) orelse return 0) != null);
 }
 
 fn getMethodArgumentCount(p: c.GDExtensionScriptInstanceDataPtr, name: c.GDExtensionConstStringNamePtr, r_is_valid: [*c]c.GDExtensionBool) callconv(.c) c.GDExtensionInt {
     if (r_is_valid != null) r_is_valid.* = 0;
     const rec = record(p) orelse return 0;
+    gate.enter();
+    defer gate.leave();
     const i = rec.methodIndex(nameOf(name) orelse return 0) orelse return 0;
     if (r_is_valid != null) r_is_valid.* = 1;
     return rec.desc().methods[i].arg_count;
@@ -358,6 +424,8 @@ fn getMethodList(p: c.GDExtensionScriptInstanceDataPtr, r_count: [*c]u32) callco
     if (r_count != null) r_count.* = 0;
     const rec = record(p) orelse return null;
     if (r_count == null) return null;
+    gate.enter();
+    defer gate.leave();
     const d = rec.desc();
     const n = d.method_count;
     if (n == 0) return null;
@@ -408,6 +476,11 @@ fn call(
     r_error.* = .{ .@"error" = abi.call_invalid_method, .argument = 0, .expected = 0 };
     const rec = record(p) orelse return;
     if (r_return == null) return;
+    if (!gate.enterInstance(rec)) {
+        r_error.* = .{ .@"error" = abi.call_instance_is_null, .argument = 0, .expected = 0 };
+        return;
+    }
+    defer gate.leave();
     const i = rec.methodIndex(nameOf(method) orelse return) orelse return;
     var err: abi.CallError = .{ .@"error" = abi.call_ok, .argument = 0, .expected = 0 };
     var v: Variant = .nil;
@@ -420,6 +493,8 @@ fn call(
 /// so there is nothing to order; the module ignores the flag.
 fn notification(p: c.GDExtensionScriptInstanceDataPtr, what: i32, reversed: c.GDExtensionBool) callconv(.c) void {
     const rec = record(p) orelse return;
+    if (!gate.enterInstance(rec)) return;
+    defer gate.leave();
     rec.desc().notification(rec.data, what, @intFromBool(reversed != 0));
 }
 
@@ -429,6 +504,8 @@ fn toString(p: c.GDExtensionScriptInstanceDataPtr, r_is_valid: [*c]c.GDExtension
     if (r_is_valid != null) r_is_valid.* = 0;
     const rec = record(p) orelse return;
     if (r_is_valid == null or r_out == null) return;
+    if (!gate.enterInstance(rec)) return;
+    defer gate.leave();
     const d = rec.desc();
     const i = findMethod(d, "_to_string") orelse return;
     if (d.methods[i].arg_count != 0) return;
@@ -476,9 +553,24 @@ fn refcountDecremented(_: c.GDExtensionScriptInstanceDataPtr) callconv(.c) c.GDE
 }
 
 /// Runs the module's `destroy`, drops the script reference and frees the
-/// record. Godot calls it from `~ScriptInstanceExtension` (934-936).
+/// record. Godot calls it from `~ScriptInstanceExtension` (934-936). For
+/// the instance being migrated (code the swap runs freed its owner) it only
+/// marks the record; `endMigration` releases it.
 fn free(p: c.GDExtensionScriptInstanceDataPtr) callconv(.c) void {
     const rec = record(p) orelse return;
+    gate.enter();
+    defer gate.leave();
+    if (gate.isMigrating(rec)) {
+        rec.free_pending = true;
+        return;
+    }
+    registry.remove(rec);
+    release(rec);
+}
+
+/// `destroy` in the module, then the script reference and the record.
+/// Inside the gate.
+fn release(rec: *Instance) void {
     rec.desc().destroy(rec.data);
     const script = rec.script;
     std.heap.c_allocator.destroy(rec);

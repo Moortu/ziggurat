@@ -19,6 +19,8 @@ const diag_cache = @import("diag_cache.zig");
 const main_queue = @import("main_queue.zig");
 const resource = @import("resource.zig");
 const editor_build = @import("editor_build.zig");
+const gate = @import("gate.zig");
+const registry = @import("registry.zig");
 const PackedStringArray = godot.builtin.PackedStringArray;
 
 const Allocator = std.mem.Allocator;
@@ -490,6 +492,101 @@ pub const ZigguratTestProbe = struct {
         return editor_build.busy();
     }
 
+    /// The gate depth of the calling thread.
+    pub fn gateDepth(_: *ZigguratTestProbe) i64 {
+        return gate.depth();
+    }
+
+    /// Takes the swap lock and releases it at once: false when a thread is
+    /// inside the gate.
+    pub fn gateTrySwap(_: *ZigguratTestProbe) bool {
+        if (!gate.trySwap()) return false;
+        gate.endSwap();
+        return true;
+    }
+
+    /// A test-only swap within one generation, standing in for the swap
+    /// engine: under the swap lock, every live instance is marked as
+    /// migrating in turn and its record rewritten. `mode` 0 keeps each
+    /// data block (the record is rewritten to itself and the block
+    /// retagged to its own generation, as a same-layout swap does); 1 moves
+    /// the bytes to a new block of the same generation and frees the old
+    /// one, as a changed layout does (no module code runs: the bytes
+    /// move, ownership with them). False when the swap lock was not free.
+    pub fn gateTestSwap(_: *ZigguratTestProbe, mode: i64) bool {
+        if (!gate.trySwap()) return false;
+        defer gate.endSwap();
+        const recs = registry.all(std.heap.c_allocator) catch return true;
+        defer std.heap.c_allocator.free(recs);
+        const api = runtime.hostApi();
+        for (recs) |rec| {
+            gate.setMigrating(rec);
+            const d = &rec.gen.scripts()[rec.index];
+            const size: usize = @max(d.instance_size, 1);
+            const old = rec.data;
+            if (mode == 0) {
+                _ = runtime.retag(old, size, rec.gen.n, rec.gen.n);
+                rec.* = .{ .owner = rec.owner, .script = rec.script, .gen = rec.gen, .index = rec.index, .data = old, .slot = rec.slot };
+            } else if (api.alloc(rec.gen.n, size, d.instance_align)) |new| {
+                @memcpy(@as([*]u8, @ptrCast(new))[0..size], @as([*]const u8, @ptrCast(old))[0..size]);
+                rec.data = new;
+                api.free(rec.gen.n, old, size, d.instance_align);
+            }
+            _ = instance.endMigration(rec);
+        }
+        return true;
+    }
+
+    /// Under the swap lock, marks `obj`'s instance as migrating, calls
+    /// `method` on it through the instance's call callback and through
+    /// Godot's Variant call, gets and sets its `value` property, and frees
+    /// `obj` when `free_during`. Returns [callback call error, Variant call
+    /// error, whether the get found nothing], or [-1] when the swap lock or
+    /// the instance was not there.
+    pub fn gateMigrateProbe(_: *ZigguratTestProbe, obj: ?*Object, method: StringName, free_during: bool) Array {
+        var out = Array.init();
+        const o = obj orelse return fail(&out);
+        const rec = instance.recordOf(o) orelse return fail(&out);
+        if (!gate.trySwap()) return fail(&out);
+        defer gate.endSwap();
+        gate.setMigrating(rec);
+        // What the script instance answers (Godot's
+        // `ScriptInstanceExtension::callp` calls this callback) ...
+        var ret: Variant = .nil;
+        var err: godot.c.GDExtensionCallError = .{ .@"error" = 0, .argument = 0, .expected = 0 };
+        instance.info.call_func.?(@ptrCast(rec), @ptrCast(&method), null, 0, @ptrCast(&ret), &err);
+        ret.deinit();
+        const e1: i64 = err.@"error";
+        // ... and what a caller through `Object::callp` sees: Godot treats
+        // INSTANCE_IS_NULL from a script instance like a missing method and
+        // tries the engine class (core/object/object.cpp:800-826).
+        const e2 = callErrorOf(o, &method);
+        var sn = StringName.fromUtf8("value");
+        defer sn.deinit();
+        const got = o.get(sn);
+        const nothing = got.tag == .nil;
+        got.deinit();
+        const v = Variant.init(i64, 99);
+        o.set(sn, v);
+        v.deinit();
+        if (free_during) godot.raw.objectDestroy(@ptrCast(o));
+        _ = instance.endMigration(rec);
+        out.pushBack(Variant.init(i64, e1));
+        out.pushBack(Variant.init(i64, e2));
+        out.pushBack(Variant.init(bool, nothing));
+        return out;
+    }
+
+    /// Instance records in the registry.
+    pub fn registryCount(_: *ZigguratTestProbe) i64 {
+        return @intCast(registry.count());
+    }
+
+    /// Runs the runtime's shutdown now, as SCENE exit does.
+    pub fn runtimeShutdown(_: *ZigguratTestProbe) void {
+        runtime.shutdown();
+    }
+
     pub fn propertyIsGroup(_: *ZigguratTestProbe, script: i64, index: i64) bool {
         const d = scriptDesc(script) orelse return false;
         const i = std.math.cast(u32, index) orelse return false;
@@ -497,6 +594,28 @@ pub const ZigguratTestProbe = struct {
         return d.properties[i].field_index == abi.no_field;
     }
 };
+
+fn fail(out: *Array) Array {
+    out.pushBack(Variant.init(i64, -1));
+    return out.*;
+}
+
+/// Calls `method` on `obj` with no arguments through Godot's Variant call;
+/// the call error code (0 is OK).
+fn callErrorOf(obj: *Object, method: *const StringName) i64 {
+    // A RefCounted owner goes in as RefCounted: gdzig counts the
+    // reference the Variant drops only then.
+    var self_v = if (obj.isClass(.fromComptimeLatin1("RefCounted")))
+        Variant.init(*RefCounted, @ptrCast(obj))
+    else
+        Variant.init(?*Object, obj);
+    defer self_v.deinit();
+    var ret: Variant = .nil;
+    var err: godot.c.GDExtensionCallError = .{ .@"error" = 0, .argument = 0, .expected = 0 };
+    godot.raw.variantCall(@ptrCast(&self_v), @ptrCast(method), null, 0, @ptrCast(&ret), &err);
+    ret.deinit();
+    return err.@"error";
+}
 
 /// The paths `resource.on_saved` received (`saved_hook_install`).
 var saved_paths: std.ArrayList([]u8) = .empty;
@@ -546,7 +665,8 @@ pub const method_names = [_][:0]const u8{
     "language_lookup_code",    "set_diagnostics",             "has_global_constant",     "queue_push",
     "queue_runs",              "saved_hook_install",          "saved_hook_clear",        "saved_hook_paths",
     "language_reload_scripts", "language_reload_tool_script", "editor_build_outcomes",   "editor_build_busy",
-    "cache_write_snapshot",
+    "cache_write_snapshot",    "gate_depth",                  "gate_try_swap",           "gate_test_swap",
+    "gate_migrate_probe",      "registry_count",              "runtime_shutdown",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

@@ -43,6 +43,7 @@ const host_io = @import("host_io.zig");
 const language = @import("language.zig");
 const instance = @import("instance.zig");
 const placeholder = @import("placeholder.zig");
+const gate = @import("gate.zig");
 const global_class = @import("global_class.zig");
 const diag_cache = @import("diag_cache.zig");
 
@@ -922,6 +923,9 @@ pub const ZigScript = struct {
         const lang = language.registered orelse return null;
         const p = placeholder.create(lang.base, self.base, o) orelse return null;
         self.addOwner(p, o.getInstanceId());
+        // Feeding reads a generation's descriptors, which a swap replaces.
+        gate.enter();
+        defer gate.leave();
         const d = self.liveDesc();
         self.placeholders.add(p, if (d) |x| x.key() else null, Feed{ .d = d });
         return p;
@@ -950,6 +954,8 @@ pub const ZigScript = struct {
     /// first good build after a failed one) are they fed again. Nothing is
     /// fed while fallback is on.
     pub fn _updateExports(self: *ZigScript) void {
+        gate.enter();
+        defer gate.leave();
         const d = self.liveDesc();
         _ = self.placeholders.refresh(if (d) |x| x.key() else null, Feed{ .d = d });
     }
