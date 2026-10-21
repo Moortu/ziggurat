@@ -148,6 +148,14 @@ pub fn Wrappers(
             return raw;
         }
 
+        /// Runs the script's `migrate` on `new_inst` (from `create_blank`,
+        /// with the fields the host already moved in) with a view of the
+        /// old instance. `describe` sets this entry only when `S` has a
+        /// `pub fn migrate` and checks its signature.
+        pub fn migrate(new_inst: *anyopaque, prev: *const abi.PrevView) callconv(.c) void {
+            S.migrate(instance(new_inst), .{ .view = prev });
+        }
+
         pub fn destroy(inst: *anyopaque) callconv(.c) void {
             const self = instance(inst);
             if (comptime hasPub("deinit")) S.deinit(self);

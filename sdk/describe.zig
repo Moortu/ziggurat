@@ -56,6 +56,7 @@ const object = @import("object.zig");
 const godot = @import("gdzig");
 const wrap = @import("wrap.zig");
 const own = @import("own.zig");
+const previous = @import("previous.zig");
 
 /// Usage of an exported field: STORAGE | EDITOR | SCRIPT_VARIABLE, as
 /// GDScript sets for script variables.
@@ -763,13 +764,15 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             return false;
         }
 
-        /// `init`, `deinit`, `_notification` and the `get_<field>` and
+        /// `init`, `deinit`, `migrate`, `_notification` and the `get_<field>` and
         /// `set_<field>` overrides of exported fields, as `wrap.zig` calls them.
         fn checkHooks() void {
             for ([_][]const u8{ "init", "deinit" }) |n| {
                 if (isPub(n) and !fnMatches(n, &.{*S}, void))
                     fail(n, "'" ++ n ++ "' must be 'pub fn " ++ n ++ "(self: *@This()) void'.");
             }
+            if (isPub("migrate") and !fnMatches("migrate", &.{ *S, previous.Previous(S) }, void))
+                fail("migrate", "'migrate' must be 'pub fn migrate(self: *@This(), old: z.Previous(@This())) void'.");
             if (isPub("_notification") and !fnMatches("_notification", &.{ *S, i32 }, void))
                 fail("_notification", "'_notification' must be 'pub fn _notification(self: *@This(), what: i32) void'.");
             // Overrides are `pub fn get_<field>` and `set_<field>`. Most
@@ -839,7 +842,7 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                 .set = W.set,
                 .get_default = W.getDefault,
                 .notification = W.notification,
-                .migrate = null,
+                .migrate = if (isPub("migrate")) &W.migrate else null,
             };
         };
     };
@@ -1008,7 +1011,7 @@ fn valueKind(comptime T: type) abi.ValueKind {
 /// `FieldDesc.shape` of a field type: 0 when the type name fixes the
 /// layout (scalars, pointers, engine values, SDK handles and text), else a
 /// hash of the inner layout (`shapeHash`), never 0.
-fn shapeOf(comptime T: type) u64 {
+pub fn shapeOf(comptime T: type) u64 {
     return switch (@typeInfo(T)) {
         .@"struct" => if (convert.isBuiltin(T) or own.isText(T) or handleKind(T) != null) 0 else shapeHash(T),
         .array, .@"union", .@"enum" => shapeHash(T),
@@ -1077,7 +1080,7 @@ fn shapeHash(comptime T: type) u64 {
 /// loses its `_<digits>`. The counter depends on what the compiler analysed
 /// before, so it differs between builds of the same source; the field's
 /// `shape` tells two anonymous types of one parent apart.
-fn stableTypeName(comptime T: type) []const u8 {
+pub fn stableTypeName(comptime T: type) []const u8 {
     const name = @typeName(T);
     switch (@typeInfo(T)) {
         // Their names are never anonymous; skip the scan.

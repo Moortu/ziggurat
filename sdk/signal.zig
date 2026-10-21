@@ -213,7 +213,7 @@ fn fail(comptime S: type, comptime sentence: []const u8) noreturn {
 /// root (`pub const s<i>`) whose path gives `@typeName(S)`, or null. The
 /// branch quota grows with the number of root declarations; a path whose
 /// length cannot match is skipped before any per-byte work.
-fn scriptRel(comptime S: type) ?[]const u8 {
+pub fn scriptRel(comptime S: type) ?[]const u8 {
     const root = @import("root");
     if (@typeInfo(root) != .@"struct") return null;
     const decls = @typeInfo(root).@"struct".decl_names;

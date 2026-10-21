@@ -17,6 +17,7 @@ comptime {
     _ = @import("object.zig");
     _ = @import("describe.zig");
     _ = @import("wrap.zig");
+    _ = @import("migrate.zig");
 }
 
 // Variant types (GDExtensionVariantType).

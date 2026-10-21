@@ -6,6 +6,35 @@
 //! A script's `pub fn deinit(self: *@This()) void` runs while Godot is
 //! destroying the owner object, so it must not use `base`; cleanup that
 //! needs the owner belongs in `_notification` on NOTIFICATION_PREDELETE.
+//!
+//! State migration (spec sections 6 and 8): when a script's code changes,
+//! each live instance moves into the new code. Before anything of the
+//! script runs, the host copies into the new instance every field whose
+//! name and exact type are unchanged (text and `Ref` fields included: their
+//! values move, they are not copied) and leaves every other field at its
+//! default; `init` does not run. Then it calls the script's optional
+//! `pub fn migrate(self: *@This(), old: z.Previous(@This())) void`, so
+//! `migrate` is only for renames and conversions:
+//!
+//!     pub fn migrate(self: *@This(), old: z.Previous(@This())) void {
+//!         if (old.get(i32, "hp")) |hp| self.health = hp; // renamed
+//!         if (old.get(i32, "count")) |c| self.count = @intCast(@max(c, 0)); // i32 -> u32
+//!         if (old.take(z.String, "note")) |text| self.memo = text; // renamed text
+//!     }
+//!
+//! `old.get(T, "name")` copies a plain value (bool, numbers, enums, packed
+//! flags, vectors, `z.Obj`, and structs or arrays of those);
+//! `old.take(T, "name")` moves a `z.String`, `z.StringName`, `z.NodePath`
+//! or `z.Ref` out of the old instance. Both give null unless the old field
+//! exists with exactly the type `T` (same name, same layout inside), and
+//! `take` gives null for a value already moved (by the host or an earlier
+//! `take`). A taken value belongs to `migrate`: store it in an empty field
+//! as above (a field the host did not fill; release a filled one first) or
+//! release it. The host resets every moved old field before the old
+//! instance's `deinit`, so each value is released once. When the
+//! script's layout did not change, the data stays in place and `migrate`
+//! does not run. Calls from `migrate` back into script instances are not
+//! supported (spec section 6).
 const std = @import("std");
 const sdk_options = @import("sdk_options");
 const abi = @import("ziggurat_abi");
@@ -61,6 +90,9 @@ pub const assign = @import("own.zig").assign;
 pub const String = @import("own.zig").String;
 pub const StringName = @import("own.zig").StringName;
 pub const NodePath = @import("own.zig").NodePath;
+/// The old instance during a migration, as `migrate` gets it; see the top
+/// of this file and `previous.zig`.
+pub const Previous = @import("previous.zig").Previous;
 
 /// Emits a signal the script declares, checked at compile time:
 /// `z.emit(self, .hit, .{ .damage = 3 })`. See `signal.zig`.

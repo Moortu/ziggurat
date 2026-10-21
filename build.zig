@@ -455,6 +455,10 @@ fn addGodotTests(
     const fixture_player = fixtureModule(b, target, optimize, sdk, "test/fixtures/sdk_project/player.zig");
     const fixture_coin = fixtureModule(b, target, optimize, sdk, "test/fixtures/sdk_project/items/coin.zig");
     const fixture_hud_label = fixtureModule(b, target, optimize, sdk, "test/fixtures/sdk_project/ui/hud_label.zig");
+    // Two versions of one script for the migration tests; both files are
+    // named mover.zig, so their type names agree as two builds' do.
+    const fixture_mover_v1 = fixtureModule(b, target, optimize, sdk, "test/fixtures/migrate_v1/mover.zig");
+    const fixture_mover_v2 = fixtureModule(b, target, optimize, sdk, "test/fixtures/migrate_v2/mover.zig");
     const mod = b.createModule(.{
         .root_source_file = b.path("test/godot/convert.zig"),
         .target = target,
@@ -465,6 +469,8 @@ fn addGodotTests(
             .{ .name = "fixture_player", .module = fixture_player },
             .{ .name = "fixture_coin", .module = fixture_coin },
             .{ .name = "fixture_hud_label", .module = fixture_hud_label },
+            .{ .name = "fixture_mover_v1", .module = fixture_mover_v1 },
+            .{ .name = "fixture_mover_v2", .module = fixture_mover_v2 },
         },
     });
     const name = "sdk_godot";

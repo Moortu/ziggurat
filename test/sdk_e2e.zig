@@ -668,6 +668,45 @@ const bad_scripts = [_]BadScript{
         .decl = "pub fn _notification",
     },
     .{
+        .rel = "bad_migrate.zig",
+        .data = prelude ++
+            \\pub const extends = g.Node;
+            \\hp: i32 = 1,
+            \\pub fn migrate(self: *@This(), old: *const @This()) void {
+            \\    self.hp = old.hp;
+            \\}
+            \\
+        ,
+        .sentence = "'migrate' must be 'pub fn migrate(self: *@This(), old: z.Previous(@This())) void'.",
+        .decl = "pub fn migrate",
+    },
+    .{
+        .rel = "migrate_get_text.zig",
+        .data = prelude ++
+            \\pub const extends = g.Node;
+            \\note: z.String = .empty,
+            \\pub fn migrate(self: *@This(), old: z.Previous(@This())) void {
+            \\    if (old.get(z.String, "note")) |n| self.note = n;
+            \\}
+            \\
+        ,
+        .sentence = "old.get cannot copy 'note': its type owns an engine reference; use old.take for z.String, z.StringName, z.NodePath and z.Ref.",
+        .decl = "pub fn migrate",
+    },
+    .{
+        .rel = "migrate_take_plain.zig",
+        .data = prelude ++
+            \\pub const extends = g.Node;
+            \\hp: i32 = 1,
+            \\pub fn migrate(self: *@This(), old: z.Previous(@This())) void {
+            \\    if (old.take(i32, "hp")) |v| self.hp = v;
+            \\}
+            \\
+        ,
+        .sentence = "old.take of 'hp' as i32: take moves only z.String, z.StringName, z.NodePath and z.Ref; use old.get for a plain value.",
+        .decl = "pub fn migrate",
+    },
+    .{
         .rel = "h#a%25x[b]:c/bad_type.zig",
         .data = prelude ++
             \\pub const extends = g.Node;
