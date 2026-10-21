@@ -116,7 +116,12 @@ pub const CallError = extern struct {
 /// How the host may read a field's bytes in the defaults image (and in an
 /// instance), for the Inspector's defaults without running module code.
 /// Integers and floats are little-endian of the field's `size`; the
-/// validator checks that the size fits the kind.
+/// validator checks that the size fits the kind. For the integer, enum and
+/// flags kinds only the low `FieldDesc.bits` bits carry the value (an
+/// `enum(u3)` tag or a `packed struct` of 2 bools in one byte): the host
+/// masks the rest away, or sign-extends from bit `bits - 1` for the signed
+/// kinds, and does not rely on how the compiler filled the unused bits.
+/// A one-tag enum and an empty packed struct have size 0 and value 0.
 pub const ValueKind = enum(u32) {
     /// The host never reads it: `base` and private (`_`-prefixed) fields.
     none = 0,
@@ -139,11 +144,11 @@ pub const ValueKind = enum(u32) {
     string_empty = 8,
     /// An object handle; its default is always null.
     object_null = 9,
-    /// An enum tag, signed, of 1, 2, 4 or 8 bytes.
+    /// An enum tag, signed, of 0, 1, 2, 4 or 8 bytes.
     enum_signed = 10,
-    /// An enum tag, unsigned, of 1, 2, 4 or 8 bytes.
+    /// An enum tag, unsigned, of 0, 1, 2, 4 or 8 bytes.
     enum_unsigned = 11,
-    /// A packed struct's backing integer (unsigned) of 1, 2, 4 or 8 bytes.
+    /// A packed struct's backing integer (unsigned) of 0, 1, 2, 4 or 8 bytes.
     flags = 12,
     /// The host must not decode it.
     other = 13,
@@ -151,10 +156,17 @@ pub const ValueKind = enum(u32) {
 
 /// One field of the instance struct, `base` and private fields included.
 /// Exact type identity (for moving a field between generations) is equal
-/// `type_name`, `shape`, `size` and `align`.
+/// `type_name`, `shape`, `size` and `align`. The validator guarantees that
+/// `offset` is a multiple of `align` and that `align` is at most the
+/// script's `instance_align`.
 pub const FieldDesc = extern struct {
     name: Str,
-    /// The Zig type name (`@typeName`), for example `i32` or `player.Mood`.
+    /// The Zig type name (`@typeName`), for example `i32` or `player.Mood`,
+    /// with Zig's anonymous-type counters removed (`player__struct_785`
+    /// becomes `player__struct`): the counter depends on what else the
+    /// compiler analysed first, so it is not stable between builds. Two
+    /// anonymous types of one parent can then share a name; `shape` tells
+    /// them apart.
     type_name: Str,
     /// 0 for types whose name fixes their layout (scalars, pointers, engine
     /// values, SDK handles). For struct, array, union, enum and packed
@@ -167,6 +179,9 @@ pub const FieldDesc = extern struct {
     @"align": u32,
     /// A `ValueKind`.
     value_kind: u32,
+    /// The logical width in bits of an integer, enum or flags value
+    /// (`@bitSizeOf`), at most `8 * size`; 0 for every other kind.
+    bits: u32,
 };
 
 pub const ArgDesc = extern struct {
@@ -510,7 +525,7 @@ const HashTest = struct {
     }
 
     fn field(name: []const u8, type_name: []const u8, shape: u64, offset: u32) FieldDesc {
-        return .{ .name = str(name), .type_name = str(type_name), .shape = shape, .offset = offset, .size = 4, .@"align" = 4, .value_kind = @backingInt(ValueKind.int_signed) };
+        return .{ .name = str(name), .type_name = str(type_name), .shape = shape, .offset = offset, .size = 4, .@"align" = 4, .value_kind = @backingInt(ValueKind.int_signed), .bits = 32 };
     }
 
     fn desc(fields: []const FieldDesc, defaults: *const anyopaque) ScriptDesc {
@@ -591,6 +606,7 @@ test "layout pinned" {
     try std.testing.expectEqual(@as(usize, 208), @sizeOf(ScriptDesc));
     try std.testing.expectEqual(@as(usize, 136), @offsetOf(ScriptDesc, "create"));
     try std.testing.expectEqual(@as(usize, 144), @offsetOf(ScriptDesc, "create_blank"));
-    try std.testing.expectEqual(@as(usize, 56), @sizeOf(FieldDesc));
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(FieldDesc));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(FieldDesc, "bits"));
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(PrevView));
 }

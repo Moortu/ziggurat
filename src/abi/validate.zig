@@ -393,11 +393,24 @@ const Ctx = struct {
             if (f.@"align" == 0 or f.@"align" > 4096 or !std.math.isPowerOfTwo(f.@"align")) {
                 return c.fail(error.BadLayout, "has field {d} \"{f}\" with alignment {d}, which is not a power of two up to 4096.", .{ i, Clip{ .s = name }, f.@"align" });
             }
+            if (f.@"align" > s.instance_align) {
+                return c.fail(error.BadLayout, "has field {d} \"{f}\" with alignment {d}, above the instance alignment {d}.", .{ i, Clip{ .s = name }, f.@"align", s.instance_align });
+            }
+            if (f.offset % f.@"align" != 0) {
+                return c.fail(error.BadLayout, "has field {d} \"{f}\" at offset {d}, which is not a multiple of its alignment {d}.", .{ i, Clip{ .s = name }, f.offset, f.@"align" });
+            }
             if (f.value_kind >= value_kind_count) {
                 return c.fail(error.BadType, "has field {d} \"{f}\" with value kind {d}, above the maximum {d}.", .{ i, Clip{ .s = name }, f.value_kind, value_kind_count - 1 });
             }
             if (!kindSizeOk(f.value_kind, f.size)) {
                 return c.fail(error.BadType, "has field {d} \"{f}\" of value kind {s} with size {d}, which that kind cannot have.", .{ i, Clip{ .s = name }, @tagName(@as(abi.ValueKind, @fromBackingInt(@intCast(f.value_kind)))), f.size });
+            }
+            if (hasBits(f.value_kind)) {
+                if (f.bits > @as(u64, f.size) * 8) {
+                    return c.fail(error.BadType, "has field {d} \"{f}\" with {d} bits, more than its {d} bytes hold.", .{ i, Clip{ .s = name }, f.bits, f.size });
+                }
+            } else if (f.bits != 0) {
+                return c.fail(error.BadType, "has field {d} \"{f}\" of value kind {s} with {d} bits; only integer, enum and flags kinds have bits.", .{ i, Clip{ .s = name }, @tagName(@as(abi.ValueKind, @fromBackingInt(@intCast(f.value_kind)))), f.bits });
             }
         }
 
@@ -449,12 +462,23 @@ fn kindSizeOk(kind: u32, size: u32) bool {
     return switch (@as(abi.ValueKind, @fromBackingInt(@intCast(kind)))) {
         .none, .other => true,
         .bool => size == 1,
-        .int_signed, .int_unsigned, .enum_signed, .enum_unsigned, .flags => int_size,
+        .int_signed, .int_unsigned => int_size,
+        // A one-tag enum and an empty packed struct take no bytes.
+        .enum_signed, .enum_unsigned, .flags => int_size or size == 0,
         .float => size == 4 or size == 8,
         .vector_f32 => size % 4 == 0 and size >= 8 and size <= 64,
         .vector_i32 => size % 4 == 0 and size >= 8 and size <= 16,
         .color => size == 16,
         .string_empty, .object_null => size >= 1,
+    };
+}
+
+/// The kinds whose `FieldDesc.bits` is a logical width; others have 0.
+fn hasBits(kind: u32) bool {
+    if (kind >= value_kind_count) return false;
+    return switch (@as(abi.ValueKind, @fromBackingInt(@intCast(kind)))) {
+        .int_signed, .int_unsigned, .enum_signed, .enum_unsigned, .flags => true,
+        else => false,
     };
 }
 
@@ -595,8 +619,8 @@ const Fixture = struct {
         // Script 0 has content; script 1 is bare.
         var x = &f.scripts[0];
         x.field_count = 2;
-        f.fields[0][0] = .{ .name = lit("hp"), .type_name = lit("i32"), .shape = 0, .offset = 0, .size = 4, .@"align" = 4, .value_kind = @backingInt(abi.ValueKind.int_signed) };
-        f.fields[0][1] = .{ .name = lit("name"), .type_name = lit("own.String"), .shape = 0, .offset = 8, .size = 16, .@"align" = 8, .value_kind = @backingInt(abi.ValueKind.string_empty) };
+        f.fields[0][0] = .{ .name = lit("hp"), .type_name = lit("i32"), .shape = 0, .offset = 0, .size = 4, .@"align" = 4, .value_kind = @backingInt(abi.ValueKind.int_signed), .bits = 32 };
+        f.fields[0][1] = .{ .name = lit("name"), .type_name = lit("own.String"), .shape = 0, .offset = 8, .size = 16, .@"align" = 8, .value_kind = @backingInt(abi.ValueKind.string_empty), .bits = 0 };
         x.property_count = 2;
         f.props[0][0] = .{ .name = lit("hp"), .field_index = 0, .variant_type = 2, .class_name = no_str, .hint = 0, .hint_string = no_str, .usage = 6 };
         f.props[0][1] = .{ .name = lit("name"), .field_index = abi.no_field, .variant_type = 0, .class_name = no_str, .hint = 0, .hint_string = lit("Ünï"), .usage = 6 };
@@ -1040,12 +1064,45 @@ test "validate v2 field rules" {
             f.fields[0][0].value_kind = @backingInt(abi.ValueKind.color);
         }
     }.m, error.BadType, "of value kind color with size 4");
+    // bits: at most what the size holds, and only for integer, enum and
+    // flags kinds.
+    try expectRule(struct {
+        fn m(f: *Fixture) void {
+            f.fields[0][0].bits = 33;
+        }
+    }.m, error.BadType, "has field 0 \"hp\" with 33 bits, more than its 4 bytes hold.");
+    try expectRule(struct {
+        fn m(f: *Fixture) void {
+            f.fields[0][1].bits = 8;
+        }
+    }.m, error.BadType, "has field 1 \"name\" of value kind string_empty with 8 bits; only integer, enum and flags kinds have bits.");
+    // offset a multiple of align; align at most the instance's.
+    try expectRule(struct {
+        fn m(f: *Fixture) void {
+            f.fields[0][0].offset = 2;
+        }
+    }.m, error.BadLayout, "has field 0 \"hp\" at offset 2, which is not a multiple of its alignment 4.");
+    try expectRule(struct {
+        fn m(f: *Fixture) void {
+            f.fields[0][0].@"align" = 16;
+        }
+    }.m, error.BadLayout, "has field 0 \"hp\" with alignment 16, above the instance alignment 8.");
     // create_blank: never null.
     try expectRule(struct {
         fn m(f: *Fixture) void {
             @memset(std.mem.asBytes(&f.scripts[0].create_blank), 0);
         }
     }.m, error.NullPointer, "Script \"a/x.zig\" has a null create_blank function pointer.");
+}
+
+test "validate accepts zero-size enum and flags fields" {
+    var f = Fixture.init();
+    f.link();
+    f.scripts[0].field_count = 4;
+    f.fields[0][2] = .{ .name = lit("hit"), .type_name = lit("Node"), .shape = 5, .offset = 4, .size = 0, .@"align" = 1, .value_kind = @backingInt(abi.ValueKind.enum_unsigned), .bits = 0 };
+    f.fields[0][3] = .{ .name = lit("died"), .type_name = lit("Node2D"), .shape = 6, .offset = 4, .size = 0, .@"align" = 1, .value_kind = @backingInt(abi.ValueKind.flags), .bits = 0 };
+    var diag: [256]u8 = undefined;
+    try f.check(.{}, &diag);
 }
 
 test "validate value kind sizes" {
@@ -1056,12 +1113,15 @@ test "validate value kind sizes" {
         .{ .float, 8 },         .{ .vector_f32, 8 },   .{ .vector_f32, 64 },  .{ .vector_i32, 16 },
         .{ .color, 16 },        .{ .string_empty, 8 }, .{ .object_null, 8 },  .{ .enum_signed, 1 },
         .{ .enum_unsigned, 4 }, .{ .flags, 8 },
+        // A one-tag enum and an empty packed struct take no bytes.
+               .{ .enum_signed, 0 },  .{ .enum_unsigned, 0 },
+        .{ .flags, 0 },
     };
     for (ok) |c| try testing.expect(kindSizeOk(@backingInt(c[0]), c[1]));
     const bad = [_]struct { K, u32 }{
         .{ .bool, 4 },        .{ .int_signed, 3 },  .{ .int_unsigned, 16 }, .{ .float, 2 },
         .{ .vector_f32, 4 },  .{ .vector_f32, 68 }, .{ .vector_f32, 10 },   .{ .vector_i32, 20 },
-        .{ .color, 32 },      .{ .enum_signed, 0 }, .{ .flags, 5 },         .{ .string_empty, 0 },
+        .{ .color, 32 },      .{ .int_signed, 0 },  .{ .flags, 5 },         .{ .string_empty, 0 },
         .{ .object_null, 0 },
     };
     for (bad) |c| try testing.expect(!kindSizeOk(@backingInt(c[0]), c[1]));
@@ -1378,6 +1438,8 @@ fn mustReject(f: *const Fixture) bool {
                 if (nameBad(fd.name) or @as(u64, fd.offset) + fd.size > sc.instance_size) return true;
                 if (nameBad(fd.type_name) or !kindSizeOk(fd.value_kind, fd.size)) return true;
                 if (fd.@"align" == 0 or fd.@"align" > 4096 or !std.math.isPowerOfTwo(fd.@"align")) return true;
+                if (fd.@"align" > sc.instance_align or fd.offset % fd.@"align" != 0) return true;
+                if (if (hasBits(fd.value_kind)) fd.bits > @as(u64, fd.size) * 8 else fd.bits != 0) return true;
             }
         }
         if (sc.property_count > 0) {

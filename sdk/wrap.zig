@@ -109,7 +109,7 @@ pub fn Wrappers(
         }
 
         pub fn create(owner: *anyopaque, gen: u32) callconv(.c) ?*anyopaque {
-            const raw = make(owner, gen) orelse return null;
+            const raw = make(owner, gen, "create") orelse return null;
             if (comptime hasPub("init")) S.init(@ptrCast(@alignCast(raw)));
             return raw;
         }
@@ -117,15 +117,16 @@ pub fn Wrappers(
         /// `create` without `init`: the host moves the fields of an older
         /// generation's instance in next.
         pub fn createBlank(owner: *anyopaque, gen: u32) callconv(.c) ?*anyopaque {
-            return make(owner, gen);
+            return make(owner, gen, "create_blank");
         }
 
-        /// A new instance at its defaults with `base` set, or null (logged).
-        fn make(owner: *anyopaque, gen: u32) ?*anyopaque {
+        /// A new instance at its defaults with `base` set, or null (logged;
+        /// `what` names the entry point in the log line).
+        fn make(owner: *anyopaque, gen: u32, what: []const u8) ?*anyopaque {
             // Without moduleInit there is no allocator and no log.
             const h = runtime.hostApi() orelse return null;
             if (gen != runtime.generation()) {
-                runtime.log(.err, "ziggurat: {s}: create got generation {d}, but this module is generation {d}.", .{ rt([]const u8, rel), gen, runtime.generation() });
+                runtime.log(.err, "ziggurat: {s}: {s} got generation {d}, but this module is generation {d}.", .{ rt([]const u8, rel), what, gen, runtime.generation() });
                 return null;
             }
             const raw = h.alloc(gen, alloc_size, alloc_align) orelse {

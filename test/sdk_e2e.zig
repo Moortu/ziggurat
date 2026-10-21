@@ -434,6 +434,123 @@ const prelude =
     \\
 ;
 
+/// A script with inline anonymous field types, a union over a named tag and
+/// two different anonymous structs. `tag_values` is the body of `Tag`.
+fn anonScript(comptime tag_values: []const u8) []const u8 {
+    return prelude ++
+        \\pub const extends = g.Node;
+        \\mode: enum { idle, run } = .idle,
+        \\layers: packed struct { ground: bool = true, water: bool = false } = .{},
+        \\_inner: struct { v: i32 = 0, w: f32 = 0 } = .{},
+        \\_a: struct { x: i32 = 0 } = .{},
+        \\_b: struct { y: i32 = 0 } = .{},
+        \\_u: U = .{ .a = 0 },
+        \\_opt: ?struct { k: [2]enum { p, q } = .{ .p, .q } } = null,
+        \\pub const U = union(Tag) { a: i32, b: f32 };
+        \\
+    ++ "pub const Tag = enum(u8) { " ++ tag_values ++ " };\n";
+}
+
+/// Analysed before `s.zig` (paths sort first): it resolves more anonymous
+/// types, which moves Zig's counters for the types analysed after it.
+const anon_first = prelude ++
+    \\pub const extends = g.Node;
+    \\_p: struct { a: u8 = 0 } = .{},
+    \\_q: enum { x, y } = .x,
+    \\_r: union { a: i32, b: u8 } = .{ .a = 0 },
+    \\_s: packed struct { a: bool = false } = .{},
+    \\_t: struct { z: struct { y: u8 = 0 } = .{} } = .{},
+    \\pub fn touch(self: *@This()) i64 {
+    \\    const L = struct { k: u8, m: enum { u, v } };
+    \\    _ = self;
+    \\    return @sizeOf(L);
+    \\}
+    \\
+;
+
+const FieldSnap = struct { name: []const u8, type_name: []const u8, shape: u64, bits: u32 };
+const ScriptSnap = struct { fields: []const FieldSnap, layout_hash: u64 };
+
+/// Builds `files` in a fresh project and copies the fields of `rel`.
+fn snapFields(a: std.mem.Allocator, files: []const File, rel: []const u8) !ScriptSnap {
+    var h: Harness = undefined;
+    try h.initOpts(files, .{ .check_tables = true });
+    defer h.deinit();
+    const o = try h.build(.open);
+    try expectOk(o);
+    const l = try Loaded.open(o.generation orelse return error.NoGeneration);
+    defer l.close();
+    try l.validate();
+    for (l.scripts()) |*d| {
+        if (!std.mem.eql(u8, str(d.path), rel)) continue;
+        const out = try a.alloc(FieldSnap, d.field_count);
+        for (d.fields[0..d.field_count], out) |f, *fs| fs.* = .{
+            .name = try a.dupe(u8, str(f.name)),
+            .type_name = try a.dupe(u8, str(f.type_name)),
+            .shape = f.shape,
+            .bits = f.bits,
+        };
+        return .{ .fields = out, .layout_hash = abi.layoutHash(d) };
+    }
+    return error.ScriptMissing;
+}
+
+fn snapField(s: ScriptSnap, name: []const u8) !FieldSnap {
+    for (s.fields) |f| {
+        if (std.mem.eql(u8, f.name, name)) return f;
+    }
+    return error.FieldMissing;
+}
+
+/// True when `name` still holds one of Zig's anonymous-type counters.
+fn hasCounter(name: []const u8) bool {
+    for ([_][]const u8{ "__struct_", "__enum_", "__union_", "__opaque_" }) |m| {
+        var at: usize = 0;
+        while (std.mem.indexOfPos(u8, name, at, m)) |k| : (at = k + 1) {
+            if (k + m.len < name.len and std.ascii.isDigit(name[k + m.len])) return true;
+        }
+    }
+    return false;
+}
+
+test "integration: type names and shapes are stable across builds" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v1 = anonScript("a = 1, b = 0");
+
+    // The same script alone and after another script full of anonymous types.
+    const alone = try snapFields(a, &.{.{ .rel = "s.zig", .data = v1 }}, "s.zig");
+    const after = try snapFields(a, &.{ .{ .rel = "0first.zig", .data = anon_first }, .{ .rel = "s.zig", .data = v1 } }, "s.zig");
+    try testing.expectEqual(alone.fields.len, after.fields.len);
+    for (alone.fields, after.fields) |x, y| {
+        errdefer std.debug.print("field {s}: {s} / {s}\n", .{ x.name, x.type_name, y.type_name });
+        try testing.expect(!hasCounter(x.type_name));
+        try testing.expectEqualStrings(x.type_name, y.type_name);
+        try testing.expectEqual(x.shape, y.shape);
+    }
+    try testing.expectEqual(alone.layout_hash, after.layout_hash);
+
+    // Two different anonymous structs: one name, told apart by shape.
+    const fa = try snapField(alone, "_a");
+    const fb = try snapField(alone, "_b");
+    try testing.expectEqualStrings(fa.type_name, fb.type_name);
+    try testing.expect(fa.shape != 0 and fb.shape != 0 and fa.shape != fb.shape);
+    // The logical bit widths of the enum and the flags.
+    try testing.expectEqual(@as(u32, 1), (try snapField(alone, "mode")).bits);
+    try testing.expectEqual(@as(u32, 2), (try snapField(alone, "layers")).bits);
+
+    // Only the tag values change: the union keeps its name, not its shape.
+    const v2 = try snapFields(a, &.{.{ .rel = "s.zig", .data = anonScript("a = 0, b = 1") }}, "s.zig");
+    const union1 = try snapField(alone, "_u");
+    const union2 = try snapField(v2, "_u");
+    try testing.expectEqualStrings(union1.type_name, union2.type_name);
+    try testing.expect(union1.shape != union2.shape);
+    try testing.expect(alone.layout_hash != v2.layout_hash);
+}
+
 const bad_scripts = [_]BadScript{
     .{
         .rel = "bad_getter.zig",

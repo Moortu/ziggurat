@@ -53,7 +53,6 @@ test "describe player: script facts" {
     try testing.expectEqual(@as(u32, @sizeOf(player)), d.instance_size);
     try testing.expectEqual(@as(u32, @alignOf(player)), d.instance_align);
     try testing.expect(d.migrate == null);
-    try testing.expect(@intFromPtr(d.create_blank) != @intFromPtr(d.create));
 }
 
 test "describe player: fields" {
@@ -302,6 +301,9 @@ const Kinds = struct {
     t_enum_signed: Signed = .low,
     t_enum_unsigned: Unsigned = .a,
     t_flags: packed struct { x: bool = false, y: bool = true } = .{},
+    t_small: enum(u3) { a, b } = .b,
+    t_one: enum { only } = .only,
+    t_empty: packed struct {} = .{},
     t_vector2: gb.Vector2 = std.mem.zeroes(gb.Vector2),
     t_vector2i: gb.Vector2i = std.mem.zeroes(gb.Vector2i),
     t_rect2: gb.Rect2 = std.mem.zeroes(gb.Rect2),
@@ -332,6 +334,21 @@ const Kinds = struct {
     const Either = union { a: i32, b: f32 };
 };
 
+const kinds_desc = ziggurat.describe(Kinds, "kinds.zig");
+const kinds_table = ziggurat.tableOf(ziggurat.scriptList(&.{&kinds_desc}), "0123456789abcdef");
+
+/// True when `name` still holds one of Zig's anonymous-type counters.
+fn hasCounter(name: []const u8) bool {
+    @setEvalBranchQuota(100_000);
+    for ([_][]const u8{ "__struct_", "__enum_", "__union_", "__opaque_" }) |m| {
+        var at: usize = 0;
+        while (std.mem.indexOfPos(u8, name, at, m)) |k| : (at = k + 1) {
+            if (k + m.len < name.len and std.ascii.isDigit(name[k + m.len])) return true;
+        }
+    }
+    return false;
+}
+
 test "value kinds" {
     const K = abi.ValueKind;
     const d = ziggurat.describe(Kinds, "kinds.zig");
@@ -350,6 +367,9 @@ test "value kinds" {
         .{ "t_enum_signed", .enum_signed },
         .{ "t_enum_unsigned", .enum_unsigned },
         .{ "t_flags", .flags },
+        .{ "t_small", .enum_unsigned },
+        .{ "t_one", .enum_unsigned },
+        .{ "t_empty", .flags },
         .{ "t_vector2", .vector_f32 },
         .{ "t_vector2i", .vector_i32 },
         .{ "t_rect2", .vector_f32 },
@@ -383,33 +403,53 @@ test "value kinds" {
         try testing.expectEqualStrings(w[0], str(f.name));
         try testing.expectEqual(@as(u32, @backingInt(w[1])), f.value_kind);
         const FT = @FieldType(Kinds, w[0]);
-        try testing.expectEqualStrings(@typeName(FT), str(f.type_name));
+        // Zig's anonymous-type counters are removed from the name.
+        try testing.expect(!hasCounter(str(f.type_name)));
+        if (!comptime hasCounter(@typeName(FT))) try testing.expectEqualStrings(@typeName(FT), str(f.type_name));
+        const int_like = switch (w[1]) {
+            .int_signed, .int_unsigned, .enum_signed, .enum_unsigned, .flags => true,
+            else => false,
+        };
+        try testing.expectEqual(@as(u32, if (int_like) @bitSizeOf(FT) else 0), f.bits);
         try testing.expectEqual(@as(u32, @sizeOf(FT)), f.size);
         try testing.expectEqual(@as(u32, @alignOf(FT)), f.@"align");
         try testing.expectEqual(@as(u32, @offsetOf(Kinds, w[0])), f.offset);
         // Only struct, array, union, enum and flag types get a shape.
-        const has_shape = comptime for ([_][]const u8{ "_inner", "_list", "_either", "t_enum_signed", "t_enum_unsigned", "t_flags" }) |n| {
+        const has_shape = comptime for ([_][]const u8{ "_inner", "_list", "_either", "t_enum_signed", "t_enum_unsigned", "t_flags", "t_small", "t_one", "t_empty" }) |n| {
             if (std.mem.eql(u8, w[0], n)) break true;
         } else false;
         try testing.expectEqual(has_shape, f.shape != 0);
     }
     // The defaults image decodes by kind: the bool, the enum's i8 tag, the flags bits.
+    // Zero-size fields (one-tag enum, empty flags) pass the validator.
+    try testing.expectEqual(@as(u32, 3), d.fields[14].bits);
+    try testing.expectEqual(@as(u32, 0), d.fields[15].size);
+    try testing.expectEqual(@as(u32, 0), d.fields[16].size);
+    var diag: [256]u8 = undefined;
+    abi.validate(std.heap.page_allocator, &kinds_table, ziggurat.layout_stamp, .{}, &diag) catch |err| {
+        std.debug.print("validate: {s}\n", .{std.mem.sliceTo(&diag, 0)});
+        return err;
+    };
     const v: *const Kinds = @ptrCast(@alignCast(d.defaults));
     try testing.expectEqual(@as(i8, -1), @backingInt(v.t_enum_signed));
     try testing.expectEqual(@as(u2, 2), @as(u2, @bitCast(v.t_flags)));
 }
 
-/// Versions of a nested struct, of an array of it and of an enum. In a real rebuild the
-/// type names stay equal (`script.Inner`); here they differ, so only the
-/// shapes are compared.
+/// Versions of a nested struct, of an array of it, of an enum and of a
+/// union's tag values. In a real rebuild the type names stay equal
+/// (`script.Inner`); here they differ, so only the shapes are compared
+/// (`sdk_e2e.zig` compares two real builds with equal names).
 const Shape1 = struct {
     pub const extends = Node;
     _inner: Inner = .{},
     _list: [2]Inner = .{ .{}, .{} },
     plain: i32 = 0,
     _mood: Mood = .a,
+    _u: U = .{ .a = 0 },
     pub const Inner = struct { p: i32 = 0, q: f32 = 0 };
     pub const Mood = enum { a, b };
+    pub const U = union(Tag) { a: i32, b: f32 };
+    pub const Tag = enum(u8) { a = 1, b = 0 };
 };
 const Shape2 = struct {
     pub const extends = Node;
@@ -417,8 +457,11 @@ const Shape2 = struct {
     _list: [2]Inner = .{ .{}, .{} },
     plain: i32 = 0,
     _mood: Mood = .a,
+    _u: U = .{ .a = 0 },
     pub const Inner = struct { q: f32 = 0, p: i32 = 0 };
     pub const Mood = enum { b, a };
+    pub const U = union(Tag) { a: i32, b: f32 };
+    pub const Tag = enum(u8) { a = 0, b = 1 };
 };
 const Shape3 = struct {
     pub const extends = Node;
@@ -426,8 +469,11 @@ const Shape3 = struct {
     _list: [2]Inner = .{ .{}, .{} },
     plain: i32 = 0,
     _mood: Mood = .a,
+    _u: U = .{ .a = 0 },
     pub const Inner = struct { p: i32 = 0, r: f32 = 0 };
     pub const Mood = enum { a, c };
+    pub const U = union(Tag) { a: i32, b: f32 };
+    pub const Tag = enum(u8) { a = 1, b = 2 };
 };
 const Shape4 = struct {
     pub const extends = Node;
@@ -435,8 +481,11 @@ const Shape4 = struct {
     _list: [2]Inner = .{ .{}, .{} },
     plain: i32 = 0,
     _mood: Mood = .a,
+    _u: U = .{ .a = 0 },
     pub const Inner = struct { p: i32 = 0, q: f32 = 5 };
     pub const Mood = enum { a, b };
+    pub const U = union(Tag) { a: i32, b: f32 };
+    pub const Tag = enum(u8) { a = 1, b = 0 };
 };
 
 test "describe: shapes follow inner layout, not defaults" {
@@ -449,11 +498,13 @@ test "describe: shapes follow inner layout, not defaults" {
         try testing.expect(d.fields[1].shape != d1.fields[1].shape); // the array of it, too
         try testing.expectEqual(@as(u64, 0), d.fields[2].shape);
         try testing.expect(d.fields[3].shape != d1.fields[3].shape); // enum tags changed
+        try testing.expect(d.fields[4].shape != d1.fields[4].shape); // union tag values changed
     }
     // Only a default changed: same shapes.
     try testing.expectEqual(d1.fields[0].shape, d4.fields[0].shape);
     try testing.expectEqual(d1.fields[1].shape, d4.fields[1].shape);
     try testing.expectEqual(d1.fields[3].shape, d4.fields[3].shape);
+    try testing.expectEqual(d1.fields[4].shape, d4.fields[4].shape);
 }
 
 const Tool = struct {

@@ -290,8 +290,8 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             for (info.field_names, info.field_types, info.field_attrs) |name, FT, attrs| {
                 checkName(name, "Field '" ++ clip(name) ++ "'", name);
                 if (attrs.@"comptime") fail(name, "Field '" ++ name ++ "' must not be comptime.");
-                if (@typeName(FT).len > limits.max_string)
-                    fail(name, std.fmt.comptimePrint("Field '{s}' has a type whose name is {d} bytes long; the limit is {d}.", .{ name, @typeName(FT).len, limits.max_string }));
+                if (stableTypeName(FT).len > limits.max_string)
+                    fail(name, std.fmt.comptimePrint("Field '{s}' has a type whose name is {d} bytes long; the limit is {d}.", .{ name, stableTypeName(FT).len, limits.max_string }));
                 if (eql(name, "base")) {
                     if (FT != *Extends)
                         fail("base", "Field 'base' must have type *" ++ shortName(Extends) ++ ".");
@@ -490,14 +490,19 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             @setEvalBranchQuota(quota);
             var out: [info.field_names.len]abi.FieldDesc = undefined;
             for (info.field_names, info.field_types, 0..) |name, FT, i| {
+                const kind: abi.ValueKind = if (exported(name)) valueKind(FT) else .none;
                 out[i] = .{
                     .name = str(name),
-                    .type_name = str(@typeName(FT)),
+                    .type_name = str(stableTypeName(FT)),
                     .shape = shapeOf(FT),
                     .offset = @offsetOf(S, name),
                     .size = @sizeOf(FT),
                     .@"align" = @alignOf(FT),
-                    .value_kind = @backingInt(if (exported(name)) valueKind(FT) else abi.ValueKind.none),
+                    .value_kind = @backingInt(kind),
+                    .bits = switch (kind) {
+                        .int_signed, .int_unsigned, .enum_signed, .enum_unsigned, .flags => @bitSizeOf(FT),
+                        else => 0,
+                    },
                 };
             }
             const final = out;
@@ -519,11 +524,11 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
         // ---- methods ----
 
         fn checkMethods() void {
-            for (method_decls) |d| {
+            for (method_decls, method_names) |d, godot_name| {
                 const f = @typeInfo(@TypeOf(@field(S, d))).@"fn";
                 if (f.param_types.len - 1 > limits.max_args)
                     fail(d, std.fmt.comptimePrint("Method '{s}' takes {d} arguments; Godot allows at most {d}.", .{ clip(d), f.param_types.len - 1, limits.max_args }));
-                checkLength(d, "The Godot name of method '" ++ clip(d) ++ "'", godotMethodName(d));
+                checkLength(d, "The Godot name of method '" ++ clip(d) ++ "'", godot_name);
                 for (f.param_types[1..]) |maybe_p| {
                     const P = maybe_p orelse
                         fail(d, "Method '" ++ d ++ "' has a parameter of type anytype, which Godot cannot pass.");
@@ -556,6 +561,15 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             }
         }
 
+        /// The Godot name of each method in `method_decls`, computed once.
+        const method_names: []const []const u8 = blk: {
+            @setEvalBranchQuota(quota);
+            var out: [method_decls.len][]const u8 = undefined;
+            for (method_decls, 0..) |d, i| out[i] = godotMethodName(d);
+            const final = out;
+            break :blk &final;
+        };
+
         fn godotMethodName(comptime d: []const u8) []const u8 {
             if (metaIdentifier(d, "name")) |n| return n;
             if (!isIdentifier(d)) fail(d, "Method '" ++ d ++ "' needs a name override in meta, because its name is not an identifier.");
@@ -586,7 +600,7 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                 const args = methodArgs(d);
                 const R = own.ReturnValue(f.return_type.?);
                 out[i] = .{
-                    .name = str(godotMethodName(d)),
+                    .name = str(method_names[i]),
                     .args = args.ptr,
                     .arg_count = args.len,
                     .ret = if (R == void) argDesc("", void) else argDesc("", R),
@@ -697,8 +711,7 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
                     k += 1;
                 }
             }
-            for (method_decls, 0..) |d, j| {
-                const g = godotMethodName(d);
+            for (method_decls, method_names, 0..) |d, g, j| {
                 if (!eql(g, d)) {
                     buf[k] = .{ .zig = d, .godot = g, .marker = d, .pos = info.field_names.len + j };
                     k += 1;
@@ -759,17 +772,24 @@ fn Script(comptime S: type, comptime rel: []const u8) type {
             }
             if (isPub("_notification") and !fnMatches("_notification", &.{ *S, i32 }, void))
                 fail("_notification", "'_notification' must be 'pub fn _notification(self: *@This(), what: i32) void'.");
-            for (info.field_names, info.field_types) |name, FT| {
-                if (!exported(name)) continue;
+            // Overrides are `pub fn get_<field>` and `set_<field>`. Most
+            // scripts have none, so the declarations are scanned for the
+            // prefixes instead of building both names for every field.
+            for (info.decl_names) |d| {
+                const is_getter = std.mem.startsWith(u8, d, "get_");
+                if (!is_getter and !std.mem.startsWith(u8, d, "set_")) continue;
+                const name = d[4..];
+                if (!@hasField(S, name) or !exported(name)) continue;
+                const FT = @FieldType(S, name);
                 const A = own.Access(FT);
                 const spelled = if (own.isText(FT)) shortName(A) else @typeName(A);
                 const getter = "get_" ++ name;
-                if (isPub(getter) and !getterMatches(getter, FT))
+                if (is_getter and !getterMatches(getter, FT))
                     fail(getter, "'" ++ getter ++ "' overrides reading '" ++ name ++ "' and must be 'pub fn " ++ getter ++ "(self: *const @This()) " ++ spelled ++ "'" ++
                         (if (own.isText(FT)) " or *const " ++ spelled ++ " (as self." ++ name ++ ".get() gives it)" else "") ++
                         (if (own.ownsEngineValue(A)) " (or return z.Owned(" ++ spelled ++ ") for a new value)" else "") ++ ".");
                 const setter = "set_" ++ name;
-                if (isPub(setter) and !fnMatches(setter, &.{ *S, A }, void))
+                if (!is_getter and !fnMatches(setter, &.{ *S, A }, void))
                     fail(setter, "'" ++ setter ++ "' overrides writing '" ++ name ++ "' and must be 'pub fn " ++ setter ++ "(self: *@This(), value: " ++ spelled ++ ") void'" ++
                         (if (own.isText(FT)) "; the value is borrowed, so store it with self." ++ name ++ ".set(value)" else if (own.ownsEngineValue(A)) "; the value is borrowed, so store it with z.assign" else "") ++ ".");
             }
@@ -1013,7 +1033,7 @@ fn shapeHash(comptime T: type) u64 {
             for (s.field_names, s.field_types, s.field_attrs) |name, FT, attrs| {
                 if (attrs.@"comptime") continue;
                 hashStr(&h, name);
-                hashStr(&h, @typeName(FT));
+                hashStr(&h, stableTypeName(FT));
                 hashInt(&h, if (s.layout == .@"packed") @bitOffsetOf(T, name) else @offsetOf(T, name));
                 hashInt(&h, shapeOf(FT));
             }
@@ -1026,16 +1046,19 @@ fn shapeHash(comptime T: type) u64 {
         .@"union" => |u| {
             hashInt(&h, 3);
             hashInt(&h, @backingInt(u.layout));
-            hashStr(&h, if (u.tag_type) |Tag| @typeName(Tag) else "");
+            // The tag enum by its shape (tag names and values), not its
+            // name: the stored tag selects the field, so new values under
+            // an old name must not count as the same type.
+            if (u.tag_type) |Tag| hashInt(&h, shapeOf(Tag)) else hashInt(&h, 0);
             for (u.field_names, u.field_types) |name, FT| {
                 hashStr(&h, name);
-                hashStr(&h, @typeName(FT));
+                hashStr(&h, stableTypeName(FT));
                 hashInt(&h, shapeOf(FT));
             }
         },
         .@"enum" => |e| {
             hashInt(&h, 4);
-            hashStr(&h, @typeName(e.tag_type));
+            hashStr(&h, @typeName(e.tag_type)); // an integer type: no counter
             hashInt(&h, @backingInt(e.mode));
             for (e.field_names, e.field_values) |name, value| {
                 hashStr(&h, name);
@@ -1046,6 +1069,44 @@ fn shapeHash(comptime T: type) u64 {
     }
     const v = h.final();
     return if (v == 0) 1 else v;
+}
+
+/// `@typeName(T)` without Zig's anonymous-type counters: every
+/// `__struct_<digits>`, `__enum_<digits>`, `__union_<digits>` and
+/// `__opaque_<digits>` (also inside `?`, `[N]` and generic arguments)
+/// loses its `_<digits>`. The counter depends on what the compiler analysed
+/// before, so it differs between builds of the same source; the field's
+/// `shape` tells two anonymous types of one parent apart.
+fn stableTypeName(comptime T: type) []const u8 {
+    const name = @typeName(T);
+    switch (@typeInfo(T)) {
+        // Their names are never anonymous; skip the scan.
+        .int, .float, .bool, .void => return name,
+        else => {},
+    }
+    return comptime blk: {
+        @setEvalBranchQuota(10_000 + 100 * name.len);
+        if (std.mem.indexOf(u8, name, "__") == null) break :blk name;
+        var out: []const u8 = "";
+        var start: usize = 0;
+        var i: usize = 0;
+        while (i + 1 < name.len) {
+            if (name[i] == '_' and name[i + 1] == '_') {
+                for ([_][]const u8{ "struct_", "enum_", "union_", "opaque_" }) |m| {
+                    const at = i + 2 + m.len; // first digit
+                    if (at < name.len and std.mem.startsWith(u8, name[i + 2 ..], m) and std.ascii.isDigit(name[at])) {
+                        var end = at;
+                        while (end < name.len and std.ascii.isDigit(name[end])) end += 1;
+                        out = out ++ name[start .. at - 1];
+                        start = end;
+                        i = end;
+                        break;
+                    }
+                } else i += 1;
+            } else i += 1;
+        }
+        break :blk out ++ name[start..];
+    };
 }
 
 fn hashInt(h: *std.hash.Wyhash, v: u64) void {
