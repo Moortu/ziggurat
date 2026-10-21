@@ -9,6 +9,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const opts = @import("host_test_options");
 const gui_opts = @import("host_gui_options");
+const stress_opts = @import("host_stress_options");
 const platform = @import("ziggurat_platform");
 const zbuild = @import("ziggurat_build");
 const abi = @import("ziggurat_abi");
@@ -42,6 +43,11 @@ const Project = struct {
     }
 
     fn initWith(p: *Project, fixture: []const u8, host_lib: []const u8) !void {
+        return p.initFrom(opts.projects_dir, fixture, host_lib);
+    }
+
+    /// As `init`, with the project `fixture` of folder `root`.
+    fn initFrom(p: *Project, root: []const u8, fixture: []const u8, host_lib: []const u8) !void {
         p.env = null;
         p.arena_state = .init(testing.allocator);
         errdefer p.arena_state.deinit();
@@ -50,7 +56,7 @@ const Project = struct {
         errdefer p.tmp.cleanup();
         const cwd = Io.Dir.cwd();
 
-        var projects = try cwd.openDir(io, opts.projects_dir, .{});
+        var projects = try cwd.openDir(io, root, .{});
         defer projects.close(io);
         var src = try projects.openDir(io, fixture, .{ .iterate = true });
         defer src.close(io);
@@ -81,8 +87,13 @@ const Project = struct {
 
     /// Copies test/host/checks/<name> into the project as `res://check.gd`.
     fn addCheck(p: *Project, name: []const u8) !void {
+        return p.addCheckFrom(opts.checks_dir, name);
+    }
+
+    /// As `addCheck`, with the file `name` of folder `dir`.
+    fn addCheckFrom(p: *Project, dir: []const u8, name: []const u8) !void {
         const cwd = Io.Dir.cwd();
-        var checks = try cwd.openDir(io, opts.checks_dir, .{});
+        var checks = try cwd.openDir(io, dir, .{});
         defer checks.close(io);
         var dst = try cwd.openDir(io, p.path, .{});
         defer dst.close(io);
@@ -92,7 +103,12 @@ const Project = struct {
     /// Adds test/host/checks/<name> as `res://check.gd` and makes it an
     /// autoload, so a `@tool` check runs inside the editor.
     fn addAutoloadCheck(p: *Project, name: []const u8) !void {
-        try p.addCheck(name);
+        return p.addAutoloadCheckFrom(opts.checks_dir, name);
+    }
+
+    /// As `addAutoloadCheck`, with the file `name` of folder `from`.
+    fn addAutoloadCheckFrom(p: *Project, from: []const u8, name: []const u8) !void {
+        try p.addCheckFrom(from, name);
         var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
         defer dir.close(io);
         const a = p.arena_state.allocator();
@@ -128,6 +144,11 @@ const Project = struct {
         expect: []const []const u8 = &.{},
         once: []const []const u8 = &.{},
         reject: []const []const u8 = &.{},
+        /// Exact output lines the runner leaves out of its leak scan.
+        allow_report: []const []const u8 = &.{},
+        /// Godot output lines starting with one of these are printed also
+        /// when the run passes.
+        echo: []const []const u8 = &.{},
         /// Seconds for the whole Godot run.
         deadline: []const u8 = deadline_s,
     };
@@ -141,8 +162,13 @@ const Project = struct {
         for (texts.expect) |text| try argv.appendSlice(a, &.{ "--expect", text });
         for (texts.once) |text| try argv.appendSlice(a, &.{ "--expect-once", text });
         for (texts.reject) |text| try argv.appendSlice(a, &.{ "--reject", text });
+        for (texts.allow_report) |text| try argv.appendSlice(a, &.{ "--allow-report", text });
+        for (texts.echo) |text| try argv.appendSlice(a, &.{ "--echo", text });
         const result = try std.process.run(a, io, .{ .argv = argv.items, .environ_map = p.env });
-        if (result.term.success()) return;
+        if (result.term.success()) {
+            if (texts.echo.len > 0) std.debug.print("{s}", .{result.stderr});
+            return;
+        }
         std.debug.print("{s}{s}", .{ result.stdout, result.stderr });
         return error.GodotRunFailed;
     }
@@ -1265,6 +1291,25 @@ test "editor reload: tool node gets new code, rejected build never loads, size w
     });
 }
 
+test "editor reload: defaults after a layout change" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("editor_defaults");
+    defer p.deinit();
+    try addBuildSettings(&p);
+    try p.addAutoloadCheck("editor_defaults.gd");
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS defaults_build_1",
+            "ZTEST PASS defaults_after_layout_change",
+            "ZTEST PASS new_instance_after_layout_change",
+            "ziggurat: build 2 loaded (save, incremental, ",
+            "ziggurat: swapped to build 2 (0 instances kept their data, 1 migrated)",
+        },
+        .deadline = build_deadline_s,
+    });
+}
+
 test "editor reload: no tool scripts loads nothing" {
     try requireIntegration();
     var p: Project = undefined;
@@ -1300,6 +1345,75 @@ test "editor reload: no tool scripts loads nothing" {
             "[ziggurat] walker ready speed=9\n",
         },
         .reject = &.{ refused_prefix, "ziggurat: build" },
+    });
+}
+
+// ------------------------------------------------------------ stress
+
+/// The ZTEST cases of test/host/stress/driver.gd.
+const stress_cases = [_][]const u8{
+    "ZTEST PASS stress_start",
+    "ZTEST PASS stress_edits_applied",
+    "ZTEST PASS saves",
+    "ZTEST PASS moved_fields",
+    "ZTEST PASS migrate_results",
+    "ZTEST PASS type_change_default",
+    "ZTEST PASS added_field_default",
+    "ZTEST PASS owned_fields_kept",
+    "ZTEST PASS new_code_no_invalid_method",
+    "ZTEST PASS defaults_match_source",
+    "ZTEST PASS placeholder_default",
+    "ZTEST PASS old_generations_released",
+    "ZTEST PASS generation_count",
+    "ZTEST PASS registry_matches_live",
+    "ZTEST PASS broken_build_keeps_last_good",
+    "ZTEST PASS nested_iteration_runs_frame",
+    "ZTEST PASS nested_iteration_defers_the_swap",
+    "ZTEST PASS threads_no_errors",
+    "ZTEST PASS instances_released",
+    // The nested frames deferred the swap: logged when the outcome changed
+    // from waiting for the holding thread to waiting for the stack.
+    "the swap to build ",
+    "waits: a script call is on the main thread's stack",
+    "waits for script calls on other threads to return",
+    "mover.zig: field 'level' was dropped (type changed)",
+    "mover.zig: field 'extra' was dropped (removed)",
+};
+
+// `zig build test` runs this with 20 edits (stress short), `zig build
+// test-stress` with 300 (test/host/stress/driver.gd; edit counts in
+// build.zig). One headless editor run.
+test "reload stress: edits with swaps, threads and nested iteration" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initFrom(stress_opts.stress_dir, "project", opts.probe_host_lib);
+    defer p.deinit();
+    try addBuildSettings(&p);
+    try p.addAutoloadCheckFrom(stress_opts.stress_dir, "driver.gd");
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+    defer dir.close(io);
+    var buf: [160]u8 = undefined;
+    // The driver's own watchdog ends the run a minute before the runner's
+    // deadline, so a stuck run still shows its output.
+    const deadline = try std.fmt.parseInt(u32, stress_opts.deadline_s, 10);
+    const cfg = try std.fmt.bufPrint(&buf, "edits={d}\nbroken_every={d}\nnested_every={d}\nwatchdog_s={d}\n", .{
+        stress_opts.edits, stress_opts.broken_every, stress_opts.nested_every, deadline -| 60,
+    });
+    try dir.writeFile(io, .{ .sub_path = "stress.cfg", .data = cfg });
+    // Godot leaks one render instance per mesh preview in a headless run:
+    // EditorInterface::make_mesh_previews (editor/editor_interface.cpp:220)
+    // skips `free_rid(inst)` through ERR_CONTINUE when the dummy renderer
+    // returns no image. Every edit that builds calls one preview; that
+    // exact report, and no other, is allowed.
+    const previews = stress_opts.edits - stress_opts.edits / stress_opts.broken_every;
+    var leak_buf: [128]u8 = undefined;
+    const leak = try std.fmt.bufPrint(&leak_buf, "ERROR: {d} RID allocations of type 'N17RendererSceneCull8InstanceE' were leaked at exit.", .{previews});
+    try p.runEditorChecked("100000000", .{
+        .expect = &stress_cases,
+        .reject = &.{ "Program crashed", "Nonexistent function", "is not usable" },
+        .allow_report = &.{leak},
+        .echo = if (stress_opts.report_times) &.{"ZTEST INFO stress:"} else &.{},
+        .deadline = stress_opts.deadline_s,
     });
 }
 
@@ -1592,9 +1706,9 @@ test "game reload: swaps on reload, keeps old on bad build, reload before stagin
     const cwd = Io.Dir.cwd();
     var dir = try cwd.openDir(io, p.path, .{});
     defer dir.close(io);
-    var names: [6][64]u8 = undefined;
+    var names: [9][64]u8 = undefined;
     var list: std.ArrayList(u8) = .empty;
-    for ([_]u32{ 1, 2, 3, 4, 5 }) |n| {
+    for ([_]u32{ 1, 2, 3, 4, 5, 7, 8 }) |n| {
         const name = try genLibName(&names[n], n);
         try list.print(a, "lib{d}={s}\n", .{ n, name });
     }
@@ -1608,6 +1722,12 @@ test "game reload: swaps on reload, keeps old on bad build, reload before stagin
     // case swaps back to it.
     try dir.createDirPath(io, ".godot/ziggurat/gen/5");
     try cwd.copyFile(v1, dir, try std.fmt.allocPrint(a, ".godot/ziggurat/gen/5/{s}", .{try genLibName(&names[5], 5)}), io, .{});
+    // Generations 7 (generation 2's code) and 8 (generation 1's): the
+    // reload while a swap waits for a thread.
+    try dir.createDirPath(io, ".godot/ziggurat/gen/7");
+    try dir.createDirPath(io, ".godot/ziggurat/gen/8");
+    try cwd.copyFile(v2, dir, try std.fmt.allocPrint(a, ".godot/ziggurat/gen/7/{s}", .{try genLibName(&names[7], 7)}), io, .{});
+    try cwd.copyFile(v1, dir, try std.fmt.allocPrint(a, ".godot/ziggurat/gen/8/{s}", .{try genLibName(&names[8], 8)}), io, .{});
     const bytes = try cwd.readFileAlloc(io, v2, a, .limited(256 << 20));
     try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, ".godot/ziggurat/gen/4/{s}", .{try genLibName(&names[4], 4)}), .data = bytes[0 .. bytes.len / 2] });
     var store = try dir.openDir(io, ".godot/ziggurat", .{});
@@ -1636,6 +1756,7 @@ test "game reload: swaps on reload, keeps old on bad build, reload before stagin
             "ZTEST PASS repeat_does_nothing",
             "ZTEST PASS refused_manifest_keeps_gen",
             "ZTEST PASS polling_swaps_without_a_request",
+            "ZTEST PASS newest_reload_wins_after_deferral",
             "ZTEST DONE",
         },
         .once = &.{
@@ -1647,8 +1768,13 @@ test "game reload: swaps on reload, keeps old on bad build, reload before stagin
             "ziggurat: reload: nothing to do (gen 2)",
             "Ziggurat ignores the generation manifest for this reload because the library file name is not the one the editor writes for that generation; keeping gen 2.",
             "ziggurat: generation 5 loaded",
+            "ziggurat: generation 7 loaded",
+            "ziggurat: generation 8 loaded",
+            "ziggurat: the swap to build 7 waits for script calls on other threads to return",
+            "ziggurat: the swap to build 8 waits for script calls on other threads to return",
+            "ziggurat: swapped to build 8",
         },
-        .reject = &.{ "ZTEST FAIL", "swaps arrive in a later version", "nothing to do (gen 5)" },
+        .reject = &.{ "ZTEST FAIL", "swaps arrive in a later version", "nothing to do (gen 5)", "swapped to build 7" },
     });
 }
 

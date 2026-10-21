@@ -288,7 +288,14 @@ pub fn Wrappers(
                 if (comptime p.field_index != abi.no_field) {
                     if (property == i) {
                         const name = info.field_names[p.field_index];
-                        convert.write(@FieldType(S, name), &@field(defaults, name), ret);
+                        // Read from a copy of the whole image, as `make`
+                        // does. Zig 0.17's incremental mode keeps a stale
+                        // field address for `&@field(defaults, name)` after
+                        // the struct's layout changes, so the next build
+                        // read another field's bytes (host test "editor
+                        // reload: defaults after a layout change").
+                        const image: S = defaults.*;
+                        convert.write(@FieldType(S, name), &@field(image, name), ret);
                         return 1;
                     }
                 }

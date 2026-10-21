@@ -34,6 +34,7 @@ pub fn build(b: *std.Build) void {
     const host_step = b.step("host", "Install the host library and its .gdextension into <prefix>/addon (zig build host -p <project>)");
     const host_test_step = b.step("test-host", "Run the host tests in a headless Godot (needs Godot)");
     const gui_test_step = b.step("test-gui", "Run the GUI editor test under Xvfb (needs Godot and xvfb-run); not part of test");
+    const stress_step = b.step("test-stress", "Run the reload stress test with 300 edits in a headless editor (needs Godot); not part of test");
 
     const sdk = addSdk(b, target, optimize, godot_path);
     const manifest_tool = b.addExecutable(.{
@@ -88,6 +89,7 @@ pub fn build(b: *std.Build) void {
     if (godot_found == null) {
         host_test_step.dependOn(&b.addFail("test-host needs Godot on PATH or -Dgodot-path=<absolute path>").step);
         gui_test_step.dependOn(&b.addFail("test-gui needs Godot on PATH or -Dgodot-path=<absolute path>").step);
+        stress_step.dependOn(&b.addFail("test-stress needs Godot on PATH or -Dgodot-path=<absolute path>").step);
     } else {
         const probe_host = addHost(b, target, optimize, godot_path, zig_exe, sdk_options, .{ .test_probe = true });
         const export_host = addHost(b, target, optimize, godot_path, zig_exe, sdk_options, .{ .export_build = true });
@@ -102,6 +104,7 @@ pub fn build(b: *std.Build) void {
             .sdk_options = sdk_options,
             .filter = host_test_filter,
             .gui_step = gui_test_step,
+            .stress_step = stress_step,
         });
     }
     test_step.dependOn(host_test_step);
@@ -293,6 +296,23 @@ const HostTestInputs = struct {
     /// The step that runs the GUI test (`test-gui`): the host tests named
     /// "gui: ..." with a GUI editor under Xvfb. It needs xvfb-run on PATH.
     gui_step: *std.Build.Step,
+    /// The step that runs the long reload stress test (`test-stress`).
+    stress_step: *std.Build.Step,
+};
+
+/// The reload stress test's size (test/host/stress/driver.gd): `short` runs
+/// in `test` and `test-host`, `long` in `test-stress`.
+const Stress = struct {
+    edits: u32,
+    broken_every: u32,
+    nested_every: u32,
+    /// Seconds for the whole editor run.
+    deadline_s: []const u8,
+    /// Print the run's timing line also when it passes.
+    report_times: bool,
+
+    const short: Stress = .{ .edits = 20, .broken_every = 10, .nested_every = 7, .deadline_s = "900", .report_times = false };
+    const long: Stress = .{ .edits = 300, .broken_every = 25, .nested_every = 10, .deadline_s = "3600", .report_times = true };
 };
 
 /// The host tests (test/host): a Zig test that copies a fixture project,
@@ -361,10 +381,14 @@ fn addHostTests(
         },
     });
     // `test-host` skips the GUI test; `test-gui` runs only that test.
-    const headless = hostTestRun(b, target, optimize, in, options_mod, platform, build_mod, abi, .{ .run_gui = false, .filter = in.filter });
+    const headless = hostTestRun(b, target, optimize, in, options_mod, platform, build_mod, abi, .{ .run_gui = false, .filter = in.filter }, .short);
     step.dependOn(&headless.step);
+    const stress = hostTestRun(b, target, optimize, in, options_mod, platform, build_mod, abi, .{ .run_gui = false, .filter = "reload stress" }, .long);
+    // Never cached: it reports run times.
+    stress.has_side_effects = true;
+    in.stress_step.dependOn(&stress.step);
     if (b.findProgram(.{ .names = &.{"xvfb-run"} })) |xvfb| {
-        const gui = hostTestRun(b, target, optimize, in, options_mod, platform, build_mod, abi, .{ .run_gui = true, .xvfb_run = xvfb, .filter = "gui: " });
+        const gui = hostTestRun(b, target, optimize, in, options_mod, platform, build_mod, abi, .{ .run_gui = true, .xvfb_run = xvfb, .filter = "gui: " }, .short);
         // Never cached: it drives a GUI and reports timing.
         gui.has_side_effects = true;
         in.gui_step.dependOn(&gui.step);
@@ -391,7 +415,15 @@ fn hostTestRun(
     build_mod: *std.Build.Module,
     abi: *std.Build.Module,
     gui: GuiChoice,
+    stress: Stress,
 ) *std.Build.Step.Run {
+    const stress_options = b.addOptions();
+    stress_options.addOption(u32, "edits", stress.edits);
+    stress_options.addOption(u32, "broken_every", stress.broken_every);
+    stress_options.addOption(u32, "nested_every", stress.nested_every);
+    stress_options.addOption([]const u8, "deadline_s", stress.deadline_s);
+    stress_options.addOption(bool, "report_times", stress.report_times);
+    stress_options.addOption([]const u8, "stress_dir", b.root.joinString(b.allocator, "test/host/stress") catch @panic("OOM"));
     const gui_options = b.addOptions();
     gui_options.addOption(bool, "run_gui", gui.run_gui);
     gui_options.addOption([]const u8, "xvfb_run", gui.xvfb_run);
@@ -404,6 +436,7 @@ fn hostTestRun(
         .imports = &.{
             .{ .name = "host_test_options", .module = options_mod },
             .{ .name = "host_gui_options", .module = gui_options.createModule() },
+            .{ .name = "host_stress_options", .module = stress_options.createModule() },
             .{ .name = "ziggurat_platform", .module = platform },
             .{ .name = "ziggurat_build", .module = build_mod },
             .{ .name = "ziggurat_abi", .module = abi },

@@ -11,12 +11,20 @@ extends SceneTree
 #      frames, `version()` returns the new value, field values are kept;
 #   5. a new instance runs gen 2, and a repeat request has nothing to do;
 #   6. a manifest the reader refuses keeps gen 2;
-#   7. with polling on, a newer manifest alone swaps (gen 5).
+#   7. with polling on, a newer manifest alone swaps (gen 5);
+#   8. a thread holds the gate (as a script call on another thread does),
+#      so the swap to a reloaded gen 7 waits; a second reload to gen 8
+#      arrives meanwhile; when the thread lets go, the newest request wins:
+#      gen 8 runs and gen 7 was never current.
 # modules.txt holds the library file name of each generation.
+
+const DEFERRED_LOCK := 2
 
 var probe: Object
 var failed := false
 var node: Node
+var hold_inside := false
+var hold_release := false
 
 
 func report(name: String, ok: bool, why: String) -> void:
@@ -132,4 +140,45 @@ func run() -> void:
 		await process_frame
 	report("polling_swaps_without_a_request", probe.current_generation() == 5 and node.call("version") == 1 and node.get("speed") == 2.5,
 		"gen %d version %s" % [probe.current_generation(), node.call("version")])
+
+	# 8. A reload while the swap waits for a thread: the newest one wins.
+	var t := Thread.new()
+	t.start(func() -> void: probe.gate_hold(_hold))
+	var waited := 0
+	while not hold_inside and waited < 10000:
+		OS.delay_msec(1)
+		waited += 1
+	write_manifest(7)
+	probe.language_reload_scripts([node.get_script()])
+	var frames := 0
+	while not (probe.generation_loaded(7) and probe.swap_outcome() == DEFERRED_LOCK) and frames < 50:
+		await process_frame
+		frames += 1
+	var first_waits: bool = probe.generation_loaded(7) and probe.swap_outcome() == DEFERRED_LOCK and probe.current_generation() == 5
+	write_manifest(8)
+	probe.language_reload_scripts([node.get_script()])
+	frames = 0
+	while not probe.generation_loaded(8) and frames < 50:
+		await process_frame
+		frames += 1
+	for k in 3:
+		await process_frame
+	var second_waits: bool = probe.generation_loaded(8) and probe.swap_outcome() == DEFERRED_LOCK and probe.current_generation() == 5
+	hold_release = true
+	t.wait_to_finish()
+	frames = 0
+	while probe.current_generation() != 8 and frames < 50:
+		await process_frame
+		frames += 1
+	report("newest_reload_wins_after_deferral", hold_inside and first_waits and second_waits and probe.current_generation() == 8
+		and not probe.was_ever_current(7) and node.call("version") == 1 and node.get("speed") == 2.5 and node.get("id") == 7,
+		"held %s, gen 7 waited %s, gen 8 waited %s, current %d, 7 ever current %s, version %s" % [hold_inside, first_waits, second_waits,
+			probe.current_generation(), probe.was_ever_current(7), node.call("version")])
 	finish()
+
+
+# Runs on the thread inside the gate until released.
+func _hold() -> void:
+	hold_inside = true
+	while not hold_release:
+		OS.delay_msec(1)

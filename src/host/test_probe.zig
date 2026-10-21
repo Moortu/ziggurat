@@ -362,10 +362,12 @@ pub const ZigguratTestProbe = struct {
     }
 
     /// Calls `method` on `obj` with no arguments through Godot's Variant
-    /// call and returns the call error code (0 is OK).
+    /// call and returns the call error code (0 is OK). A RefCounted `obj`
+    /// keeps its reference count (`callErrorOf`); null gives Godot's error
+    /// for a call on nil.
     pub fn callError(_: *ZigguratTestProbe, obj: ?*Object, method: StringName) i64 {
-        var self_v = Variant.init(?*Object, obj);
-        defer self_v.deinit();
+        if (obj) |o| return callErrorOf(o, &method);
+        var self_v: Variant = .nil;
         var ret: Variant = .nil;
         var err: godot.c.GDExtensionCallError = .{ .@"error" = 0, .argument = 0, .expected = 0 };
         godot.raw.variantCall(@ptrCast(&self_v), @ptrCast(&method), null, 0, @ptrCast(&ret), &err);
@@ -451,6 +453,27 @@ pub const ZigguratTestProbe = struct {
     pub fn languageFrame(_: *ZigguratTestProbe) void {
         const lang = language.registered orelse return;
         lang._frame();
+    }
+
+    /// Nested `_frame` calls so far (`language.nestedFrames`): calls Godot
+    /// made from a nested `Main::iteration()` while module code was on the
+    /// main thread's stack, or from inside another `_frame`.
+    pub fn languageNestedFrames(_: *ZigguratTestProbe) i64 {
+        return @intCast(language.nestedFrames());
+    }
+
+    /// Enters the gate as a script call does, calls `callable` with no
+    /// arguments and leaves: while the callable runs, this thread holds the
+    /// gate like a script method on its stack, so a swap waits
+    /// (`deferred_lock`). Any thread.
+    pub fn gateHold(_: *ZigguratTestProbe, callable: Callable) void {
+        gate.enter();
+        defer gate.leave();
+        var c = callable;
+        var args = Array.init();
+        defer args.deinit();
+        const r = c.callv(args);
+        r.deinit();
     }
 
     /// The number of entries `_debug_get_current_stack_info` returns. Any
@@ -842,7 +865,7 @@ pub const method_names = [_][:0]const u8{
     "swap_outcome",             "swaps_done",                  "fail_allocation",         "instance_data",
     "swap_hook",                "game_polling",                "set_size_warning_bytes",  "loaded_generations",
     "generation_loaded",        "language_frame",              "language_stack_info",     "queue_pending",
-    "queue_nested_frame_check",
+    "queue_nested_frame_check", "language_nested_frames",      "gate_hold",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

@@ -72,6 +72,14 @@ var project_root_buf: [max_path_bytes]u8 = undefined;
 var project_root: std.atomic.Value(usize) = .init(0);
 /// Main thread only: set while `_frame` runs its work.
 var in_frame = false;
+/// Nested `_frame` calls in this process (main thread only), for the host
+/// tests (`nestedFrames`).
+var nested_frames: u64 = 0;
+
+/// Nested `_frame` calls so far (see `ZigLanguage._frame`). Main thread.
+pub fn nestedFrames() u64 {
+    return nested_frames;
+}
 
 /// The reload requests Godot can make; each is logged once and counted.
 pub const Reload = enum { all, scripts, tool };
@@ -167,6 +175,7 @@ pub const ZigLanguage = struct {
     /// place that rule lives.
     pub fn _frame(_: *ZigLanguage) void {
         if (in_frame or gate.depth() > 0) {
+            nested_frames += 1;
             _ = swap.deferNested();
             return;
         }
