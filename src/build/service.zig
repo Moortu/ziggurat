@@ -49,6 +49,16 @@
 //!     carries `stale_note` (also when that full build fails). A full build
 //!     whose build id does not match fails as invalid.
 //!   `init` refuses `check_tables` without `expected_stamp`.
+//!   A checked build that validated carries `Outcome.snapshot`, a copy of its
+//!   table (`ziggurat_abi.snapshot`). After an incremental update the
+//!   service compares each script's layout hash with the previous checked
+//!   build's. A script whose layout changed although neither its own file
+//!   nor any helper file did (scan fingerprints) means the incremental
+//!   compiler kept stale layout data: the incremental output is deleted, the
+//!   warm server is dropped (not counted as a death) and the request is
+//!   built in full; the outcome's `message` then starts with `layout of
+//!   <script> changed without a source change; the build was refreshed in
+//!   full`.
 //!   Loading each checked build into the editor process has side effects:
 //!   the library's `.init_array` constructors run on every check (Zig code
 //!   has none, but C code a project links in would run its constructors in
@@ -103,6 +113,11 @@ pub const Outcome = struct {
     path: BuildPath,
     /// Wall time of the whole build, from start to staged output.
     ms: u64,
+    /// A copy of the validated table of `generation`: set whenever
+    /// `Config.check_tables` is on and the build's table validated (on the
+    /// full and the incremental path). The outcome owns it; `freeOutcome`
+    /// frees it.
+    snapshot: ?abi.Snapshot = null,
 };
 
 pub const WarmState = enum {
@@ -190,6 +205,13 @@ pub const Config = struct {
     /// previous build instead of the table's own, as it would when the
     /// compiler kept stale code.
     test_stale_build_id: bool = false,
+    /// TEST ONLY, and read only in test builds. The layout comparison after
+    /// an incremental update sees every script's previous layout hash
+    /// changed, as it would when the compiler kept stale layout data.
+    test_layout_drift: bool = false,
+    /// TEST ONLY, and read only in test builds. The full build that follows
+    /// a stale incremental update fails.
+    test_fail_full_after_stale: bool = false,
 };
 
 const Timer = struct {
@@ -273,6 +295,9 @@ pub const BuildService = struct {
     last_build_id: ?[16]u8 = null,
     /// See `Stats.table_check_us`. Guarded by `mu`.
     table_check_us: u64 = 0,
+    /// The table snapshot and file fingerprints of the last build whose
+    /// table was checked and validated. Build thread only.
+    prev: ?Prev = null,
 
     pub const InitError = error{ MissingSdkModule, TargetNotHost, MissingExpectedStamp, OutOfMemory } || std.Thread.SpawnError;
 
@@ -406,6 +431,7 @@ pub const BuildService = struct {
         if (self.full_slot) |*s| s.deinit();
         if (self.zig) |z| z.deinit(self.a);
         if (self.last_outcome) |o| freeOutcome(self.a, o);
+        if (self.prev) |p| p.deinit(self.a);
         self.scan_cache.deinit();
         self.a.destroy(self);
     }
@@ -499,15 +525,34 @@ pub const BuildService = struct {
         defer ws.deinit(a);
 
         if (try self.incrementalBuild(arena, &ws, zig, &sc.build_id, o, &stale.found)) {
-            // TODO(Stage 4): compare each script's layout hash
-            // (`ziggurat_abi.layoutHash` over the table's fields) with the
-            // previous generation's (spec section 5).
+            // A script whose layout changed although its source (and every
+            // helper) did not: the incremental compiler kept stale layout
+            // data. Refresh the build in full.
+            const drift = if (o.ok and o.snapshot != null) try self.layoutDrift(sc, &o.snapshot.?) else null;
+            if (drift) |note| {
+                defer a.free(note);
+                self.discardGeneration(o);
+                o.path = .full;
+                {
+                    self.session_mu.lockUncancelable(self.io);
+                    defer self.session_mu.unlock(self.io);
+                    self.dropWarm(false);
+                }
+                try self.fullBuild(arena, &ws, zig, &sc.build_id, o);
+                if (o.ok) self.startWarm(&ws, zig);
+                try addNote(a, o, note);
+            }
         } else {
             o.path = .full;
+            if (builtin.is_test and stale.found and self.cfg.test_fail_full_after_stale) {
+                o.message = try a.dupe(u8, "The full build failed (test fault).");
+                return error.TestFault;
+            }
             try self.fullBuild(arena, &ws, zig, &sc.build_id, o);
             if (o.ok) self.startWarm(&ws, zig);
         }
         if (o.ok) self.last_build_id = sc.build_id;
+        if (o.ok) if (o.snapshot) |*snap| self.remember(sc, snap);
         try appendProblems(a, o, sc.problems);
         if (stale.found) {
             try addStaleNote(a, o);
@@ -516,6 +561,89 @@ pub const BuildService = struct {
         // Last, after every step that can fail: a failed build reports its
         // own error, and the notice stays pending for the next outcome.
         if (o.path == .full and o.message == null) o.message = try self.takeNotice();
+    }
+
+    /// What the next build compares with: the last checked table and the
+    /// fingerprint of every scanned file.
+    const Prev = struct {
+        snap: abi.Snapshot,
+        files: []FileFp,
+        helpers: usize,
+
+        const FileFp = struct { rel: []const u8, fingerprint: u64 };
+
+        fn deinit(p: Prev, a: std.mem.Allocator) void {
+            p.snap.deinit(a);
+            for (p.files) |f| a.free(f.rel);
+            a.free(p.files);
+        }
+
+        fn fingerprint(p: *const Prev, rel: []const u8) u64 {
+            for (p.files) |f| {
+                if (std.mem.eql(u8, f.rel, rel)) return f.fingerprint;
+            }
+            return 0;
+        }
+    };
+
+    /// Keeps a copy of `snap` and the file fingerprints of `sc` for the next
+    /// comparison. On out-of-memory the comparison is simply skipped once.
+    fn remember(self: *BuildService, sc: scan_mod.ScanResult, snap: *const abi.Snapshot) void {
+        const a = self.a;
+        if (self.prev) |p| p.deinit(a);
+        self.prev = null;
+        const copy = snap.clone(a) catch return;
+        const files = a.alloc(Prev.FileFp, sc.scripts.len + sc.helper_paths.len) catch {
+            copy.deinit(a);
+            return;
+        };
+        var n: usize = 0;
+        for ([_][]const scan_mod.Script{ sc.scripts, sc.helper_paths }) |list| {
+            for (list) |f| {
+                const rel = a.dupe(u8, f.rel) catch {
+                    for (files[0..n]) |x| a.free(x.rel);
+                    a.free(files);
+                    copy.deinit(a);
+                    return;
+                };
+                files[n] = .{ .rel = rel, .fingerprint = f.fingerprint };
+                n += 1;
+            }
+        }
+        self.prev = .{ .snap = copy, .files = files, .helpers = sc.helper_paths.len };
+    }
+
+    /// After an incremental build: one sentence per script whose layout hash
+    /// differs from the previous checked build although its own source file
+    /// did not change. Null when there is none. Nothing is compared when a
+    /// helper file changed, appeared or went (a helper can change the layout
+    /// of a script that imports it), or when a fingerprint is unknown.
+    fn layoutDrift(self: *BuildService, sc: scan_mod.ScanResult, snap: *const abi.Snapshot) !?[]u8 {
+        const prev = &(self.prev orelse return null);
+        if (prev.helpers != sc.helper_paths.len) return null;
+        for (sc.helper_paths) |h| {
+            const was = prev.fingerprint(h.rel);
+            if (was == 0 or was != h.fingerprint) return null;
+        }
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.a);
+        for (snap.scripts) |s| {
+            const before = prev.snap.find(s.path) orelse continue;
+            const old_hash = if (builtin.is_test and self.cfg.test_layout_drift) before.layout_hash +% 1 else before.layout_hash;
+            if (old_hash == s.layout_hash) continue;
+            const fp = for (sc.scripts) |x| {
+                if (std.mem.eql(u8, x.rel, s.path)) break x.fingerprint;
+            } else 0;
+            const was = prev.fingerprint(s.path);
+            if (fp == 0 or was == 0 or fp != was) continue;
+            if (out.items.len > 0) try out.append(self.a, ' ');
+            try out.print(self.a, "layout of {s} changed without a source change; the build was refreshed in full", .{s.path});
+        }
+        if (out.items.len == 0) {
+            out.deinit(self.a);
+            return null;
+        }
+        return try out.toOwnedSlice(self.a);
     }
 
     fn locateZig(self: *BuildService, o: *Outcome) !ZigInstall {
@@ -619,7 +747,7 @@ pub const BuildService = struct {
         };
         if (o.ok and self.cfg.check_tables) {
             switch (self.checkTable(arena, o.generation.?, build_id, false)) {
-                .ok => {},
+                .ok => |snap| o.snapshot = snap,
                 .stale => unreachable,
                 .invalid => |sentence| {
                     self.discardGeneration(o);
@@ -675,7 +803,7 @@ pub const BuildService = struct {
         };
         if (o.ok and self.cfg.check_tables) {
             switch (self.checkTable(arena, o.generation.?, build_id, true)) {
-                .ok => {},
+                .ok => |snap| o.snapshot = snap,
                 .stale => {
                     // Never handed out: delete it, and treat the server as dead.
                     self.discardGeneration(o);
@@ -702,6 +830,8 @@ pub const BuildService = struct {
         gen.deinit(self.a);
         o.generation = null;
         o.ok = false;
+        if (o.snapshot) |snap| snap.deinit(self.a);
+        o.snapshot = null;
     }
 
     /// One sentence for the user, NUL-padded.
@@ -714,7 +844,9 @@ pub const BuildService = struct {
     };
 
     const TableCheck = union(enum) {
-        ok,
+        /// The table validates and carries this build's id; the snapshot is
+        /// the caller's (allocated with the service's allocator).
+        ok: abi.Snapshot,
         /// The table validates but carries another build's id.
         stale,
         /// The library or its table would be refused by the host.
@@ -755,7 +887,13 @@ pub const BuildService = struct {
         const own = if (table.build_id.len == 0) "" else table.build_id.ptr.?[0..table.build_id.len];
         const previous = self.last_build_id orelse @as([16]u8, @splat(0));
         const seen: []const u8 = if (builtin.is_test and incremental and self.cfg.test_stale_build_id) &previous else own;
-        if (std.mem.eql(u8, seen, build_id)) return .ok;
+        if (std.mem.eql(u8, seen, build_id)) {
+            const snap = abi.snapshot.take(self.a, table) catch {
+                platform.elf.setDiag(&s.buf, "The table check ran out of memory.", .{});
+                return .{ .invalid = s };
+            };
+            return .{ .ok = snap };
+        }
         if (incremental) return .stale;
         platform.elf.setDiag(&s.buf, "The full build's table has build id \"{f}\", but this build wrote \"{s}\" into the root.", .{ std.zig.fmtString(seen[0..@min(seen.len, 32)]), build_id });
         return .{ .invalid = s };
@@ -1037,6 +1175,7 @@ pub fn freeOutcome(a: std.mem.Allocator, o: Outcome) void {
     if (o.generation) |g| g.deinit(a);
     diagnostics.free(a, o.diagnostics);
     if (o.message) |m| a.free(m);
+    if (o.snapshot) |snap| snap.deinit(a);
 }
 
 fn freeDiag(a: std.mem.Allocator, d: Diagnostic) void {
@@ -1067,8 +1206,10 @@ fn cloneOutcome(a: std.mem.Allocator, o: Outcome) !Outcome {
     c.generation = null;
     c.diagnostics = &.{};
     c.message = null;
+    c.snapshot = null;
     errdefer freeOutcome(a, c);
     if (o.message) |m| c.message = try a.dupe(u8, m);
+    if (o.snapshot) |*snap| c.snapshot = try snap.clone(a);
     if (o.generation) |g| {
         const dir = try a.dupe(u8, g.dir.bytes);
         errdefer a.free(dir);
@@ -1084,6 +1225,16 @@ fn cloneOutcome(a: std.mem.Allocator, o: Outcome) !Outcome {
     while (n < o.diagnostics.len) : (n += 1) list[n] = try cloneDiag(a, o.diagnostics[n]);
     c.diagnostics = list;
     return c;
+}
+
+/// Puts `note` in front of `o.message` (alone when there is none).
+fn addNote(a: std.mem.Allocator, o: *Outcome, note: []const u8) !void {
+    const old = o.message orelse {
+        o.message = try a.dupe(u8, note);
+        return;
+    };
+    o.message = try std.mem.concat(a, u8, &.{ note, " ", old });
+    a.free(old);
 }
 
 /// Puts `stale_note` in front of `o.message` (alone when there is none).

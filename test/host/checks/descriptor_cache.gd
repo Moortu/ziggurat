@@ -71,6 +71,14 @@ func write_run(probe: Object, cache_path: String) -> void:
 	err = probe.cache_write(cache_path)
 	var left := DirAccess.get_files_at("res://.godot/ziggurat")
 	report("cache_write_twice_no_temporary_file", err == "" and left == PackedStringArray(["descriptors.json"]), "%s %s" % [err, left])
+	# The cache made from a snapshot of the table (no module call) is the
+	# same file, defaults included.
+	var snap_path := cache_path + ".snapshot"
+	err = probe.cache_write_snapshot(snap_path)
+	var live_text := FileAccess.get_file_as_string(CACHE)
+	var snap_text := FileAccess.get_file_as_string("res://.godot/ziggurat/descriptors.json.snapshot")
+	report("snapshot_cache_equals_live", err == "" and snap_text != "" and snap_text == live_text, "%s\nsnapshot:\n%s\nlive:\n%s" % [err, snap_text, live_text])
+	DirAccess.remove_absolute(snap_path)
 	var f := FileAccess.open("res://lists.txt", FileAccess.WRITE)
 	f.store_string(dump(probe, false))
 	f.close()

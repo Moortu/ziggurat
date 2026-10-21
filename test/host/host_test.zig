@@ -409,6 +409,7 @@ test "cache round trip" {
         "ZTEST PASS cache_write_load",
         "ZTEST PASS cache_write\n",
         "ZTEST PASS cache_write_twice_no_temporary_file",
+        "ZTEST PASS snapshot_cache_equals_live",
         "ZTEST PASS cache_is_json",
         "ZTEST PASS cache_fields",
     });

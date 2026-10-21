@@ -519,6 +519,7 @@ fn isRelativePath(s: []const u8) bool {
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;
+const snapshot = @import("snapshot.zig");
 
 const n = 16; // room for every count a fuzz mutation may set (see `fuzz_limits`)
 const stamp: u64 = 0xABCD_1234;
@@ -1527,4 +1528,48 @@ fn fuzzOne(_: void, smith: *testing.Smith) anyerror!void {
 
 test "fuzz validate with std.testing.fuzz" {
     try testing.fuzz({}, fuzzOne, .{ .corpus = &.{ "seed one", "seed two" } });
+}
+
+/// A defaults image as large as `fuzz_limits.max_instance_size`, so reading
+/// any validated field from it stays inside the buffer.
+var big_defaults: [1 << 16]u8 align(16) = @splat(0xA5);
+
+test "snapshot from hostile table" {
+    // `take` is called only after `validate` passed, over the validator's own
+    // mutations. It must not panic and must not leak (`testing.allocator`).
+    var prng = std.Random.DefaultPrng.init(0x534E_4150);
+    const r = prng.random();
+    var pristine = Fixture.init();
+    for (&pristine.scripts) |*s| s.defaults = &big_defaults;
+    var diag: [256]u8 = undefined;
+    var taken: usize = 0;
+    var skipped: usize = 0;
+    for (0..20000) |_| {
+        var work = pristine;
+        work.link();
+        for (0..1 + r.uintLessThan(usize, 3)) |_| mutateOnce(&work, r);
+        work.check(fuzz_limits, &diag) catch continue;
+        // A mutation may have pointed `defaults` at a smaller buffer; a real
+        // module's image always has `instance_size` bytes.
+        var image_ok = true;
+        for (work.scripts[0..work.table.script_count]) |*s| {
+            if (addr(&s.defaults) != @intFromPtr(&big_defaults)) image_ok = false;
+        }
+        if (!image_ok) {
+            skipped += 1;
+            continue;
+        }
+        const snap = try snapshot.take(testing.allocator, &work.table);
+        defer snap.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, work.table.script_count), snap.scripts.len);
+        for (snap.scripts, work.scripts[0..work.table.script_count]) |*s, *d| {
+            try testing.expectEqual(abi.layoutHash(d), s.layout_hash);
+            try testing.expectEqual(@as(usize, d.property_count), s.properties.len);
+            try testing.expectEqual(@as(usize, d.method_count), s.methods.len);
+            try testing.expectEqual(@as(usize, d.signal_count), s.signals.len);
+        }
+        taken += 1;
+    }
+    try testing.expect(taken > 1000);
+    try testing.expect(skipped < taken);
 }

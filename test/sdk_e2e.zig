@@ -39,6 +39,8 @@ const host_stamp: u64 = abi.expectedStamp(sdk_options);
 const Opts = struct {
     check_tables: bool = false,
     test_stale_build_id: bool = false,
+    test_layout_drift: bool = false,
+    test_fail_full_after_stale: bool = false,
 };
 
 /// A temp project with `files`, the SDK manifest and a `BuildService` on it.
@@ -95,6 +97,8 @@ const Harness = struct {
             .check_tables = opts.check_tables,
             .expected_stamp = host_stamp,
             .test_stale_build_id = opts.test_stale_build_id,
+            .test_layout_drift = opts.test_layout_drift,
+            .test_fail_full_after_stale = opts.test_fail_full_after_stale,
         });
     }
 
@@ -167,6 +171,8 @@ test "integration: fixture project builds" {
 
     const o = try h.build(.open);
     try expectOk(o);
+    // No table check, no snapshot.
+    try testing.expect(o.snapshot == null);
     if (timingOn()) std.debug.print("sdk_e2e: fixture project (3 fixtures + 30-field, 30-method script) full build {d} ms\n", .{o.ms});
 }
 
@@ -1257,6 +1263,17 @@ test "integration: incremental check passes" {
     try expectOk(o1);
     try testing.expectEqual(service.BuildPath.full, o1.path);
     try h.svc.waitWarm(build_wait_ms);
+    const snap1 = o1.snapshot.?;
+    try testing.expectEqual(@as(usize, 1), snap1.scripts.len);
+    try testing.expectEqualStrings("hero.zig", snap1.scripts[0].path);
+    try testing.expectEqualStrings("CharacterBody2D", snap1.scripts[0].base_class);
+    // `last()` is freed by the next build: keep the hash by value.
+    const hash1 = snap1.scripts[0].layout_hash;
+    try testing.expect(hash1 != 0);
+    // `lastCopy` deep-copies the snapshot with the outcome.
+    const copy = (try h.svc.lastCopy(testing.allocator)).?;
+    defer service.freeOutcome(testing.allocator, copy);
+    try testing.expectEqual(hash1, copy.snapshot.?.scripts[0].layout_hash);
 
     // Two body edits, each checked.
     var check_us: [2]u64 = undefined;
@@ -1266,6 +1283,8 @@ test "integration: incremental check passes" {
         try expectOk(o);
         try testing.expectEqual(service.BuildPath.incremental, o.path);
         try testing.expect(o.message == null);
+        // A body edit leaves the layout alone.
+        try testing.expectEqual(hash1, o.snapshot.?.scripts[0].layout_hash);
         try testing.expectEqual(@as(u32, @intCast(1 + i)), o.generation.?.n);
         check_us[i - 1] = h.svc.stats().table_check_us;
         try testing.expect(check_us[i - 1] > 0);
@@ -1304,6 +1323,101 @@ test "integration: stale table is caught" {
     try expectGenGone(store, 2);
     try std.Io.Dir.cwd().access(io, o2.generation.?.lib.bytes, .{});
     try testing.expectEqual(@as(u32, 1), h.svc.stats().session_deaths);
+}
+
+test "integration: stale note survives a failing rebuild" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const emit_args = ".hit, .{ .damage = amount, .source = null }";
+
+    var h: Harness = undefined;
+    try h.initOpts(&.{.{ .rel = "hero.zig", .data = try heroScript(a, emit_args, 0) }}, .{
+        .check_tables = true,
+        .test_stale_build_id = true,
+        .test_fail_full_after_stale = true,
+    });
+    defer h.deinit();
+    const o1 = try h.build(.open);
+    try expectOk(o1);
+    try h.svc.waitWarm(build_wait_ms);
+
+    // The incremental update is stale, and the full build that replaces it
+    // fails: the outcome is a failure that still says the fast path was dropped.
+    try h.write("hero.zig", try heroScript(a, emit_args, 1));
+    const o2 = try h.build(.save);
+    try testing.expect(!o2.ok);
+    try testing.expect(o2.generation == null);
+    try testing.expect(o2.snapshot == null);
+    try testing.expect(std.mem.startsWith(u8, o2.message.?, service.stale_note));
+    try testing.expect(std.mem.indexOf(u8, o2.message.?, "The full build failed") != null);
+    try testing.expectEqual(@as(u32, 1), h.svc.stats().session_deaths);
+}
+
+test "integration: a layout change without a source change refreshes the build in full" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const emit_args = ".hit, .{ .damage = amount, .source = null }";
+
+    // The hook makes every previous layout hash differ, as stale layout
+    // data from the incremental compiler would.
+    var h: Harness = undefined;
+    try h.initOpts(&.{
+        .{ .rel = "hero.zig", .data = try heroScript(a, emit_args, 0) },
+        .{ .rel = "other.zig", .data = try namedScript(a, "Other", 0) },
+    }, .{ .check_tables = true, .test_layout_drift = true });
+    defer h.deinit();
+    const o1 = try h.build(.open);
+    try expectOk(o1);
+    try h.svc.waitWarm(build_wait_ms);
+
+    // Editing hero.zig: its own source changed, so a new layout hash is
+    // nothing to report for it; other.zig did not change but the hook says
+    // its layout did.
+    try h.write("hero.zig", try heroScript(a, emit_args, 1));
+    const o2 = try h.build(.save);
+    try expectOk(o2);
+    try testing.expectEqual(service.BuildPath.full, o2.path);
+    const msg = o2.message.?;
+    try testing.expect(std.mem.indexOf(u8, msg, "layout of other.zig changed without a source change; the build was refreshed in full") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "layout of hero.zig") == null);
+    // The incremental output (generation 2) was deleted; the full build is 3.
+    try testing.expectEqual(@as(u32, 3), o2.generation.?.n);
+    try testing.expectEqual(@as(usize, 2), o2.snapshot.?.scripts.len);
+    try testing.expectEqual(@as(u32, 0), h.svc.stats().session_deaths);
+    const store = try std.fs.path.join(a, &.{ try h.tmp.dir.realPathFileAlloc(io, ".", a), "store" });
+    try expectGenGone(store, 2);
+}
+
+test "integration: a changed helper is not a layout drift" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const emit_args = ".hit, .{ .damage = amount, .source = null }";
+
+    var h: Harness = undefined;
+    try h.initOpts(&.{
+        .{ .rel = "hero.zig", .data = try heroScript(a, emit_args, 0) },
+        .{ .rel = "lib/util.zig", .data = "pub const k = 1;\n" },
+    }, .{ .check_tables = true, .test_layout_drift = true });
+    defer h.deinit();
+    try expectOk(try h.build(.open));
+    try h.svc.waitWarm(build_wait_ms);
+
+    // A helper can change the layout of a script that imports it, so the
+    // comparison is skipped when one changed.
+    try h.write("lib/util.zig", "pub const k = 2;\n");
+    const o2 = try h.build(.save);
+    try expectOk(o2);
+    try testing.expectEqual(service.BuildPath.incremental, o2.path);
+    try testing.expect(o2.message == null);
 }
 
 /// A script named `class` whose body changes with `n`.

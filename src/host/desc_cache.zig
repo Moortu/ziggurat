@@ -262,13 +262,103 @@ pub fn serialize(a: Allocator, gen: u32, scripts: []const abi.ScriptDesc, defaul
 
     const out = try arena.alloc(Script, scripts.len);
     for (scripts, out) |*d, *o| o.* = try scriptJson(arena, d, defaults);
-    const file: FileJson = .{ .version = .{ .v = format_version }, .generation = .{ .v = gen }, .scripts = out };
+    return stringify(a, gen, out);
+}
 
+fn stringify(a: Allocator, gen: u32, scripts: []const Script) ![]u8 {
+    const file: FileJson = .{ .version = .{ .v = format_version }, .generation = .{ .v = gen }, .scripts = scripts };
     var w: std.Io.Writer.Allocating = .init(a);
     errdefer w.deinit();
     try std.json.Stringify.value(file, .{ .whitespace = .indent_2, .emit_null_optional_fields = false }, &w.writer);
     try w.writer.writeByte('\n');
     return w.toOwnedSlice();
+}
+
+/// The cache file's bytes for `snap` as generation `gen`, made without the
+/// module: for the same build it equals what `serialize` makes from the
+/// loaded generation. Pure Zig; no Godot call.
+pub fn fromSnapshot(a: Allocator, gen: u32, snap: *const abi.snapshot.Snapshot) ![]u8 {
+    var arena_state: std.heap.ArenaAllocator = .init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const out = try arena.alloc(Script, snap.scripts.len);
+    for (snap.scripts, out) |*d, *o| o.* = try snapshotScriptJson(arena, d);
+    return stringify(a, gen, out);
+}
+
+fn snapArgJsons(arena: Allocator, list: []const abi.snapshot.ArgSnap) ![]ArgJson {
+    const out = try arena.alloc(ArgJson, list.len);
+    for (list, out) |d, *o| o.* = snapArgJson(d);
+    return out;
+}
+
+fn snapArgJson(d: abi.snapshot.ArgSnap) ArgJson {
+    return .{ .name = d.name, .class_name = d.class_name, .type = .{ .v = d.variant_type } };
+}
+
+fn snapshotScriptJson(arena: Allocator, d: *const abi.snapshot.ScriptSnap) !Script {
+    const ps = try arena.alloc(PropertyJson, d.properties.len);
+    for (d.properties, ps) |p, *o| {
+        o.* = .{
+            .name = p.name,
+            .class_name = p.class_name,
+            .type = .{ .v = p.variant_type },
+            .hint = .{ .v = p.hint },
+            .hint_string = p.hint_string,
+            .usage = .{ .v = p.usage },
+            .default = try snapshotDefault(arena, p.variant_type, p.default),
+        };
+    }
+    const ms = try arena.alloc(MethodJson, d.methods.len);
+    for (d.methods, ms) |m, *o| {
+        o.* = .{ .name = m.name, .flags = .{ .v = m.flags }, .ret = snapArgJson(m.ret), .args = try snapArgJsons(arena, m.args) };
+    }
+    const ss = try arena.alloc(SignalJson, d.signals.len);
+    for (d.signals, ss) |g, *o| o.* = .{ .name = g.name, .args = try snapArgJsons(arena, g.args) };
+    return .{
+        .path = d.path,
+        .class_name = d.class_name,
+        .base_class = d.base_class,
+        .flags = .{ .v = d.flags },
+        .layout_hash = try std.fmt.allocPrint(arena, "{d}", .{d.layout_hash}),
+        .properties = ps,
+        .methods = ms,
+        .signals = ss,
+    };
+}
+
+/// The typed default for a property of Variant type `type_id` whose snapshot
+/// default is `d`: what `default_value.fromVariant` makes from the module's
+/// value, for every kind the snapshot decodes; `.absent` when the value has
+/// no stored form for that type.
+fn snapshotDefault(arena: Allocator, type_id: u32, d: abi.snapshot.Default) !Default {
+    const out: Default = switch (d) {
+        .none => .absent,
+        .boolean => |b| .{ .boolean = b },
+        .int => |i| .{ .int = i },
+        .float => |f| .{ .float = f },
+        .floats => |f| blk: {
+            const nums = try arena.alloc(f64, f.len);
+            for (f.slice(), nums) |x, *o| o.* = x;
+            break :blk .{ .nums = nums };
+        },
+        .ints => |f| blk: {
+            const nums = try arena.alloc(f64, f.len);
+            for (f.slice(), nums) |x, *o| o.* = @floatFromInt(x);
+            break :blk .{ .nums = nums };
+        },
+        .string_empty => .{ .text = "" },
+        .object_null => .null_,
+    };
+    // A float keeps NaN and infinity (written as text); a vector must be
+    // finite, as `fromVariant` has it.
+    switch (out) {
+        .float => return if (type_id == default_value.t_float) out else .absent,
+        .nums => |ns| for (ns) |x| if (!std.math.isFinite(x)) return .absent,
+        else => {},
+    }
+    return if (default_value.fits(type_id, out)) out else .absent;
 }
 
 fn argJsons(arena: Allocator, list: []const abi.ArgDesc) ![]ArgJson {
@@ -320,6 +410,14 @@ fn scriptJson(arena: Allocator, d: *const abi.ScriptDesc, defaults: anytype) !Sc
         .methods = ms,
         .signals = ss,
     };
+}
+
+/// Writes the cache of `snap` as generation `gen` to `path` (atomically;
+/// missing folders are created). Needs no Godot call, so any thread may do it.
+pub fn writeSnapshot(a: Allocator, io: std.Io, path: OsPath, gen: u32, snap: *const abi.snapshot.Snapshot) !void {
+    const bytes = try fromSnapshot(a, gen, snap);
+    defer a.free(bytes);
+    try platform.atomic_file.write(io, path, bytes);
 }
 
 /// Writes the cache of the loaded generation `gen` to `path` (atomically;
@@ -585,6 +683,51 @@ test "serialize then parse keeps every field" {
     try testing.expectEqual(@as(usize, 0), s.methods[1].args.len);
     try testing.expectEqual(@as(usize, 1), s.signals.len);
     try testing.expectEqual(@as(u32, 2), s.signals[0].args[0].type.v);
+}
+
+test "a snapshot makes the same file as the module's defaults" {
+    var image: [8]u8 = @splat(0);
+    std.mem.writeInt(u32, image[0..4], @bitCast(@as(f32, 300.5)), .little);
+    const fields = [_]abi.FieldDesc{.{ .name = Stub.str("speed"), .type_name = Stub.str("f32"), .shape = 0, .offset = 0, .size = 4, .@"align" = 4, .value_kind = @backingInt(abi.ValueKind.float), .bits = 0 }};
+    var d = Stub.script;
+    d.defaults = &image;
+    d.fields = &fields;
+    d.field_count = 1;
+    const table: abi.Table = .{ .magic = abi.magic, .abi_version = abi.abi_version, .size = @sizeOf(abi.Table), .layout_stamp = 0, .sdk_version = Stub.str("1"), .build_id = Stub.str("0123456789abcdef"), .scripts = @ptrCast(&d), .script_count = 1 };
+
+    const live = try serialize(testing.allocator, 3, &.{d}, StubDefaults{});
+    defer testing.allocator.free(live);
+    const snap = try abi.snapshot.take(testing.allocator, &table);
+    defer snap.deinit(testing.allocator);
+    const from_snap = try fromSnapshot(testing.allocator, 3, &snap);
+    defer testing.allocator.free(from_snap);
+    try testing.expectEqualStrings(live, from_snap);
+}
+
+test "snapshot defaults keep only what fits the property type" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var fl: abi.snapshot.Floats = .{ .len = 2 };
+    fl.v[0] = 1;
+    fl.v[1] = 2;
+    var bad = fl;
+    bad.v[0] = std.math.inf(f32);
+    const ints: abi.snapshot.Ints = .{ .v = .{ -1, 2, 0, 0 }, .len = 2 };
+    try testing.expectEqualSlices(f64, &.{ 1, 2 }, (try snapshotDefault(a, 5, .{ .floats = fl })).nums);
+    // Vector2 is type 5, Vector2i type 6; a Vector3 (type 9) needs 3 numbers.
+    try testing.expect((try snapshotDefault(a, 9, .{ .floats = fl })) == .absent);
+    try testing.expect((try snapshotDefault(a, 5, .{ .floats = bad })) == .absent);
+    try testing.expectEqualSlices(f64, &.{ -1, 2 }, (try snapshotDefault(a, 6, .{ .ints = ints })).nums);
+    try testing.expectEqual(@as(i64, 4), (try snapshotDefault(a, 2, .{ .int = 4 })).int);
+    try testing.expect((try snapshotDefault(a, 1, .{ .int = 4 })) == .absent);
+    try testing.expect(std.math.isNan((try snapshotDefault(a, 3, .{ .float = std.math.nan(f64) })).float));
+    try testing.expect((try snapshotDefault(a, 2, .{ .float = 1 })) == .absent);
+    try testing.expectEqualStrings("", (try snapshotDefault(a, 4, .string_empty)).text);
+    try testing.expect((try snapshotDefault(a, 21, .string_empty)).text.len == 0);
+    try testing.expect((try snapshotDefault(a, 2, .string_empty)) == .absent);
+    try testing.expect((try snapshotDefault(a, 24, .object_null)) == .null_);
+    try testing.expect((try snapshotDefault(a, 24, .none)) == .absent);
 }
 
 test "parse rejects unknown versions, truncation and wrong types" {

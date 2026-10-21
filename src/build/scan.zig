@@ -19,7 +19,13 @@ const OsPath = platform.path.OsPath;
 const rootgen = @import("rootgen.zig");
 
 /// Project-relative path, `/`-separated.
-pub const Script = struct { rel: []const u8 };
+pub const Script = struct {
+    rel: []const u8,
+    /// Hash of the file's size, modification time, status-change time and
+    /// inode: equal between two scans when the file did not change. 0 when
+    /// the file could not be stat'ed (then it counts as changed).
+    fingerprint: u64 = 0,
+};
 
 pub const Problem = struct { rel: []const u8, message: []const u8 };
 
@@ -154,6 +160,16 @@ const Stamp = struct {
         return .{ .rel = rel, .size = x.size, .mtime = x.mtime.nanoseconds, .ctime = x.ctime.nanoseconds, .inode = @intCast(x.inode) };
     }
 
+    fn fingerprint(self: Stamp) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&self.size));
+        h.update(std.mem.asBytes(&self.mtime));
+        h.update(std.mem.asBytes(&self.ctime));
+        h.update(std.mem.asBytes(&self.inode));
+        // 0 is reserved for "unknown".
+        return h.final() | 1;
+    }
+
     fn lessThan(_: void, x: Stamp, y: Stamp) bool {
         return std.mem.lessThan(u8, x.rel, y.rel);
     }
@@ -239,8 +255,10 @@ const Scanner = struct {
         if ((try self.seen.getOrPut(self.a, rel)).found_existing) return;
         // Without a usable stat the file is read and parsed, and not cached.
         const st: ?std.Io.File.Stat = dir.statFile(self.io, name, .{}) catch null;
-        try self.stamps.append(self.a, .fromStat(rel, st));
-        if (self.cache) |c| if (st) |x| if (c.lookup(rel, x)) |script| return self.classify(rel, script);
+        const stamp: Stamp = .fromStat(rel, st);
+        const fp: u64 = if (st != null) stamp.fingerprint() else 0;
+        try self.stamps.append(self.a, stamp);
+        if (self.cache) |c| if (st) |x| if (c.lookup(rel, x)) |script| return self.classify(rel, script, fp);
         const src = dir.readFileAllocOptions(self.io, name, self.a, .limited(max_file_bytes), .of(u8), 0) catch |err| {
             try self.problem(rel, "Could not read \"{s}\": {t}.", .{ rel, err });
             return;
@@ -250,14 +268,14 @@ const Scanner = struct {
         // The stat was taken before the read: a write in between changes the
         // key, so the next scan reads the file again.
         if (self.cache) |c| if (st) |x| try c.store(rel, x, script, self.now);
-        try self.classify(rel, script);
+        try self.classify(rel, script, fp);
     }
 
-    fn classify(self: *Scanner, rel: []const u8, script: bool) !void {
+    fn classify(self: *Scanner, rel: []const u8, script: bool, fp: u64) !void {
         if (script) {
-            try self.scripts.append(self.a, .{ .rel = rel });
+            try self.scripts.append(self.a, .{ .rel = rel, .fingerprint = fp });
         } else {
-            try self.helper_list.append(self.a, .{ .rel = rel });
+            try self.helper_list.append(self.a, .{ .rel = rel, .fingerprint = fp });
         }
     }
 
@@ -648,4 +666,27 @@ test "scan cache never trusts an entry stored inside the guard window" {
     const r2 = try scanCached(a, testing.io, project, default_script_dirs, &cache);
     try testing.expectEqual(@as(u32, 1), r2.parsed);
     try testing.expectEqual(@as(usize, 0), r2.scripts.len);
+}
+
+test "file fingerprints change with the file and only then" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try put(tmp, "a.zig", "pub const extends = \"Node\";\n");
+    try put(tmp, "lib/h.zig", "pub fn f() void {}\n");
+    const project = try tmpProject(tmp, a);
+
+    const r1 = try scan(a, testing.io, project, default_script_dirs);
+    const r2 = try scan(a, testing.io, project, default_script_dirs);
+    try testing.expect(r1.scripts[0].fingerprint != 0 and r1.helper_paths[0].fingerprint != 0);
+    try testing.expectEqual(r1.scripts[0].fingerprint, r2.scripts[0].fingerprint);
+    try testing.expectEqual(r1.helper_paths[0].fingerprint, r2.helper_paths[0].fingerprint);
+
+    try put(tmp, "lib/h.zig", "pub fn g() void {}\n");
+    const r3 = try scan(a, testing.io, project, default_script_dirs);
+    try testing.expectEqual(r1.scripts[0].fingerprint, r3.scripts[0].fingerprint);
+    try testing.expect(r1.helper_paths[0].fingerprint != r3.helper_paths[0].fingerprint);
 }

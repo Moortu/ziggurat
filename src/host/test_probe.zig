@@ -170,6 +170,20 @@ pub const ZigguratTestProbe = struct {
         return .fromLatin1("");
     }
 
+    /// Writes the descriptor cache of the current generation to `path` from
+    /// a snapshot of its table (no module call): "" on success, the error
+    /// name otherwise.
+    pub fn cacheWriteSnapshot(_: *ZigguratTestProbe, path: String) String {
+        const g = runtime.current() orelse return .fromLatin1("no module loaded");
+        var buf: [4096]u8 = undefined;
+        const p = path.toUtf8Buf(&buf);
+        const a = std.heap.c_allocator;
+        const snap = abi.snapshot.take(a, g.table) catch |err| return String.fromLatin1(@errorName(err));
+        defer snap.deinit(a);
+        desc_cache.writeSnapshot(a, host_io.get(), .fromTrusted(p), g.n, &snap) catch |err| return String.fromLatin1(@errorName(err));
+        return .fromLatin1("");
+    }
+
     /// Reads the descriptor cache at `path`: the number of scripts in it,
     /// or -1 when it is missing, -2 when it was rejected (and logged).
     pub fn cacheRead(_: *ZigguratTestProbe, path: String) i64 {
@@ -532,6 +546,7 @@ pub const method_names = [_][:0]const u8{
     "language_lookup_code",    "set_diagnostics",             "has_global_constant",     "queue_push",
     "queue_runs",              "saved_hook_install",          "saved_hook_clear",        "saved_hook_paths",
     "language_reload_scripts", "language_reload_tool_script", "editor_build_outcomes",   "editor_build_busy",
+    "cache_write_snapshot",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {
