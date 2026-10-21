@@ -69,6 +69,11 @@ pub fn emitWith(comptime Bind: type, self: anytype, comptime signal: @EnumLitera
     const Sig = comptime SignalArgs(S, sname);
     comptime checkArgs(S, sname, Sig, @TypeOf(args));
 
+    // The warnings below name the script by its type name, not its
+    // `res://` path: `scriptRel` scans every script of the generated root,
+    // so using it here made each emitting script cost time in proportion
+    // to the number of scripts (about 270 ms of analysis per script at
+    // 1000 scripts, against 0.5 ms without it).
     const bind = Bind.get() orelse {
         runtime.log(.err, "emit of signal '{s}' skipped: Godot has no method bind for Object.emit_signal.", .{sname});
         return;
@@ -93,16 +98,10 @@ pub fn emitWith(comptime Bind: type, self: anytype, comptime signal: @EnumLitera
     var code: i64 = 0;
     const bad_ret = convert.read(i64, &ret, &code) != null;
     if (err.@"error" != 0 or bad_ret or !emitResultOk(code)) {
-        runtime.log(.warning, "emit of signal '{s}' of {s} failed (call error {d}, result {d}).", .{ sname, comptime scriptName(S), err.@"error", code });
+        runtime.log(.warning, "emit of signal '{s}' of {s} failed (call error {d}, result {d}).", .{ sname, @typeName(S), err.@"error", code });
     } else if (code == err_unavailable and !objectHasSignal(@ptrCast(self.base), name)) {
-        runtime.log(.warning, "emit of signal '{s}' of {s} did nothing: the object has no signal of that name, so Godot does not know the script's signals.", .{ sname, comptime scriptName(S) });
+        runtime.log(.warning, "emit of signal '{s}' of {s} did nothing: the object has no signal of that name, so Godot does not know the script's signals.", .{ sname, @typeName(S) });
     }
-}
-
-/// The script's `res://` path when it can be found, else its type name.
-fn scriptName(comptime S: type) []const u8 {
-    if (scriptRel(S)) |rel| return "res://" ++ rel;
-    return @typeName(S);
 }
 
 /// `Object.has_signal(name)` on `obj`; true when the bind is missing (the
@@ -212,7 +211,8 @@ fn fail(comptime S: type, comptime sentence: []const u8) noreturn {
 /// The project-relative path of `S`: the one descriptor in the generated
 /// root (`pub const s<i>`) whose path gives `@typeName(S)`, or null. The
 /// branch quota grows with the number of root declarations; a path whose
-/// length cannot match is skipped before any per-byte work.
+/// length cannot match is skipped before any per-byte work. Use it only
+/// for compile errors: its cost grows with the number of scripts.
 pub fn scriptRel(comptime S: type) ?[]const u8 {
     const root = @import("root");
     if (@typeInfo(root) != .@"struct") return null;
