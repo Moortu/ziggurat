@@ -1590,9 +1590,9 @@ test "game reload: swaps on reload, keeps old on bad build, reload before stagin
     const cwd = Io.Dir.cwd();
     var dir = try cwd.openDir(io, p.path, .{});
     defer dir.close(io);
-    var names: [5][64]u8 = undefined;
+    var names: [6][64]u8 = undefined;
     var list: std.ArrayList(u8) = .empty;
-    for ([_]u32{ 1, 2, 3, 4 }) |n| {
+    for ([_]u32{ 1, 2, 3, 4, 5 }) |n| {
         const name = try genLibName(&names[n], n);
         try list.print(a, "lib{d}={s}\n", .{ n, name });
     }
@@ -1602,6 +1602,10 @@ test "game reload: swaps on reload, keeps old on bad build, reload before stagin
     try dir.createDirPath(io, ".godot/ziggurat/gen/4");
     try cwd.copyFile(v1, dir, try std.fmt.allocPrint(a, ".godot/ziggurat/gen/1/{s}", .{try genLibName(&names[1], 1)}), io, .{});
     try cwd.copyFile(v2, dir, try std.fmt.allocPrint(a, ".godot/ziggurat/gen/2/{s}", .{try genLibName(&names[2], 2)}), io, .{});
+    // Generation 5 is another file with generation 1's code: the polling
+    // case swaps back to it.
+    try dir.createDirPath(io, ".godot/ziggurat/gen/5");
+    try cwd.copyFile(v1, dir, try std.fmt.allocPrint(a, ".godot/ziggurat/gen/5/{s}", .{try genLibName(&names[5], 5)}), io, .{});
     const bytes = try cwd.readFileAlloc(io, v2, a, .limited(256 << 20));
     try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, ".godot/ziggurat/gen/4/{s}", .{try genLibName(&names[4], 4)}), .data = bytes[0 .. bytes.len / 2] });
     var store = try dir.openDir(io, ".godot/ziggurat", .{});
@@ -1628,6 +1632,8 @@ test "game reload: swaps on reload, keeps old on bad build, reload before stagin
             "ZTEST PASS field_values_kept",
             "ZTEST PASS new_instance_runs_gen_2",
             "ZTEST PASS repeat_does_nothing",
+            "ZTEST PASS refused_manifest_keeps_gen",
+            "ZTEST PASS polling_swaps_without_a_request",
             "ZTEST DONE",
         },
         .once = &.{
@@ -1637,8 +1643,10 @@ test "game reload: swaps on reload, keeps old on bad build, reload before stagin
             "ziggurat: generation 2 loaded",
             "ziggurat: swapped to build 2",
             "ziggurat: reload: nothing to do (gen 2)",
+            "Ziggurat ignores the generation manifest for this reload because the library file name is not the one the editor writes for that generation; keeping gen 2.",
+            "ziggurat: generation 5 loaded",
         },
-        .reject = &.{ "ZTEST FAIL", "swaps arrive in a later version" },
+        .reject = &.{ "ZTEST FAIL", "swaps arrive in a later version", "nothing to do (gen 5)" },
     });
 }
 
@@ -1706,7 +1714,6 @@ const gui_cases = [_][]const u8{
     "ZTEST PASS gui_script_edited",
     "ZTEST PASS gui_script_saved",
     "ZTEST PASS gui_save_builds",
-    "ZTEST PASS gui_game_still_old_code",
     "ZTEST PASS gui_game_runs_new_code",
     "ZTEST PASS gui_game_swapped_line",
 };
@@ -1714,9 +1721,9 @@ const gui_cases = [_][]const u8{
 // Run by `zig build test-gui` only (spec section 12, check 6): the GUI
 // editor under Xvfb plays the e2e project's main scene, a tool autoload
 // edits res://hero.zig in the script editor and saves it with
-// ScriptEditor.save_all_scripts(); a second save sends the game another
-// reload, and the running game swaps to the new build and returns the new
-// value of a changed method with its field values kept. The manual desktop run of the same
+// ScriptEditor.save_all_scripts(); the running game finds the new build in
+// the manifest, swaps to it and returns the new value of a changed method
+// with its field values kept. The manual desktop run of the same
 // steps is in test/host/gui/README.md.
 test "gui: save in the script editor reaches the running game" {
     if (!gui_opts.run_gui) return error.SkipZigTest;

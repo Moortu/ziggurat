@@ -15,6 +15,7 @@ const host_io = @import("host_io.zig");
 const script_mod = @import("script.zig");
 const instance = @import("instance.zig");
 const language = @import("language.zig");
+const game = @import("game.zig");
 const diag_cache = @import("diag_cache.zig");
 const main_queue = @import("main_queue.zig");
 const resource = @import("resource.zig");
@@ -452,6 +453,12 @@ pub const ZigguratTestProbe = struct {
         lang._reloadScripts(scripts, true);
     }
 
+    /// Turns on the game's manifest polling (a game the editor did not
+    /// start has it off).
+    pub fn gamePolling(_: *ZigguratTestProbe, on: bool) void {
+        game.test_poll = on;
+    }
+
     /// Calls the language's `reload_tool_script` hook.
     pub fn languageReloadToolScript(_: *ZigguratTestProbe, s: ?*ZigScript) void {
         const lang = language.registered orelse return;
@@ -783,7 +790,8 @@ pub const method_names = [_][:0]const u8{
     "gate_migrate_probe",      "registry_count",              "runtime_shutdown",        "stage_module",
     "gate_swap_begin",         "gate_swap_end",               "instance_generation",     "swap_request",
     "swap_outcome",            "swaps_done",                  "fail_allocation",         "instance_data",
-    "swap_hook",               "set_size_warning_bytes",      "loaded_generations",      "generation_loaded",
+    "swap_hook",               "game_polling",                "set_size_warning_bytes",  "loaded_generations",
+    "generation_loaded",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

@@ -31,11 +31,25 @@ const gpa = std.heap.c_allocator;
 var pin: ?platform.generation_store.FileLock = null;
 
 /// The pins of generations loaded by a reload, held until `stop`: an old
-/// generation is never unloaded, so its folder stays too. Main thread.
+/// generation is never unloaded, so its folder stays too: one lock file is
+/// held per loaded generation until the game exits. Main thread.
 var reload_pins: std.ArrayList(platform.generation_store.FileLock) = .empty;
 
-/// Set by `requestReload` (any thread), taken by `frame`.
-var reload_wanted: std.atomic.Value(bool) = .init(false);
+/// What `requestReload` (any thread) asked for, taken by `frame`: 0 nothing,
+/// `quiet` a check that says nothing when no newer generation is named,
+/// `loud` an explicit request that logs "nothing to do".
+var reload_wanted: std.atomic.Value(u8) = .init(0);
+pub const Request = enum(u8) { quiet = 1, loud = 2 };
+
+/// The manifest's identity (inode, size, modification time) the last time
+/// `frame` looked, and when (Godot's `Time.get_ticks_msec`).
+const Ident = struct { inode: u64, size: u64, mtime_ns: i128 };
+var seen: ?Ident = null;
+var last_poll_ms: u64 = 0;
+/// How often a game started by the editor looks at the manifest.
+const poll_interval_ms = 500;
+/// A test turns polling on in a game the editor did not start.
+pub var test_poll = false;
 
 /// Main thread, SCENE init, in a game process, after the language and the
 /// loader are registered.
@@ -45,6 +59,7 @@ pub fn start() void {
         return;
     }
     loadFromStore();
+    rememberManifest();
 }
 
 /// Releases the pin. Main thread, SCENE exit.
@@ -54,15 +69,58 @@ pub fn stop() void {
     pin = null;
     for (reload_pins.items) |*l| l.release();
     reload_pins.clearAndFree(gpa);
-    reload_wanted.store(false, .release);
+    reload_wanted.store(0, .release);
 }
 
-/// The editor told this game to reload its scripts (`_reload_scripts` or
-/// `_reload_all_scripts`). Any thread; it only sets a flag, `frame` does
-/// the work. An export build has no reload path.
-pub fn requestReload() void {
+/// The editor told this game to reload its scripts (`_reload_scripts` is
+/// `.loud`; `_reload_all_scripts` is `.quiet`, since other extensions
+/// trigger it too). Any thread; it only sets a flag, `frame` does the work.
+/// An export build has no reload path.
+pub fn requestReload(kind: Request) void {
     if (comptime host_options.export_build) return;
-    reload_wanted.store(true, .release);
+    _ = reload_wanted.fetchMax(@backingInt(kind), .acq_rel);
+}
+
+fn manifestIdent(store: []const u8) ?Ident {
+    const manifest = @import("manifest.zig");
+    var buf: [4200]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}{c}{s}", .{ store, std.fs.path.sep, manifest.file_name }) catch return null;
+    const st = std.Io.Dir.cwd().statFile(host_io.get(), path, .{ .follow_symlinks = false }) catch return null;
+    return .{ .inode = @intCast(st.inode), .size = st.size, .mtime_ns = st.mtime.nanoseconds };
+}
+
+fn identEql(a: ?Ident, b: ?Ident) bool {
+    const x = a orelse return b == null;
+    const y = b orelse return false;
+    return x.inode == y.inode and x.size == y.size and x.mtime_ns == y.mtime_ns;
+}
+
+/// Remembers the manifest's identity as the one already handled.
+fn rememberManifest() void {
+    var store_buf: [4096]u8 = undefined;
+    const store = desc_cache.dataPath(&store_buf, "ziggurat") orelse return;
+    seen = manifestIdent(store);
+    last_poll_ms = godot.class.Time.getTicksMsec();
+}
+
+/// True when polling is on, half a second passed since the last look and
+/// the manifest's identity changed (the new one is remembered). Polling is
+/// on in a game the editor started (an active `EngineDebugger`): Godot's
+/// reload message comes when the script is saved, before the editor has
+/// staged the build and written the manifest, so the manifest is watched
+/// too. It only decides when to run the reload; every trust rule is in the
+/// reader.
+fn manifestChanged() bool {
+    const now = godot.class.Time.getTicksMsec();
+    if (now -% last_poll_ms < poll_interval_ms) return false;
+    last_poll_ms = now;
+    if (!test_poll and !godot.class.EngineDebugger.isActive()) return false;
+    var store_buf: [4096]u8 = undefined;
+    const store = desc_cache.dataPath(&store_buf, "ziggurat") orelse return false;
+    const now_ident = manifestIdent(store);
+    if (identEql(seen, now_ident)) return false;
+    seen = now_ident;
+    return true;
 }
 
 /// Handles a reload request: from `ZigLanguage._frame`, main thread, before
@@ -77,8 +135,12 @@ pub fn requestReload() void {
 /// uses (`manifest.readTrusted`, `recheck`).
 pub fn frame() void {
     if (comptime host_options.export_build) return;
-    if (!reload_wanted.swap(false, .acq_rel)) return;
-    reloadFromManifest();
+    var want = reload_wanted.swap(0, .acq_rel);
+    if (want == 0) {
+        if (!manifestChanged()) return;
+        want = @backingInt(Request.quiet);
+    }
+    reloadFromManifest(want == @backingInt(Request.loud));
 }
 
 fn keepingText(buf: *[48]u8) []const u8 {
@@ -86,7 +148,7 @@ fn keepingText(buf: *[48]u8) []const u8 {
     return "no generation is loaded";
 }
 
-fn reloadFromManifest() void {
+fn reloadFromManifest(loud: bool) void {
     const manifest = @import("manifest.zig");
     const zbuild = @import("ziggurat_build");
     const stem = zbuild.service.lib_stem;
@@ -118,7 +180,7 @@ fn reloadFromManifest() void {
     const cur = runtime.current();
     if (cur) |c| {
         if (trusted.n <= c.n) {
-            log("ziggurat: reload: nothing to do (gen {d})", .{c.n});
+            if (loud) log("ziggurat: reload: nothing to do (gen {d})", .{c.n});
             return;
         }
     }
@@ -129,14 +191,19 @@ fn reloadFromManifest() void {
     }
 
     var store_obj = platform.generation_store.GenerationStore.init(gpa, io, .fromTrusted(store), os, stem, .{});
-    var new_pin: ?platform.generation_store.FileLock = store_obj.pin(trusted.n) catch |err| blk: {
-        logWarning("Ziggurat could not pin generation {d} ({s}); an editor's cleanup may delete its files while this game runs.", .{ trusted.n, @errorName(err) });
-        break :blk null;
+    // The pin is kept for the life of the game, so the generation the game
+    // swaps to is never swept. Without one, or without room to list it, the
+    // generation is not loaded: the game keeps running the current one.
+    reload_pins.ensureUnusedCapacity(gpa, 1) catch {
+        logError("Ziggurat cannot reload Zig scripts: out of memory.", .{});
+        return;
+    };
+    var new_pin: platform.generation_store.FileLock = store_obj.pin(trusted.n) catch |err| {
+        logError("Ziggurat could not pin generation {d} ({s}), so it is not loaded; {s}.", .{ trusted.n, @errorName(err), keepingText(&keep_buf) });
+        return;
     };
     var keep_pin = false;
-    defer if (!keep_pin) {
-        if (new_pin) |*l| l.release();
-    };
+    defer if (!keep_pin) new_pin.release();
     const changed = manifest.recheck(gpa, io, store, trusted, os, stem) catch {
         logError("Ziggurat cannot reload Zig scripts: out of memory.", .{});
         return;
@@ -155,13 +222,8 @@ fn reloadFromManifest() void {
         }
         return;
     };
-    if (new_pin) |l| {
-        reload_pins.append(gpa, l) catch {
-            logWarning("Ziggurat could not keep the pin of generation {d}: out of memory.", .{trusted.n});
-            return finishLoad(gen, cur);
-        };
-        keep_pin = true;
-    }
+    reload_pins.appendAssumeCapacity(new_pin);
+    keep_pin = true;
     finishLoad(gen, cur);
 }
 

@@ -368,7 +368,7 @@ pub const ZigLanguage = struct {
     /// Also fires when any other extension reloads (spec section 7).
     pub fn _reloadAllScripts(self: *ZigLanguage) void {
         self.noteReload(.all);
-        if (!script.isEditor()) game.requestReload();
+        if (!script.isEditor()) game.requestReload(.quiet);
     }
     /// Godot calls this with this language's own scripts only (for
     /// example `Script::reload_from_file` when the editor discards edits),
@@ -377,7 +377,7 @@ pub const ZigLanguage = struct {
     /// a flag, and its next `_frame` reads the manifest (`game.frame`).
     pub fn _reloadScripts(self: *ZigLanguage, scripts: Array, _: bool) void {
         self.noteReload(.scripts);
-        if (!script.isEditor()) game.requestReload();
+        if (!script.isEditor()) game.requestReload(.loud);
         var i: i64 = 0;
         while (i < scripts.size()) : (i += 1) {
             var v = scripts.get(i);

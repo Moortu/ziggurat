@@ -9,7 +9,9 @@ extends SceneTree
 #   3. a build that fails to load (a cut file): refused, gen 1 keeps running;
 #   4. a good gen 2 (test/fixtures/swap_v2): the game swaps within a few
 #      frames, `version()` returns the new value, field values are kept;
-#   5. a new instance runs gen 2, and a repeat request has nothing to do.
+#   5. a new instance runs gen 2, and a repeat request has nothing to do;
+#   6. a manifest the reader refuses keeps gen 2;
+#   7. with polling on, a newer manifest alone swaps (gen 5).
 # modules.txt holds the library file name of each generation.
 
 var probe: Object
@@ -49,6 +51,12 @@ func reload_and_wait(want: int, limit: int) -> int:
 	if probe.current_generation() != want:
 		return -1
 	return frames
+
+
+func write_raw_manifest(text: String) -> void:
+	var f := FileAccess.open("res://.godot/ziggurat/manifest", FileAccess.WRITE)
+	f.store_string(text)
+	f.close()
 
 
 func finish() -> void:
@@ -108,4 +116,20 @@ func run() -> void:
 	fresh.free()
 	r = await reload_and_wait(3, 4)
 	report("repeat_does_nothing", r == -1 and probe.current_generation() == 2, "frames %d" % r)
+
+	# 6. A manifest the reader refuses (a wrong library name): refused with
+	# its fixed reason, the game keeps running gen 2.
+	write_raw_manifest("gen=6\npath=gen/6/other.so\n")
+	r = await reload_and_wait(6, 4)
+	report("refused_manifest_keeps_gen", r == -1 and probe.current_generation() == 2 and node.call("version") == 2, "frames %d gen %d" % [r, probe.current_generation()])
+
+	# 7. The game watches the manifest when the editor started it: a newer
+	# manifest alone, with no reload request, swaps (to gen 5, gen 1's code).
+	probe.game_polling(true)
+	write_manifest(5)
+	var end := Time.get_ticks_msec() + 3000
+	while probe.current_generation() != 5 and Time.get_ticks_msec() < end:
+		await process_frame
+	report("polling_swaps_without_a_request", probe.current_generation() == 5 and node.call("version") == 1 and node.get("speed") == 2.5,
+		"gen %d version %s" % [probe.current_generation(), node.call("version")])
 	finish()
