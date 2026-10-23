@@ -95,7 +95,10 @@ export fn ziggurat_host_init(
     registry.addClass(script.ZigScript, registry.allocator, .auto);
     registry.addClass(resource.ZigLoader, registry.allocator, .auto);
     registry.addClass(resource.ZigSaver, registry.allocator, .auto);
-    if (comptime !host_options.export_build) editor_plugin.register(&registry);
+    if (comptime !host_options.export_build) {
+        editor_plugin.register(&registry);
+        game.register(&registry);
+    }
     if (host_options.test_probe) {
         const probe = registry.createClass(test_probe.ZigguratTestProbe, registry.allocator, .auto);
         inline for (test_probe.method_names) |name| probe.addMethod(name, .auto);
@@ -345,5 +348,6 @@ test {
     _ = game;
     _ = @import("host_callable.zig");
     _ = editor_plugin;
+    _ = @import("debugger_plugin.zig");
     _ = @import("editor_panel.zig");
 }

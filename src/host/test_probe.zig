@@ -25,6 +25,7 @@ const registry = @import("registry.zig");
 const swap = @import("swap.zig");
 const editor_plugin = @import("editor_plugin.zig");
 const editor_panel = @import("editor_panel.zig");
+const debugger_plugin = @import("debugger_plugin.zig");
 const host_callable = @import("host_callable.zig");
 const Callable = godot.builtin.Callable;
 const PackedStringArray = godot.builtin.PackedStringArray;
@@ -520,10 +521,31 @@ pub const ZigguratTestProbe = struct {
         editor_build.test_default_mismatch = true;
     }
 
-    /// Turns on the game's manifest polling (a game the editor did not
-    /// start has it off).
-    pub fn gamePolling(_: *ZigguratTestProbe, on: bool) void {
-        game.test_poll = on;
+    /// Hands the game the editor's `ziggurat:reload` message for
+    /// generation `n` (`game.onReloadMessage`).
+    pub fn gameReloadMessage(_: *ZigguratTestProbe, n: i64) void {
+        game.onReloadMessage(std.math.cast(u32, n) orelse return);
+    }
+
+    /// Runs the game's `ziggurat` capture as the debugger does with
+    /// `ziggurat:<message>` and `data`; returns what the capture returns.
+    pub fn gameCapture(_: *ZigguratTestProbe, message: String, data: Array) bool {
+        return game.handleCapture(message, data);
+    }
+
+    /// True while the game's `ziggurat` debugger capture is registered.
+    pub fn gameCaptureRegistered(_: *ZigguratTestProbe) bool {
+        return game.captureRegistered();
+    }
+
+    /// The generation of the editor's last `sendReload` call (-1: none).
+    pub fn debuggerReloadLast(_: *ZigguratTestProbe) i64 {
+        return debugger_plugin.test_last_n;
+    }
+
+    /// The `ziggurat:reload` messages the editor sent to active sessions.
+    pub fn debuggerReloadSends(_: *ZigguratTestProbe) i64 {
+        return debugger_plugin.test_sends;
     }
 
     /// Calls the language's `reload_tool_script` hook.
@@ -985,11 +1007,12 @@ pub const method_names = [_][:0]const u8{
     "gate_migrate_probe",       "registry_count",              "runtime_shutdown",         "stage_module",
     "gate_swap_begin",          "gate_swap_end",               "instance_generation",      "swap_request",
     "swap_outcome",             "swaps_done",                  "fail_allocation",          "instance_data",
-    "swap_hook",                "game_polling",                "set_size_warning_bytes",   "loaded_generations",
+    "swap_hook",                "game_reload_message",         "set_size_warning_bytes",   "loaded_generations",
     "generation_loaded",        "language_frame",              "language_stack_info",      "queue_pending",
     "queue_nested_frame_check", "language_nested_frames",      "gate_hold",                "default_mismatch_once",
     "editor_build_request",     "editor_build_status",         "editor_build_diagnostics", "editor_plugin_connect",
-    "editor_plugin_pings",      "editor_panel_toasts",         "editor_plugin_play",
+    "editor_plugin_pings",      "editor_panel_toasts",         "editor_plugin_play",       "game_capture",
+    "game_capture_registered",  "debugger_reload_last",        "debugger_reload_sends",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

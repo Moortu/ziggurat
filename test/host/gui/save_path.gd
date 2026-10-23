@@ -15,12 +15,14 @@ extends Node
 #    All;
 #    The same edit changes the body of `score` (adds 100 to its result);
 # 5. the save reaches the game as `_reload_scripts` before the editor has
-#    staged the build (the game logs that and keeps the old code); the game
-#    also watches the manifest, so when the editor writes it a few seconds
-#    later the game loads the build and swaps at its next frame;
-# 6. the save also builds a new generation in the editor, and the game
-#    prints the new `score` with `speed` unchanged (the running node's field
-#    value is kept).
+#    staged the build (the game reads the manifest quietly and keeps the old
+#    code); the save also builds a new generation in the editor;
+# 6. right after the editor writes the manifest it sends the game the
+#    debugger message `ziggurat:reload` with the generation; the game logs
+#    `ziggurat: generation <n> loaded` within 10 s of the save (it does not
+#    watch the manifest), swaps at its next frame and prints the new
+#    `score` with `speed` unchanged (the running node's field value is
+#    kept).
 # Play itself saves open scripts first (EditorNode saves external data before
 # a run, and the script editor's indent conversion on save marks the file
 # changed), which builds another generation before the game starts; the
@@ -139,7 +141,10 @@ func run() -> void:
 	if not built:
 		return
 
-	# 6. The game finds the manifest, loads the build and swaps by itself.
+	# 6. The editor's message makes the game load the build and swap.
+	var gen_line := "ziggurat: generation %d loaded" % manifest_gen()
+	var loaded: bool = await wait_for(func(): return log_text().contains(gen_line), maxi(t0 + RELOAD_WAIT_MS - Time.get_ticks_msec(), 0))
+	report("gui_game_loads_message_gen", loaded, "no '%s' in the log %d ms after the save" % [gen_line, Time.get_ticks_msec() - t0])
 	var t1 := Time.get_ticks_msec()
 	var swapped: bool = await wait_for(func(): return log_text().contains(NEW_SCORE_LINE), RELOAD_WAIT_MS)
 	print("gui save path: new code in the game %d ms after the manifest, %d ms after the save" % [Time.get_ticks_msec() - t1, Time.get_ticks_msec() - t0])

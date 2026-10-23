@@ -89,6 +89,10 @@ func run() -> void:
 	st = probe.editor_build_status()
 	report("api_manual_outcome", probe.editor_build_outcomes() == outcomes + 1 and not st.building and st.trigger == "manual" and st.ok and st.n > first_n and st.zig_problem == "none" and st.error_count == 0,
 		"outcomes %d -> %d, %s" % [outcomes, probe.editor_build_outcomes(), str(st)])
+	# The manifest write tells running games; this editor runs none, so no
+	# session is active and nothing is sent.
+	report("api_reload_after_manifest", probe.debugger_reload_last() == st.n and probe.debugger_reload_sends() == 0,
+		"last %d sends %d n %d" % [probe.debugger_reload_last(), probe.debugger_reload_sends(), st.n])
 
 	# Settings are read again at each request.
 	ProjectSettings.set_setting(SETTING, missing)

@@ -7,7 +7,8 @@ extends SceneTree
 # node has no script. Prints which of the two happened, then ZTEST DONE;
 # the Zig test checks the log lines. With ZigguratTestProbe present it also
 # calls the language's `reload_scripts` hook twice, as Godot's debugger does
-# after two saves; the game handles them at its next frame and logs that the manifest names the build it runs (one line).
+# after two saves; the game handles them at its next frame quietly: the
+# manifest names the build it runs, so nothing is logged.
 
 var node: Node2D
 var mover_script: Script

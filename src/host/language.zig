@@ -170,7 +170,7 @@ pub const ZigLanguage = struct {
     /// point (spec section 2): Godot calls it also from nested
     /// `Main::iteration()` calls. A nested call is one made while another
     /// `_frame` is running or while module code is on the main thread's
-    /// stack; it runs no queued callback, no manifest poll and no swap, and
+    /// stack; it runs no queued callback, no game reload and no swap, and
     /// records the swap as waiting (`swap.deferNested`). This is the only
     /// place that rule lives.
     pub fn _frame(_: *ZigLanguage) void {
@@ -388,16 +388,18 @@ pub const ZigLanguage = struct {
     /// Also fires when any other extension reloads (spec section 7).
     pub fn _reloadAllScripts(self: *ZigLanguage) void {
         self.noteReload(.all);
-        if (!script.isEditor()) game.requestReload(.quiet);
+        if (!script.isEditor()) game.requestReload(.quiet, 0);
     }
     /// Godot calls this with this language's own scripts only (for
     /// example `Script::reload_from_file` when the editor discards edits),
     /// so each listed script gets its text back from its file. In a game
-    /// the debugger sends it after a save in the editor; the game only sets
-    /// a flag, and its next `_frame` reads the manifest (`game.frame`).
+    /// the debugger sends it after a save in the editor, before the build
+    /// is staged; the game only sets a flag, and its next `_frame` reads the
+    /// manifest quietly (`game.frame`). The editor's `ziggurat:reload`
+    /// message brings the build once it is staged.
     pub fn _reloadScripts(self: *ZigLanguage, scripts: Array, _: bool) void {
         self.noteReload(.scripts);
-        if (!script.isEditor()) game.requestReload(.loud);
+        if (!script.isEditor()) game.requestReload(.quiet, 0);
         var i: i64 = 0;
         while (i < scripts.size()) : (i += 1) {
             var v = scripts.get(i);

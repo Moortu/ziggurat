@@ -1589,6 +1589,7 @@ test "public build API" {
             "ZTEST PASS api_request_known_trigger",
             "ZTEST PASS api_building",
             "ZTEST PASS api_manual_outcome",
+            "ZTEST PASS api_reload_after_manifest",
             "ZTEST PASS api_zig_missing",
             "ZTEST PASS api_zig_wrong_version",
             "ZTEST PASS api_editor_setting_used",
@@ -1994,15 +1995,14 @@ test "game runs ready" {
             "ziggurat: generation 1 loaded",
             "[ziggurat] mover ready speed=5\n",
             "game check: scripts running",
-            // The debugger's reload requests: the manifest names the build
-            // the game runs, so one line says there is nothing to do.
-            "ziggurat: reload: nothing to do (gen 1)",
         },
-        .reject = &.{ refused_prefix, "placeholder", "swaps arrive in a later version" },
+        // The debugger's reload requests: the manifest names the build the
+        // game runs, and Godot's reloads are quiet, so nothing is logged.
+        .reject = &.{ refused_prefix, "placeholder", "swaps arrive in a later version", "nothing to do", "may not be staged yet" },
     });
 }
 
-test "game reload: swaps on reload, keeps old on bad build, reload before staging" {
+test "game reload: reload message swaps the game, no polling, quiet godot reload, keeps old on bad build" {
     try requireIntegration();
     var p: Project = undefined;
     try p.initProbe("empty");
@@ -2032,8 +2032,8 @@ test "game reload: swaps on reload, keeps old on bad build, reload before stagin
     try dir.createDirPath(io, ".godot/ziggurat/gen/4");
     try cwd.copyFile(v1, dir, try std.fmt.allocPrint(a, ".godot/ziggurat/gen/1/{s}", .{try genLibName(&names[1], 1)}), io, .{});
     try cwd.copyFile(v2, dir, try std.fmt.allocPrint(a, ".godot/ziggurat/gen/2/{s}", .{try genLibName(&names[2], 2)}), io, .{});
-    // Generation 5 is another file with generation 1's code: the polling
-    // case swaps back to it.
+    // Generation 5 is another file with generation 1's code: the reload
+    // message swaps back to it.
     try dir.createDirPath(io, ".godot/ziggurat/gen/5");
     try cwd.copyFile(v1, dir, try std.fmt.allocPrint(a, ".godot/ziggurat/gen/5/{s}", .{try genLibName(&names[5], 5)}), io, .{});
     // Generations 7 (generation 2's code) and 8 (generation 1's): the
@@ -2069,17 +2069,18 @@ test "game reload: swaps on reload, keeps old on bad build, reload before stagin
             "ZTEST PASS new_instance_runs_gen_2",
             "ZTEST PASS repeat_does_nothing",
             "ZTEST PASS refused_manifest_keeps_gen",
-            "ZTEST PASS polling_swaps_without_a_request",
+            "ZTEST PASS no_polling",
+            "ZTEST PASS reload_message_swaps",
+            "ZTEST PASS old_message_does_nothing",
+            "ZTEST PASS capture_registered",
+            "ZTEST PASS capture_takes_reload_only",
             "ZTEST PASS newest_reload_wins_after_deferral",
             "ZTEST DONE",
         },
         .once = &.{
-            "ziggurat: reload: the build may not be staged yet; keeping gen 1",
-            "ziggurat: reload: nothing to do (gen 1)",
             "Ziggurat refused generation 4: ",
             "ziggurat: generation 2 loaded",
             "ziggurat: swapped to build 2",
-            "ziggurat: reload: nothing to do (gen 2)",
             "Ziggurat ignores the generation manifest for this reload because the library file name is not the one the editor writes for that generation; keeping gen 2.",
             "ziggurat: generation 5 loaded",
             "ziggurat: generation 7 loaded",
@@ -2088,7 +2089,9 @@ test "game reload: swaps on reload, keeps old on bad build, reload before stagin
             "ziggurat: the swap to build 8 waits for script calls on other threads to return",
             "ziggurat: swapped to build 8",
         },
-        .reject = &.{ "ZTEST FAIL", "swaps arrive in a later version", "nothing to do (gen 5)", "swapped to build 7" },
+        // Godot's reloads with nothing newer and the message for gen 4 log
+        // nothing (quiet godot reload).
+        .reject = &.{ "ZTEST FAIL", "swaps arrive in a later version", "swapped to build 7", "may not be staged yet", "nothing to do", "keeping gen 5" },
     });
 }
 
@@ -2156,6 +2159,7 @@ const gui_cases = [_][]const u8{
     "ZTEST PASS gui_script_edited",
     "ZTEST PASS gui_script_saved",
     "ZTEST PASS gui_save_builds",
+    "ZTEST PASS gui_game_loads_message_gen",
     "ZTEST PASS gui_game_runs_new_code",
     "ZTEST PASS gui_game_swapped_line",
 };
@@ -2222,7 +2226,9 @@ test "gui: save in the script editor reaches the running game" {
         if (std.mem.indexOf(u8, out, text) == null)
             try problems.append(a, try std.fmt.allocPrint(a, "missing expected text: {s}", .{text}));
     }
-    for ([_][]const u8{ "ZTEST FAIL", "Program crashed", "emit of signal" }) |text| {
+    // Godot's reload on the save comes before staging; the game reads the
+    // manifest quietly.
+    for ([_][]const u8{ "ZTEST FAIL", "Program crashed", "emit of signal", "may not be staged yet" }) |text| {
         if (std.mem.indexOf(u8, out, text) != null)
             try problems.append(a, try std.fmt.allocPrint(a, "rejected text present: {s}", .{text}));
     }

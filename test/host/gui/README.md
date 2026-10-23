@@ -15,10 +15,13 @@ Files:
 - `save_path.gd`: the editor-side test, a tool autoload. It waits for the
   build at project open, opens `res://hero.zig` in the script editor, plays
   the main scene, changes two lines (the default of `speed` and the body of
-  `score`), saves with `ScriptEditor.save_all_scripts()`, waits for the new
-  build, saves once more (so the game reads the manifest again) and waits up
-  to 10 s for the game's line `e2e game: hero score=126 speed=12.5` (the
-  running game's new code, the field value kept; before: `score=26`).
+  `score`), saves with `ScriptEditor.save_all_scripts()` and waits for the
+  new build. The editor sends the game the debugger message
+  `ziggurat:reload` right after it writes the manifest; the test checks that
+  the game logs `ziggurat: generation <n> loaded` within 10 s of the save,
+  then waits up to 10 s for the game's line `e2e game: hero score=126
+  speed=12.5` (the running game's new code, the field value kept; before:
+  `score=26`).
 - `run-gui.sh`: starts the editor under `xvfb-run` in its own session with a
   deadline, writes the editor's and the game's output to one log file, and
   kills whatever of the run is left at the end, also when it is interrupted.
@@ -68,10 +71,9 @@ nix shell 'github:silversquirl/zig-flake/compat#"0.17.0"' nixpkgs#godot
    speed=12.5`), change `speed: f32 = 5,` to `speed: f32 = 6,` and add
    ` + 100` before the `;` in the `return` of `score`, then save with
    **File > Save** (Ctrl+S).
-7. The game logs `the build may not be staged yet; keeping gen N` (the
-   build is not done yet). When the editor logs `ziggurat: build M loaded
-   (save, ...)`, save once more (add a space and save). Expected within 10 s
-   from the game: `ziggurat: swapped to build M ...` and `e2e game: hero
+7. When the editor logs `ziggurat: build M loaded (save, ...)`, it tells the
+   game. Expected within a few seconds from the game: `ziggurat: generation
+   M loaded`, `ziggurat: swapped to build M ...` and `e2e game: hero
    score=126 speed=12.5`.
 8. Stop the game and close the editor. Delete `/tmp/ziggurat-e2e` and
    `/tmp/ziggurat-e2e-sdk.json`.

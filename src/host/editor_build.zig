@@ -82,6 +82,7 @@ const props = @import("props.zig");
 const swap = @import("swap.zig");
 const registry = @import("registry.zig");
 const abi = @import("ziggurat_abi");
+const debugger_plugin = @import("debugger_plugin.zig");
 
 const Allocator = std.mem.Allocator;
 const OsPath = platform.path.OsPath;
@@ -1186,6 +1187,8 @@ fn writeManifest(st: *State, n: u32, lib: []const u8) void {
     };
     if (st.manifest_pin) |*old| old.release();
     st.manifest_pin = lock;
+    // Running games load it now (game.zig, the `ziggurat` capture).
+    debugger_plugin.sendReload(n);
 }
 
 /// Warns once per session when what the editor holds of its builds exceeds

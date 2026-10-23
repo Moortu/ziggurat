@@ -16,7 +16,9 @@
 //! `Download Zig 0.17.0`. Each frame (`_process`) it checks whether a new
 //! build outcome was applied (`editor_build.outcomes_applied`) or a build
 //! started or ended; then it updates the panel and pushes the outcome's
-//! toast. When it leaves the tree it takes the menu items and the panel
+//! toast. It also adds the debugger plugin (debugger_plugin.zig), which
+//! tells running games to reload after each manifest write. When it leaves
+//! the tree it takes the menu items, the panel and the debugger plugin
 //! back. The download builds on it (editor_build.zig has the build API).
 //!
 //! Build on Play (`_build`: Godot calls it on the main thread when Play is
@@ -37,6 +39,7 @@ const godot = @import("gdzig");
 const host_options = @import("host_options");
 const editor_build = @import("editor_build.zig");
 const editor_panel = @import("editor_panel.zig");
+const debugger_plugin = @import("debugger_plugin.zig");
 const host_callable = @import("host_callable.zig");
 const host_io = @import("host_io.zig");
 
@@ -89,11 +92,13 @@ pub const ZigEditorPlugin = struct {
         }
         self.addMenuItem(menu_build, "build_menu");
         self.addMenuItem(menu_download, "download_menu");
+        debugger_plugin.attach(self.base);
         self.base.setProcess(true);
     }
 
     pub fn _exitTree(self: *ZigEditorPlugin) void {
         self.base.setProcess(false);
+        debugger_plugin.detach(self.base);
         inline for (.{ menu_build, menu_download }) |name| {
             var n = String.fromLatin1(name);
             defer n.deinit();
@@ -266,6 +271,7 @@ pub fn register(registry: *godot.extension.Registry) void {
     const panel = registry.createClass(ZigPanel, registry.allocator, .{ .level = .editor, .is_exposed = false });
     panel.addMethod("build_pressed", .auto);
     panel.addMethod("on_meta_clicked", .auto);
+    debugger_plugin.register(registry);
 }
 
 /// Hands the class to the editor (EDITOR init, after the class is

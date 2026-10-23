@@ -8,6 +8,14 @@
 //! lock on `gen/<n>/.lock`) from the first check until SCENE exit, so an
 //! editor's sweep never deletes the folder of the generation it runs.
 //!
+//! A game reloads when the editor says so: right after the editor writes a
+//! new manifest it sends the debugger message `ziggurat:reload` with the
+//! generation number (debugger_plugin.zig), which the `ziggurat` capture
+//! registered here at start turns into a reload request; the next frame
+//! loads that generation and the swap engine moves the scripts to it. A
+//! game does not watch the manifest file. Godot's own reload messages (on
+//! a save, before the build is staged) read the manifest quietly.
+//!
 //! An export build (`host_options.export_build`) compiles all of this out:
 //! no reader, no file name and no symbol of it remain in the library. Until
 //! scripts are linked into the export (Stage 6) such a game has no module
@@ -21,8 +29,14 @@ const host_io = @import("host_io.zig");
 const desc_cache = @import("desc_cache.zig");
 const platform = @import("ziggurat_platform");
 const swap = @import("swap.zig");
+const props = @import("props.zig");
+const host_callable = @import("host_callable.zig");
 
+const Allocator = std.mem.Allocator;
 const String = godot.builtin.String;
+const StringName = godot.builtin.StringName;
+const Array = godot.builtin.Array;
+const Object = godot.class.Object;
 
 /// Thread-safe and never destroyed, as `runtime.load` requires.
 const gpa = std.heap.c_allocator;
@@ -40,87 +54,152 @@ var reload_pins: std.ArrayList(platform.generation_store.FileLock) = .empty;
 /// `loud` an explicit request that logs "nothing to do".
 var reload_wanted: std.atomic.Value(u8) = .init(0);
 pub const Request = enum(u8) { quiet = 1, loud = 2 };
+/// The highest generation number a request named (0: none), taken with
+/// `reload_wanted` by `frame`.
+var reload_min_gen: std.atomic.Value(u32) = .init(0);
 
-/// The manifest's identity (inode, size, modification time) the last time
-/// `frame` looked, and when (Godot's `Time.get_ticks_msec`).
-const Ident = struct { inode: u64, size: u64, mtime_ns: i128 };
-var seen: ?Ident = null;
-var last_poll_ms: u64 = 0;
-/// How often a game started by the editor looks at the manifest.
-const poll_interval_ms = 500;
-/// A test turns polling on in a game the editor did not start.
-pub var test_poll = false;
+/// The debugger message capture this game registered (`ziggurat`), and the
+/// object its Callable calls. Main thread, between `start` and `stop`.
+var capture_obj: ?*ZigReloadCapture = null;
+/// The capture's name: messages `ziggurat:<msg>` from the editor reach it.
+const capture_name = "ziggurat";
 
 /// Main thread, SCENE init, in a game process, after the language and the
-/// loader are registered.
+/// loader are registered. The message capture is registered first, so a
+/// manifest the editor writes after the load below always comes with a
+/// message the game hears.
 pub fn start() void {
     if (comptime host_options.export_build) {
         log("This export build of Ziggurat has no module source yet, so this game runs without Zig scripts.", .{});
         return;
     }
+    registerCapture();
     loadFromStore();
-    rememberManifest();
 }
 
-/// Releases the pin. Main thread, SCENE exit.
+/// Releases the pins and the message capture. Main thread, SCENE exit.
 pub fn stop() void {
     if (comptime host_options.export_build) return;
+    unregisterCapture();
+    releasePins();
+    reload_wanted.store(0, .release);
+    reload_min_gen.store(0, .release);
+}
+
+fn releasePins() void {
     if (pin) |*l| l.release();
     pin = null;
     for (reload_pins.items) |*l| l.release();
     reload_pins.clearAndFree(gpa);
-    reload_wanted.store(0, .release);
 }
 
-/// The editor told this game to reload its scripts (`_reload_scripts` is
-/// `.loud`; `_reload_all_scripts` is `.quiet`, since other extensions
-/// trigger it too). Any thread; it only sets a flag, `frame` does the work.
-/// An export build has no reload path.
-pub fn requestReload(kind: Request) void {
+/// Something asked this game to reload its scripts: Godot's
+/// `_reload_scripts` and `_reload_all_scripts` (`.quiet`, `min_gen` 0: they
+/// come on a save, before the editor staged the build, and from other
+/// extensions) or the editor's `ziggurat:reload` message (`.quiet`, the
+/// generation it just wrote into the manifest). Any thread; it only sets
+/// flags, `frame` does the work. An export build has no reload path.
+pub fn requestReload(kind: Request, min_gen: u32) void {
     if (comptime host_options.export_build) return;
+    _ = reload_min_gen.fetchMax(min_gen, .acq_rel);
     _ = reload_wanted.fetchMax(@backingInt(kind), .acq_rel);
 }
 
-fn manifestIdent(store: []const u8) ?Ident {
-    const manifest = @import("manifest.zig");
-    var buf: [4200]u8 = undefined;
-    const path = std.fmt.bufPrint(&buf, "{s}{c}{s}", .{ store, std.fs.path.sep, manifest.file_name }) catch return null;
-    const st = std.Io.Dir.cwd().statFile(host_io.get(), path, .{ .follow_symlinks = false }) catch return null;
-    return .{ .inode = @intCast(st.inode), .size = st.size, .mtime_ns = st.mtime.nanoseconds };
+/// The editor wrote generation `n` into the manifest (`ziggurat:reload`).
+/// A number not newer than the current generation does nothing: a game
+/// started by Play already loaded the generation the message names.
+pub fn onReloadMessage(n: u32) void {
+    requestReload(.quiet, n);
 }
 
-fn identEql(a: ?Ident, b: ?Ident) bool {
-    const x = a orelse return b == null;
-    const y = b orelse return false;
-    return x.inode == y.inode and x.size == y.size and x.mtime_ns == y.mtime_ns;
+/// The generation a `ziggurat:<message>` capture call names: `reload` with
+/// data `[n]`, n from 1 to the largest u32. Anything else is null.
+pub fn reloadMessageGen(message: []const u8, first: ?i64, len: i64) ?u32 {
+    if (!std.mem.eql(u8, message, "reload") or len != 1) return null;
+    const n = std.math.cast(u32, first orelse return null) orelse return null;
+    return if (n == 0) null else n;
 }
 
-/// Remembers the manifest's identity as the one already handled.
-fn rememberManifest() void {
-    var store_buf: [4096]u8 = undefined;
-    const store = desc_cache.dataPath(&store_buf, "ziggurat") orelse return;
-    seen = manifestIdent(store);
-    last_poll_ms = godot.class.Time.getTicksMsec();
-}
+/// The object the `ziggurat` capture's Callable calls (`capture`, bound
+/// below): Godot's debugger calls it on the main thread from its message
+/// poll with the message without the prefix and its data. Registered only
+/// in builds with a reload path (not in export builds); never exposed.
+pub const ZigReloadCapture = struct {
+    base: *Object,
 
-/// True when polling is on, half a second passed since the last look and
-/// the manifest's identity changed (the new one is remembered). Polling is
-/// on in a game the editor started (an active `EngineDebugger`): Godot's
-/// reload message comes when the script is saved, before the editor has
-/// staged the build and written the manifest, so the manifest is watched
-/// too. It only decides when to run the reload; every trust rule is in the
-/// reader.
-fn manifestChanged() bool {
-    const now = godot.class.Time.getTicksMsec();
-    if (now -% last_poll_ms < poll_interval_ms) return false;
-    last_poll_ms = now;
-    if (!test_poll and !godot.class.EngineDebugger.isActive()) return false;
-    var store_buf: [4096]u8 = undefined;
-    const store = desc_cache.dataPath(&store_buf, "ziggurat") orelse return false;
-    const now_ident = manifestIdent(store);
-    if (identEql(seen, now_ident)) return false;
-    seen = now_ident;
+    pub fn create(allocator: *Allocator) !*ZigReloadCapture {
+        const self = try allocator.create(ZigReloadCapture);
+        self.* = .{ .base = Object.init() };
+        self.base.setInstance(ZigReloadCapture, self);
+        return self;
+    }
+
+    pub fn destroy(self: *ZigReloadCapture, allocator: *Allocator) void {
+        self.base.destroy();
+        allocator.destroy(self);
+    }
+
+    /// Bound as `capture`. True when the message was this game's.
+    pub fn capture(_: *ZigReloadCapture, message: String, data: Array) bool {
+        return handleCapture(message, data);
+    }
+};
+
+/// What the `ziggurat` capture does with a message: `reload [n]` asks for a
+/// reload; anything else is not this game's message.
+pub fn handleCapture(message: String, data: Array) bool {
+    var buf: [32]u8 = undefined;
+    const text = props.stringText(&message, &buf) orelse return false;
+    var first: ?i64 = null;
+    if (data.size() >= 1) {
+        var v = data.get(0);
+        defer v.deinit();
+        first = v.as(i64);
+    }
+    const n = reloadMessageGen(text, first, data.size()) orelse return false;
+    onReloadMessage(n);
     return true;
+}
+
+/// Adds the capture's class (SCENE level, not exposed). Not in export
+/// builds.
+pub fn register(registry: *godot.extension.Registry) void {
+    comptime std.debug.assert(!host_options.export_build);
+    const cls = registry.createClass(ZigReloadCapture, registry.allocator, .{ .is_exposed = false });
+    cls.addMethod("capture", .auto);
+}
+
+fn registerCapture() void {
+    if (capture_obj != null) return;
+    var alloc = godot.engine_allocator;
+    const obj = ZigReloadCapture.create(&alloc) catch {
+        logError("Ziggurat cannot listen for the editor's reload messages: out of memory.", .{});
+        return;
+    };
+    const name: StringName = .fromComptimeLatin1(capture_name);
+    if (godot.class.EngineDebugger.hasCapture(name)) {
+        logError("Ziggurat cannot listen for the editor's reload messages: the debugger capture '" ++ capture_name ++ "' is taken.", .{});
+        obj.destroy(&alloc);
+        return;
+    }
+    var c = host_callable.callable(Object.upcast(obj.base), "capture");
+    defer c.deinit();
+    godot.class.EngineDebugger.registerMessageCapture(name, c);
+    capture_obj = obj;
+}
+
+fn unregisterCapture() void {
+    const obj = capture_obj orelse return;
+    const name: StringName = .fromComptimeLatin1(capture_name);
+    if (godot.class.EngineDebugger.hasCapture(name)) godot.class.EngineDebugger.unregisterMessageCapture(name);
+    var alloc = godot.engine_allocator;
+    obj.destroy(&alloc);
+    capture_obj = null;
+}
+
+/// True while this game's capture is registered (for the host tests).
+pub fn captureRegistered() bool {
+    return capture_obj != null and godot.class.EngineDebugger.hasCapture(.fromComptimeLatin1(capture_name));
 }
 
 /// Handles a reload request: from `ZigLanguage._frame`, main thread, before
@@ -135,12 +214,16 @@ fn manifestChanged() bool {
 /// uses (`manifest.readTrusted`, `recheck`).
 pub fn frame() void {
     if (comptime host_options.export_build) return;
-    var want = reload_wanted.swap(0, .acq_rel);
-    if (want == 0) {
-        if (!manifestChanged()) return;
-        want = @backingInt(Request.quiet);
+    const want = reload_wanted.swap(0, .acq_rel);
+    if (want == 0) return;
+    const min_gen = reload_min_gen.swap(0, .acq_rel);
+    const loud = want == @backingInt(Request.loud);
+    // The message names a generation this game runs already (or an older
+    // one): nothing to read.
+    if (!loud and min_gen != 0) {
+        if (runtime.current()) |c| if (min_gen <= c.n) return;
     }
-    reloadFromManifest(want == @backingInt(Request.loud));
+    reloadFromManifest(loud);
 }
 
 fn keepingText(buf: *[48]u8) []const u8 {
@@ -170,8 +253,9 @@ fn reloadFromManifest(loud: bool) void {
         .ok => |*t| t,
         .refused => |r| {
             switch (r) {
-                // The editor sends another reload after it stages.
-                .missing, .library_missing => log("ziggurat: reload: the build may not be staged yet; {s}", .{keepingText(&keep_buf)}),
+                // Godot's reload comes on a save, before the editor staged
+                // the build; the editor's message follows the staging.
+                .missing, .library_missing => if (loud) log("ziggurat: reload: the build may not be staged yet; {s}", .{keepingText(&keep_buf)}),
                 else => logError("Ziggurat ignores the generation manifest for this reload because {s}; {s}.", .{ r.because(), keepingText(&keep_buf) }),
             }
             return;
@@ -278,7 +362,7 @@ fn loadFromStore() void {
     };
     if (changed) |r| {
         logError("{s}", .{r.sentence()});
-        stop();
+        releasePins();
         return;
     }
     var diag: [256]u8 = undefined;
@@ -289,7 +373,7 @@ fn loadFromStore() void {
             error.NotMainThread => {},
             error.Refused => logError("{s}", .{std.mem.sliceTo(&diag, 0)}),
         }
-        stop();
+        releasePins();
         return;
     };
     // New instances use it from now on.
@@ -315,4 +399,16 @@ fn log(comptime fmt: []const u8, args: anytype) void {
     var s: String = String.fromUtf8(msg) catch String.fromLatin1(msg);
     defer s.deinit();
     godot.general.print(.init(String, s), .{});
+}
+
+test "reload message: only reload with one generation from 1 up" {
+    try std.testing.expectEqual(@as(?u32, 5), reloadMessageGen("reload", 5, 1));
+    try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), reloadMessageGen("reload", std.math.maxInt(u32), 1));
+    try std.testing.expectEqual(@as(?u32, null), reloadMessageGen("reload", 0, 1));
+    try std.testing.expectEqual(@as(?u32, null), reloadMessageGen("reload", -1, 1));
+    try std.testing.expectEqual(@as(?u32, null), reloadMessageGen("reload", 1 << 32, 1));
+    try std.testing.expectEqual(@as(?u32, null), reloadMessageGen("reload", null, 1));
+    try std.testing.expectEqual(@as(?u32, null), reloadMessageGen("reload", 5, 2));
+    try std.testing.expectEqual(@as(?u32, null), reloadMessageGen("reload", null, 0));
+    try std.testing.expectEqual(@as(?u32, null), reloadMessageGen("reloads", 5, 1));
 }

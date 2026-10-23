@@ -2,16 +2,24 @@ extends SceneTree
 # Host test "game reload": a game process loads generation 1 from the
 # manifest and runs a node with res://mover.zig (test/fixtures/swap_v1).
 # The check then plays the editor's part: it writes the manifest, asks the
-# game to reload as the debugger does (the probe calls the language's
-# `reload_scripts` hook) and waits for the game's frames.
-#   1. a manifest that names a build not staged yet: the game keeps gen 1;
-#   2. a manifest that names the current build: nothing to do;
+# game to reload as Godot's debugger does on a save (the probe calls the
+# language's `reload_scripts` hook, which reads the manifest quietly) or as
+# the editor does after staging (the probe hands the game the
+# `ziggurat:reload` message) and waits for the game's frames.
+#   1. a manifest that names a build not staged yet: the game keeps gen 1
+#      and logs nothing;
+#   2. a manifest that names the current build: nothing to do, nothing
+#      logged;
 #   3. a build that fails to load (a cut file): refused, gen 1 keeps running;
 #   4. a good gen 2 (test/fixtures/swap_v2): the game swaps within a few
 #      frames, `version()` returns the new value, field values are kept;
 #   5. a new instance runs gen 2, and a repeat request has nothing to do;
 #   6. a manifest the reader refuses keeps gen 2;
-#   7. with polling on, a newer manifest alone swaps (gen 5);
+#   7. no polling: a newer manifest alone (gen 5) is not loaded within 3 s;
+#      the editor's message for gen 5 swaps; a later message for gen 4
+#      does nothing and logs nothing (the manifest it would read is one the
+#      reader refuses); the `ziggurat` capture is registered and takes only
+#      `reload [n]`;
 #   8. a thread holds the gate (as a script call on another thread does),
 #      so the swap to a reloaded gen 7 waits; a second reload to gen 8
 #      arrives meanwhile; when the thread lets go, the newest request wins:
@@ -131,15 +139,37 @@ func run() -> void:
 	r = await reload_and_wait(6, 4)
 	report("refused_manifest_keeps_gen", r == -1 and probe.current_generation() == 2 and node.call("version") == 2, "frames %d gen %d" % [r, probe.current_generation()])
 
-	# 7. The game watches the manifest when the editor started it: a newer
-	# manifest alone, with no reload request, swaps (to gen 5, gen 1's code).
-	probe.game_polling(true)
+	# 7. No polling: a newer manifest alone, with no message, is not loaded.
 	write_manifest(5)
 	var end := Time.get_ticks_msec() + 3000
 	while probe.current_generation() != 5 and Time.get_ticks_msec() < end:
 		await process_frame
-	report("polling_swaps_without_a_request", probe.current_generation() == 5 and node.call("version") == 1 and node.get("speed") == 2.5,
-		"gen %d version %s" % [probe.current_generation(), node.call("version")])
+	report("no_polling", probe.current_generation() == 2 and node.call("version") == 2, "gen %d" % probe.current_generation())
+	# The editor's message for gen 5 swaps (to gen 1's code).
+	probe.game_reload_message(5)
+	var frames := 0
+	while probe.current_generation() != 5 and frames < 10:
+		await process_frame
+		frames += 1
+	report("reload_message_swaps", probe.current_generation() == 5 and node.call("version") == 1 and node.get("speed") == 2.5,
+		"frames %d gen %d version %s" % [frames, probe.current_generation(), node.call("version")])
+	# A message for an older generation is not even read: the manifest now
+	# names a file the reader refuses, which would log a line.
+	write_raw_manifest("gen=6\npath=gen/6/other.so\n")
+	probe.game_reload_message(4)
+	for k in 4:
+		await process_frame
+	report("old_message_does_nothing", probe.current_generation() == 5, "gen %d" % probe.current_generation())
+	# The capture as the debugger calls it: `reload [n]` is taken (n = 5 is
+	# the current gen, so nothing happens), anything else is not.
+	report("capture_registered", probe.game_capture_registered(), "no capture")
+	var taken: bool = probe.game_capture("reload", [5])
+	var others: Array = [probe.game_capture("reload", []), probe.game_capture("reload", [0]), probe.game_capture("reload", ["5"]),
+		probe.game_capture("reload", [5, 6]), probe.game_capture("other", [5]), probe.game_capture("reload", [-1]),
+		probe.game_capture("reload", [4294967296])]
+	for k in 4:
+		await process_frame
+	report("capture_takes_reload_only", taken and not others.has(true) and probe.current_generation() == 5, "taken %s others %s" % [taken, others])
 
 	# 8. A reload while the swap waits for a thread: the newest one wins.
 	var t := Thread.new()
@@ -150,7 +180,7 @@ func run() -> void:
 		waited += 1
 	write_manifest(7)
 	probe.language_reload_scripts([node.get_script()])
-	var frames := 0
+	frames = 0
 	while not (probe.generation_loaded(7) and probe.swap_outcome() == DEFERRED_LOCK) and frames < 50:
 		await process_frame
 		frames += 1
