@@ -135,6 +135,12 @@ fn addSdk(
         .@"godot-path" = godot_path,
         // gdzig's name for single precision; `sdk_options.precision` says "single".
         .precision = "float",
+        // Scripts must not use gdzig's Object helpers (setInstance,
+        // asInstance, connect, disconnect, emit, emitAlloc); with false each
+        // is a compile error (vendor/gdzig/PATCHES.md, patch 3). This makes
+        // the SDK's gdzig a second dependency instance; the host keeps the
+        // helpers.
+        .object_helpers = false,
     });
 
     const options_tool = b.addExecutable(.{

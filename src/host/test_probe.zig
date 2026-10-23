@@ -31,6 +31,18 @@ const host_callable = @import("host_callable.zig");
 const Callable = godot.builtin.Callable;
 const PackedStringArray = godot.builtin.PackedStringArray;
 
+// The host's gdzig keeps the Object helpers that the SDK's gdzig withholds
+// from scripts (`object_helpers`, vendor/gdzig/PATCHES.md, patch 3).
+comptime {
+    const Node = godot.class.Node;
+    _ = Node.setInstance;
+    _ = Node.asInstance;
+    _ = Node.connect;
+    _ = Node.disconnect;
+    _ = Node.emit;
+    _ = Node.emitAlloc;
+}
+
 const Allocator = std.mem.Allocator;
 const String = godot.builtin.String;
 const StringName = godot.builtin.StringName;

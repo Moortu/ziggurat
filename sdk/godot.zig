@@ -44,13 +44,18 @@
 //! Limit: this curates names, it is not a sandbox. Methods of the
 //! re-exported types take and return gdzig types, and `@TypeOf` reaches
 //! any of them, the withheld ones included (`Callable.engine()` returns the
-//! gdzig Callable, whose type has `fromClosure`). Every re-exported class
-//! also inherits gdzig's Object helpers, which scripts must not use:
-//! `setInstance` and `asInstance` (the instance binding belongs to the
-//! host), `connect(comptime S, Callable)` (takes a gdzig Callable) and
-//! `emit`/`emitAlloc` (they convert through gdzig's Variant helpers; scripts
-//! use `z.emit`). Stage 3 leaves them reachable; withholding them (or a
-//! compile error on use) is Stage 4 work, before the SDK surface is frozen.
+//! gdzig Callable, whose type has `fromClosure`).
+//!
+//! gdzig's Object helpers are withheld from every re-exported class: the
+//! SDK's gdzig is built with `object_helpers = false` (vendor/gdzig/PATCHES.md,
+//! patch 3), so `setInstance` and `asInstance` (the instance binding belongs
+//! to the host), `connect`/`disconnect(comptime S, Callable)` (take a gdzig
+//! Callable) and `emit`/`emitAlloc` (they convert through gdzig's Variant
+//! helpers) are compile errors: "ziggurat: <name> is not available in
+//! scripts; use z.emit or z.godot.Callable". Scripts emit with `z.emit` and
+//! connect with the engine method `connectRaw(signal, callable.engine(),
+//! flags)`, `callable` a `Callable` from this file. The host's gdzig keeps
+//! the helpers.
 const gdzig = @import("gdzig");
 const builtin = gdzig.builtin;
 const global = gdzig.global;

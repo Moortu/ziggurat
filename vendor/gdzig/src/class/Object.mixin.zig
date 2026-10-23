@@ -88,8 +88,23 @@ pub fn constPtr(self: *const Self) *const anyopaque {
     return @ptrCast(self);
 }
 
+// Ziggurat patch 3 (vendor/gdzig/PATCHES.md): with the build option
+// `object_helpers = false` these six helpers are compile errors.
+pub const setInstance = if (object_helpers) setInstanceHelper else @compileError(withheld("setInstance"));
+pub const asInstance = if (object_helpers) asInstanceHelper else @compileError(withheld("asInstance"));
+pub const connect = if (object_helpers) connectHelper else @compileError(withheld("connect"));
+pub const disconnect = if (object_helpers) disconnectHelper else @compileError(withheld("disconnect"));
+pub const emit = if (object_helpers) emitHelper else @compileError(withheld("emit"));
+pub const emitAlloc = if (object_helpers) emitAllocHelper else @compileError(withheld("emitAlloc"));
+
+const object_helpers = @import("build_options").object_helpers;
+
+fn withheld(comptime name: []const u8) []const u8 {
+    return "ziggurat: " ++ name ++ " is not available in scripts; use z.emit or z.godot.Callable";
+}
+
 /// Bind an instance of an extension class to this engine class.
-pub fn setInstance(self: *Self, comptime T: type, instance_: *T) void {
+fn setInstanceHelper(self: *Self, comptime T: type, instance_: *T) void {
     comptime std.debug.assert(class.isA(Self, T));
     comptime std.debug.assert(class.isStructClass(T));
 
@@ -115,7 +130,7 @@ pub fn setInstance(self: *Self, comptime T: type, instance_: *T) void {
     }.callbacks);
 }
 
-pub fn asInstance(self: *Self, comptime T: type) ?*T {
+fn asInstanceHelper(self: *Self, comptime T: type) ?*T {
     comptime std.debug.assert(class.isA(Self, T));
     comptime std.debug.assert(class.isStructClass(T));
 
@@ -136,20 +151,20 @@ fn typeToken(comptime T: type) *anyopaque {
 }
 
 /// Connects a signal to a callable.
-pub fn connect(self: *Self, comptime S: type, callable: Callable) ConnectError!void {
+fn connectHelper(self: *Self, comptime S: type, callable: Callable) ConnectError!void {
     const signal_name: StringName = .fromSignal(S);
     const result = self.connectRaw(signal_name, callable, .{});
     if (result != .ok) return ConnectError.AlreadyConnected;
 }
 
 /// Disconnects a signal from a callable.
-pub fn disconnect(self: *Self, comptime S: type, callable: Callable) void {
+fn disconnectHelper(self: *Self, comptime S: type, callable: Callable) void {
     const signal_name: StringName = .fromSignal(S);
     self.disconnectRaw(signal_name, callable);
 }
 
 /// Emits a signal. Guarantees no allocations when calling across the FFI. Passing Transform2D, AABB, Basis, Transform3D, or Projection is a compile error; use the Alloc variant.
-pub fn emit(self: *Self, comptime SignalType: type, signal: AssertNonAllocating(SignalType)) EmitError!void {
+fn emitHelper(self: *Self, comptime SignalType: type, signal: AssertNonAllocating(SignalType)) EmitError!void {
     const signal_name: StringName = .fromSignal(SignalType);
     const fields = meta.structFields(SignalType);
     var args: [fields.len]Variant = undefined;
@@ -161,7 +176,7 @@ pub fn emit(self: *Self, comptime SignalType: type, signal: AssertNonAllocating(
 }
 
 /// Emits a signal. Will necessarily allocate when calling across the FFI with Transform2d, Aabb, Basis, Transform3d, or Projection.
-pub fn emitAlloc(self: *Self, comptime SignalType: type, signal: SignalType) EmitError!void {
+fn emitAllocHelper(self: *Self, comptime SignalType: type, signal: SignalType) EmitError!void {
     const signal_name: StringName = .fromSignal(SignalType);
     const fields = meta.structFields(SignalType);
     var args: [fields.len]Variant = undefined;

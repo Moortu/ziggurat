@@ -1259,6 +1259,61 @@ test "integration: emit compile errors" {
     } else return error.FromClosureNotRefused;
 }
 
+test "integration: scripts cannot call object helpers" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The SDK's gdzig is built with `object_helpers = false`
+    // (vendor/gdzig/PATCHES.md, patch 3): each of gdzig's Object helpers on
+    // an engine class is a compile error with this sentence.
+    const cases = [_]struct { name: []const u8, call: []const u8 }{
+        .{ .name = "setInstance", .call = "self.base.setInstance(@This(), self);" },
+        .{ .name = "asInstance", .call = "_ = self.base.asInstance(@This());" },
+        .{ .name = "connect", .call = "self.base.connect(signals.hit, undefined) catch {};" },
+        .{ .name = "disconnect", .call = "self.base.disconnect(signals.hit, undefined);" },
+        .{ .name = "emit", .call = "self.base.emit(signals.hit, .{}) catch {};" },
+        .{ .name = "emitAlloc", .call = "self.base.emitAlloc(signals.hit, .{}) catch {};" },
+    };
+    var h: Harness = undefined;
+    try h.init(&.{.{ .rel = "hero.zig", .data = try helperScript(a, "_ = self;") }});
+    defer h.deinit();
+    // The same script without a helper call builds.
+    try expectOk(try h.build(.open));
+    for (cases) |c| {
+        errdefer std.debug.print("case {s}\n", .{c.name});
+        try h.write("hero.zig", try helperScript(a, c.call));
+        const o = try h.build(.save);
+        errdefer printDiagnostics(o);
+        try testing.expect(!o.ok);
+        const want = try std.fmt.allocPrint(a, "ziggurat: {s} is not available in scripts; use z.emit or z.godot.Callable", .{c.name});
+        for (o.diagnostics) |d| {
+            if (std.mem.eql(u8, d.message, want)) break;
+        } else {
+            std.debug.print("want: {s}\n", .{want});
+            return error.HelperNotRefused;
+        }
+    }
+}
+
+/// A Node script whose `go` runs `call` (Zig statements).
+fn helperScript(a: std.mem.Allocator, call: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a,
+        \\const z = @import("ziggurat");
+        \\pub const extends = z.godot.Node;
+        \\base: *z.godot.Node,
+        \\pub const signals = struct {{
+        \\    pub const hit = struct {{}};
+        \\}};
+        \\pub fn go(self: *@This()) void {{
+        \\    {s}
+        \\}}
+        \\
+    , .{call});
+}
+
 /// Number of scripts in the large-project emit test.
 const many_scripts = 1500;
 

@@ -10,6 +10,8 @@ pub fn build(b: *Build) !void {
     const architecture = b.option([]const u8, "arch", "32") orelse "64";
     const godot_path = b.option([]const u8, "godot-path", "Path to a Godot executable");
     const regenerate_interface = b.option(bool, "regenerate-interface", "Regenerate the vendored GDExtension interface header (requires Python)") orelse false;
+    // Ziggurat patch 3 (vendor/gdzig/PATCHES.md).
+    const object_helpers = b.option(bool, "object_helpers", "Provide the Object helpers setInstance, asInstance, connect, disconnect, emit and emitAlloc on every class [default: true]") orelse true;
 
     //
     // Steps
@@ -145,6 +147,7 @@ pub fn build(b: *Build) !void {
     const gdzig_options = b.addOptions();
     gdzig_options.addOption([]const u8, "architecture", architecture);
     gdzig_options.addOption([]const u8, "precision", precision);
+    gdzig_options.addOption(bool, "object_helpers", object_helpers);
 
     const gdzig_mod = b.addModule("gdzig", .{
         .root_source_file = gdzig_combined.path(b, "gdzig.zig"),
