@@ -93,6 +93,18 @@ func run() -> void:
 	# session is active and nothing is sent.
 	report("api_reload_after_manifest", probe.debugger_reload_last() == st.n and probe.debugger_reload_sends() == 0,
 		"last %d sends %d n %d" % [probe.debugger_reload_last(), probe.debugger_reload_sends(), st.n])
+	# A session that starts after the write (a game whose connection the
+	# editor accepts later) gets the last generation: each session's
+	# `started` signal reaches the plugin, which sends the last written
+	# generation (none is active here, so nothing goes out).
+	var sessions: Array = probe.debugger_sessions()
+	var started_before: Dictionary = probe.debugger_started()
+	for s in sessions:
+		s.emit_signal("started")
+	var started_after: Dictionary = probe.debugger_started()
+	report("api_session_start_resends", sessions.size() >= 1 and started_after.calls == started_before.calls + sessions.size()
+		and started_after.resent == st.n and probe.debugger_reload_sends() == 0,
+		"sessions %d before %s after %s n %d" % [sessions.size(), started_before, started_after, st.n])
 
 	# Settings are read again at each request.
 	ProjectSettings.set_setting(SETTING, missing)

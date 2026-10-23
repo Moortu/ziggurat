@@ -65,9 +65,12 @@ var capture_obj: ?*ZigReloadCapture = null;
 const capture_name = "ziggurat";
 
 /// Main thread, SCENE init, in a game process, after the language and the
-/// loader are registered. The message capture is registered first, so a
-/// manifest the editor writes after the load below always comes with a
-/// message the game hears.
+/// loader are registered. The message capture is registered before the
+/// load below, so no message that arrives later is dropped. A manifest the
+/// editor writes after the load but before it accepted this game's
+/// debugger connection reaches the game too: when the session starts, the
+/// editor sends the generation of its last manifest write again
+/// (debugger_plugin.zig, `sessionStarted`).
 pub fn start() void {
     if (comptime host_options.export_build) {
         log("This export build of Ziggurat has no module source yet, so this game runs without Zig scripts.", .{});
@@ -223,7 +226,9 @@ pub fn frame() void {
     if (!loud and min_gen != 0) {
         if (runtime.current()) |c| if (min_gen <= c.n) return;
     }
-    reloadFromManifest(loud);
+    // Here `min_gen` is 0 (Godot's reload) or newer than the current
+    // generation (the editor announced a build this game does not run).
+    reloadFromManifest(loud, min_gen);
 }
 
 fn keepingText(buf: *[48]u8) []const u8 {
@@ -231,7 +236,10 @@ fn keepingText(buf: *[48]u8) []const u8 {
     return "no generation is loaded";
 }
 
-fn reloadFromManifest(loud: bool) void {
+/// `announced` is the generation the editor's message named when it is
+/// newer than the current one, else 0. A refusal is then a fault, not the
+/// expected state before staging, and is logged even for a quiet request.
+fn reloadFromManifest(loud: bool, announced: u32) void {
     const manifest = @import("manifest.zig");
     const zbuild = @import("ziggurat_build");
     const stem = zbuild.service.lib_stem;
@@ -255,7 +263,10 @@ fn reloadFromManifest(loud: bool) void {
             switch (r) {
                 // Godot's reload comes on a save, before the editor staged
                 // the build; the editor's message follows the staging.
-                .missing, .library_missing => if (loud) log("ziggurat: reload: the build may not be staged yet; {s}", .{keepingText(&keep_buf)}),
+                .missing, .library_missing => if (announced != 0)
+                    logError("Ziggurat cannot load build {d}, which the editor announced, because {s}; {s}.", .{ announced, r.because(), keepingText(&keep_buf) })
+                else if (loud)
+                    log("ziggurat: reload: the build may not be staged yet; {s}", .{keepingText(&keep_buf)}),
                 else => logError("Ziggurat ignores the generation manifest for this reload because {s}; {s}.", .{ r.because(), keepingText(&keep_buf) }),
             }
             return;
@@ -264,7 +275,10 @@ fn reloadFromManifest(loud: bool) void {
     const cur = runtime.current();
     if (cur) |c| {
         if (trusted.n <= c.n) {
-            if (loud) log("ziggurat: reload: nothing to do (gen {d})", .{c.n});
+            if (announced != 0)
+                logError("Ziggurat cannot load build {d}, which the editor announced, because the manifest names build {d}; {s}.", .{ announced, trusted.n, keepingText(&keep_buf) })
+            else if (loud)
+                log("ziggurat: reload: nothing to do (gen {d})", .{c.n});
             return;
         }
     }

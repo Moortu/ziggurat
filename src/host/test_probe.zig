@@ -543,6 +543,20 @@ pub const ZigguratTestProbe = struct {
         return debugger_plugin.test_last_n;
     }
 
+    /// The debugger plugin's sessions (EditorDebuggerSession objects).
+    pub fn debuggerSessions(_: *ZigguratTestProbe) Array {
+        return debugger_plugin.testSessions();
+    }
+
+    /// Calls of the plugin's `session_started` and the generation it sent
+    /// last (-1: none): keys `calls`, `resent`.
+    pub fn debuggerStarted(_: *ZigguratTestProbe) Dictionary {
+        var d: Dictionary = .init();
+        dictSet(&d, "calls", .init(i64, debugger_plugin.test_started));
+        dictSet(&d, "resent", .init(i64, debugger_plugin.test_resent_n));
+        return d;
+    }
+
     /// The `ziggurat:reload` messages the editor sent to active sessions.
     pub fn debuggerReloadSends(_: *ZigguratTestProbe) i64 {
         return debugger_plugin.test_sends;
@@ -1012,7 +1026,8 @@ pub const method_names = [_][:0]const u8{
     "queue_nested_frame_check", "language_nested_frames",      "gate_hold",                "default_mismatch_once",
     "editor_build_request",     "editor_build_status",         "editor_build_diagnostics", "editor_plugin_connect",
     "editor_plugin_pings",      "editor_panel_toasts",         "editor_plugin_play",       "game_capture",
-    "game_capture_registered",  "debugger_reload_last",        "debugger_reload_sends",
+    "game_capture_registered",  "debugger_reload_last",        "debugger_reload_sends",    "debugger_sessions",
+    "debugger_started",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

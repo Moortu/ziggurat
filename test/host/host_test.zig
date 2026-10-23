@@ -1590,6 +1590,7 @@ test "public build API" {
             "ZTEST PASS api_building",
             "ZTEST PASS api_manual_outcome",
             "ZTEST PASS api_reload_after_manifest",
+            "ZTEST PASS api_session_start_resends",
             "ZTEST PASS api_zig_missing",
             "ZTEST PASS api_zig_wrong_version",
             "ZTEST PASS api_editor_setting_used",
@@ -2075,6 +2076,7 @@ test "game reload: reload message swaps the game, no polling, quiet godot reload
             "ZTEST PASS capture_registered",
             "ZTEST PASS capture_takes_reload_only",
             "ZTEST PASS newest_reload_wins_after_deferral",
+            "ZTEST PASS announced_refusal_keeps_gen",
             "ZTEST DONE",
         },
         .once = &.{
@@ -2088,6 +2090,8 @@ test "game reload: reload message swaps the game, no polling, quiet godot reload
             "ziggurat: the swap to build 7 waits for script calls on other threads to return",
             "ziggurat: the swap to build 8 waits for script calls on other threads to return",
             "ziggurat: swapped to build 8",
+            "Ziggurat cannot load build 9, which the editor announced, because the library does not exist or cannot be resolved; keeping gen 8.",
+            "Ziggurat cannot load build 10, which the editor announced, because the manifest names build 2; keeping gen 8.",
         },
         // Godot's reloads with nothing newer and the message for gen 4 log
         // nothing (quiet godot reload).

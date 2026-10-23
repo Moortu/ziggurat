@@ -12,10 +12,17 @@
 //! creates one in `_enterTree` (`attach`) and hands it to the editor with
 //! `add_debugger_plugin`; Godot then gives it one session per debugger
 //! (one per running game instance). `_exitTree` takes it back (`detach`).
+//!
+//! A game reads the manifest at start, and the editor accepts its debugger
+//! connection a frame or more later; a manifest written in between would
+//! reach the game through no message. So each session's `started` signal
+//! (a game connected) sends the generation of the last manifest write once
+//! more (`session_started`); the game ignores a generation it runs.
 //! An export build has none of this.
 const std = @import("std");
 const godot = @import("gdzig");
 const host_options = @import("host_options");
+const host_callable = @import("host_callable.zig");
 
 const Allocator = std.mem.Allocator;
 const String = godot.builtin.String;
@@ -40,11 +47,46 @@ pub const ZigDebuggerPlugin = struct {
         return self;
     }
 
+    /// Called by gdzig's free callback when Godot frees the object (the
+    /// last reference dropped, see `detach`); `base.destroy` then does
+    /// nothing more.
     pub fn destroy(self: *ZigDebuggerPlugin, allocator: *Allocator) void {
         self.base.destroy();
         allocator.destroy(self);
     }
+
+    /// `EditorDebuggerPlugin._setup_session`: Godot calls it once per
+    /// session (one per debugger, so per game instance the editor can run),
+    /// when the plugin is added and when a debugger is added later. The
+    /// session may be inactive then; its `started` signal fires each time a
+    /// game connects and the session becomes active.
+    pub fn _setupSession(self: *ZigDebuggerPlugin, session_id: i32) void {
+        const s = self.base.getSession(session_id) orelse return;
+        // `get_session` returns a Ref: the reference is the caller's.
+        defer {
+            const rc = RefCounted.upcast(s);
+            if (rc.unreference()) godot.raw.objectDestroy(@ptrCast(rc));
+        }
+        var c = host_callable.callable(Object.upcast(self.base), "session_started");
+        defer c.deinit();
+        _ = Object.upcast(s).connectRaw(.fromComptimeLatin1("started"), c, .{});
+    }
+
+    /// Bound as `session_started` (a session's `started` signal): a game
+    /// connected. It may have read the manifest before the editor accepted
+    /// its connection, and a manifest written in between sent it nothing,
+    /// so the generation of the last manifest write goes to every active
+    /// session again. A game that runs it already does nothing.
+    pub fn sessionStarted(self: *ZigDebuggerPlugin) void {
+        test_started += 1;
+        if (last_written) |n| test_resent_n = n;
+        sendNow(self, last_written);
+    }
 };
+
+/// The generation of the last manifest write (`sendReload`) in this editor
+/// session, or null. Main thread.
+var last_written: ?u32 = null;
 
 /// The plugin while the editor plugin is in the tree; this module holds one
 /// counted reference to it. Main thread.
@@ -54,6 +96,10 @@ var current: ?*ZigDebuggerPlugin = null;
 /// none), for the host tests. Main thread.
 pub var test_sends: i64 = 0;
 pub var test_last_n: i64 = -1;
+/// Calls of `session_started`, and the generation it sent last (-1: none),
+/// for the host tests. Main thread.
+pub var test_started: i64 = 0;
+pub var test_resent_n: i64 = -1;
 
 /// Creates the plugin and hands it to the editor (`ZigEditorPlugin`'s
 /// `_enterTree`). Main thread.
@@ -88,7 +134,15 @@ pub fn detach(editor_plugin: *EditorPlugin) void {
 pub fn sendReload(n: u32) void {
     if (comptime host_options.export_build) return;
     test_last_n = n;
+    last_written = n;
     const plugin = current orelse return;
+    sendNow(plugin, n);
+}
+
+/// Sends generation `last` (none when null) on every active session of
+/// `plugin`.
+fn sendNow(plugin: *ZigDebuggerPlugin, last: ?u32) void {
+    const n = last orelse return;
     var sessions = plugin.base.getSessions();
     defer sessions.deinit();
     const len: usize = @intCast(@max(sessions.size(), 0));
@@ -108,7 +162,7 @@ pub fn sendReload(n: u32) void {
         s.* = .{ .session = if (v.as(*Object)) |o| EditorDebuggerSession.downcast(o) else null };
     }
     defer for (vars) |*v| v.deinit();
-    test_sends += sendToActive(list, n);
+    test_sends += sendLast(list, n);
 }
 
 /// One editor debugger session as `sendToActive` sees it.
@@ -144,10 +198,24 @@ pub fn sendToActive(sessions: anytype, n: u32) u32 {
     return sent;
 }
 
+/// The plugin's sessions (an empty Array without a plugin), for the host
+/// tests. The caller deinits the Array.
+pub fn testSessions() Array {
+    const plugin = current orelse return Array.init();
+    return plugin.base.getSessions();
+}
+
+/// What `session_started` does with the sessions: the last written
+/// generation (if any) to each active one.
+pub fn sendLast(sessions: anytype, last: ?u32) u32 {
+    return sendToActive(sessions, last orelse return 0);
+}
+
 /// Adds the class registry entry: EDITOR level, not exposed.
 pub fn register(registry: *godot.extension.Registry) void {
     comptime std.debug.assert(!host_options.export_build);
-    _ = registry.createClass(ZigDebuggerPlugin, registry.allocator, .{ .level = .editor, .is_exposed = false });
+    const cls = registry.createClass(ZigDebuggerPlugin, registry.allocator, .{ .level = .editor, .is_exposed = false });
+    cls.addMethod("session_started", .auto);
 }
 
 fn log(comptime fmt: []const u8, args: anytype) void {
@@ -189,4 +257,20 @@ test "two sessions: each active session gets one message, inactive ones none" {
     try std.testing.expectEqualSlices(u32, &.{7}, c.items);
     // No sessions at all: nothing is sent.
     try std.testing.expectEqual(@as(u32, 0), sendToActive(@as([]const FakeSession, &.{}), 8));
+}
+
+test "a session that becomes active after the write gets the last generation" {
+    var got: std.ArrayList(u32) = .empty;
+    defer got.deinit(std.testing.allocator);
+    var list = [_]FakeSession{.{ .active = false, .got = &got }};
+    // The manifest write: the game's session is not active yet.
+    try std.testing.expectEqual(@as(u32, 0), sendToActive(&list, 9));
+    try std.testing.expectEqual(@as(usize, 0), got.items.len);
+    // The session starts: the last written generation goes out once.
+    list[0].active = true;
+    try std.testing.expectEqual(@as(u32, 1), sendLast(&list, 9));
+    try std.testing.expectEqualSlices(u32, &.{9}, got.items);
+    // Nothing written yet in this editor session: nothing is sent.
+    try std.testing.expectEqual(@as(u32, 0), sendLast(&list, null));
+    try std.testing.expectEqualSlices(u32, &.{9}, got.items);
 }

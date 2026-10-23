@@ -23,7 +23,9 @@ extends SceneTree
 #   8. a thread holds the gate (as a script call on another thread does),
 #      so the swap to a reloaded gen 7 waits; a second reload to gen 8
 #      arrives meanwhile; when the thread lets go, the newest request wins:
-#      gen 8 runs and gen 7 was never current.
+#      gen 8 runs and gen 7 was never current;
+#   9. a message for a build the game cannot load (its library is missing,
+#      or the manifest names an older build) logs why and keeps gen 8.
 # modules.txt holds the library file name of each generation.
 
 const DEFERRED_LOCK := 2
@@ -204,6 +206,20 @@ func run() -> void:
 		and not probe.was_ever_current(7) and node.call("version") == 1 and node.get("speed") == 2.5 and node.get("id") == 7,
 		"held %s, gen 7 waited %s, gen 8 waited %s, current %d, 7 ever current %s, version %s" % [hold_inside, first_waits, second_waits,
 			probe.current_generation(), probe.was_ever_current(7), node.call("version")])
+
+	# 9. The editor announces a build the game cannot load: the refusal is
+	# logged (once per message), the game keeps gen 8. First the manifest
+	# names gen 3, whose library was never staged; then gen 2, older than
+	# the current one.
+	write_manifest(3)
+	probe.game_reload_message(9)
+	for k in 4:
+		await process_frame
+	write_manifest(2)
+	probe.game_reload_message(10)
+	for k in 4:
+		await process_frame
+	report("announced_refusal_keeps_gen", probe.current_generation() == 8 and node.call("version") == 1, "gen %d" % probe.current_generation())
 	finish()
 
 
