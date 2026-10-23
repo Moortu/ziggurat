@@ -155,6 +155,8 @@ const Project = struct {
         echo_file: []const u8 = "",
         /// Seconds for the whole Godot run.
         deadline: []const u8 = deadline_s,
+        /// The exit status Godot must end with.
+        exit_code: []const u8 = "0",
     };
 
     fn run(p: *Project, mode: []const []const u8, texts: Texts) !void {
@@ -168,6 +170,7 @@ const Project = struct {
         for (texts.reject) |text| try argv.appendSlice(a, &.{ "--reject", text });
         for (texts.allow_report) |text| try argv.appendSlice(a, &.{ "--allow-report", text });
         for (texts.echo) |text| try argv.appendSlice(a, &.{ "--echo", text });
+        try argv.appendSlice(a, &.{ "--exit-code", texts.exit_code });
         const result = try std.process.run(a, io, .{ .argv = argv.items, .environ_map = p.env });
         if (result.term.success()) {
             if (texts.echo.len == 0) return;
@@ -1648,6 +1651,161 @@ test "zig panel" {
             "build service stopped (0 threads left)",
         },
         .deadline = build_deadline_s,
+    });
+}
+
+// ------------------------------------------------------------ build on play
+
+/// Adds play_build.gd as the tool autoload and names its case in
+/// `res://play_case.txt`.
+fn addPlayCheck(p: *Project, case: []const u8) !void {
+    try setPlayCase(p, case);
+    try p.addAutoloadCheck("play_build.gd");
+}
+
+/// Names the case play_build.gd runs.
+fn setPlayCase(p: *Project, case: []const u8) !void {
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+    defer dir.close(io);
+    try dir.writeFile(io, .{ .sub_path = "play_case.txt", .data = case });
+}
+
+/// Runs the editor with `--build-solutions`: it calls `_build` once,
+/// before the first frame's `process_frame` signal (`E` section 2), and
+/// exits with status 1 when it returns false.
+fn runPlay(p: *Project, texts: Project.Texts) !void {
+    return p.run(&.{ "build", "10000000" }, texts);
+}
+
+const play_cancelled = "An EditorPlugin build callback failed.";
+
+test "play builds first, times out with a good build" {
+    try requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("editor_panel");
+    defer p.deinit();
+    const gate = try addZigWrapper(&p);
+    try isolateUserFolders(&p);
+    try addPlayCheck(&p, "builds_first");
+    try runPlay(&p, .{
+        .expect = &.{
+            "ZTEST PASS play_settings_default",
+            "ZTEST PASS play_edit_saved",
+            "ZTEST PASS play_not_before_first_frame",
+            "ZTEST PASS play_called_once",
+            "ZTEST PASS play_builds_first",
+            "build service stopped (0 threads left)",
+        },
+        .reject = &.{play_cancelled},
+        .deadline = build_deadline_s,
+    });
+    // The same project again, the build held at the gate: the build of the
+    // first run is the good build the game starts with.
+    var gate_dir = try Io.Dir.cwd().openDir(io, gate, .{});
+    defer gate_dir.close(io);
+    try gate_dir.writeFile(io, .{ .sub_path = "block", .data = "" });
+    try setPlayCase(&p, "timeout_good");
+    try runPlay(&p, .{
+        .expect = &.{
+            "ZTEST PASS play_not_before_first_frame",
+            "ZTEST PASS play_called_once",
+            "ZTEST PASS play_timeout_with_good_build",
+            "build service stopped (0 threads left)",
+        },
+        .reject = &.{play_cancelled},
+        .deadline = "300",
+    });
+}
+
+test "play cancels on a failed build" {
+    try requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("editor_panel");
+    defer p.deinit();
+    const gate = try addZigWrapper(&p);
+    try isolateUserFolders(&p);
+    var gate_dir = try Io.Dir.cwd().openDir(io, gate, .{});
+    defer gate_dir.close(io);
+    try gate_dir.writeFile(io, .{ .sub_path = "fail", .data = "" });
+    try addPlayCheck(&p, "failed");
+    try runPlay(&p, .{
+        .expect = &.{
+            "ZTEST PASS play_not_before_first_frame",
+            "ZTEST PASS play_cancel_shows_panel",
+            "Ziggurat cancelled the run because the Zig build failed; see the Zig panel.",
+            play_cancelled,
+            "build service stopped (0 threads left)",
+        },
+        .exit_code = "1",
+        .deadline = "300",
+    });
+}
+
+test "play times out without a good build" {
+    try requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("editor_panel");
+    defer p.deinit();
+    const gate = try addZigWrapper(&p);
+    try isolateUserFolders(&p);
+    var gate_dir = try Io.Dir.cwd().openDir(io, gate, .{});
+    defer gate_dir.close(io);
+    try gate_dir.writeFile(io, .{ .sub_path = "block", .data = "" });
+    try addPlayCheck(&p, "timeout_none");
+    try runPlay(&p, .{
+        .expect = &.{
+            "ZTEST PASS play_not_before_first_frame",
+            "ZTEST PASS play_cancel_shows_panel",
+            "Ziggurat cancelled the run because the Zig build still runs after 1 s and no good build exists yet; see the Zig panel.",
+            play_cancelled,
+            "build service stopped (0 threads left)",
+        },
+        .exit_code = "1",
+        .deadline = "300",
+    });
+}
+
+test "play without a service" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("editor_panel");
+    defer p.deinit();
+    try isolateUserFolders(&p);
+    try addPlayCheck(&p, "no_service");
+    try runPlay(&p, .{
+        .expect = &.{
+            "ZTEST PASS play_not_before_first_frame",
+            "ZTEST PASS play_called_once",
+            "ZTEST PASS play_without_service",
+        },
+        .reject = &.{play_cancelled},
+    });
+}
+
+test "build on play off" {
+    try requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("editor_panel");
+    defer p.deinit();
+    const gate = try addZigWrapper(&p);
+    try isolateUserFolders(&p);
+    var gate_dir = try Io.Dir.cwd().openDir(io, gate, .{});
+    defer gate_dir.close(io);
+    try gate_dir.writeFile(io, .{ .sub_path = "block", .data = "" });
+    try addPlayCheck(&p, "off");
+    try runPlay(&p, .{
+        .expect = &.{
+            "ZTEST PASS play_not_before_first_frame",
+            "ZTEST PASS play_called_once",
+            "ZTEST PASS play_off",
+            "build service stopped (0 threads left)",
+        },
+        .reject = &.{play_cancelled},
+        .deadline = "300",
     });
 }
 

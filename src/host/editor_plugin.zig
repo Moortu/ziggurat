@@ -17,14 +17,28 @@
 //! build outcome was applied (`editor_build.outcomes_applied`) or a build
 //! started or ended; then it updates the panel and pushes the outcome's
 //! toast. When it leaves the tree it takes the menu items and the panel
-//! back. Play and the download build on it (editor_build.zig has the build
-//! API they use).
+//! back. The download builds on it (editor_build.zig has the build API).
+//!
+//! Build on Play (`_build`: Godot calls it on the main thread when Play is
+//! pressed, after it saved the open scenes and scripts, and the run waits
+//! for its answer; `--build-solutions` calls it once and exits with status
+//! 1 on false): with the project setting
+//! `ziggurat/build/build_on_play` on (the default) and a build service,
+//! the plugin requests a `play` build, waits up to
+//! `ziggurat/build/play_wait_seconds` (60 by default) for the service and
+//! applies the outcome, so the manifest names the new build before the
+//! game starts. A good build plays; a failed one cancels the run and shows
+//! the Zig panel, as C# does. After the timeout the game starts with the
+//! last good build (this session's, else the one the manifest names) and a
+//! toast says it reloads when the build finishes; without any good build
+//! the run is cancelled.
 const std = @import("std");
 const godot = @import("gdzig");
 const host_options = @import("host_options");
 const editor_build = @import("editor_build.zig");
 const editor_panel = @import("editor_panel.zig");
 const host_callable = @import("host_callable.zig");
+const host_io = @import("host_io.zig");
 
 const Allocator = std.mem.Allocator;
 const String = godot.builtin.String;
@@ -40,7 +54,9 @@ pub const ZigEditorPlugin = struct {
     base: *EditorPlugin,
     /// The Zig panel while the plugin is in the tree.
     panel: ?*ZigPanel = null,
-    /// `editor_build.outcomes_applied` the panel shows.
+    /// `editor_build.outcomes_applied` the panel shows. It starts at 0 and
+    /// is not reset when the panel is made, so an outcome applied before
+    /// the panel existed still gets its toast once (`_process`).
     seen_outcomes: u32 = 0,
     /// `editor_build.status().building` the panel shows.
     seen_building: bool = false,
@@ -67,7 +83,6 @@ pub const ZigEditorPlugin = struct {
         if (ZigPanel.create(&alloc)) |panel| {
             self.panel = panel;
             self.base.addDock(panel.base);
-            self.seen_outcomes = editor_build.outcomes_applied.load(.acquire);
             _ = self.refresh();
         } else |_| {
             log("Ziggurat could not create the Zig panel: out of memory.", .{});
@@ -111,6 +126,64 @@ pub const ZigEditorPlugin = struct {
             self.seen_building = building;
             panel.setBuilding(building);
         }
+    }
+
+    /// `EditorPlugin._build`: Build on Play (see the file comment). True
+    /// lets the game start; false cancels the run. Main thread.
+    pub fn _build(self: *ZigEditorPlugin) bool {
+        play_calls += 1;
+        play_result = self.playBuild();
+        return play_result;
+    }
+
+    fn playBuild(self: *ZigEditorPlugin) bool {
+        if (!editor_build.hasService() or !editor_build.buildOnPlay()) return true;
+        play_requests += 1;
+        // Play saved the open scenes and scripts just before; a save's
+        // build request may still wait in the main-thread queue. Running
+        // the queue first turns it into a request this one joins.
+        editor_build.applyFinished();
+        editor_build.requestBuild(.play);
+        const wait_s = editor_build.playWaitSeconds();
+        const limit_ms: u64 = @as(u64, wait_s) * 1000;
+        const io = host_io.get();
+        const t0 = std.Io.Clock.awake.now(io);
+        while (true) {
+            const spent: u64 = @intCast(@max(t0.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds(), 0));
+            const left = std.math.cast(u32, limit_ms -| spent) orelse std.math.maxInt(u32);
+            const idle = left > 0 and editor_build.waitIdle(left);
+            // Applies the outcome now: the manifest names the build before
+            // the game starts.
+            editor_build.applyFinished();
+            const st = editor_build.status();
+            if (!st.building) {
+                const last = st.last orelse return true;
+                if (last.ok) return true;
+                log("Ziggurat cancelled the run because the Zig build failed; see the Zig panel.", .{});
+                self.showPanel();
+                return false;
+            }
+            // Still building: an applied outcome may have asked for another
+            // build (a stale fast build is built again in full), or more
+            // outcomes wait than one drain runs. Wait on while time is left.
+            if (idle) continue;
+            if (editor_build.startableGeneration()) |n| {
+                var buf: [160]u8 = undefined;
+                const text = std.fmt.bufPrint(&buf, "Zig build still running; the game starts with build {d} and reloads when the build finishes", .{n}) catch return true;
+                editor_panel.pushToast(.{ .severity = .warning, .text = text, .tooltip = "" });
+                return true;
+            }
+            log("Ziggurat cancelled the run because the Zig build still runs after {d} s and no good build exists yet; see the Zig panel.", .{wait_s});
+            self.showPanel();
+            return false;
+        }
+    }
+
+    /// Updates the panel and brings it to the front.
+    fn showPanel(self: *ZigEditorPlugin) void {
+        const panel = self.panel orelse return;
+        _ = self.refresh();
+        panel.makeVisible();
     }
 
     /// Shows the current status and diagnostics in the panel.
@@ -159,6 +232,14 @@ pub const ZigEditorPlugin = struct {
 
 /// Calls of `test_ping`. Main thread.
 pub var test_pings: i64 = 0;
+
+/// Calls of `_build` (for the host tests). Main thread.
+pub var play_calls: i64 = 0;
+/// What the last `_build` returned (for the host tests). Main thread.
+pub var play_result: bool = false;
+/// Calls of `_build` that requested a build (for the host tests). Main
+/// thread.
+pub var play_requests: i64 = 0;
 
 /// Set once `download_menu` logged. Main thread.
 var download_logged = false;

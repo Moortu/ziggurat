@@ -647,6 +647,17 @@ pub const ZigguratTestProbe = struct {
         return out;
     }
 
+    /// The editor plugin's `_build` (Build on Play) so far: `calls`, the
+    /// last call's `result`, and `requested` (the calls that asked for a
+    /// build).
+    pub fn editorPluginPlay(_: *ZigguratTestProbe) Dictionary {
+        var d: Dictionary = .init();
+        dictSet(&d, "calls", .init(i64, editor_plugin.play_calls));
+        dictSet(&d, "result", .init(bool, editor_plugin.play_result));
+        dictSet(&d, "requested", .init(i64, editor_plugin.play_requests));
+        return d;
+    }
+
     /// Calls of the editor plugin's test method so far.
     pub fn editorPluginPings(_: *ZigguratTestProbe) i64 {
         return editor_plugin.test_pings;
@@ -978,7 +989,7 @@ pub const method_names = [_][:0]const u8{
     "generation_loaded",        "language_frame",              "language_stack_info",      "queue_pending",
     "queue_nested_frame_check", "language_nested_frames",      "gate_hold",                "default_mismatch_once",
     "editor_build_request",     "editor_build_status",         "editor_build_diagnostics", "editor_plugin_connect",
-    "editor_plugin_pings",      "editor_panel_toasts",
+    "editor_plugin_pings",      "editor_panel_toasts",         "editor_plugin_play",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

@@ -101,6 +101,12 @@ const Os = godot.class.Os;
 
 pub const setting_zig_path = "ziggurat/zig_path";
 pub const setting_sdk_manifest = "ziggurat/dev/sdk_manifest";
+/// Whether Play builds the Zig scripts first (the editor plugin's
+/// `_build`); a bool, true by default.
+pub const setting_build_on_play = "ziggurat/build/build_on_play";
+/// How long Play waits for that build, in seconds; an int, 60 by default.
+pub const setting_play_wait = "ziggurat/build/play_wait_seconds";
+pub const default_play_wait_seconds: u32 = 60;
 
 /// Thread-safe, as the service requires.
 const gpa = std.heap.c_allocator;
@@ -108,9 +114,13 @@ const gpa = std.heap.c_allocator;
 /// Longest path handled.
 const max_path_bytes = 4096;
 
-/// Godot's `Variant::STRING` and `PROPERTY_HINT_GLOBAL_FILE`
-/// (core/object/property_info.h).
+/// Godot's `Variant::BOOL`, `Variant::INT`, `Variant::STRING`,
+/// `PROPERTY_HINT_RANGE` and `PROPERTY_HINT_GLOBAL_FILE`
+/// (core/variant/variant.h, core/object/property_info.h).
+const type_bool: i64 = 1;
+const type_int: i64 = 2;
 const type_string: i64 = 4;
+const hint_range: i64 = 1;
 const hint_global_file: i64 = 15;
 
 /// The running service and what its configuration borrows. Main thread.
@@ -258,6 +268,62 @@ pub fn applyFinished() void {
     _ = main_queue.drain();
 }
 
+/// True when the project has a build service (see `start`). Main thread.
+pub fn hasService() bool {
+    return state != null;
+}
+
+/// Waits until the service runs no build and has none pending, at most
+/// `timeout_ms`. An outcome the service published by then waits in the
+/// main-thread queue (`applyFinished` applies it). True when the service
+/// is idle (also without a service), false after the timeout. Blocks the
+/// calling thread. Main thread.
+pub fn waitIdle(timeout_ms: u32) bool {
+    const st = state orelse return true;
+    st.svc.waitIdle(timeout_ms) catch return false;
+    return true;
+}
+
+/// The project setting `ziggurat/build/build_on_play` (true when unset or
+/// not a bool).
+pub fn buildOnPlay() bool {
+    var n = String.fromLatin1(setting_build_on_play);
+    defer n.deinit();
+    const v = ProjectSettings.getSetting(n, .{ .default_value = Variant.init(bool, true) });
+    defer v.deinit();
+    return v.as(bool) orelse true;
+}
+
+/// The project setting `ziggurat/build/play_wait_seconds`, at least 0
+/// (60 when unset or not an int).
+pub fn playWaitSeconds() u32 {
+    var n = String.fromLatin1(setting_play_wait);
+    defer n.deinit();
+    const v = ProjectSettings.getSetting(n, .{ .default_value = Variant.init(i64, default_play_wait_seconds) });
+    defer v.deinit();
+    const s = v.as(i64) orelse return default_play_wait_seconds;
+    return std.math.cast(u32, @max(s, 0)) orelse std.math.maxInt(u32);
+}
+
+/// The generation a game started now would load: the last build the
+/// editor took into use in this session (`Status.good_n`), otherwise the
+/// one the generation manifest names (a good build of an earlier session,
+/// when the manifest and its library pass the game's own checks). Null
+/// without either. Main thread.
+pub fn startableGeneration() ?u32 {
+    if (good_n) |n| return n;
+    // The manifest reader is not in an export build (manifest.zig), and an
+    // export build has no editor plugin to ask.
+    if (comptime @import("host_options").export_build) return null;
+    const st = state orelse return null;
+    var r = manifest.readTrusted(gpa, host_io.get(), st.store_root, @import("builtin").os.tag, zbuild.service.lib_stem) catch return null;
+    defer r.deinit(gpa);
+    return switch (r) {
+        .ok => |t| t.n,
+        .refused => null,
+    };
+}
+
 /// Registers the editor setting `ziggurat/zig_path` (the per-user Zig
 /// path, empty by default, with a file picker). Main thread, once the
 /// editor exists (the editor plugin's `_enter_tree`). A value equal to the
@@ -345,6 +411,8 @@ fn failNow(t: Trigger, message: []const u8) void {
         return logError("{s}", .{message});
     };
     _ = queued_outcomes.fetchAdd(1, .acq_rel);
+    // On a failed push the queue has already run `drop`, which frees `m`
+    // and takes the count back (`main_queue.push`).
     main_queue.push(apply, m, drop) catch {};
 }
 
@@ -530,9 +598,11 @@ fn readCmdline(buf: []u8) ?[]const u8 {
     return buf[0..n];
 }
 
-/// Adds both project settings with an empty default, so they show in
-/// Project Settings with a file picker.
+/// Adds the project settings: both paths with an empty default, so they
+/// show in Project Settings with a file picker, and the Play settings
+/// (`registerPlaySettings`).
 fn registerSettings() void {
+    registerPlaySettings();
     inline for (.{ setting_zig_path, setting_sdk_manifest }) |name| {
         var n = String.fromLatin1(name);
         defer n.deinit();
@@ -551,6 +621,34 @@ fn registerSettings() void {
         putInfo(&info, "hint_string", Variant.init(String, empty));
         ProjectSettings.addPropertyInfo(info);
     }
+}
+
+/// `ziggurat/build/build_on_play` (default true) and
+/// `ziggurat/build/play_wait_seconds` (default 60; 0 to 3600 in the
+/// inspector, more when typed).
+fn registerPlaySettings() void {
+    addSetting(setting_build_on_play, Variant.init(bool, true), type_bool, 0, "");
+    addSetting(setting_play_wait, Variant.init(i64, default_play_wait_seconds), type_int, hint_range, "0,3600,1,or_greater,suffix:s");
+}
+
+/// Registers the project setting `name` with default `value` (consumed)
+/// and its property info.
+fn addSetting(comptime name: []const u8, value: Variant, type_id: i64, hint: i64, comptime hint_string: []const u8) void {
+    defer value.deinit();
+    var n = String.fromLatin1(name);
+    defer n.deinit();
+    if (!ProjectSettings.hasSetting(n)) ProjectSettings.setSetting(n, value);
+    ProjectSettings.setInitialValue(n, value);
+    ProjectSettings.setAsBasic(n, true);
+    var hs = String.fromLatin1(hint_string);
+    defer hs.deinit();
+    var info = Dictionary.init();
+    defer info.deinit();
+    putInfo(&info, "name", Variant.init(String, n));
+    putInfo(&info, "type", Variant.init(i64, type_id));
+    putInfo(&info, "hint", Variant.init(i64, hint));
+    putInfo(&info, "hint_string", Variant.init(String, hs));
+    ProjectSettings.addPropertyInfo(info);
 }
 
 fn putInfo(d: *Dictionary, comptime key: []const u8, value: Variant) void {
@@ -824,6 +922,7 @@ fn onOutcome(_: ?*anyopaque, o: *const Outcome) void {
     // Counted while the service still counts the build as running, so
     // `status` never shows a gap between the two.
     _ = queued_outcomes.fetchAdd(1, .acq_rel);
+    // On a failed push the queue has already run `drop` (see `failNow`).
     main_queue.push(apply, m, drop) catch {};
 }
 
