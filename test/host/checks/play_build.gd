@@ -20,6 +20,12 @@ extends Node
 # - `no_service`: no SDK manifest setting: true at once.
 # - `off`: `build_on_play` is false (the build is held): true, nothing
 #   requested.
+# - `nested`: the build is held and `play_wait_seconds` is 5. The probe
+#   calls `_build` once with the gate held (module code on the main
+#   thread's stack) and once from a main-queue callback (a running drain).
+#   Neither may wait or drain: each returns within 2 s, true with the toast
+#   when a good build exists (the manifest names one), else false. Then
+#   `build_on_play` is set false, so Play's own `_build` returns true.
 # Each case prints ZTEST lines; a case that returns false prints them when
 # the editor exits (no frame follows), then ZTEST DONE.
 
@@ -33,6 +39,9 @@ var dock: Node = null
 var hidden_before := false
 var shown := false
 var finished := false
+# `_build` calls made before Play's own one (the `nested` case).
+var base_calls := 0
+var base_requests := 0
 
 
 func report(name: String, ok: bool, why: String) -> void:
@@ -85,6 +94,22 @@ func _ready() -> void:
 			ProjectSettings.set_setting("ziggurat/build/play_wait_seconds", 1)
 		"off":
 			ProjectSettings.set_setting("ziggurat/build/build_on_play", false)
+		"nested":
+			ProjectSettings.set_setting("ziggurat/build/play_wait_seconds", 5)
+			var good := manifest_gen() >= 1
+			for mode in ["gate", "drain"]:
+				var r: Dictionary = probe.editor_plugin_play_nested(mode)
+				report("play_nested_" + mode,
+					r.has("ms") and r.ms < 2000 and r.result == good,
+					"result %s, good build %s" % [str(r), good])
+			if good:
+				var want := STILL_RUNNING % manifest_gen()
+				var toasts: Array = probe.editor_panel_toasts()
+				report("play_nested_toast", toasts.has("warning: " + want), str(toasts))
+			var before: Dictionary = probe.editor_plugin_play()
+			base_calls = before.calls
+			base_requests = before.requested
+			ProjectSettings.set_setting("ziggurat/build/build_on_play", false)
 	get_tree().process_frame.connect(_on_frame)
 
 
@@ -93,7 +118,7 @@ func _on_frame() -> void:
 	var play: Dictionary = probe.editor_plugin_play()
 	if finished:
 		return
-	if play.calls == 0:
+	if play.calls == base_calls:
 		if frame >= 30:
 			finished = true
 			report("play_called", false, "_build was not called in %d frames" % frame)
@@ -103,7 +128,7 @@ func _on_frame() -> void:
 	# The first frame after `_build` returned true.
 	finished = true
 	var st: Dictionary = probe.editor_build_status()
-	report("play_called_once", play.calls == 1, str(play))
+	report("play_called_once", play.calls == base_calls + 1, str(play))
 	match case_name:
 		"builds_first":
 			var s: Script = load("res://broken.zig")
@@ -120,6 +145,8 @@ func _on_frame() -> void:
 			report("play_without_service", play.result and play.requested == 0 and not st.building and not st.has_last, "play %s, status %s" % [str(play), str(st)])
 		"off":
 			report("play_off", play.result and play.requested == 0 and st.building and not st.has_last, "play %s, status %s" % [str(play), str(st)])
+		"nested":
+			report("play_nested_then_off", play.result and base_calls == 2 and play.requested == base_requests and base_requests == 2 and st.building, "play %s, base %d/%d, status %s" % [str(play), base_calls, base_requests, str(st)])
 		_:
 			report("play_returned_false", false, "case %s: _build returned true (%s, status %s)" % [case_name, str(play), str(st)])
 	print("ZTEST DONE")

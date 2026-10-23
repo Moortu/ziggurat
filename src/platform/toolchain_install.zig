@@ -24,7 +24,46 @@ pub const temp_prefix = "." ++ target_name ++ ".tmp-";
 /// A broken folder at the target is moved to `<old_prefix><hex>` and deleted.
 pub const old_prefix = "." ++ target_name ++ ".old-";
 
+/// The editor downloads an archive into `<toolchains>/<download_prefix><hex>`.
+pub const download_prefix = ".download-";
+/// Leftovers younger than this may belong to a run in another editor
+/// (`sweepLeftovers` keeps them).
+pub const leftover_age_ns: i96 = std.time.ns_per_hour;
+
 const exe_name = if (builtin.os.tag == .windows) "zig.exe" else "zig";
+
+/// Deletes what a crashed download or install left in `toolchains_dir`:
+/// entries named `<download_prefix>*`, and `.zig-*` entries with `.tmp-` or
+/// `.old-` in the name, last changed more than `min_age_ns` before
+/// `now_ns`. Never touches `zig-<pin>` or any other entry, and never
+/// follows a link (a link is deleted itself). Call it under the toolchain
+/// lock, so no install of this kind runs; a download runs outside the lock,
+/// but its file changes every few seconds. An entry that cannot be read or
+/// deleted is skipped. Returns how many entries were deleted.
+pub fn sweepLeftovers(io: Io, toolchains_dir: []const u8, now_ns: i96, min_age_ns: i96) u32 {
+    var tc = Dir.cwd().openDir(io, toolchains_dir, .{ .iterate = true }) catch return 0;
+    defer tc.close(io);
+    var deleted: u32 = 0;
+    var it = tc.iterate();
+    while (it.next(io) catch return deleted) |e| {
+        if (!isLeftover(e.name)) continue;
+        const st = tc.statFile(io, e.name, .{ .follow_symlinks = false }) catch continue;
+        if (now_ns - st.mtime.nanoseconds <= min_age_ns) continue;
+        if (st.kind == .directory) {
+            tc.deleteTree(io, e.name) catch continue;
+        } else {
+            tc.deleteFile(io, e.name) catch continue;
+        }
+        deleted += 1;
+    }
+    return deleted;
+}
+
+fn isLeftover(name: []const u8) bool {
+    if (std.mem.startsWith(u8, name, download_prefix)) return true;
+    if (!std.mem.startsWith(u8, name, ".zig-")) return false;
+    return std.mem.indexOf(u8, name, ".tmp-") != null or std.mem.indexOf(u8, name, ".old-") != null;
+}
 
 pub const Options = struct {
     /// The downloaded archive (a file on disk).
@@ -1351,4 +1390,36 @@ test "a good folder placed meanwhile is never deleted" {
     try testing.expectEqual(Result.already_present, try install(io, testing.allocator, opts));
     try testing.expectEqual(Result.installed, try place.result.?);
     try f.expectInstalled();
+}
+
+test "leftovers of a crashed run are swept after an hour" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.createDirPath(io, "toolchains/" ++ target_name);
+    try d.writeFile(io, .{ .sub_path = "toolchains/" ++ target_name ++ "/zig", .data = "keep" });
+    try d.writeFile(io, .{ .sub_path = "toolchains/" ++ download_prefix ++ "00112233", .data = "partial" });
+    try d.createDirPath(io, "toolchains/" ++ temp_prefix ++ "aabb/zig-x/lib");
+    try d.writeFile(io, .{ .sub_path = "toolchains/" ++ temp_prefix ++ "aabb/zig-x/zig", .data = "unpacked" });
+    try d.createDirPath(io, "toolchains/" ++ old_prefix ++ "ccdd");
+    try d.writeFile(io, .{ .sub_path = "toolchains/.install.lock", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "toolchains/notes.txt", .data = "not ours" });
+    const tc = try d.realPathFileAlloc(io, "toolchains", a);
+    defer a.free(tc);
+    const now = Io.Clock.real.now(io).nanoseconds;
+    // Young leftovers may belong to a run in another editor: kept.
+    try testing.expectEqual(@as(u32, 0), sweepLeftovers(io, tc, now, leftover_age_ns));
+    try d.access(io, "toolchains/" ++ download_prefix ++ "00112233", .{});
+    // Two hours later they go; the installed Zig and other files stay.
+    try testing.expectEqual(@as(u32, 3), sweepLeftovers(io, tc, now + 2 * leftover_age_ns, leftover_age_ns));
+    try testing.expectError(error.FileNotFound, d.access(io, "toolchains/" ++ download_prefix ++ "00112233", .{}));
+    try testing.expectError(error.FileNotFound, d.access(io, "toolchains/" ++ temp_prefix ++ "aabb", .{}));
+    try testing.expectError(error.FileNotFound, d.access(io, "toolchains/" ++ old_prefix ++ "ccdd", .{}));
+    try d.access(io, "toolchains/" ++ target_name ++ "/zig", .{});
+    try d.access(io, "toolchains/.install.lock", .{});
+    try d.access(io, "toolchains/notes.txt", .{});
+    // A missing folder is no error.
+    try testing.expectEqual(@as(u32, 0), sweepLeftovers(io, "/nonexistent/ziggurat-toolchains", now, leftover_age_ns));
 }

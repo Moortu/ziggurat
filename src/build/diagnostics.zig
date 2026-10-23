@@ -12,7 +12,8 @@ const ErrorBundle = std.zig.ErrorBundle;
 /// error has no source location.
 pub const Diagnostic = struct {
     /// Project-relative path with `/` separators, or null for errors outside
-    /// the project (std, the SDK without a marker, the generated root).
+    /// the project (std, the SDK without a marker, the generated root) whose
+    /// reference trace names no project file.
     rel: ?[]const u8,
     line: u32,
     column: u32,
@@ -55,7 +56,9 @@ const marker_open = "[ziggurat:";
 /// contract in `rootgen.zig` says) is mapped to the decoded `<rel>`, at the first
 /// top-level line of `<source_root>/<rel>` that declares `<name>` (`<name>:`,
 /// `const <name>`, `fn <name>(`, each optionally after `pub `), or line 1.
-/// The marker is removed from every message that carries one.
+/// The marker is removed from every message that carries one. Any other
+/// error outside the project whose reference trace names a project file is
+/// mapped to the first such frame (`firstProjectFrame`).
 /// Free the result with `free`.
 pub fn decode(a: std.mem.Allocator, io: std.Io, bundle: ErrorBundle, ws: *const Workspace) error{ MalformedBundle, OutOfMemory }![]Diagnostic {
     const v: View = .{ .eb = bundle };
@@ -104,6 +107,13 @@ fn decodeOne(a: std.mem.Allocator, io: std.Io, v: View, mi: u32, ws: *const Work
             column = 1;
         }
     }
+    if (rel == null and m.src_loc != 0) {
+        if (try firstProjectFrame(a, v, m.src_loc, ws)) |f| {
+            rel = f.rel;
+            line = f.line;
+            column = f.column;
+        }
+    }
 
     const message = if (marker) |mk|
         try stripMarker(a, raw, mk)
@@ -124,6 +134,30 @@ fn decodeOne(a: std.mem.Allocator, io: std.Io, v: View, mi: u32, ws: *const Work
         filled += 1;
     }
     return .{ .rel = rel, .line = line, .column = column, .message = message, .notes = notes };
+}
+
+const Frame = struct { rel: []const u8, line: u32, column: u32 };
+
+/// The first entry of the reference trace of source location `si` that lies
+/// in the project's files (1-based), or null. For an error outside the
+/// files, such as a withheld gdzig helper reported at gdzig's generated
+/// class file, this is the script line that named it. The compiler keeps
+/// two frames by default.
+fn firstProjectFrame(a: std.mem.Allocator, v: View, si: u32, ws: *const Workspace) error{ MalformedBundle, OutOfMemory }!?Frame {
+    const loc = try v.sourceLocation(si);
+    const base = @as(u64, si) + View.source_location_words;
+    for (0..loc.reference_trace_len) |k| {
+        const trace_loc = try v.word(base + k * View.reference_trace_words + 1);
+        // The sentinel entry (src_loc 0) counts hidden references.
+        if (trace_loc == 0) continue;
+        const tl = try v.sourceLocation(trace_loc);
+        const rel = ws.mapPath(a, try v.string(tl.src_path)) catch |err| switch (err) {
+            error.OutsideProject => continue,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        return .{ .rel = rel, .line = tl.line +| 1, .column = tl.column +| 1 };
+    }
+    return null;
 }
 
 const Marker = struct {
@@ -427,6 +461,67 @@ test "decode maps project paths, notes and 1-based positions" {
     try testing.expectEqual(@as(u32, 3), ds[1].column);
     try testing.expect(ds[2].rel == null);
     try testing.expectEqual(@as(u32, 0), ds[2].line);
+}
+
+/// One root error at `src` whose reference trace lists `trace` (outermost
+/// last), then the hidden-references sentinel.
+fn buildTraced(a: std.mem.Allocator, msg: []const u8, src: Src, trace: []const Src) !ErrorBundle {
+    var wip: ErrorBundle.Wip = try .init(a);
+    errdefer wip.deinit();
+    const locs = try a.alloc(ErrorBundle.SourceLocationIndex, trace.len);
+    defer a.free(locs);
+    for (trace, locs) |t, *l| l.* = try wip.addSourceLocation(.{
+        .src_path = try wip.addString(t.path),
+        .line = t.line,
+        .column = t.column,
+        .span_start = 0,
+        .span_main = 0,
+        .span_end = 0,
+    });
+    const src_loc = try wip.addSourceLocation(.{
+        .src_path = try wip.addString(src.path),
+        .line = src.line,
+        .column = src.column,
+        .span_start = 0,
+        .span_main = 0,
+        .span_end = 0,
+        .reference_trace_len = @intCast(trace.len + 1),
+    });
+    for (locs) |l| try wip.addReferenceTrace(.{ .decl_name = try wip.addString("go"), .src_loc = l });
+    try wip.addReferenceTrace(.{ .decl_name = 5, .src_loc = .none });
+    try wip.addRootErrorMessage(.{ .msg = try wip.addString(msg), .src_loc = src_loc, .notes_len = 0 });
+    return wip.toOwnedBundle("");
+}
+
+test "an error outside the project takes the first project frame of its reference trace" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const ws = fakeWorkspace("/proj", "/cache/build");
+    const helper = "ziggurat: connect is not available in scripts; use z.emit or z.godot.Callable";
+    const node: Src = .{ .path = "/sdk/gdzig/class/Node.zig", .line = 120, .column = 4 };
+    // SDK frame first, then the script's line, then the generated root.
+    const eb = try buildTraced(a, helper, node, &.{
+        .{ .path = "/sdk/ziggurat/z.zig", .line = 30, .column = 8 },
+        .{ .path = "/proj/scripts/hero.zig", .line = 7, .column = 13 },
+        .{ .path = "/cache/build/root.zig", .line = 2, .column = 1 },
+    });
+    const ds = try decode(a, testing.io, eb, &ws);
+    try testing.expectEqual(@as(usize, 1), ds.len);
+    try testing.expectEqualStrings("scripts/hero.zig", ds[0].rel.?);
+    try testing.expectEqual(@as(u32, 8), ds[0].line);
+    try testing.expectEqual(@as(u32, 14), ds[0].column);
+    try testing.expectEqualStrings(helper, ds[0].message);
+    // No project frame: the error stays outside the files.
+    const outside = try buildTraced(a, "std trouble", node, &.{.{ .path = "/cache/build/root.zig", .line = 2, .column = 1 }});
+    const ds2 = try decode(a, testing.io, outside, &ws);
+    try testing.expect(ds2[0].rel == null);
+    try testing.expectEqual(@as(u32, 121), ds2[0].line);
+    // An error in a project file keeps its own place.
+    const inside = try buildTraced(a, "expected type", .{ .path = "/proj/a.zig", .line = 3, .column = 0 }, &.{.{ .path = "/proj/scripts/hero.zig", .line = 7, .column = 13 }});
+    const ds3 = try decode(a, testing.io, inside, &ws);
+    try testing.expectEqualStrings("a.zig", ds3[0].rel.?);
+    try testing.expectEqual(@as(u32, 4), ds3[0].line);
 }
 
 test "decode of the empty bundle is empty" {

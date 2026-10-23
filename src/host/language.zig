@@ -72,6 +72,15 @@ var project_root_buf: [max_path_bytes]u8 = undefined;
 var project_root: std.atomic.Value(usize) = .init(0);
 /// Main thread only: set while `_frame` runs its work.
 var in_frame = false;
+
+/// True when the main thread may run queued callbacks, a game reload or a
+/// swap now: no `_frame` runs, no module code is on the main thread's stack
+/// (`gate.depth() == 0`) and no `main_queue.drain` runs callbacks. `_frame`
+/// and Build on Play (`editor_build.applyFinished`) both ask it; this is
+/// the only place the rule lives (spec section 2). Main thread.
+pub fn atSafePoint() bool {
+    return !in_frame and gate.depth() == 0 and !main_queue.isDraining();
+}
 /// Nested `_frame` calls in this process (main thread only), for the host
 /// tests (`nestedFrames`).
 var nested_frames: u64 = 0;
@@ -172,13 +181,11 @@ pub const ZigLanguage = struct {
     /// Runs queued main-thread work, at most `main_queue.per_frame` items,
     /// then a requested swap (`swap.runPending`). `_frame` is not a safe
     /// point (spec section 2): Godot calls it also from nested
-    /// `Main::iteration()` calls. A nested call is one made while another
-    /// `_frame` is running or while module code is on the main thread's
-    /// stack; it runs no queued callback, no game reload and no swap, and
-    /// records the swap as waiting (`swap.deferNested`). This is the only
-    /// place that rule lives.
+    /// `Main::iteration()` calls. A nested call is one made where
+    /// `atSafePoint` is false; it runs no queued callback, no game reload
+    /// and no swap, and records the swap as waiting (`swap.deferNested`).
     pub fn _frame(_: *ZigLanguage) void {
-        if (in_frame or gate.depth() > 0) {
+        if (!atSafePoint()) {
             nested_frames += 1;
             _ = swap.deferNested();
             return;

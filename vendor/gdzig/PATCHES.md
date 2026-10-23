@@ -13,9 +13,9 @@ is in `LICENSE`.
 Patch 3 adds a build option that withholds the Object helpers (see its
 section). Patches 1 and 2 each raise a comptime branch quota. gdzig builds
 the virtual method table of a user class at compile time:
-`virtualMethodNames` lists the class's
-`_`-prefixed functions, and `VTable.findMethod` looks each name up and builds
-its wrapper. The work grows with the number of virtuals the class implements.
+`virtualMethodNames` lists the class's `_`-prefixed functions, and
+`VTable.findMethod` looks each name up and builds its wrapper. The work
+grows with the number of virtuals the class implements.
 `ZigLanguage` (`src/host/language.zig`) implements all 60 virtuals of
 `ScriptLanguageExtension` in Godot 4.7.2, which the stock quotas do not allow.
 

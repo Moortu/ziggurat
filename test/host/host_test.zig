@@ -1850,6 +1850,8 @@ fn setupDownload(p: *Project, case: []const u8, mirrors: []const []const u8, off
     try writeIn(www, "slowsig/" ++ sig_name ++ ".slow", "");
     try writeIn(www, "oldsig/" ++ dl_archive, archive);
     try writeIn(www, "oldsig/" ++ sig_name, old_sig);
+    try writeIn(www, "garbagesig/" ++ dl_archive, archive);
+    try writeIn(www, "garbagesig/" ++ sig_name, "untrusted comment: well-formed garbage\nnot a signature\n");
 
     var sha: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(archive, &sha, .{});
@@ -1948,7 +1950,7 @@ test "download falls through bad mirrors" {
     var p: Project = undefined;
     try p.initProbe("highlighter");
     defer p.deinit();
-    var d = try setupDownload(&p, "installs", &.{ "notfound", "redirect", "truncated", "oldsig" }, true);
+    var d = try setupDownload(&p, "installs", &.{ "notfound", "redirect", "truncated", "oldsig", "garbagesig" }, true);
     defer d.deinit();
     errdefer d.server.dump();
     const a = p.arena_state.allocator();
@@ -1963,12 +1965,18 @@ test "download falls through bad mirrors" {
     try expect.append(a, try m.line(a, d.base, "redirect", "the download does not match the pinned SHA-256"));
     try expect.append(a, try m.line(a, d.base, "truncated", "the transfer stopped after "));
     try expect.append(a, try m.line(a, d.base, "oldsig", "the signature is for another file"));
+    try expect.append(a, try m.line(a, d.base, "garbagesig", "the signature file is not a minisign signature"));
     try expect.append(a, try std.fmt.allocPrint(a, "Ziggurat installed Zig 0.17.0 from {s}/official", .{d.base}));
     try p.runEditorChecked("10000000", .{ .expect = expect.items, .reject = &.{"ZTEST FAIL"} });
     try testing.expect(fileExists(try std.fs.path.join(a, &.{ d.toolchains, "zig-0.17.0", "zig" })));
     try expectNoTemp(d.toolchains);
     // The redirect was followed to the tampered file.
     try testing.expectEqual(@as(usize, 1), d.server.count("/tampered/"));
+    // A bad signature file ends a mirror before its archive is fetched.
+    for ([_][]const u8{ "oldsig", "garbagesig" }) |mirror| {
+        try testing.expectEqual(@as(usize, 1), d.server.countExact(try std.fmt.allocPrint(a, "/{s}/{s}.minisig", .{ mirror, dl_archive })));
+        try testing.expectEqual(@as(usize, 0), d.server.countExact(try std.fmt.allocPrint(a, "/{s}/{s}", .{ mirror, dl_archive })));
+    }
 }
 
 test "download: all mirrors fail" {
@@ -2283,6 +2291,51 @@ test "play builds first, times out with a good build" {
             "ZTEST PASS play_not_before_first_frame",
             "ZTEST PASS play_called_once",
             "ZTEST PASS play_timeout_with_good_build",
+            "build service stopped (0 threads left)",
+        },
+        .reject = &.{play_cancelled},
+        .deadline = "300",
+    });
+    // Still held: `_build` from inside module code or a running drain
+    // neither waits nor drains, and starts with the good build at once.
+    try setPlayCase(&p, "nested");
+    try runPlay(&p, .{
+        .expect = &.{
+            "ZTEST PASS play_not_before_first_frame",
+            "ZTEST PASS play_nested_gate",
+            "ZTEST PASS play_nested_drain",
+            "ZTEST PASS play_nested_toast",
+            "ZTEST PASS play_called_once",
+            "ZTEST PASS play_nested_then_off",
+            "build service stopped (0 threads left)",
+        },
+        .reject = &.{ play_cancelled, play_nested_cancelled },
+        .deadline = "300",
+    });
+}
+
+const play_nested_cancelled = "Ziggurat cancelled the run because Play was started while Zig code or a build update ran on the main thread, so it could not wait for the Zig build, and no good build exists yet; see the Zig panel.";
+
+test "play from inside zig code decides at once" {
+    try requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("editor_panel");
+    defer p.deinit();
+    const gate = try addZigWrapper(&p);
+    try isolateUserFolders(&p);
+    var gate_dir = try Io.Dir.cwd().openDir(io, gate, .{});
+    defer gate_dir.close(io);
+    try gate_dir.writeFile(io, .{ .sub_path = "block", .data = "" });
+    try addPlayCheck(&p, "nested");
+    try runPlay(&p, .{
+        .expect = &.{
+            "ZTEST PASS play_not_before_first_frame",
+            "ZTEST PASS play_nested_gate",
+            "ZTEST PASS play_nested_drain",
+            play_nested_cancelled,
+            "ZTEST PASS play_called_once",
+            "ZTEST PASS play_nested_then_off",
             "build service stopped (0 threads left)",
         },
         .reject = &.{play_cancelled},
@@ -2834,8 +2887,10 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 test "export build has no editor plugin" {
     try requireIntegration();
     const a = testing.allocator;
-    // The plugin's class name and the Zig download's mirror list URL.
-    const needles = [_][]const u8{ "ZigEditorPlugin", platform.mirrors.list_url };
+    // The plugin's class name, the Zig download's mirror list URL, the
+    // minisign check of the download and install (apart from the URL) and
+    // the game's reload capture of editor messages.
+    const needles = [_][]const u8{ "ZigEditorPlugin", platform.mirrors.list_url, "minisig", "ZigReloadCapture" };
     const export_lib = try Io.Dir.cwd().readFileAlloc(io, opts.export_host_lib, a, .limited(1 << 30));
     defer a.free(export_lib);
     const host_lib = try Io.Dir.cwd().readFileAlloc(io, opts.host_lib, a, .limited(1 << 30));

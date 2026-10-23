@@ -74,6 +74,11 @@ pub fn drain() usize {
     return n;
 }
 
+/// True while `drain` runs callbacks. Main thread.
+pub fn isDraining() bool {
+    return draining;
+}
+
 /// Callbacks waiting. Any thread.
 pub fn pending() usize {
     mu.lockUncancelable(host_io.get());

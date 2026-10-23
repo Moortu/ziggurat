@@ -65,7 +65,11 @@
 //! the Zig panel, as C# does. After the timeout the game starts with the
 //! last good build (this session's, else the one the manifest names) and a
 //! toast says it reloads when the build finishes; without any good build
-//! the run is cancelled.
+//! the run is cancelled. Where the main-thread queue may not run
+//! (`language.atSafePoint` is false: module code on the main thread's
+//! stack, as when a tool script starts Play, or a drain running), Play does
+//! not wait: it requests the build and decides at once, as after the
+//! timeout.
 const std = @import("std");
 const godot = @import("gdzig");
 const host_options = @import("host_options");
@@ -132,6 +136,7 @@ pub const ZigEditorPlugin = struct {
     }
 
     pub fn _enterTree(self: *ZigEditorPlugin) void {
+        if (host_options.test_probe) active = self;
         editor_build.editorReady();
         var alloc = godot.engine_allocator;
         if (ZigPanel.create(&alloc)) |panel| {
@@ -157,6 +162,7 @@ pub const ZigEditorPlugin = struct {
     }
 
     pub fn _exitTree(self: *ZigEditorPlugin) void {
+        if (host_options.test_probe) active = null;
         self.base.setProcess(false);
         zig_download.detach();
         self.connectSignals(false);
@@ -253,8 +259,14 @@ pub const ZigEditorPlugin = struct {
         play_requests += 1;
         // Play saved the open scenes and scripts just before; a save's
         // build request may still wait in the main-thread queue. Running
-        // the queue first turns it into a request this one joins.
-        editor_build.applyFinished();
+        // the queue first turns it into a request this one joins. Where the
+        // queue may not run (module code on the main thread's stack, as
+        // when a tool script presses Play, or a drain running), the outcome
+        // cannot be applied either, so Play decides at once.
+        if (editor_build.applyFinished() == null) {
+            editor_build.requestBuild(.play);
+            return self.startWithoutWaiting();
+        }
         editor_build.requestBuild(.play);
         const wait_s = editor_build.playWaitSeconds();
         const limit_ms: u64 = @as(u64, wait_s) * 1000;
@@ -266,7 +278,7 @@ pub const ZigEditorPlugin = struct {
             const idle = left > 0 and editor_build.waitIdle(left);
             // Applies the outcome now: the manifest names the build before
             // the game starts.
-            editor_build.applyFinished();
+            const ran = editor_build.applyFinished() orelse 0;
             const st = editor_build.status();
             if (!st.building) {
                 const last = st.last orelse return true;
@@ -277,18 +289,37 @@ pub const ZigEditorPlugin = struct {
             }
             // Still building: an applied outcome may have asked for another
             // build (a stale fast build is built again in full), or more
-            // outcomes wait than one drain runs. Wait on while time is left.
-            if (idle) continue;
-            if (editor_build.startableGeneration()) |n| {
-                var buf: [160]u8 = undefined;
-                const text = std.fmt.bufPrint(&buf, "Zig build still running; the game starts with build {d} and reloads when the build finishes", .{n}) catch return true;
-                editor_panel.pushToast(.{ .severity = .warning, .text = text, .tooltip = "" });
-                return true;
+            // outcomes wait than one drain runs. Wait on while time is left;
+            // a round that applied nothing pauses briefly, so the loop
+            // never spins.
+            if (idle) {
+                if (ran == 0) io.sleep(.fromMilliseconds(1), .awake) catch {};
+                continue;
             }
+            if (startNotice()) return true;
             log("Ziggurat cancelled the run because the Zig build still runs after {d} s and no good build exists yet; see the Zig panel.", .{wait_s});
             self.showPanel();
             return false;
         }
+    }
+
+    /// Play reached from where it cannot wait for the build: true with
+    /// the toast while a good build exists, else false.
+    fn startWithoutWaiting(self: *ZigEditorPlugin) bool {
+        if (startNotice()) return true;
+        log("Ziggurat cancelled the run because Play was started while Zig code or a build update ran on the main thread, so it could not wait for the Zig build, and no good build exists yet; see the Zig panel.", .{});
+        self.showPanel();
+        return false;
+    }
+
+    /// While a good build exists, pushes the "still running" toast and
+    /// returns true; else false.
+    fn startNotice() bool {
+        const n = editor_build.startableGeneration() orelse return false;
+        var buf: [160]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "Zig build still running; the game starts with build {d} and reloads when the build finishes", .{n}) catch return true;
+        editor_panel.pushToast(.{ .severity = .warning, .text = text, .tooltip = "" });
+        return true;
     }
 
     /// Updates the panel and brings it to the front.
@@ -520,6 +551,10 @@ fn nowMs() i64 {
 
 /// Calls of `test_ping`. Main thread.
 pub var test_pings: i64 = 0;
+
+/// The plugin while it is in the tree; set only in probe builds (the
+/// probe calls its `_build`). Main thread.
+pub var active: ?*ZigEditorPlugin = null;
 
 /// Calls of `_build` (for the host tests). Main thread.
 pub var play_calls: i64 = 0;

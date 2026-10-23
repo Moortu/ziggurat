@@ -72,7 +72,8 @@
 //! - The public build API for the editor plugin: `requestBuild`, `status`
 //!   (whether a build runs, and a summary of the last applied outcome),
 //!   `diagnosticsCopy` (that outcome's diagnostics per file) and
-//!   `applyFinished` (runs queued outcomes now). All main thread.
+//!   `applyFinished` (runs queued outcomes now, only at a safe point). All
+//!   main thread.
 //! - `stop` (SCENE exit, before the main-thread queue closes and the
 //!   language is destroyed) clears the save hook and stops the service,
 //!   which kills a running compiler and joins the service's threads.
@@ -96,6 +97,7 @@ const swap = @import("swap.zig");
 const registry = @import("registry.zig");
 const abi = @import("ziggurat_abi");
 const debugger_plugin = @import("debugger_plugin.zig");
+const language = @import("language.zig");
 
 const Allocator = std.mem.Allocator;
 const OsPath = platform.path.OsPath;
@@ -164,8 +166,9 @@ const State = struct {
     size_warned: bool = false,
     /// A shared lock on the generation the manifest names (`writeManifest`),
     /// so the store's sweep never deletes the build a game is told to load,
-    /// also when the editor did not load it. Released when a newer manifest
-    /// is written and at SCENE exit.
+    /// also when the editor did not load it. Null when the editor loaded
+    /// that generation: its load pin (`pins`) already holds it. Released
+    /// when a newer manifest is written and at SCENE exit.
     manifest_pin: ?platform.generation_store.FileLock = null,
     /// Set once a build had a tool script (`applyGood`).
     had_tool: bool = false,
@@ -308,9 +311,12 @@ fn freeFile(a: Allocator, f: FileDiagnostics) void {
 
 /// Runs what waits in the main-thread queue now (one `main_queue.drain`),
 /// so an outcome the service has published is applied before the caller
-/// goes on. Main thread; inside a running drain it does nothing.
-pub fn applyFinished() void {
-    _ = main_queue.drain();
+/// goes on, and returns how many callbacks ran. Null, with nothing run,
+/// when the main thread is not at a safe point (`language.atSafePoint`:
+/// module code on the stack, a `_frame` or a drain running). Main thread.
+pub fn applyFinished() ?usize {
+    if (!language.atSafePoint()) return null;
+    return main_queue.drain();
 }
 
 /// True when the project has a build service (see `start`). Main thread.
@@ -1180,7 +1186,7 @@ fn applyGood(a: Allocator, st: *State, m: *Msg, files: *Files, all: *Files) Allo
                 desc_cache.writeSnapshot(gpa, io, .fromTrusted(path), m.gen_n, sn) catch |err|
                     logError("Ziggurat could not write the descriptor cache {s} ({s}).", .{ path, @errorName(err) });
             }
-            writeManifest(st, m.gen_n, lib, &m.pin);
+            writeManifest(st, m.gen_n, lib, &m.pin, false);
             log("ziggurat: build {d} ready ({t}, {t}, {d} ms); the editor did not load it, because the project has no tool scripts", .{ m.gen_n, m.trigger, m.path, m.ms });
             warnSize(st);
             return .used;
@@ -1197,7 +1203,7 @@ fn applyGood(a: Allocator, st: *State, m: *Msg, files: *Files, all: *Files) Allo
             return .not_used;
         },
     };
-    notePinned(st, g.n, &m.pin);
+    const load_pinned = notePinned(st, g.n, &m.pin);
     if (snap == null) {
         const findings = try load_checks.run(a, g);
         if (findings.len != 0) {
@@ -1220,7 +1226,7 @@ fn applyGood(a: Allocator, st: *State, m: *Msg, files: *Files, all: *Files) Allo
         desc_cache.write(gpa, io, .fromTrusted(path), g) catch |err|
             logError("Ziggurat could not write the descriptor cache {s} ({s}).", .{ path, @errorName(err) });
     }
-    writeManifest(st, g.n, lib, &m.pin);
+    writeManifest(st, g.n, lib, &m.pin, load_pinned);
     log("ziggurat: build {d} loaded ({t}, {t}, {d} ms)", .{ g.n, m.trigger, m.path, m.ms });
     warnSize(st);
     return .used;
@@ -1280,13 +1286,17 @@ fn installSnapshot(n: u32, sn: *const abi.Snapshot) void {
 
 /// Pins generation `n` (taking `staged`, the outcome's staging pin, when it
 /// is still there), writes the manifest naming it, then releases the pin of
-/// the generation the previous manifest named (`State.manifest_pin`). A pin
-/// that fails is logged; the manifest is still written. Then running games
-/// are told to reload (`debugger_plugin.sendReload`).
-fn writeManifest(st: *State, n: u32, lib: []const u8, staged: *?FileLock) void {
+/// the generation the previous manifest named (`State.manifest_pin`). With
+/// `load_pinned` the editor loaded `n` and holds its pin until SCENE exit
+/// (`notePinned`), so no second pin is taken: `store.pin` would wait for
+/// `store.lock`, which a concurrent staging copy holds for seconds, and
+/// Play would return late (spec section 9). A pin that fails is logged; the
+/// manifest is still written. Then running games are told to reload
+/// (`debugger_plugin.sendReload`).
+fn writeManifest(st: *State, n: u32, lib: []const u8, staged: *?FileLock, load_pinned: bool) void {
     const taken = staged.*;
     staged.* = null;
-    var lock: ?FileLock = taken orelse (st.store.pin(n) catch |err| blk: {
+    var lock: ?FileLock = taken orelse if (load_pinned) null else (st.store.pin(n) catch |err| blk: {
         logError("Ziggurat could not pin generation {d} in {s} ({s}); a later sweep may delete the build the manifest names.", .{ n, st.store_root, @errorName(err) });
         break :blk null;
     });
@@ -1372,6 +1382,7 @@ pub fn memoryText(buf: []u8) []const u8 {
 /// TEST ONLY (probe `editor_build_set_store_caps`): waits until the
 /// service is idle, then gives its generation store `caps`. Main thread.
 pub fn setStoreCapsForTest(caps: platform.generation_store.Caps) bool {
+    comptime std.debug.assert(@import("host_options").test_probe);
     const st = &(state orelse return false);
     st.svc.waitIdle(60_000) catch return false;
     // The build thread waits for a request; the next `request` takes the
@@ -1419,20 +1430,23 @@ fn sizeText(buf: []u8, bytes: u64) []const u8 {
 
 /// Pins generation `n` until SCENE exit and counts it (spec section 6: the
 /// host counts the generations it loaded; none is ever unloaded). The pin
-/// is `staged`, the outcome's staging pin, when it is still there.
-fn notePinned(st: *State, n: u32, staged: *?FileLock) void {
+/// is `staged`, the outcome's staging pin, when it is still there. True
+/// when the generation is pinned.
+fn notePinned(st: *State, n: u32, staged: *?FileLock) bool {
     st.loaded_count += 1;
     log("ziggurat: {d} generations loaded in this editor session", .{st.loaded_count});
     const taken = staged.*;
     staged.* = null;
     const lock = taken orelse (st.store.pin(n) catch |err| {
         logError("Ziggurat could not pin generation {d} in {s} ({s}); a later sweep may delete its files.", .{ n, st.store_root, @errorName(err) });
-        return;
+        return false;
     });
     st.pins.append(gpa, lock) catch {
         var l = lock;
         l.release();
+        return false;
     };
+    return true;
 }
 
 fn addDiagnostic(a: Allocator, files: *Files, rel: []const u8, d: diag_cache.Diagnostic) Allocator.Error!void {

@@ -755,6 +755,40 @@ pub const ZigguratTestProbe = struct {
         return d;
     }
 
+    /// Calls the editor plugin's `_build` (Build on Play) where it is not a
+    /// safe point: `mode` `gate` holds the gate around it, as module code on
+    /// the main thread's stack does; `drain` runs it from a main-queue
+    /// callback, as a tool script run by an outcome's apply does. Returns
+    /// `result` and `ms` (how long `_build` took); empty without a plugin or
+    /// for another mode.
+    pub fn editorPluginPlayNested(_: *ZigguratTestProbe, mode: String) Dictionary {
+        var d: Dictionary = .init();
+        const p = editor_plugin.active orelse return d;
+        var buf: [16]u8 = undefined;
+        const m = mode.toUtf8Buf(&buf);
+        const io = host_io.get();
+        const t0 = std.Io.Clock.awake.now(io);
+        var result = false;
+        if (std.mem.eql(u8, m, "gate")) {
+            gate.enter();
+            defer gate.leave();
+            result = p._build();
+        } else if (std.mem.eql(u8, m, "drain")) {
+            nested_play = .{ .plugin = p };
+            main_queue.push(nestedPlayCallback, null, null) catch return d;
+            // Earlier queued callbacks run first; this one runs in the same
+            // drain unless more than `per_frame` wait.
+            while (!nested_play.ran) {
+                if (main_queue.drain() == 0) return d;
+            }
+            result = nested_play.result;
+        } else return d;
+        const ms = t0.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+        dictSet(&d, "result", .init(bool, result));
+        dictSet(&d, "ms", .init(i64, @intCast(ms)));
+        return d;
+    }
+
     /// Hands the Zig download its test overrides (`key=value` lines; see
     /// `zig_download.configureForTest`). False when they are incomplete.
     pub fn zigDownloadConfigure(_: *ZigguratTestProbe, lines: String) bool {
@@ -1087,6 +1121,14 @@ fn nestedFrameCallback(_: ?*anyopaque) void {
     if (runtime.find(1)) |one| swap.requestExact(one);
 }
 
+var nested_play: struct { plugin: ?*editor_plugin.ZigEditorPlugin = null, result: bool = false, ran: bool = false } = .{};
+
+fn nestedPlayCallback(_: ?*anyopaque) void {
+    const p = nested_play.plugin orelse return;
+    nested_play.result = p._build();
+    nested_play.ran = true;
+}
+
 fn countRun(_: ?*anyopaque) void {
     _ = queue_runs.fetchAdd(1, .monotonic);
 }
@@ -1106,34 +1148,34 @@ fn cachedScript(rel: String) ?*const desc_cache.Script {
 }
 
 pub const method_names = [_][:0]const u8{
-    "property_list",            "method_list",                 "signal_list",              "default_text",
-    "cache_write",              "cache_read",                  "cache_rejections",         "cached_property_list",
-    "cached_method_list",       "cached_signal_list",          "cached_default_text",      "cached_layout_hash",
-    "layout_hash",              "cached_generation",           "roundtrip_default",        "stored_default",
-    "cache_drops",              "load_module",                 "current_generation",       "was_ever_current",
-    "init_calls",               "find_script",                 "method_index",             "property_index",
-    "method_count",             "method_name",                 "property_count",           "property_name",
-    "property_is_group",        "api_log",                     "api_request_swap",         "script_is_valid",
-    "script_fallback_enabled",  "script_members",              "script_member_line",       "script_method_info",
-    "script_has_default",       "script_update_exports",       "script_method_arg_count",  "live_instances",
-    "live_bytes",               "call_error",                  "property_state",           "script_placeholder_count",
-    "script_set_build_failed",  "language_validate",           "language_global_class",    "language_complete_code",
-    "language_lookup_code",     "set_diagnostics",             "has_global_constant",      "queue_push",
-    "queue_runs",               "saved_hook_install",          "saved_hook_clear",         "saved_hook_paths",
-    "language_reload_scripts",  "language_reload_tool_script", "editor_build_outcomes",    "editor_build_busy",
-    "cache_write_snapshot",     "gate_depth",                  "gate_try_swap",            "gate_test_swap",
-    "gate_migrate_probe",       "registry_count",              "runtime_shutdown",         "stage_module",
-    "gate_swap_begin",          "gate_swap_end",               "instance_generation",      "swap_request",
-    "swap_outcome",             "swaps_done",                  "fail_allocation",          "instance_data",
-    "swap_hook",                "game_reload_message",         "set_size_warning_bytes",   "loaded_generations",
-    "generation_loaded",        "language_frame",              "language_stack_info",      "queue_pending",
-    "queue_nested_frame_check", "language_nested_frames",      "gate_hold",                "default_mismatch_once",
-    "editor_build_request",     "editor_build_status",         "editor_build_diagnostics", "editor_plugin_connect",
-    "editor_plugin_pings",      "editor_panel_toasts",         "editor_plugin_play",       "game_capture",
-    "game_capture_registered",  "debugger_reload_last",        "debugger_reload_sends",    "debugger_sessions",
-    "debugger_started",         "editor_build_checks",         "zig_download_configure",   "zig_download_state",
-    "zig_download_cancel",      "zig_download_requests",       "editor_build_wait_idle",   "editor_build_set_store_caps",
-    "editor_build_hold_queue",  "editor_build_memory",
+    "property_list",            "method_list",                 "signal_list",               "default_text",
+    "cache_write",              "cache_read",                  "cache_rejections",          "cached_property_list",
+    "cached_method_list",       "cached_signal_list",          "cached_default_text",       "cached_layout_hash",
+    "layout_hash",              "cached_generation",           "roundtrip_default",         "stored_default",
+    "cache_drops",              "load_module",                 "current_generation",        "was_ever_current",
+    "init_calls",               "find_script",                 "method_index",              "property_index",
+    "method_count",             "method_name",                 "property_count",            "property_name",
+    "property_is_group",        "api_log",                     "api_request_swap",          "script_is_valid",
+    "script_fallback_enabled",  "script_members",              "script_member_line",        "script_method_info",
+    "script_has_default",       "script_update_exports",       "script_method_arg_count",   "live_instances",
+    "live_bytes",               "call_error",                  "property_state",            "script_placeholder_count",
+    "script_set_build_failed",  "language_validate",           "language_global_class",     "language_complete_code",
+    "language_lookup_code",     "set_diagnostics",             "has_global_constant",       "queue_push",
+    "queue_runs",               "saved_hook_install",          "saved_hook_clear",          "saved_hook_paths",
+    "language_reload_scripts",  "language_reload_tool_script", "editor_build_outcomes",     "editor_build_busy",
+    "cache_write_snapshot",     "gate_depth",                  "gate_try_swap",             "gate_test_swap",
+    "gate_migrate_probe",       "registry_count",              "runtime_shutdown",          "stage_module",
+    "gate_swap_begin",          "gate_swap_end",               "instance_generation",       "swap_request",
+    "swap_outcome",             "swaps_done",                  "fail_allocation",           "instance_data",
+    "swap_hook",                "game_reload_message",         "set_size_warning_bytes",    "loaded_generations",
+    "generation_loaded",        "language_frame",              "language_stack_info",       "queue_pending",
+    "queue_nested_frame_check", "language_nested_frames",      "gate_hold",                 "default_mismatch_once",
+    "editor_build_request",     "editor_build_status",         "editor_build_diagnostics",  "editor_plugin_connect",
+    "editor_plugin_pings",      "editor_panel_toasts",         "editor_plugin_play",        "game_capture",
+    "game_capture_registered",  "debugger_reload_last",        "debugger_reload_sends",     "debugger_sessions",
+    "debugger_started",         "editor_build_checks",         "zig_download_configure",    "zig_download_state",
+    "zig_download_cancel",      "zig_download_requests",       "editor_build_wait_idle",    "editor_build_set_store_caps",
+    "editor_build_hold_queue",  "editor_build_memory",         "editor_plugin_play_nested",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

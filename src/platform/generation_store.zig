@@ -75,7 +75,8 @@ pub const SweepReport = struct {
     kept: u32,
     /// Total allocated size of the files in the kept generations.
     bytes_kept: u64,
-    /// Unpinned generations whose delete failed; they count as kept.
+    /// Generations whose pin could not be checked (kept as if pinned) plus
+    /// unpinned generations whose delete failed; they count as kept.
     failed: u32 = 0,
 };
 
@@ -242,16 +243,22 @@ pub const GenerationStore = struct {
         // release a pin; such a generation stays until the next sweep).
         var total: u64 = 0;
         var unpinned_total: u64 = 0;
+        var failed: u32 = 0;
         for (gens, sizes, pinned) |n, *sz, *pn| {
             sz.* = try self.genBytes(n);
-            pn.* = try self.isPinned(n);
+            // A lock that cannot be checked (a link, a file of another
+            // user) counts as pinned: never delete it, and go on with the
+            // others.
+            pn.* = self.isPinned(n) catch blk: {
+                failed += 1;
+                break :blk true;
+            };
             total += sz.*;
             if (!pn.*) unpinned_total += sz.*;
         }
 
         const over_count: usize = if (gens.len > self.caps.max_count) gens.len - self.caps.max_count else 0;
         var deleted: u32 = 0;
-        var failed: u32 = 0;
         // The last entry is the newest: never a candidate.
         const candidates = if (gens.len == 0) 0 else gens.len - 1;
         for (gens[0..candidates], sizes[0..candidates], pinned[0..candidates], 0..) |n, sz, pn, i| {
@@ -288,7 +295,8 @@ pub const GenerationStore = struct {
         defer a.free(gens);
         var held: u32 = 0;
         for (gens) |n| {
-            if (try self.isPinned(n)) held += 1;
+            // As in `sweep`: a lock that cannot be checked counts as held.
+            if (self.isPinned(n) catch true) held += 1;
         }
         return held;
     }
@@ -730,6 +738,35 @@ test "pin never follows a linked lock file" {
     try std.testing.expectError(error.SymLink, s.pin(1));
     // Nothing was created at the link's target.
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, target.bytes, .{}));
+}
+
+test "a lock that cannot be checked does not end the sweep" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    try f.writeElf("built.so", "hello");
+    const built = try f.p(a, &.{"built.so"});
+    defer a.free(built.bytes);
+    var s = f.store(a, .{ .max_count = 1 });
+    for (0..4) |_| _ = try stageOne(a, &s, built);
+    // Gen 2's lock is replaced by a link (a restore, a copy as another
+    // user): its pin state cannot be checked.
+    const lock_file = try path.join(a, f.root, &.{ "gen", "2", ".lock" });
+    defer a.free(lock_file.bytes);
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, lock_file.bytes);
+    const target = try f.p(a, &.{"elsewhere"});
+    defer a.free(target.bytes);
+    try std.Io.Dir.cwd().symLink(std.testing.io, target.bytes, lock_file.bytes, .{});
+    // It counts as pinned and failed; the others are still swept.
+    const rep = try s.sweep();
+    try std.testing.expectEqual(@as(u32, 2), rep.deleted);
+    try std.testing.expectEqual(@as(u32, 1), rep.failed);
+    try std.testing.expect(!try genExists(a, &f, 1));
+    try std.testing.expect(try genExists(a, &f, 2));
+    try std.testing.expect(!try genExists(a, &f, 3));
+    try std.testing.expect(try genExists(a, &f, 4));
+    try std.testing.expectEqual(@as(u32, 1), try s.heldPins());
 }
 
 test "sweep keeps newest" {

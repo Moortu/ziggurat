@@ -12,7 +12,10 @@
 //! 2. The order: the mirrors shuffled with a ChaCha CSPRNG seeded from the
 //!    process Io's random source, then ziglang.org (`mirrors.urls`).
 //! 3. Per mirror: the `.minisig` into memory (at most 4096 bytes, status
-//!    200), then the archive into `<toolchains>/.download-<random>` (at most
+//!    200), checked at once for all but the file signature (format `ED`,
+//!    key id, global signature, `file:` name; `minisign.verifyBeforeFile`),
+//!    so a bad one moves to the next mirror without the archive transfer;
+//!    then the archive into `<toolchains>/.download-<random>` (at most
 //!    the pinned size, status 200). Godot's HTTPRequest does the transfers,
 //!    polled each frame on the main thread, and reports there
 //!    (`request_completed`, received by the editor plugin's bound method).
@@ -27,6 +30,10 @@
 //!    It needs about 800 MB of memory for a few seconds. The worker deletes
 //!    the downloaded file afterwards and hands the result back through the
 //!    main-thread queue; the next frame (`tick`) takes it.
+//!
+//! Before the first request, under the toolchain lock (skipped while
+//! another editor holds it), leftovers of a crashed run older than an hour
+//! are deleted (`toolchain_install.sweepLeftovers`).
 //!
 //! Any failure of a mirror deletes its temporary file, logs the mirror and
 //! the reason and tries the next one; no unchecked file is ever used. When
@@ -114,7 +121,7 @@ const installed_check_ms = 5_000;
 /// How long the worker waits for another editor's install.
 const lock_timeout_ms = 300_000;
 const lock_name = ".install.lock";
-const download_prefix = ".download-";
+const download_prefix = toolchain_install.download_prefix;
 const cache_name = "mirrors.txt";
 
 const gpa = std.heap.c_allocator;
@@ -255,6 +262,7 @@ pub fn start() void {
         changes +%= 1;
         return;
     }
+    sweepLeftovers();
     log("Ziggurat downloads Zig " ++ pins.zig_version ++ " into {s}.", .{tc_dir.?});
     if (readCache()) |list| return useList(list);
     phase = .list;
@@ -322,6 +330,10 @@ pub fn onCompleted(result: i64, code: i64, body: *const PackedByteArray) void {
             if (!ok) return httpFailed(result, code);
             const text = bodyBytes(body);
             if (text.len == 0 or text.len > minisign.max_signature_text) return mirrorFailed("the signature file has {d} bytes", .{text.len});
+            // Everything but the file signature is checked now, so a bad
+            // signature file costs no archive transfer.
+            minisign.verifyBeforeFile(conf.key, text, conf.archive.name) catch |err|
+                return mirrorFailed("{s}", .{toolchain_install.describe(err)});
             sig_text = gpa.dupe(u8, text) catch return fail("out of memory", .{});
             startArchive();
         },
@@ -377,6 +389,20 @@ fn folders() !void {
     data_dir = try gpa.dupe(u8, std.fs.path.dirname(tc.bytes) orelse return error.NoDataFolder);
     const io = host_io.get();
     try std.Io.Dir.cwd().createDirPath(io, tc.bytes);
+}
+
+/// Deletes what a crashed run left in `<toolchains>` (older than an hour;
+/// `toolchain_install.sweepLeftovers`), under the toolchain lock. Skipped
+/// while another editor holds the lock (it installs now).
+fn sweepLeftovers() void {
+    const io = host_io.get();
+    var buf: [max_path_bytes]u8 = undefined;
+    const lock_path = std.fmt.bufPrint(&buf, "{s}/" ++ lock_name, .{tc_dir.?}) catch return;
+    var lock = platform.lock.FileLock.acquire(io, .fromTrusted(lock_path), .exclusive, 0) catch return;
+    defer lock.release();
+    const now = std.Io.Clock.real.now(io).nanoseconds;
+    const n = toolchain_install.sweepLeftovers(io, tc_dir.?, now, toolchain_install.leftover_age_ns);
+    if (n != 0) log("Ziggurat deleted {d} leftovers of an earlier Zig download in {s}.", .{ n, tc_dir.? });
 }
 
 /// The saved list when it is younger than 24 hours and parses. An older
@@ -804,15 +830,16 @@ const TestConfig = struct {
 
 var test_config: if (host_options.test_probe) ?TestConfig else void = if (host_options.test_probe) null else {};
 
-/// TEST ONLY (probe builds): takes the overrides from `key=value` lines
-/// (`list_url`, `official_base`, `key`, `archive_name`, `archive_size`,
-/// `archive_sha256`, `plain_http`; optional `request_timeout_ms`,
-/// `stall_ms`, `archive_deadline_ms`). False when one is missing or bad.
+/// Frees the copied override text and refuses it (`configureForTest`).
 fn rejectConfig(own: []u8) bool {
     gpa.free(own);
     return false;
 }
 
+/// TEST ONLY (probe builds): takes the overrides from `key=value` lines
+/// (`list_url`, `official_base`, `key`, `archive_name`, `archive_size`,
+/// `archive_sha256`, `plain_http`; optional `request_timeout_ms`,
+/// `stall_ms`, `archive_deadline_ms`). False when one is missing or bad.
 pub fn configureForTest(text: []const u8) bool {
     comptime std.debug.assert(host_options.test_probe);
     const own = gpa.dupe(u8, text) catch return false;

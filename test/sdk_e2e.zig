@@ -1290,7 +1290,12 @@ test "integration: scripts cannot call object helpers" {
         try testing.expect(!o.ok);
         const want = try std.fmt.allocPrint(a, "ziggurat: {s} is not available in scripts; use z.emit or z.godot.Callable", .{c.name});
         for (o.diagnostics) |d| {
-            if (std.mem.eql(u8, d.message, want)) break;
+            if (!std.mem.eql(u8, d.message, want)) continue;
+            // Reported at gdzig's class file; the reference trace gives the
+            // script line that names the helper (line 8, the `go` body).
+            try testing.expectEqualStrings("hero.zig", d.rel orelse return error.HelperNotInScript);
+            try testing.expectEqual(@as(u32, 8), d.line);
+            break;
         } else {
             std.debug.print("want: {s}\n", .{want});
             return error.HelperNotRefused;

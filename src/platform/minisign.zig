@@ -149,6 +149,16 @@ fn checkGlobal(key: PublicKey, sig: Signature) Error!void {
     v.verifyStrict() catch return error.BadGlobalSignature;
 }
 
+/// Everything `verifyFile` checks except the file signature, so a
+/// signature file can be refused before the file is fetched: the format
+/// (`ED` only), the key id, the global signature, and the trusted
+/// comment's one `file:` field equal to `expected_file`.
+pub fn verifyBeforeFile(key: PublicKey, sig_text: []const u8, expected_file: []const u8) Error!void {
+    const sig = try verifyGlobal(key, sig_text);
+    const name = fileField(sig.trusted_comment) orelse return error.FileNameMismatch;
+    if (!std.mem.eql(u8, name, expected_file)) return error.FileNameMismatch;
+}
+
 /// Full check of a downloaded file: format (`ED` only) and key id, the file
 /// signature over `digest` (BLAKE2b-512 of the file), the global signature,
 /// then the trusted comment's one `file:` field must equal `expected_file`.
@@ -327,6 +337,30 @@ test "tab-separated comment" {
     const spaces = try s.sign(a, "ED", &testDigest(), "timestamp:1790965431 file:" ++ test_name ++ " hashed");
     defer a.free(spaces);
     try testing.expectError(error.FileNameMismatch, verifyFile(s.publicKey(), spaces, testDigest(), test_name));
+}
+
+test "verifyBeforeFile checks all but the file signature" {
+    const a = testing.allocator;
+    const s = TestSigner.init(7, test_key_id);
+    const text = try s.signFile(a, test_data, test_name);
+    defer a.free(text);
+    try verifyBeforeFile(s.publicKey(), text, test_name);
+    // Another release's signature, a legacy one, another key id, a changed
+    // comment and garbage are refused without the file.
+    const old = try s.signFile(a, test_data, "zig-x86_64-linux-0.16.0.tar.xz");
+    defer a.free(old);
+    try testing.expectError(error.FileNameMismatch, verifyBeforeFile(s.publicKey(), old, test_name));
+    const legacy = try s.sign(a, "Ed", test_data, "timestamp:1\tfile:" ++ test_name);
+    defer a.free(legacy);
+    try testing.expectError(error.LegacyAlgorithm, verifyBeforeFile(s.publicKey(), legacy, test_name));
+    const other_id = TestSigner.init(7, .{ 1, 1, 1, 1, 1, 1, 1, 1 });
+    const foreign = try other_id.signFile(a, test_data, test_name);
+    defer a.free(foreign);
+    try testing.expectError(error.KeyIdMismatch, verifyBeforeFile(s.publicKey(), foreign, test_name));
+    const changed = try std.mem.replaceOwned(u8, a, text, "timestamp:", "timestamp:9");
+    defer a.free(changed);
+    try testing.expectError(error.BadGlobalSignature, verifyBeforeFile(s.publicKey(), changed, test_name));
+    try testing.expectError(error.Malformed, verifyBeforeFile(s.publicKey(), "untrusted comment: x\nnot a signature\n", test_name));
 }
 
 test "missing trailing newline accepted" {
