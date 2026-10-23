@@ -26,6 +26,7 @@ const swap = @import("swap.zig");
 const editor_plugin = @import("editor_plugin.zig");
 const editor_panel = @import("editor_panel.zig");
 const debugger_plugin = @import("debugger_plugin.zig");
+const zig_download = @import("zig_download.zig");
 const host_callable = @import("host_callable.zig");
 const Callable = godot.builtin.Callable;
 const PackedStringArray = godot.builtin.PackedStringArray;
@@ -704,6 +705,49 @@ pub const ZigguratTestProbe = struct {
         return d;
     }
 
+    /// Hands the Zig download its test overrides (`key=value` lines; see
+    /// `zig_download.configureForTest`). False when they are incomplete.
+    pub fn zigDownloadConfigure(_: *ZigguratTestProbe, lines: String) bool {
+        var buf: [8192]u8 = undefined;
+        const t = props.stringText(&lines, &buf) orelse return false;
+        return zig_download.configureForTest(t);
+    }
+
+    /// `zig_download.state` as a Dictionary: `state` (the tag), `mirror`,
+    /// `bytes`, `total` (while downloading) and `reason` (when failed).
+    pub fn zigDownloadState(_: *ZigguratTestProbe) Dictionary {
+        var d: Dictionary = .init();
+        const st = zig_download.state();
+        dictSetText(&d, "state", @tagName(st));
+        dictSetText(&d, "mirror", switch (st) {
+            .downloading => |x| x.mirror,
+            else => "",
+        });
+        dictSet(&d, "bytes", .init(i64, switch (st) {
+            .downloading => |x| @intCast(@min(x.bytes, std.math.maxInt(i64))),
+            else => 0,
+        }));
+        dictSet(&d, "total", .init(i64, switch (st) {
+            .downloading => |x| @intCast(@min(x.total, std.math.maxInt(i64))),
+            else => 0,
+        }));
+        dictSetText(&d, "reason", switch (st) {
+            .failed => |x| x.reason,
+            else => "",
+        });
+        return d;
+    }
+
+    /// `zig_download.cancel`.
+    pub fn zigDownloadCancel(_: *ZigguratTestProbe) void {
+        zig_download.cancel();
+    }
+
+    /// HTTP requests the Zig download started so far.
+    pub fn zigDownloadRequests(_: *ZigguratTestProbe) i64 {
+        return zig_download.requests;
+    }
+
     /// Calls of the editor plugin's test method so far.
     pub fn editorPluginPings(_: *ZigguratTestProbe) i64 {
         return editor_plugin.test_pings;
@@ -1037,7 +1081,8 @@ pub const method_names = [_][:0]const u8{
     "editor_build_request",     "editor_build_status",         "editor_build_diagnostics", "editor_plugin_connect",
     "editor_plugin_pings",      "editor_panel_toasts",         "editor_plugin_play",       "game_capture",
     "game_capture_registered",  "debugger_reload_last",        "debugger_reload_sends",    "debugger_sessions",
-    "debugger_started",         "editor_build_checks",
+    "debugger_started",         "editor_build_checks",         "zig_download_configure",   "zig_download_state",
+    "zig_download_cancel",      "zig_download_requests",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

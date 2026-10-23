@@ -199,7 +199,12 @@ const Lifecycle = struct {
         // language), so nothing pushes outcomes after that, and before the
         // process Io ends. The file loader and saver go before the language,
         // so no load or save can reach a destroyed language.
-        if (comptime !host_options.export_build) editor_build.stop();
+        if (comptime !host_options.export_build) {
+            // A Zig download's check thread normally ended when the editor
+            // plugin left the tree; this waits for one that did not.
+            @import("zig_download.zig").stop();
+            editor_build.stop();
+        }
         game.stop();
         resource.unregister();
         if (zig_language) |lang| {
@@ -350,4 +355,5 @@ test {
     _ = editor_plugin;
     _ = @import("debugger_plugin.zig");
     _ = @import("editor_panel.zig");
+    _ = @import("zig_download.zig");
 }

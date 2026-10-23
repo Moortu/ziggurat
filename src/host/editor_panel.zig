@@ -8,7 +8,8 @@
 //!   `Build failed: <e> errors, <w> warnings (<ms> ms); build <n> stays in
 //!   use`;
 //! - a memory line (hidden until `setMemory` gives it text);
-//! - a download row (hidden until `showDownload` shows it);
+//! - a download row (hidden until `showDownload` shows it): the Zig
+//!   download's line and a Cancel button while it transfers;
 //! - a `RichTextLabel` of the last build's diagnostics. Each diagnostic in
 //!   a project file starts with a link `res://<path>:<line>:<column>`;
 //!   clicking it (`meta_clicked`) opens the script there with
@@ -23,6 +24,7 @@ const std = @import("std");
 const godot = @import("gdzig");
 const host_options = @import("host_options");
 const editor_build = @import("editor_build.zig");
+const zig_download = @import("zig_download.zig");
 const host_callable = @import("host_callable.zig");
 const props = @import("props.zig");
 
@@ -54,6 +56,7 @@ pub const ZigPanel = struct {
     memory: *Label,
     download_row: *HBoxContainer,
     download_text: *Label,
+    download_cancel: *Button,
     diagnostics: *RichTextLabel,
 
     /// Builds the dock and its children. Godot calls it too if the class
@@ -68,6 +71,7 @@ pub const ZigPanel = struct {
             .memory = Label.init(),
             .download_row = HBoxContainer.init(),
             .download_text = Label.init(),
+            .download_cancel = Button.init(),
             .diagnostics = RichTextLabel.init(),
         };
         dock.setInstance(ZigPanel, self);
@@ -114,6 +118,11 @@ pub const ZigPanel = struct {
         self.download_row.setVisible(false);
         self.download_text.setName(.fromComptimeLatin1("DownloadText"));
         self.download_row.addChild(.upcast(self.download_text), .{});
+        self.download_cancel.setName(.fromComptimeLatin1("DownloadCancel"));
+        setText(Button, self.download_cancel, "setText", "Cancel");
+        setText(Button, self.download_cancel, "setTooltipText", "Stop the Zig download");
+        self.download_cancel.setVisible(false);
+        self.download_row.addChild(.upcast(self.download_cancel), .{});
         column.addChild(.upcast(self.download_row), .{});
 
         const rt = self.diagnostics;
@@ -129,6 +138,12 @@ pub const ZigPanel = struct {
         const obj = Object.upcast(dock);
         connect(Object.upcast(self.button), "pressed", obj, "build_pressed");
         connect(Object.upcast(rt), "meta_clicked", obj, "on_meta_clicked");
+        connect(Object.upcast(self.download_cancel), "pressed", obj, "download_cancel_pressed");
+    }
+
+    /// Bound as `download_cancel_pressed` (the download row's Cancel).
+    pub fn downloadCancelPressed(_: *ZigPanel) void {
+        zig_download.cancel();
     }
 
     /// Bound as `build_pressed` (the Build button).
@@ -193,10 +208,11 @@ pub const ZigPanel = struct {
     }
 
     /// The download row (filled by the Zig download): hidden in state
-    /// `hidden`, otherwise it shows `text`.
+    /// `hidden`, otherwise it shows `text`; Cancel only while `downloading`.
     pub fn showDownload(self: *ZigPanel, state: DownloadState, text: []const u8) void {
         setText(Label, self.download_text, "setText", text);
         self.download_row.setVisible(state != .hidden);
+        self.download_cancel.setVisible(state == .downloading);
     }
 
     /// Brings the dock to the front (for example after a failed build).
@@ -206,7 +222,7 @@ pub const ZigPanel = struct {
 };
 
 /// What the download row shows (`showDownload`).
-pub const DownloadState = enum { hidden, idle, downloading, installed, failed };
+pub const DownloadState = enum { hidden, idle, downloading, checking, installed, failed };
 
 fn connect(source: *Object, comptime signal: [:0]const u8, target: *Object, comptime method: [:0]const u8) void {
     var c = host_callable.callable(target, method);

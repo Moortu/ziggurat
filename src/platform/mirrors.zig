@@ -109,6 +109,12 @@ pub fn freeList(a: std.mem.Allocator, list: []const []const u8) void {
 /// `file` must be a plain file name. The caller frees the result with
 /// `freeUrls`.
 pub fn urls(a: std.mem.Allocator, list: []const []const u8, file: []const u8, rng: std.Random) Error![]Url {
+    return urlsWith(a, list, file, rng, official_base);
+}
+
+/// As `urls`, with `last` in place of ziglang.org (the editor's host tests
+/// pass a local stand-in; the product always uses `urls`).
+pub fn urlsWith(a: std.mem.Allocator, list: []const []const u8, file: []const u8, rng: std.Random, last: []const u8) Error![]Url {
     if (!validFile(file)) return error.Malformed;
     const order = try a.alloc(usize, list.len);
     defer a.free(order);
@@ -122,7 +128,7 @@ pub fn urls(a: std.mem.Allocator, list: []const []const u8, file: []const u8, rn
     }
     try out.ensureTotalCapacityPrecise(a, list.len + 1);
     for (order) |i| out.appendAssumeCapacity(try makeUrl(a, list[i], file));
-    out.appendAssumeCapacity(try makeUrl(a, official_base, file));
+    out.appendAssumeCapacity(try makeUrl(a, last, file));
     return out.toOwnedSlice(a);
 }
 
@@ -273,6 +279,12 @@ test "urls order" {
     const only = try urls(a, &.{}, file, prng.random());
     defer freeUrls(a, only);
     try testing.expectEqual(@as(usize, 1), only.len);
+
+    // Another last resort (urlsWith) goes last the same way.
+    const stand_in = try urlsWith(a, list, file, prng.random(), "http://127.0.0.1:8080/official/");
+    defer freeUrls(a, stand_in);
+    try testing.expectEqualStrings("http://127.0.0.1:8080/official/", stand_in[stand_in.len - 1].base);
+    try testing.expectEqualStrings("http://127.0.0.1:8080/official/" ++ "zig-x86_64-linux-0.17.0.tar.xz?source=ziggurat", stand_in[stand_in.len - 1].archive);
 
     // The file must be a plain name.
     for ([_][]const u8{ "", "a/b.tar.xz", "../x", ".x", "a?b", "a b", "a%2fb" }) |f| {

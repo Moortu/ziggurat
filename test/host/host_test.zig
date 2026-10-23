@@ -1727,6 +1727,352 @@ test "zig panel" {
     });
 }
 
+// ------------------------------------------------------------ zig download
+
+const fixture_server = @import("fixture_server.zig");
+
+const dl_archive = "zig-x86_64-linux-0.17.0.tar.xz";
+const dl_mirror_prefix = "Ziggurat could not use the Zig mirror ";
+
+/// A download test's world: the fixture server, its folder and the
+/// per-user toolchains folder Godot uses.
+const Download = struct {
+    server: *fixture_server.Server,
+    /// `https://127.0.0.1:<port>`: what the mirror list names (the probe
+    /// maps it to plain http).
+    base: []const u8,
+    toolchains: []const u8,
+    /// `<XDG_DATA_HOME>/ziggurat`, where the mirror list is cached.
+    data: []const u8,
+    www: []const u8,
+
+    fn deinit(d: *Download) void {
+        d.server.stop();
+    }
+
+    /// Writes the mirror list the server answers with.
+    fn setList(d: *Download, p: *Project, mirrors: []const []const u8) !void {
+        const a = p.arena_state.allocator();
+        var text: std.ArrayList(u8) = .empty;
+        for (mirrors) |m| try text.print(a, "{s}/{s}\n", .{ d.base, m });
+        try writeIn(d.www, "community-mirrors.txt", text.items);
+    }
+};
+
+fn writeIn(dir: []const u8, name: []const u8, data: []const u8) !void {
+    var d = try Io.Dir.cwd().openDir(io, dir, .{});
+    defer d.close(io);
+    if (std.fs.path.dirname(name)) |sub| try d.createDirPath(io, sub);
+    try d.writeFile(io, .{ .sub_path = name, .data = data });
+}
+
+/// Sets up a download test in project `p` (made with `initProbe`): the SDK
+/// manifest but no Zig path, no Zig on `PATH`, per-user folders inside the
+/// test folder, the fixture server with every mirror kind, the test
+/// overrides in `res://download_cfg.txt`, the case in
+/// `res://download_case.txt`, the mirror list `mirrors` and
+/// test/host/checks/download.gd as the tool autoload. `official_ok` makes
+/// the ziglang.org stand-in serve the good archive.
+fn setupDownload(p: *Project, case: []const u8, mirrors: []const []const u8, official_ok: bool) !Download {
+    const a = p.arena_state.allocator();
+    // The SDK manifest without a Zig path, so the locator looks in the
+    // toolchains folder.
+    const manifest = try Io.Dir.cwd().realPathFileAlloc(io, opts.sdk_manifest_path, a);
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+    defer dir.close(io);
+    const old = try dir.readFileAlloc(io, "project.godot", a, .limited(64 * 1024));
+    try dir.writeFile(io, .{ .sub_path = "project.godot", .data = try std.fmt.allocPrint(a, "{s}\n[ziggurat]\n\ndev/sdk_manifest=\"{s}\"\n", .{ old, manifest }) });
+    try p.tmp.dir.createDirPath(io, "cache");
+    const env = try a.create(std.process.Environ.Map);
+    env.* = try testing.environ.createMap(testing.allocator);
+    p.env = env;
+    try env.put("XDG_CACHE_HOME", try p.tmp.dir.realPathFileAlloc(io, "cache", a));
+    try isolateUserFolders(p);
+    try pathWithoutZig(p);
+
+    const root = try p.tmp.dir.realPathFileAlloc(io, ".", a);
+    try p.tmp.dir.createDirPath(io, "www");
+    const www = try std.fs.path.join(a, &.{ root, "www" });
+    const server = try fixture_server.Server.start(testing.allocator, io, www);
+    errdefer server.stop();
+    const base = try std.fmt.allocPrint(a, "https://127.0.0.1:{d}", .{server.port});
+
+    const archive_path = try std.fs.path.join(a, &.{ opts.fixtures_dir, "toolchain", dl_archive });
+    const archive = try Io.Dir.cwd().readFileAlloc(io, archive_path, a, .limited(1 << 20));
+    const signer = platform.minisign.TestSigner.init(7, .{ 9, 8, 7, 6, 5, 4, 3, 2 });
+    const good_sig = try signer.signFile(a, archive, dl_archive);
+    const old_sig = try signer.signFile(a, archive, "zig-x86_64-linux-0.16.0.tar.xz");
+    const tampered = try a.dupe(u8, archive);
+    tampered[tampered.len / 2] ^= 0x55;
+
+    const sig_name = dl_archive ++ ".minisig";
+    for ([_][]const u8{ "good", "redirect", "truncated", "slow" }) |m| {
+        try writeIn(www, try std.fs.path.join(a, &.{ m, sig_name }), good_sig);
+    }
+    try writeIn(www, "good/" ++ dl_archive, archive);
+    if (official_ok) {
+        try writeIn(www, "official/" ++ dl_archive, archive);
+        try writeIn(www, "official/" ++ sig_name, good_sig);
+    }
+    try writeIn(www, "redirect/" ++ dl_archive ++ ".location", try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/tampered/{s}", .{ server.port, dl_archive }));
+    try writeIn(www, "tampered/" ++ dl_archive, tampered);
+    try writeIn(www, "truncated/" ++ dl_archive, archive);
+    try writeIn(www, "truncated/" ++ dl_archive ++ ".truncate", "");
+    try writeIn(www, "slow/" ++ dl_archive, archive);
+    try writeIn(www, "slow/" ++ dl_archive ++ ".slow", "");
+    try writeIn(www, "oldsig/" ++ dl_archive, archive);
+    try writeIn(www, "oldsig/" ++ sig_name, old_sig);
+
+    var sha: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(archive, &sha, .{});
+    var key_buf: [56]u8 = undefined;
+    const cfg = try std.fmt.allocPrint(a,
+        \\list_url={s}/community-mirrors.txt
+        \\official_base={s}/official
+        \\plain_http=1
+        \\key={s}
+        \\archive_name={s}
+        \\archive_size={d}
+        \\archive_sha256={s}
+        \\
+    , .{ base, base, signer.publicText(&key_buf), dl_archive, archive.len, &std.fmt.bytesToHex(sha, .lower) });
+    try dir.writeFile(io, .{ .sub_path = "download_cfg.txt", .data = cfg });
+    try dir.writeFile(io, .{ .sub_path = "download_case.txt", .data = case });
+    try p.addAutoloadCheck("download.gd");
+
+    var d: Download = .{
+        .server = server,
+        .base = base,
+        .toolchains = try std.fs.path.join(a, &.{ root, "data", "ziggurat", "toolchains" }),
+        .data = try std.fs.path.join(a, &.{ root, "data", "ziggurat" }),
+        .www = www,
+    };
+    try d.setList(p, mirrors);
+    return d;
+}
+
+/// Fails when a download or install temporary is left in `toolchains`.
+fn expectNoTemp(toolchains: []const u8) !void {
+    var d = Io.Dir.cwd().openDir(io, toolchains, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer d.close(io);
+    var it = d.iterate();
+    while (try it.next(io)) |e| {
+        if (std.mem.startsWith(u8, e.name, ".download-") or
+            (std.mem.startsWith(u8, e.name, ".zig-") and std.mem.indexOf(u8, e.name, ".tmp-") != null))
+        {
+            std.debug.print("left in the toolchains folder: {s}\n", .{e.name});
+            return error.TempLeft;
+        }
+    }
+}
+
+fn fileExists(p: []const u8) bool {
+    Io.Dir.cwd().access(io, p, .{}) catch return false;
+    return true;
+}
+
+const dl_installs_expect = [_][]const u8{
+    "ZTEST PASS download_configured",
+    "ZTEST PASS download_idle_at_start",
+    "ZTEST PASS download_menu",
+    "ZTEST PASS download_done",
+    "ZTEST PASS download_installed",
+    "ZTEST PASS download_panel_installed",
+    "ZTEST PASS download_build_follows",
+    "ZTEST PASS download_no_temp",
+    "ZTEST DONE",
+};
+
+test "download installs and builds" {
+    try requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("highlighter");
+    defer p.deinit();
+    var d = try setupDownload(&p, "installs", &.{"good"}, false);
+    defer d.deinit();
+    errdefer d.server.dump();
+    try p.runEditorChecked("10000000", .{ .expect = &dl_installs_expect, .reject = &.{"ZTEST FAIL"} });
+    const a = p.arena_state.allocator();
+    try testing.expect(fileExists(try std.fs.path.join(a, &.{ d.toolchains, "zig-0.17.0", "zig" })));
+    try expectNoTemp(d.toolchains);
+    try testing.expectEqual(@as(usize, 1), d.server.count("/community-mirrors.txt"));
+    try testing.expectEqual(@as(usize, 2), d.server.count("/good/"));
+    // The list was cached.
+    try testing.expect(fileExists(try std.fs.path.join(a, &.{ d.data, "mirrors.txt" })));
+}
+
+test "download falls through bad mirrors" {
+    try requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("highlighter");
+    defer p.deinit();
+    var d = try setupDownload(&p, "installs", &.{ "notfound", "redirect", "truncated", "oldsig" }, true);
+    defer d.deinit();
+    errdefer d.server.dump();
+    const a = p.arena_state.allocator();
+    const m = struct {
+        fn line(al: std.mem.Allocator, base: []const u8, mirror: []const u8, reason: []const u8) ![]const u8 {
+            return std.fmt.allocPrint(al, "{s}{s}/{s}: {s}", .{ dl_mirror_prefix, base, mirror, reason });
+        }
+    };
+    var expect: std.ArrayList([]const u8) = .empty;
+    try expect.appendSlice(a, &dl_installs_expect);
+    try expect.append(a, try m.line(a, d.base, "notfound", "HTTP status 404"));
+    try expect.append(a, try m.line(a, d.base, "redirect", "the download does not match the pinned SHA-256"));
+    try expect.append(a, try m.line(a, d.base, "truncated", "the transfer stopped after "));
+    try expect.append(a, try m.line(a, d.base, "oldsig", "the signature is for another file"));
+    try expect.append(a, try std.fmt.allocPrint(a, "Ziggurat installed Zig 0.17.0 from {s}/official", .{d.base}));
+    try p.runEditorChecked("10000000", .{ .expect = expect.items, .reject = &.{"ZTEST FAIL"} });
+    try testing.expect(fileExists(try std.fs.path.join(a, &.{ d.toolchains, "zig-0.17.0", "zig" })));
+    try expectNoTemp(d.toolchains);
+    // The redirect was followed to the tampered file.
+    try testing.expectEqual(@as(usize, 1), d.server.count("/tampered/"));
+}
+
+test "download: all mirrors fail" {
+    try requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("highlighter");
+    defer p.deinit();
+    var d = try setupDownload(&p, "fails", &.{ "notfound", "oldsig" }, false);
+    defer d.deinit();
+    errdefer d.server.dump();
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS download_configured",
+            "ZTEST PASS download_menu",
+            "ZTEST PASS download_failed",
+            "ZTEST PASS download_failed_toast",
+            "ZTEST PASS download_panel_failed",
+            "ZTEST PASS download_nothing_installed",
+            "ZTEST PASS download_no_temp",
+            "ZTEST DONE",
+            try std.fmt.allocPrint(p.arena_state.allocator(), "{s}{s}/official: HTTP status 404", .{ dl_mirror_prefix, d.base }),
+        },
+        .reject = &.{"ZTEST FAIL"},
+    });
+    const a = p.arena_state.allocator();
+    try testing.expect(!fileExists(try std.fs.path.join(a, &.{ d.toolchains, "zig-0.17.0" })));
+    try expectNoTemp(d.toolchains);
+}
+
+test "download: cancel" {
+    try requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("highlighter");
+    defer p.deinit();
+    var d = try setupDownload(&p, "cancel", &.{"slow"}, false);
+    defer d.deinit();
+    errdefer d.server.dump();
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS download_configured",
+            "ZTEST PASS download_menu",
+            "ZTEST PASS download_progress",
+            "ZTEST PASS download_cancelled",
+            "ZTEST PASS download_partial_gone",
+            "ZTEST PASS download_nothing_installed",
+            "ZTEST DONE",
+            "Ziggurat cancelled the Zig download.",
+        },
+        .reject = &.{"ZTEST FAIL"},
+    });
+    try expectNoTemp(d.toolchains);
+    // Nothing after the cancel: no other mirror, no ziglang.org.
+    try testing.expectEqual(@as(usize, 0), d.server.count("/official/"));
+}
+
+test "download: second click while downloading is ignored" {
+    try requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("highlighter");
+    defer p.deinit();
+    var d = try setupDownload(&p, "second", &.{"slow"}, false);
+    defer d.deinit();
+    errdefer d.server.dump();
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS download_configured",
+            "ZTEST PASS download_menu",
+            "ZTEST PASS download_second_click_ignored",
+            "ZTEST PASS download_no_temp",
+            "ZTEST DONE",
+        },
+        .reject = &.{"ZTEST FAIL"},
+    });
+    try expectNoTemp(d.toolchains);
+    try testing.expectEqual(@as(usize, 1), d.server.count("/community-mirrors.txt"));
+    try testing.expectEqual(@as(usize, 1), d.server.countExact("/slow/" ++ dl_archive ++ ".minisig"));
+    try testing.expectEqual(@as(usize, 1), d.server.countExact("/slow/" ++ dl_archive));
+}
+
+test "download: mirror list cache" {
+    try requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    // A fresh cache is used without a request.
+    {
+        var p: Project = undefined;
+        try p.initProbe("highlighter");
+        defer p.deinit();
+        // The server's list names a mirror that does not exist; the cache
+        // names the good one.
+        var d = try setupDownload(&p, "installs", &.{"notfound"}, false);
+        defer d.deinit();
+        errdefer d.server.dump();
+        const a = p.arena_state.allocator();
+        try Io.Dir.cwd().createDirPath(io, d.data);
+        try writeIn(d.data, "mirrors.txt", try std.fmt.allocPrint(a, "{s}/good\n", .{d.base}));
+        try p.runEditorChecked("10000000", .{ .expect = &dl_installs_expect, .reject = &.{"ZTEST FAIL"} });
+        try testing.expectEqual(@as(usize, 0), d.server.count("/community-mirrors.txt"));
+        try testing.expectEqual(@as(usize, 0), d.server.count("/notfound/"));
+        try testing.expectEqual(@as(usize, 2), d.server.count("/good/"));
+    }
+    // A stale cache is fetched again and replaced.
+    {
+        var p: Project = undefined;
+        try p.initProbe("highlighter");
+        defer p.deinit();
+        var d = try setupDownload(&p, "installs", &.{"good"}, false);
+        defer d.deinit();
+        errdefer d.server.dump();
+        const a = p.arena_state.allocator();
+        try Io.Dir.cwd().createDirPath(io, d.data);
+        try writeIn(d.data, "mirrors.txt", try std.fmt.allocPrint(a, "{s}/notfound\n", .{d.base}));
+        const cache = try std.fs.path.join(a, &.{ d.data, "mirrors.txt" });
+        const touch = try std.process.run(a, io, .{ .argv = &.{ "touch", "-d", "@1000000000", cache } });
+        if (!touch.term.success()) return error.TouchFailed;
+        try p.runEditorChecked("10000000", .{ .expect = &dl_installs_expect, .reject = &.{"ZTEST FAIL"} });
+        try testing.expectEqual(@as(usize, 1), d.server.count("/community-mirrors.txt"));
+        try testing.expectEqual(@as(usize, 0), d.server.count("/notfound/"));
+        const now = try Io.Dir.cwd().readFileAlloc(io, cache, a, .limited(64 * 1024));
+        try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}/good\n", .{d.base}), now);
+    }
+    // An unreadable list: only ziglang.org, and nothing is cached.
+    {
+        var p: Project = undefined;
+        try p.initProbe("highlighter");
+        defer p.deinit();
+        var d = try setupDownload(&p, "installs", &.{}, true);
+        defer d.deinit();
+        errdefer d.server.dump();
+        const a = p.arena_state.allocator();
+        try writeIn(d.www, "community-mirrors.txt", try std.fmt.allocPrint(a, "{s}/good\nftp://not a mirror\n", .{d.base}));
+        try p.runEditorChecked("10000000", .{ .expect = &dl_installs_expect, .reject = &.{"ZTEST FAIL"} });
+        try testing.expectEqual(@as(usize, 1), d.server.count("/community-mirrors.txt"));
+        try testing.expectEqual(@as(usize, 0), d.server.count("/good/"));
+        try testing.expectEqual(@as(usize, 2), d.server.count("/official/"));
+        try testing.expect(!fileExists(try std.fs.path.join(a, &.{ d.data, "mirrors.txt" })));
+    }
+}
+
 // ------------------------------------------------------------ build on play
 
 /// Adds play_build.gd as the tool autoload and names its case in
@@ -2335,17 +2681,20 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 test "export build has no editor plugin" {
     try requireIntegration();
     const a = testing.allocator;
-    const needle = "ZigEditorPlugin";
+    // The plugin's class name and the Zig download's mirror list URL.
+    const needles = [_][]const u8{ "ZigEditorPlugin", platform.mirrors.list_url };
     const export_lib = try Io.Dir.cwd().readFileAlloc(io, opts.export_host_lib, a, .limited(1 << 30));
     defer a.free(export_lib);
-    if (std.mem.indexOf(u8, export_lib, needle) != null) {
-        std.debug.print("the export build holds '{s}'\n", .{needle});
-        return error.ExportBuildHasEditorPlugin;
-    }
-    // The ordinary host holds it, so the search can find it.
     const host_lib = try Io.Dir.cwd().readFileAlloc(io, opts.host_lib, a, .limited(1 << 30));
     defer a.free(host_lib);
-    if (std.mem.indexOf(u8, host_lib, needle) == null) return error.SearchFindsNothing;
+    for (needles) |needle| {
+        if (std.mem.indexOf(u8, export_lib, needle) != null) {
+            std.debug.print("the export build holds '{s}'\n", .{needle});
+            return error.ExportBuildHasEditorPlugin;
+        }
+        // The ordinary host holds it, so the search can find it.
+        if (std.mem.indexOf(u8, host_lib, needle) == null) return error.SearchFindsNothing;
+    }
 }
 
 test "export build has no manifest path" {

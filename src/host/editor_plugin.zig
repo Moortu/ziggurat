@@ -21,8 +21,17 @@
 //! script editor the Zig syntax highlighter (highlighter.zig; the script
 //! editor exists from here on, not at EDITOR init). When it leaves the tree
 //! it takes the menu items, the panel, the debugger plugin, the
-//! highlighter and its signal connections back. The download builds on it
-//! (editor_build.zig has the build API).
+//! highlighter and its signal connections back (editor_build.zig has the
+//! build API).
+//!
+//! Zig download (zig_download.zig): `Download Zig 0.17.0` starts it. Its
+//! HTTPRequest nodes are children of the plugin, which receives their
+//! `request_completed` (bound `on_download_completed`). Each frame the
+//! plugin lets the download take a worker result and follow its progress
+//! (`zig_download.tick`), shows its state in the panel's download row, asks
+//! for a build after it installed Zig (`requestBuild(.manual)`, so the
+//! locator finds the new Zig) and shows an error toast when it failed.
+//! Leaving the tree ends a running download.
 //!
 //! Indentation: Godot has one global indentation setting for every
 //! language (tabs by default), and the script editor converts a file to
@@ -64,12 +73,15 @@ const editor_build = @import("editor_build.zig");
 const editor_panel = @import("editor_panel.zig");
 const debugger_plugin = @import("debugger_plugin.zig");
 const highlighter = @import("highlighter.zig");
+const zig_download = @import("zig_download.zig");
 const host_callable = @import("host_callable.zig");
 const host_io = @import("host_io.zig");
 
 const Allocator = std.mem.Allocator;
 const String = godot.builtin.String;
 const StringName = godot.builtin.StringName;
+const PackedStringArray = godot.builtin.PackedStringArray;
+const PackedByteArray = godot.builtin.PackedByteArray;
 const EditorPlugin = godot.class.EditorPlugin;
 const Object = godot.class.Object;
 const Node = godot.class.Node;
@@ -98,6 +110,10 @@ pub const ZigEditorPlugin = struct {
     check_interval_ms: i64 = 0,
     /// Awake-clock milliseconds of the last interval check.
     last_check_ms: i64 = 0,
+    /// `zig_download.changes` / `completions` / `failures` handled.
+    seen_download: u32 = 0,
+    seen_completions: u32 = 0,
+    seen_failures: u32 = 0,
 
     pub fn create(allocator: *Allocator) !*ZigEditorPlugin {
         const self = try allocator.create(ZigEditorPlugin);
@@ -127,6 +143,10 @@ pub const ZigEditorPlugin = struct {
         }
         self.addMenuItem(menu_build, "build_menu");
         self.addMenuItem(menu_download, "download_menu");
+        zig_download.attach(Object.upcast(self.base), Node.upcast(self.base));
+        self.seen_download = zig_download.changes;
+        self.seen_completions = zig_download.completions;
+        self.seen_failures = zig_download.failures;
         debugger_plugin.attach(self.base);
         highlighter.attach();
         self.connectSignals(true);
@@ -138,6 +158,7 @@ pub const ZigEditorPlugin = struct {
 
     pub fn _exitTree(self: *ZigEditorPlugin) void {
         self.base.setProcess(false);
+        zig_download.detach();
         self.connectSignals(false);
         highlighter.detach();
         debugger_plugin.detach(self.base);
@@ -199,6 +220,8 @@ pub const ZigEditorPlugin = struct {
                 editor_build.requestIfChanged(.watcher);
             }
         }
+        zig_download.tick();
+        self.syncDownload();
         const panel = self.panel orelse return;
         const outcomes = editor_build.outcomes_applied.load(.acquire);
         if (outcomes != self.seen_outcomes) {
@@ -324,12 +347,50 @@ pub const ZigEditorPlugin = struct {
         editor_build.requestBuild(.manual);
     }
 
-    /// Bound as `download_menu` (Tools > Download Zig 0.17.0). The download
-    /// comes in a later version; until then the item says so once.
+    /// Bound as `download_menu` (Tools > Download Zig 0.17.0): starts the
+    /// download; a second click while it runs is ignored.
     pub fn downloadMenu(_: *ZigEditorPlugin) void {
-        if (download_logged) return;
-        download_logged = true;
-        log("Ziggurat cannot download Zig yet; install Zig 0.17.0 and set " ++ editor_build.setting_zig_path ++ ".", .{});
+        zig_download.start();
+    }
+
+    /// Bound as `on_download_completed` (HTTPRequest `request_completed`
+    /// of the download's current request). Main thread.
+    pub fn onDownloadCompleted(_: *ZigEditorPlugin, result: i64, code: i64, _: PackedStringArray, body: PackedByteArray) void {
+        zig_download.onCompleted(result, code, &body);
+    }
+
+    /// Shows a changed download state in the panel; a finished install asks
+    /// for a build, a failed download shows an error toast.
+    fn syncDownload(self: *ZigEditorPlugin) void {
+        if (zig_download.changes == self.seen_download) return;
+        self.seen_download = zig_download.changes;
+        const st = zig_download.state();
+        if (self.panel) |panel| {
+            var buf: [512]u8 = undefined;
+            const shown: editor_panel.DownloadState = switch (st) {
+                .idle => .idle,
+                .fetching_mirrors, .downloading => .downloading,
+                .checking => .checking,
+                .done => .installed,
+                .failed => .failed,
+            };
+            panel.showDownload(shown, zig_download.stateText(&buf, st));
+        }
+        if (zig_download.completions != self.seen_completions) {
+            self.seen_completions = zig_download.completions;
+            editor_build.requestBuild(.manual);
+        }
+        if (zig_download.failures != self.seen_failures) {
+            self.seen_failures = zig_download.failures;
+            const reason = switch (st) {
+                .failed => |f| f.reason,
+                else => "",
+            };
+            var buf: [400]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "Ziggurat could not download Zig 0.17.0: {s}", .{reason}) catch "Ziggurat could not download Zig 0.17.0.";
+            editor_panel.pushToast(.{ .severity = .@"error", .text = text, .tooltip = "" });
+            if (self.panel) |panel| panel.makeVisible();
+        }
     }
 
     /// TEST ONLY (bound as `test_ping` in probe builds): counts its calls,
@@ -468,9 +529,6 @@ pub var play_result: bool = false;
 /// thread.
 pub var play_requests: i64 = 0;
 
-/// Set once `download_menu` logged. Main thread.
-var download_logged = false;
-
 fn log(comptime fmt: []const u8, args: anytype) void {
     var buf: [1024]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
@@ -489,12 +547,14 @@ pub fn register(registry: *godot.extension.Registry) void {
     const cls = registry.createClass(ZigEditorPlugin, registry.allocator, .{ .level = .editor, .is_exposed = false });
     cls.addMethod("build_menu", .auto);
     cls.addMethod("download_menu", .auto);
+    cls.addMethod("on_download_completed", .auto);
     cls.addMethod("on_settings_changed", .auto);
     cls.addMethod("on_script_changed", .auto);
     if (host_options.test_probe) cls.addMethod("test_ping", .auto);
     const panel = registry.createClass(ZigPanel, registry.allocator, .{ .level = .editor, .is_exposed = false });
     panel.addMethod("build_pressed", .auto);
     panel.addMethod("on_meta_clicked", .auto);
+    panel.addMethod("download_cancel_pressed", .auto);
     debugger_plugin.register(registry);
     highlighter.register(registry);
 }

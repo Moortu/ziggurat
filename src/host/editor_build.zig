@@ -888,7 +888,8 @@ pub fn editorReady() void {
 
 /// The per-user folders and `PATH` as the Zig locator and the path service
 /// need them, read through Godot (`OS.get_environment`); copies in `a`.
-fn hostEnv(a: Allocator) Allocator.Error!platform.path.HostEnv {
+/// Main thread.
+pub fn hostEnv(a: Allocator) Allocator.Error!platform.path.HostEnv {
     const builtin = @import("builtin");
     return .{
         .os = builtin.os.tag,
