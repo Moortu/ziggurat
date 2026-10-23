@@ -64,7 +64,8 @@ nix shell 'github:silversquirl/zig-flake/compat#"0.17.0"' nixpkgs#godot
 3. Check that **Debug > Synchronize Script Changes** is on (it is by
    default).
 4. Open `hero.zig` from the FileSystem dock in the script editor.
-5. Press **Run Project** (F5). The game runs `main.tscn`; the Output panel
+5. Press **Run Project** (F5). The editor builds first (Build on Play; the
+   Zig panel at the bottom, tab `Zig`, shows the build). The game runs `main.tscn`; the Output panel
    shows its lines: `ZTEST PASS ...` for each check (no `ZTEST FAIL`), then
    `e2e game: checks done`.
 6. With the game running (its Output shows `e2e game: hero score=26
@@ -80,10 +81,49 @@ nix shell 'github:silversquirl/zig-flake/compat#"0.17.0"' nixpkgs#godot
 
 Notes:
 
-- Run Project saves open scripts first. The script editor converts the
-  indentation of a saved file to the editor's indent type (tabs by default),
-  so `hero.zig` gets tabs and a build runs before the game starts. Zig accepts
-  tab indentation.
+- Run Project saves open scripts first, and the script editor converts the
+  indentation of a saved file to its tab's indent type. Ziggurat sets `.zig`
+  tabs to spaces (editor setting `ziggurat/editor/indent_with_spaces`, on by
+  default), so `hero.zig` keeps spaces; with the setting off Godot's own type
+  applies (tabs by default), which Zig also accepts.
 - Under Xvfb the log has `Unhandled XServer error: BadWindow` lines from the
   editor embedding the game window without a window manager; they do not
   appear on a desktop and do not affect the test.
+
+## Optional manual check: Zig panel and download (about 10 minutes, needs the internet)
+
+The headless host tests cover the panel and the download against a local
+fixture server. This run checks them once on a real desktop with the real
+mirrors. It downloads about 57 MB and needs about 900 MB of free memory for a
+few seconds.
+
+1. Run the commands of step 1 above, but replace the `printf` line with this
+   one, so only the SDK manifest is set and no Zig path:
+
+   ```sh
+   printf '\n[ziggurat]\n\ndev/sdk_manifest="/tmp/ziggurat-e2e-sdk.json"\n' \
+       >> /tmp/ziggurat-e2e/project.godot
+   ```
+
+2. Open the editor with an empty user data folder and no Zig on `PATH`, so
+   Ziggurat finds no Zig:
+
+   ```sh
+   env XDG_DATA_HOME=/tmp/ziggurat-dl-data PATH="$(dirname "$(command -v godot)")" \
+       godot --editor --path /tmp/ziggurat-e2e
+   ```
+
+   Expected: the Zig panel (bottom dock, tab `Zig`) says the build failed
+   because no usable Zig 0.17.0 was found, and an error toast offers
+   **Project > Tools > Download Zig 0.17.0**.
+3. Choose **Project > Tools > Download Zig 0.17.0**. The panel's download
+   row shows the mirror and the bytes received, then `Checking and unpacking
+   Zig (needs about 800 MB of memory)`, then `Zig 0.17.0 installed`. A build
+   follows; the status line shows `Build <n> ok (manual, ...)`.
+4. In `hero.zig`, break a line (for example remove a `;`) and save. Expected:
+   a warning toast `Zig build failed: ...; build <n> stays in use`, and the
+   panel lists the error with a `res://hero.zig:<line>:<column>` link. Click
+   the link: the script editor opens `hero.zig` at that line. Undo the change
+   and save; the panel shows a good build again.
+5. Close the editor. Delete `/tmp/ziggurat-e2e`, `/tmp/ziggurat-e2e-sdk.json`
+   and `/tmp/ziggurat-dl-data` (the downloaded Zig, several hundred MB).
