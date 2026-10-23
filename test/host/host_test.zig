@@ -1573,6 +1573,53 @@ test "zig tab uses the Zig highlighter" {
     });
 }
 
+test "zig tabs indent with spaces; setting off keeps godot's choice" {
+    try requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.init("highlighter");
+    defer p.deinit();
+    try isolateUserFolders(&p);
+    // No Zig: the builds at open and on save fail at once.
+    try pathWithoutZig(&p);
+    try p.addAutoloadCheck("indent.gd");
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS indent_setting_default",
+            "ZTEST PASS indent_spaces_on_open",
+            "ZTEST PASS indent_spaces_after_settings_change",
+            "ZTEST PASS indent_save_no_leading_tab",
+            "ZTEST PASS indent_setting_off_godot_choice",
+            "ZTEST PASS indent_setting_on_again",
+            "ZTEST DONE",
+        },
+        .reject = &.{"ZTEST FAIL"},
+    });
+}
+
+test "focus-in builds an external edit; interval check" {
+    try requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("editor_panel");
+    defer p.deinit();
+    try addBuildSettings(&p);
+    try isolateUserFolders(&p);
+    try p.addAutoloadCheck("external_edit.gd");
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS check_interval_default",
+            "ZTEST PASS focus_in_builds_external_edit",
+            "ZTEST PASS focus_in_unchanged_no_build",
+            "ZTEST PASS interval_check_builds",
+            "ZTEST DONE",
+            "build service stopped (0 threads left)",
+        },
+        .reject = &.{"ZTEST FAIL"},
+        .deadline = build_deadline_s,
+    });
+}
+
 test "no plugin in a game" {
     try requireIntegration();
     var p: Project = undefined;

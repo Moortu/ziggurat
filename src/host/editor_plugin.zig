@@ -20,8 +20,29 @@
 //! tells running games to reload after each manifest write, and gives the
 //! script editor the Zig syntax highlighter (highlighter.zig; the script
 //! editor exists from here on, not at EDITOR init). When it leaves the tree
-//! it takes the menu items, the panel, the debugger plugin and the
-//! highlighter back. The download builds on it (editor_build.zig has the build API).
+//! it takes the menu items, the panel, the debugger plugin, the
+//! highlighter and its signal connections back. The download builds on it
+//! (editor_build.zig has the build API).
+//!
+//! Indentation: Godot has one global indentation setting for every
+//! language (tabs by default), and the script editor converts a file to
+//! its tab's indentation on save (`convert_indent_on_save`). With the
+//! editor setting `ziggurat/editor/indent_with_spaces` on (the default)
+//! the plugin sets `indent_use_spaces` and `indent_size` 4 on the CodeEdit
+//! of every open `.zig` tab, so a save writes spaces, as `zig fmt` does.
+//! Godot sets its own values on every tab again when a `text_editor`
+//! setting changes (NOTIFICATION_EDITOR_SETTINGS_CHANGED), so the plugin
+//! applies them again at the next frame after that notification, after
+//! every `settings_changed` signal, when a tab opens or changes
+//! (`editor_script_changed`) and at focus-in. With the setting off it sets
+//! Godot's own choice (`text_editor/behavior/indent/type` and `size`).
+//!
+//! Files edited outside Godot: there is no file watcher. When the editor
+//! regains focus (NOTIFICATION_APPLICATION_FOCUS_IN) and, while the editor
+//! setting `ziggurat/build/check_interval_seconds` is above 0, at that
+//! interval, the plugin asks for a `watcher` build that the service runs
+//! only when a script or helper file changed since the last build
+//! (`editor_build.requestIfChanged`).
 //!
 //! Build on Play (`_build`: Godot calls it on the main thread when Play is
 //! pressed, after it saved the open scenes and scripts, and the run waits
@@ -51,6 +72,10 @@ const String = godot.builtin.String;
 const StringName = godot.builtin.StringName;
 const EditorPlugin = godot.class.EditorPlugin;
 const Object = godot.class.Object;
+const Node = godot.class.Node;
+const CodeEdit = godot.class.CodeEdit;
+const ScriptEditorBase = godot.class.ScriptEditorBase;
+const EditorInterface = godot.class.EditorInterface;
 const ZigPanel = editor_panel.ZigPanel;
 
 pub const menu_build = "Build Zig Scripts";
@@ -66,6 +91,13 @@ pub const ZigEditorPlugin = struct {
     seen_outcomes: u32 = 0,
     /// `editor_build.status().building` the panel shows.
     seen_building: bool = false,
+    /// The indentation of the open `.zig` tabs is set at the next frame.
+    indent_dirty: bool = true,
+    /// `ziggurat/build/check_interval_seconds` in milliseconds (0 = off),
+    /// read again when the editor settings change.
+    check_interval_ms: i64 = 0,
+    /// Awake-clock milliseconds of the last interval check.
+    last_check_ms: i64 = 0,
 
     pub fn create(allocator: *Allocator) !*ZigEditorPlugin {
         const self = try allocator.create(ZigEditorPlugin);
@@ -97,11 +129,16 @@ pub const ZigEditorPlugin = struct {
         self.addMenuItem(menu_download, "download_menu");
         debugger_plugin.attach(self.base);
         highlighter.attach();
+        self.connectSignals(true);
+        self.readSettings();
+        self.indent_dirty = true;
+        self.last_check_ms = nowMs();
         self.base.setProcess(true);
     }
 
     pub fn _exitTree(self: *ZigEditorPlugin) void {
         self.base.setProcess(false);
+        self.connectSignals(false);
         highlighter.detach();
         debugger_plugin.detach(self.base);
         inline for (.{ menu_build, menu_download }) |name| {
@@ -117,9 +154,51 @@ pub const ZigEditorPlugin = struct {
         }
     }
 
-    /// Each frame: a new applied outcome updates the panel and pushes its
-    /// toast; a build that starts or ends updates the Build button.
+    /// Focus-in looks for files changed outside the editor; Godot applied
+    /// its editor settings to every tab again (the settings dialog's
+    /// `notify_changes`), so the indentation is set at the next frame.
+    pub fn _notification(self: *ZigEditorPlugin, what: i32, _: bool) void {
+        switch (what) {
+            Node.NOTIFICATION_APPLICATION_FOCUS_IN => {
+                self.indent_dirty = true;
+                editor_build.requestIfChanged(.watcher);
+            },
+            notification_editor_settings_changed => {
+                self.indent_dirty = true;
+                self.readSettings();
+            },
+            else => {},
+        }
+    }
+
+    /// Bound as `on_settings_changed` (EditorSettings `settings_changed`).
+    pub fn onSettingsChanged(self: *ZigEditorPlugin) void {
+        self.indent_dirty = true;
+        self.readSettings();
+    }
+
+    /// Bound as `on_script_changed` (ScriptEditor `editor_script_changed`:
+    /// a tab opened or became current).
+    pub fn onScriptChanged(self: *ZigEditorPlugin, _: ?*Object) void {
+        self.indent_dirty = true;
+    }
+
+    /// Each frame: the indentation of the `.zig` tabs when it is due, the
+    /// interval check, then the panel: a new applied outcome updates it and
+    /// pushes its toast; a build that starts or ends updates the Build
+    /// button.
     pub fn _process(self: *ZigEditorPlugin, _: f64) void {
+        if (self.indent_dirty) {
+            self.indent_dirty = false;
+            applyIndent();
+        }
+        if (self.check_interval_ms > 0) {
+            const now = nowMs();
+            if (now - self.last_check_ms >= self.check_interval_ms) {
+                self.last_check_ms = now;
+                editor_build.requestIfChanged(.watcher);
+            }
+        }
         const panel = self.panel orelse return;
         const outcomes = editor_build.outcomes_applied.load(.acquire);
         if (outcomes != self.seen_outcomes) {
@@ -211,6 +290,27 @@ pub const ZigEditorPlugin = struct {
         return st;
     }
 
+    /// Reads the check interval again. A changed interval starts counting
+    /// now.
+    fn readSettings(self: *ZigEditorPlugin) void {
+        const ms = @as(i64, editor_build.checkIntervalSeconds()) * 1000;
+        if (ms != self.check_interval_ms) self.last_check_ms = nowMs();
+        self.check_interval_ms = ms;
+    }
+
+    /// Connects (or disconnects) EditorSettings `settings_changed` and
+    /// ScriptEditor `editor_script_changed` to the bound methods.
+    fn connectSignals(self: *ZigEditorPlugin, on: bool) void {
+        const obj = Object.upcast(self.base);
+        if (editorSettings()) |es| {
+            defer editor_build.releaseRef(es);
+            connectOne(Object.upcast(es), .fromComptimeLatin1("settings_changed"), obj, "on_settings_changed", on);
+        }
+        if (EditorInterface.getScriptEditor()) |se| {
+            connectOne(Object.upcast(se), .fromComptimeLatin1("editor_script_changed"), obj, "on_script_changed", on);
+        }
+    }
+
     fn addMenuItem(self: *ZigEditorPlugin, comptime name: []const u8, comptime method: [:0]const u8) void {
         var n = String.fromLatin1(name);
         defer n.deinit();
@@ -239,6 +339,123 @@ pub const ZigEditorPlugin = struct {
         test_pings += 1;
     }
 };
+
+/// `EditorSettings.NOTIFICATION_EDITOR_SETTINGS_CHANGED`
+/// (editor/settings/editor_settings.h).
+const notification_editor_settings_changed: i32 = 10000;
+
+const indent_type_setting = "text_editor/behavior/indent/type";
+const indent_size_setting = "text_editor/behavior/indent/size";
+
+/// The indentation the plugin sets on `.zig` tabs: spaces and 4 with
+/// `ziggurat/editor/indent_with_spaces` on, otherwise Godot's own
+/// (`text_editor/behavior/indent/type` 1 = spaces, and `size`).
+const Indent = struct { spaces: bool, size: i32 };
+
+fn wantedIndent() Indent {
+    if (editor_build.indentWithSpaces()) return .{ .spaces = true, .size = 4 };
+    var out: Indent = .{ .spaces = false, .size = 4 };
+    if (editor_build.editorSetting(indent_type_setting)) |v| {
+        defer v.deinit();
+        out.spaces = (v.as(i64) orelse 0) == 1;
+    }
+    if (editor_build.editorSetting(indent_size_setting)) |v| {
+        defer v.deinit();
+        out.size = std.math.cast(i32, v.as(i64) orelse 4) orelse 4;
+    }
+    return out;
+}
+
+/// Sets the indentation (`wantedIndent`) on the CodeEdit of every open
+/// `.zig` tab. `ScriptEditor.get_open_script_editors` lists every tab's
+/// editor and `get_open_scripts` the scripts of those that edit a script,
+/// both in tab order; a script tab's editor is a `ScriptTextEditor`, so
+/// those editors pair with the scripts. If the counts differ (an editor
+/// type this does not know), only the current tab is set. Main thread.
+fn applyIndent() void {
+    const se = EditorInterface.getScriptEditor() orelse return;
+    const want = wantedIndent();
+    var editors = se.getOpenScriptEditors();
+    defer editors.deinit();
+    var scripts = se.getOpenScripts();
+    defer scripts.deinit();
+    var script_editors: [max_tabs]*ScriptEditorBase = undefined;
+    var n: usize = 0;
+    var i: i64 = 0;
+    while (i < editors.size()) : (i += 1) {
+        const v = editors.get(i);
+        defer v.deinit();
+        const o = v.as(*Object) orelse continue;
+        const seb = ScriptEditorBase.downcast(o) orelse continue;
+        if (!isClass(o, "ScriptTextEditor")) continue;
+        if (n == max_tabs) break;
+        script_editors[n] = seb;
+        n += 1;
+    }
+    if (n == scripts.size()) {
+        for (script_editors[0..n], 0..) |seb, k| {
+            const v = scripts.get(@intCast(k));
+            defer v.deinit();
+            const o = v.as(*Object) orelse continue;
+            if (isZig(o)) setIndent(seb, want);
+        }
+        return;
+    }
+    const seb = se.getCurrentEditor() orelse return;
+    const cur = se.getCurrentScript() orelse return;
+    defer editor_build.releaseRef(cur);
+    if (isZig(Object.upcast(cur))) setIndent(seb, want);
+}
+
+/// Tabs looked at by `applyIndent`; more are left as Godot set them.
+const max_tabs = 256;
+
+fn setIndent(seb: *ScriptEditorBase, want: Indent) void {
+    const base = seb.getBaseEditor() orelse return;
+    const code = CodeEdit.downcast(base) orelse return;
+    if (code.isIndentUsingSpaces() != want.spaces) code.setIndentUsingSpaces(want.spaces);
+    if (code.getIndentSize() != want.size) code.setIndentSize(want.size);
+}
+
+/// True when `o` is a resource whose path ends in `.zig` (any case).
+fn isZig(o: *Object) bool {
+    const res = godot.class.Resource.downcast(o) orelse return false;
+    var path = res.getPath();
+    defer path.deinit();
+    var buf: [4096]u8 = undefined;
+    const p = path.toUtf8Buf(&buf);
+    return p.len >= 4 and std.ascii.eqlIgnoreCase(p[p.len - 4 ..], ".zig");
+}
+
+fn isClass(o: *Object, comptime name: []const u8) bool {
+    var c = o.getClass();
+    defer c.deinit();
+    var buf: [64]u8 = undefined;
+    return std.mem.eql(u8, c.toUtf8Buf(&buf), name);
+}
+
+/// Connects or disconnects `signal` of `source` to the bound `method` of
+/// `target`, once.
+fn connectOne(source: *Object, signal: StringName, target: *Object, comptime method: [:0]const u8, on: bool) void {
+    var c = host_callable.callable(target, method);
+    defer c.deinit();
+    const connected = source.isConnected(signal, c);
+    if (on and !connected) {
+        _ = source.connectRaw(signal, c, .{});
+    } else if (!on and connected) {
+        source.disconnectRaw(signal, c);
+    }
+}
+
+/// The editor's settings with a reference for the caller (release it with
+/// `editor_build.releaseRef`), or null.
+fn editorSettings() ?*godot.class.EditorSettings {
+    return EditorInterface.getEditorSettings();
+}
+
+fn nowMs() i64 {
+    return std.Io.Clock.awake.now(host_io.get()).toMilliseconds();
+}
 
 /// Calls of `test_ping`. Main thread.
 pub var test_pings: i64 = 0;
@@ -272,6 +489,8 @@ pub fn register(registry: *godot.extension.Registry) void {
     const cls = registry.createClass(ZigEditorPlugin, registry.allocator, .{ .level = .editor, .is_exposed = false });
     cls.addMethod("build_menu", .auto);
     cls.addMethod("download_menu", .auto);
+    cls.addMethod("on_settings_changed", .auto);
+    cls.addMethod("on_script_changed", .auto);
     if (host_options.test_probe) cls.addMethod("test_ping", .auto);
     const panel = registry.createClass(ZigPanel, registry.allocator, .{ .level = .editor, .is_exposed = false });
     panel.addMethod("build_pressed", .auto);

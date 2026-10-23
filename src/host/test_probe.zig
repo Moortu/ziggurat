@@ -599,6 +599,16 @@ pub const ZigguratTestProbe = struct {
         return editor_build.outcomes_applied.load(.acquire);
     }
 
+    /// `editor_build.checkCounts` as a Dictionary: `checks` (finished
+    /// `requestIfChanged` checks) and `skipped` (those that found no change).
+    pub fn editorBuildChecks(_: *ZigguratTestProbe) Dictionary {
+        var d: Dictionary = .init();
+        const c = editor_build.checkCounts();
+        dictSet(&d, "checks", .init(i64, c.checks));
+        dictSet(&d, "skipped", .init(i64, c.skipped));
+        return d;
+    }
+
     /// True while the editor's build service runs a requested build.
     pub fn editorBuildBusy(_: *ZigguratTestProbe) bool {
         return editor_build.busy();
@@ -1027,7 +1037,7 @@ pub const method_names = [_][:0]const u8{
     "editor_build_request",     "editor_build_status",         "editor_build_diagnostics", "editor_plugin_connect",
     "editor_plugin_pings",      "editor_panel_toasts",         "editor_plugin_play",       "game_capture",
     "game_capture_registered",  "debugger_reload_last",        "debugger_reload_sends",    "debugger_sessions",
-    "debugger_started",
+    "debugger_started",         "editor_build_checks",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

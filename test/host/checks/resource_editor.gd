@@ -5,12 +5,11 @@ extends Node
 # editor does: the file scan (on its own thread) picks up `.zig` files and
 # their global classes through the loader and the language, the file system
 # reports the resource type of a `.zig` file, and a save from the script
-# editor (which rewrites indentation with tabs, `convert_indent_on_save`)
-# reaches the saver. TABS_KEPT is the finding of host test "tabs compile or
-# are converted": the Zig 0.17 build accepts tab indentation, so the saver
-# writes the editor's tabs unchanged (the Zig test fails if that changes).
-
-const TABS_KEPT := true
+# editor (which converts the indentation to the tab's, `convert_indent_on_save`)
+# reaches the saver. The editor plugin makes a `.zig` tab indent with spaces
+# (editor setting `ziggurat/editor/indent_with_spaces`, on by default), so
+# the save writes spaces; the saver writes the text as it is (host test
+# "tabs compile or are converted").
 
 var probe: Object
 
@@ -51,8 +50,8 @@ func _ready() -> void:
 	print("ZTEST DONE")
 
 
-# Opens res://plain.zig in the script editor, adds a space-indented line and
-# saves all scripts. The editor converts the indentation to tabs first.
+# Opens res://plain.zig in the script editor, adds a tab-indented line and
+# saves all scripts. The editor converts the indentation to spaces first.
 func save_from_editor() -> void:
 	var script: Script = ResourceLoader.load("res://plain.zig")
 	EditorInterface.edit_script(script)
@@ -66,7 +65,7 @@ func save_from_editor() -> void:
 		return
 	code.set_caret_line(code.get_line_count() - 1)
 	code.set_caret_column(code.get_line(code.get_line_count() - 1).length())
-	code.insert_text_at_caret("\npub fn added() void {\n    const editor_added = 1;\n    _ = editor_added;\n}\n")
+	code.insert_text_at_caret("\npub fn added() void {\n\tconst editor_added = 1;\n\t_ = editor_added;\n}\n")
 	probe.saved_hook_clear()
 	editor.save_all_scripts()
 	var text := FileAccess.get_file_as_string("res://plain.zig")
@@ -75,7 +74,7 @@ func save_from_editor() -> void:
 		if l.contains("const editor_added"):
 			line = l
 	report("editor_save_written", line != "", text)
-	var want := "\tconst editor_added = 1;" if TABS_KEPT else "    const editor_added = 1;"
+	var want := "    const editor_added = 1;"
 	report("editor_save_indentation", line == want, "line %s, wanted %s" % [var_to_str(line), var_to_str(want)])
 	report("editor_save_hook", "plain.zig" in probe.saved_hook_paths(), str(probe.saved_hook_paths()))
 	var reloaded: Script = ResourceLoader.load("res://plain.zig", "", ResourceLoader.CACHE_MODE_IGNORE)

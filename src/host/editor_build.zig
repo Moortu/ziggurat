@@ -12,8 +12,15 @@
 //!   only once the editor exists), with the first frame as the fallback. A
 //!   missing or unusable SDK manifest setting is one log sentence that
 //!   names it; then nothing builds and scripts keep the descriptor cache.
-//! - The editor plugin registers the editor setting `ziggurat/zig_path`
-//!   (the per-user Zig path; `registerEditorSettings`).
+//! - The editor plugin registers the editor settings (per user;
+//!   `registerEditorSettings`): `ziggurat/zig_path` (the Zig path),
+//!   `ziggurat/editor/indent_with_spaces` (`.zig` tabs indent with spaces)
+//!   and `ziggurat/build/check_interval_seconds` (how often files changed
+//!   outside the editor are looked for; 0 = only at focus-in).
+//! - `requestIfChanged` (the plugin's `watcher` trigger: focus-in and the
+//!   interval) builds only when a script or helper file changed since the
+//!   last build (`BuildService.requestIfChanged`); without a change there
+//!   is no outcome.
 //! - Every build request (`requestBuild`: open, save, the plugin's
 //!   triggers) reads both Zig path settings again and hands them to the
 //!   service (`BuildService.setZigPaths`): the project setting wins when
@@ -108,6 +115,13 @@ pub const setting_build_on_play = "ziggurat/build/build_on_play";
 /// How long Play waits for that build, in seconds; an int, 60 by default.
 pub const setting_play_wait = "ziggurat/build/play_wait_seconds";
 pub const default_play_wait_seconds: u32 = 60;
+/// Editor setting (per user): `.zig` script tabs indent with spaces (the
+/// editor plugin); a bool, true by default.
+pub const setting_indent_with_spaces = "ziggurat/editor/indent_with_spaces";
+/// Editor setting (per user): seconds between two looks for files changed
+/// outside the editor; an int, 0 by default (only when the editor regains
+/// focus).
+pub const setting_check_interval = "ziggurat/build/check_interval_seconds";
 
 /// Thread-safe, as the service requires.
 const gpa = std.heap.c_allocator;
@@ -234,6 +248,29 @@ pub fn requestBuild(t: Trigger) void {
     }
 }
 
+/// As `requestBuild`, but the service builds only when a script or helper
+/// file changed since the last build's scan (`BuildService.requestIfChanged`);
+/// otherwise there is no outcome. An unusable Zig path setting builds
+/// nothing and reports nothing here (the open build and every requested
+/// build report it; a check at every focus-in would repeat it). Main
+/// thread.
+pub fn requestIfChanged(t: Trigger) void {
+    const st = if (state) |*s| s else return;
+    var buf: [max_path_bytes + 256]u8 = undefined;
+    switch (passZigPaths(st, &buf)) {
+        .ok => st.svc.requestIfChanged(t),
+        .unusable, .out_of_memory => {},
+    }
+}
+
+/// `requestIfChanged` checks the service finished, and how many of them
+/// found no change (for the host tests). Main thread.
+pub fn checkCounts() struct { checks: u32, skipped: u32 } {
+    const st = state orelse return .{ .checks = 0, .skipped = 0 };
+    const x = st.svc.stats();
+    return .{ .checks = x.checks, .skipped = x.checks_skipped };
+}
+
 /// Whether a build runs and the last applied outcome. Main thread; the
 /// `message` slice stays valid until the next outcome is applied.
 pub fn status() Status {
@@ -325,28 +362,70 @@ pub fn startableGeneration() ?u32 {
     };
 }
 
-/// Registers the editor setting `ziggurat/zig_path` (the per-user Zig
-/// path, empty by default, with a file picker). Main thread, once the
-/// editor exists (the editor plugin's `_enter_tree`). A value equal to the
-/// default is not written to the editor settings file.
+/// Registers the editor settings `ziggurat/zig_path` (the per-user Zig
+/// path, empty by default, with a file picker),
+/// `ziggurat/editor/indent_with_spaces` (true) and
+/// `ziggurat/build/check_interval_seconds` (0; 0 to 3600 in the inspector,
+/// more when typed). Main thread, once the editor exists (the editor
+/// plugin's `_enter_tree`). A value equal to the default is not written to
+/// the editor settings file.
 pub fn registerEditorSettings() void {
     const es = editorSettings() orelse return;
     defer releaseRef(es);
-    var n = String.fromLatin1(setting_zig_path);
-    defer n.deinit();
     var empty = String.fromLatin1("");
     defer empty.deinit();
-    const v = Variant.init(String, empty);
-    defer v.deinit();
-    if (!es.hasSetting(n)) es.setSetting(n, v);
-    es.setInitialValue(.fromComptimeLatin1(setting_zig_path), v, false);
+    addEditorSetting(es, setting_zig_path, Variant.init(String, empty), type_string, hint_global_file, "");
+    addEditorSetting(es, setting_indent_with_spaces, Variant.init(bool, true), type_bool, 0, "");
+    addEditorSetting(es, setting_check_interval, Variant.init(i64, 0), type_int, hint_range, "0,3600,1,or_greater,suffix:s");
+}
+
+/// Registers the editor setting `name` with default `value` (consumed)
+/// and its property info.
+fn addEditorSetting(es: *godot.class.EditorSettings, comptime name: [:0]const u8, value: Variant, type_id: i64, hint: i64, comptime hint_string: []const u8) void {
+    defer value.deinit();
+    var n = String.fromLatin1(name);
+    defer n.deinit();
+    if (!es.hasSetting(n)) es.setSetting(n, value);
+    es.setInitialValue(.fromComptimeLatin1(name), value, false);
+    var hs = String.fromLatin1(hint_string);
+    defer hs.deinit();
     var info = Dictionary.init();
     defer info.deinit();
     putInfo(&info, "name", Variant.init(String, n));
-    putInfo(&info, "type", Variant.init(i64, type_string));
-    putInfo(&info, "hint", Variant.init(i64, hint_global_file));
-    putInfo(&info, "hint_string", Variant.init(String, empty));
+    putInfo(&info, "type", Variant.init(i64, type_id));
+    putInfo(&info, "hint", Variant.init(i64, hint));
+    putInfo(&info, "hint_string", Variant.init(String, hs));
     es.addPropertyInfo(info);
+}
+
+/// The editor setting `ziggurat/editor/indent_with_spaces` (true when the
+/// editor does not exist yet, or the setting is unset or not a bool).
+/// Main thread.
+pub fn indentWithSpaces() bool {
+    const v = editorSetting(setting_indent_with_spaces) orelse return true;
+    defer v.deinit();
+    return v.as(bool) orelse true;
+}
+
+/// The editor setting `ziggurat/build/check_interval_seconds`, at least 0
+/// (0 when the editor does not exist yet, or the setting is unset or not
+/// an int). Main thread.
+pub fn checkIntervalSeconds() u32 {
+    const v = editorSetting(setting_check_interval) orelse return 0;
+    defer v.deinit();
+    const s = v.as(i64) orelse return 0;
+    return std.math.cast(u32, @max(s, 0)) orelse std.math.maxInt(u32);
+}
+
+/// The value of the editor setting `name` (the caller deinits it), or null
+/// while the editor does not exist or the setting is unset. Main thread.
+pub fn editorSetting(comptime name: []const u8) ?Variant {
+    const es = editorSettings() orelse return null;
+    defer releaseRef(es);
+    var n = String.fromLatin1(name);
+    defer n.deinit();
+    if (!es.hasSetting(n)) return null;
+    return es.getSetting(n);
 }
 
 /// The editor's settings, or null while the editor does not exist yet.

@@ -15,6 +15,14 @@
 //!   of the service's life.
 //! - `requestFull` asks for a build on the full path: the warm server is
 //!   dropped first (not a death) and warms again after that full build.
+//! - `requestIfChanged` asks for a build only when a `.zig` file changed (for
+//!   an editor that has no file watcher: it checks when it regains focus).
+//!   The build thread scans the project and compares the scan's id
+//!   (`ScanResult.build_id`: path, size, modification time, status-change
+//!   time and inode of every script and helper) with the id of the last
+//!   build's scan. When they are equal nothing is built and no outcome is
+//!   published (`Stats.checks_skipped` counts it). A request made before the
+//!   check starts, or during it, is built as usual.
 //! - A requested build holds `build.lock` from `Workspace.prepare` until it
 //!   has staged its output, never for the life of the service.
 //! - An incremental server holds `<cache dir>/incremental.lock` (exclusive)
@@ -157,6 +165,10 @@ pub const Stats = struct {
     /// Microseconds the last table check took (load, validate, compare,
     /// close); 0 before the first one. See `Config.check_tables`.
     table_check_us: u64,
+    /// `requestIfChanged` checks done.
+    checks: u32 = 0,
+    /// Checks that found no change and built nothing.
+    checks_skipped: u32 = 0,
 };
 
 /// The note an outcome carries when an incremental update failed the table
@@ -296,6 +308,14 @@ pub const BuildService = struct {
     pending: ?Trigger = null,
     /// The pending build must take the full path (`requestFull`).
     pending_full: bool = false,
+    /// The pending request is a `requestIfChanged` check: built only when
+    /// the scan differs from the last build's (`seen_id`).
+    pending_if_changed: bool = false,
+    /// The build thread runs a `requestIfChanged` scan. Not part of
+    /// `busy` (a check is not a build), but `waitIdle` waits for it.
+    checking: bool = false,
+    checks: u32 = 0,
+    checks_skipped: u32 = 0,
     building: bool = false,
     stopping: bool = false,
     warm: WarmState = .cold,
@@ -342,6 +362,9 @@ pub const BuildService = struct {
     /// The table snapshot and file fingerprints of the last build whose
     /// table was checked and validated. Build thread only.
     prev: ?Prev = null,
+    /// `ScanResult.build_id` of the last build's scan (or of the check that
+    /// started it), what `requestIfChanged` compares with. Build thread only.
+    seen_id: ?[16]u8 = null,
 
     pub const InitError = error{ MissingSdkModule, TargetNotHost, MissingExpectedStamp, OutOfMemory } || std.Thread.SpawnError;
 
@@ -379,6 +402,21 @@ pub const BuildService = struct {
         defer self.mu.unlock(self.io);
         if (self.stopping) return;
         self.pending = t;
+        self.pending_if_changed = false;
+        self.cond.broadcast(self.io);
+    }
+
+    /// Asks for a build only if a script or helper file changed since the
+    /// last build's scan (see the file comment): the build thread scans
+    /// first, and when nothing changed it builds nothing and publishes no
+    /// outcome. A request already pending is built as usual. Safe from any
+    /// thread; never waits for a build or the scan.
+    pub fn requestIfChanged(self: *BuildService, t: Trigger) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        if (self.stopping or self.pending != null) return;
+        self.pending = t;
+        self.pending_if_changed = true;
         self.cond.broadcast(self.io);
     }
 
@@ -417,18 +455,20 @@ pub const BuildService = struct {
         if (self.stopping) return;
         self.pending = t;
         self.pending_full = true;
+        self.pending_if_changed = false;
         self.cond.broadcast(self.io);
     }
 
-    /// Waits until no build runs and none is pending. Warm-up is not waited
-    /// for. From inside `on_outcome` it returns `error.CalledFromCallback`
-    /// (the build that called it cannot end while it waits).
+    /// Waits until no build or `requestIfChanged` check runs and none is
+    /// pending. Warm-up is not waited for. From inside `on_outcome` it
+    /// returns `error.CalledFromCallback` (the build that called it cannot
+    /// end while it waits).
     pub fn waitIdle(self: *BuildService, timeout_ms: u32) !void {
         if (self.onBuildThread()) return error.CalledFromCallback;
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         const timer = Timer.start(self.io);
-        while (self.building or self.pending != null) try self.waitLocked(timer, timeout_ms);
+        while (self.building or self.checking or self.pending != null) try self.waitLocked(timer, timeout_ms);
     }
 
     /// Waits while the incremental server warms up. `error.NotWarm` when it
@@ -487,6 +527,8 @@ pub const BuildService = struct {
             .warm = self.warm,
             .session_deaths = self.deaths,
             .table_check_us = self.table_check_us,
+            .checks = self.checks,
+            .checks_skipped = self.checks_skipped,
         };
     }
 
@@ -528,6 +570,7 @@ pub const BuildService = struct {
         const io = self.io;
         while (true) {
             var full = false;
+            var check = false;
             const t: Trigger = blk: {
                 self.mu.lockUncancelable(io);
                 defer self.mu.unlock(io);
@@ -535,15 +578,51 @@ pub const BuildService = struct {
                 if (self.stopping) return;
                 const t = self.pending.?;
                 self.pending = null;
+                if (self.pending_if_changed) {
+                    self.pending_if_changed = false;
+                    self.checking = true;
+                    check = true;
+                    break :blk t;
+                }
                 full = self.pending_full;
                 self.pending_full = false;
                 self.building = true;
                 self.builds += 1;
                 break :blk t;
             };
+            if (check) {
+                const changed = self.treeChanged();
+                self.mu.lockUncancelable(io);
+                defer self.mu.unlock(io);
+                self.checking = false;
+                self.checks += 1;
+                if (changed) {
+                    // Built at the next turn, joined by any request made
+                    // meanwhile. `checking` and `pending` change under one
+                    // lock, so `waitIdle` never sees idle in between.
+                    if (self.pending == null) self.pending = t;
+                    self.pending_if_changed = false;
+                } else self.checks_skipped += 1;
+                self.cond.broadcast(io);
+                continue;
+            }
             const o = self.runBuild(t, full);
             self.publish(o);
         }
+    }
+
+    /// For a `requestIfChanged` check: scans the project and compares the
+    /// scan's id with the last build's (`seen_id`). True when they differ,
+    /// when no build scanned yet and when the scan fails (the build then
+    /// reports why). Keeps the new id, so a build that fails before its own
+    /// scan (no Zig) is not repeated at every check. Build thread only.
+    fn treeChanged(self: *BuildService) bool {
+        var arena_state = std.heap.ArenaAllocator.init(self.a);
+        defer arena_state.deinit();
+        const sc = scan_mod.scanCached(arena_state.allocator(), self.io, self.cfg.paths.roots.project, self.cfg.script_dirs, &self.scan_cache) catch return true;
+        if (self.seen_id) |id| if (std.mem.eql(u8, &id, &sc.build_id)) return false;
+        self.seen_id = sc.build_id;
+        return true;
     }
 
     fn publish(self: *BuildService, o: Outcome) void {
@@ -608,6 +687,7 @@ pub const BuildService = struct {
             o.message = try std.fmt.allocPrint(a, "Scanning the project folder {s} failed: {t}.", .{ project.bytes, err });
             return err;
         };
+        self.seen_id = sc.build_id;
         var ws = try self.prepareWorkspace(sc, o);
         defer ws.deinit(a);
 
@@ -1601,6 +1681,62 @@ test "a located Zig is located again when the paths change" {
     const changed = try buildOnce(svc, a, .manual);
     defer freeOutcome(a, changed);
     try testing.expectEqual(ZigProblem.wrong_version, changed.zig_problem);
+}
+
+test "requestIfChanged skips an unchanged tree" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "pub const extends = \"Node\";\n" });
+    // No Zig anywhere in this configuration: every build fails fast in the
+    // locator, which runs before the build's own scan.
+    const svc = try BuildService.init(a, io, testConfig(base, &.{.{ .name = "ziggurat", .root = .fromTrusted(base), .deps = &.{} }}));
+    defer svc.deinit();
+
+    // No build has scanned yet: the check builds.
+    svc.requestIfChanged(.watcher);
+    try svc.waitIdle(30_000);
+    try testing.expectEqual(Trigger.watcher, svc.last().?.trigger);
+    var st = svc.stats();
+    try testing.expectEqual(@as(u32, 1), st.builds);
+    try testing.expectEqual(@as(u32, 1), st.checks);
+    try testing.expectEqual(@as(u32, 0), st.checks_skipped);
+
+    // Nothing changed: no build and no outcome.
+    svc.requestIfChanged(.watcher);
+    try svc.waitIdle(30_000);
+    st = svc.stats();
+    try testing.expectEqual(@as(u32, 1), st.builds);
+    try testing.expectEqual(@as(u32, 2), st.checks);
+    try testing.expectEqual(@as(u32, 1), st.checks_skipped);
+    try testing.expect(!svc.busy());
+
+    // A new helper file: built.
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib.zig", .data = "pub fn f() void {}\n" });
+    svc.requestIfChanged(.watcher);
+    try svc.waitIdle(30_000);
+    try testing.expectEqual(@as(u32, 2), svc.stats().builds);
+
+    // An edit of the same size: built.
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib.zig", .data = "pub fn g() void {}\n" });
+    svc.requestIfChanged(.watcher);
+    try svc.waitIdle(30_000);
+    try testing.expectEqual(@as(u32, 3), svc.stats().builds);
+
+    // A plain request builds without a change; the check after it does not.
+    svc.request(.manual);
+    try svc.waitIdle(30_000);
+    try testing.expectEqual(Trigger.manual, svc.last().?.trigger);
+    svc.requestIfChanged(.watcher);
+    try svc.waitIdle(30_000);
+    st = svc.stats();
+    try testing.expectEqual(@as(u32, 4), st.builds);
+    try testing.expectEqual(@as(u32, 5), st.checks);
+    try testing.expectEqual(@as(u32, 2), st.checks_skipped);
+    try testing.expectEqual(Trigger.manual, svc.last().?.trigger);
 }
 
 fn testConfig(base: []const u8, sdk: []const workspace.ModuleDep) Config {
