@@ -8,6 +8,8 @@
 //!   the first half of the file, then it closes the connection;
 //! - `<path>.slow` exists: 200 with the full `Content-Length` and the first
 //!   half of the file, then nothing more until the server stops;
+//! - `<path>.trickle` exists: 200 with the file, one byte every 100 ms
+//!   (until the client goes away or the server stops);
 //! - `<path>` exists: 200 with the file;
 //! - otherwise 404 with an HTML page (as a web server shows it).
 //!
@@ -145,6 +147,15 @@ pub const Server = struct {
         try out.print("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len});
         const truncate = exists(s.io, try std.mem.concat(a, u8, &.{ file, ".truncate" }));
         const slow = exists(s.io, try std.mem.concat(a, u8, &.{ file, ".slow" }));
+        if (exists(s.io, try std.mem.concat(a, u8, &.{ file, ".trickle" }))) {
+            for (body) |byte| {
+                if (s.stopping.load(.acquire)) return;
+                try out.writeByte(byte);
+                try out.flush();
+                s.io.sleep(.fromMilliseconds(100), .awake) catch return;
+            }
+            return;
+        }
         if (!truncate and !slow) {
             try out.writeAll(body);
             return out.flush();

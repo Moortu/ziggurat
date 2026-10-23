@@ -523,6 +523,12 @@ fn folderWorks(io: Io, gpa: std.mem.Allocator, tc_abs: []const u8, sub: []const 
     return runsPin(io, gpa, exe, timeout_ms);
 }
 
+/// True when `<toolchains_dir>/zig-<pin>` (an absolute path) holds a `zig`
+/// whose `zig version` prints the pin within `timeout_ms`. Blocking.
+pub fn installedWorks(io: Io, gpa: std.mem.Allocator, toolchains_dir: []const u8, timeout_ms: u32) bool {
+    return targetWorks(io, gpa, toolchains_dir, timeout_ms) catch false;
+}
+
 fn targetWorks(io: Io, gpa: std.mem.Allocator, tc_abs: []const u8, timeout_ms: u32) !bool {
     return folderWorks(io, gpa, tc_abs, target_name, timeout_ms);
 }

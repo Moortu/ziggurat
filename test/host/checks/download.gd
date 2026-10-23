@@ -125,6 +125,18 @@ func run() -> void:
 			await cancelled(row, text, cancel)
 		"second":
 			await second_click(cancel)
+		"exit":
+			# Quits the editor in the middle of the archive transfer.
+			report("download_menu", press_download(), "no Tools menu item '%s'" % MENU)
+			await wait_for(downloading)
+			report("download_exit_transfer", downloading(), str(state()))
+		"exit_lock":
+			# The test holds the toolchain lock: the check waits for it, and
+			# the editor quits meanwhile.
+			report("download_menu", press_download(), "no Tools menu item '%s'" % MENU)
+			await wait_for(func(): return state().state == "checking")
+			await frames(10)
+			report("download_exit_checking", state().state == "checking", str(state()))
 		_:
 			report("download_case", false, "unknown case '%s'" % case_name)
 

@@ -82,12 +82,35 @@ pub const installed_text = "Zig " ++ pins.zig_version ++ " installed";
 /// The bound method of the editor plugin that receives `request_completed`.
 pub const completed_method = "on_download_completed";
 
-/// Seconds a mirror list or signature request may take.
-const small_timeout_s = 30.0;
-/// An archive transfer that gets no new byte for this long fails the mirror.
-const stall_ms = 60_000;
+/// The time limits of a run. Probe builds may override them
+/// (`configureForTest`); product builds use `default_timings`.
+const Timings = struct {
+    /// How long a mirror list or signature request may take.
+    request_timeout_ms: u32 = 30_000,
+    /// An archive transfer that gets no new byte for this long fails the
+    /// mirror.
+    stall_ms: u32 = 60_000,
+    /// An archive transfer slower than this on average fails the mirror
+    /// once its deadline (the pinned size at this speed, at least
+    /// `min_deadline_ms`) has passed, so a mirror that trickles cannot hold
+    /// the run.
+    min_bytes_per_s: u64 = 32 * 1024,
+    min_deadline_ms: u64 = 5 * 60_000,
+    /// Replaces the computed deadline (tests).
+    archive_deadline_ms: ?u64 = null,
+};
+const default_timings: Timings = .{};
+
+/// The deadline of an archive transfer of `size` bytes.
+fn archiveDeadlineMs(t: Timings, size: u64) u64 {
+    if (t.archive_deadline_ms) |d| return d;
+    const at_floor = size / @max(t.min_bytes_per_s, 1) *| 1000;
+    return @max(at_floor, t.min_deadline_ms);
+}
 /// Bytes one frame reads at most (Godot's range is 256 B to 16 MiB).
 const download_chunk = 1 << 20;
+/// How long `start` lets an installed `zig version` take (main thread).
+const installed_check_ms = 5_000;
 /// How long the worker waits for another editor's install.
 const lock_timeout_ms = 300_000;
 const lock_name = ".install.lock";
@@ -117,6 +140,9 @@ var sig_text: ?[]u8 = null;
 var download_path: ?[]u8 = null;
 var bytes: u64 = 0;
 var last_bytes_ms: i64 = 0;
+/// When the archive transfer started and how long it may take.
+var archive_start_ms: i64 = 0;
+var archive_deadline_ms: u64 = 0;
 var reason_buf: [256]u8 = undefined;
 var reason_len: usize = 0;
 var worker: ?std.Thread = null;
@@ -143,6 +169,7 @@ const Config = struct {
     key: minisign.PublicKey,
     archive: pins.Archive,
     plain_http: bool,
+    timings: Timings,
 };
 
 /// Where the HTTPRequest nodes live and who receives their completion
@@ -218,11 +245,21 @@ pub fn start() void {
     reason_len = 0;
     conf = config() orelse return;
     folders() catch |err| return fail("the toolchains folder cannot be made ({t})", .{err});
+    // A working Zig is already there: nothing to download. `zig version`
+    // of a real Zig answers in milliseconds; the bound covers a broken one.
+    if (toolchain_install.installedWorks(host_io.get(), gpa, tc_dir.?, installed_check_ms)) {
+        log("Zig " ++ pins.zig_version ++ " is already installed in {s}/" ++ toolchain_install.target_name ++ "; Ziggurat does not download it again.", .{tc_dir.?});
+        endRun();
+        phase = .done;
+        completions +%= 1;
+        changes +%= 1;
+        return;
+    }
     log("Ziggurat downloads Zig " ++ pins.zig_version ++ " into {s}.", .{tc_dir.?});
     if (readCache()) |list| return useList(list);
     phase = .list;
     changes +%= 1;
-    if (!request(conf.list_url, mirrors.max_list_bytes, null, small_timeout_s)) listDone(null);
+    if (!request(conf.list_url, mirrors.max_list_bytes, null, conf.timings.request_timeout_ms)) listDone(null);
 }
 
 /// Stops a transfer (the check cannot be stopped).
@@ -255,9 +292,16 @@ pub fn tick() void {
         bytes = got;
         last_bytes_ms = now;
         changes +%= 1;
-    } else if (now - last_bytes_ms > stall_ms) {
+    }
+    const t = conf.timings;
+    if (now - last_bytes_ms > t.stall_ms) {
         dropHttp(.later);
-        mirrorFailed("no data for {d} s", .{stall_ms / 1000});
+        deleteDownload();
+        mirrorFailed("no data for {d} ms", .{t.stall_ms});
+    } else if (now - archive_start_ms > archive_deadline_ms) {
+        dropHttp(.later);
+        deleteDownload();
+        mirrorFailed("too slow: {d} of {d} bytes after {d} ms", .{ bytes, conf.archive.size, archive_deadline_ms });
     }
 }
 
@@ -308,6 +352,7 @@ fn config() ?Config {
             .key = t.key,
             .archive = .{ .name = t.archive_name, .size = t.archive_size, .sha256 = t.archive_sha256 },
             .plain_http = t.plain_http,
+            .timings = t.timings,
         };
     }
     const archive = pins.zig_archive(.of(builtin.target)) orelse {
@@ -318,7 +363,7 @@ fn config() ?Config {
         fail("the pinned Zig key does not parse", .{});
         return null;
     };
-    return .{ .list_url = mirrors.list_url, .official_base = null, .key = key, .archive = archive, .plain_http = false };
+    return .{ .list_url = mirrors.list_url, .official_base = null, .key = key, .archive = archive, .plain_http = false, .timings = default_timings };
 }
 
 /// Finds and makes `<toolchains>` and `<user data>/ziggurat`.
@@ -399,13 +444,13 @@ fn useList(list: [][]const u8) void {
 fn tryNext() void {
     deleteDownload();
     freeSig();
-    if (next_url >= url_list.len) return fail("no mirror and not ziglang.org gave a good Zig " ++ pins.zig_version ++ "; see the output log", .{});
+    if (next_url >= url_list.len) return fail("No mirror and not ziglang.org gave a valid Zig " ++ pins.zig_version ++ "; see the Output log for each reason.", .{});
     current = next_url;
     next_url += 1;
     bytes = 0;
     phase = .signature;
     changes +%= 1;
-    if (!request(url_list[current].signature, minisign.max_signature_text, null, small_timeout_s))
+    if (!request(url_list[current].signature, minisign.max_signature_text, null, conf.timings.request_timeout_ms))
         mirrorFailed("the request could not start", .{});
 }
 
@@ -417,9 +462,11 @@ fn startArchive() void {
     phase = .archive;
     bytes = 0;
     last_bytes_ms = nowMs();
+    archive_start_ms = last_bytes_ms;
+    archive_deadline_ms = archiveDeadlineMs(conf.timings, conf.archive.size);
     changes +%= 1;
-    // No overall timeout (a slow line may need minutes); `tick` fails a
-    // transfer that stalls.
+    // No HTTPRequest timeout (a slow line may need minutes); `tick` fails a
+    // transfer that stalls or misses its deadline.
     if (!request(url_list[current].archive, size, download_path, 0)) {
         deleteDownload();
         mirrorFailed("the request could not start", .{});
@@ -486,7 +533,10 @@ fn mirrorFailed(comptime fmt: []const u8, args: anytype) void {
 }
 
 fn fail(comptime fmt: []const u8, args: anytype) void {
-    const why = std.fmt.bufPrint(&reason_buf, fmt, args) catch reason_buf[0..];
+    var tmp: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&tmp);
+    const cut = if (w.print(fmt, args)) |_| false else |_| true;
+    const why = fitUtf8(&reason_buf, w.buffered(), cut);
     reason_len = why.len;
     endRun();
     phase = .failed;
@@ -510,6 +560,22 @@ fn endRun() void {
     if (data_dir) |d| gpa.free(d);
     data_dir = null;
     if (phase == .checking) serial +%= 1;
+}
+
+/// `text` in `dst`, cut on a UTF-8 character boundary with "…" when it
+/// does not fit or `cut` says it was cut already.
+fn fitUtf8(dst: []u8, text: []const u8, cut: bool) []const u8 {
+    const ellipsis = "\u{2026}";
+    if (!cut and text.len <= dst.len) {
+        @memcpy(dst[0..text.len], text);
+        return dst[0..text.len];
+    }
+    var n = @min(text.len, dst.len - ellipsis.len);
+    // Back off continuation bytes (10xxxxxx) to a character start.
+    while (n > 0 and n < text.len and text[n] & 0xC0 == 0x80) n -= 1;
+    @memcpy(dst[0..n], text[0..n]);
+    @memcpy(dst[n..][0..ellipsis.len], ellipsis);
+    return dst[0 .. n + ellipsis.len];
 }
 
 fn currentBase() []const u8 {
@@ -541,7 +607,7 @@ fn joinWorker() void {
 
 /// Starts one request on a new HTTPRequest node: the body goes to memory
 /// (at most `limit` bytes) or to `file`. False when it cannot start.
-fn request(url: []const u8, limit: i32, file: ?[]const u8, timeout_s: f64) bool {
+fn request(url: []const u8, limit: i32, file: ?[]const u8, timeout_ms: u32) bool {
     const p = parent orelse return false;
     const t = target orelse return false;
     const node = HttpRequest.init();
@@ -552,7 +618,7 @@ fn request(url: []const u8, limit: i32, file: ?[]const u8, timeout_s: f64) bool 
     node.setDownloadChunkSize(download_chunk);
     node.setAcceptGzip(false);
     node.setBodySizeLimit(limit);
-    node.setTimeout(timeout_s);
+    node.setTimeout(@as(f64, @floatFromInt(timeout_ms)) / 1000.0);
     if (file) |f| {
         var s = props.gstring(f);
         defer s.deinit();
@@ -731,6 +797,7 @@ const TestConfig = struct {
     archive_size: u64,
     archive_sha256: [32]u8,
     plain_http: bool,
+    timings: Timings,
     /// Owns the strings above.
     text: []u8,
 };
@@ -739,11 +806,17 @@ var test_config: if (host_options.test_probe) ?TestConfig else void = if (host_o
 
 /// TEST ONLY (probe builds): takes the overrides from `key=value` lines
 /// (`list_url`, `official_base`, `key`, `archive_name`, `archive_size`,
-/// `archive_sha256`, `plain_http`). False when one is missing or bad.
+/// `archive_sha256`, `plain_http`; optional `request_timeout_ms`,
+/// `stall_ms`, `archive_deadline_ms`). False when one is missing or bad.
+fn rejectConfig(own: []u8) bool {
+    gpa.free(own);
+    return false;
+}
+
 pub fn configureForTest(text: []const u8) bool {
     comptime std.debug.assert(host_options.test_probe);
     const own = gpa.dupe(u8, text) catch return false;
-    var t: TestConfig = .{ .list_url = "", .official_base = "", .key = undefined, .archive_name = "", .archive_size = 0, .archive_sha256 = undefined, .plain_http = false, .text = own };
+    var t: TestConfig = .{ .list_url = "", .official_base = "", .key = undefined, .archive_name = "", .archive_size = 0, .archive_sha256 = undefined, .plain_http = false, .timings = default_timings, .text = own };
     var have: u8 = 0;
     var lines = std.mem.tokenizeAny(u8, own, "\r\n");
     while (lines.next()) |line| {
@@ -757,26 +830,29 @@ pub fn configureForTest(text: []const u8) bool {
             t.official_base = v;
             have |= 2;
         } else if (std.mem.eql(u8, k, "key")) {
-            t.key = minisign.PublicKey.parse(v) catch break;
+            t.key = minisign.PublicKey.parse(v) catch return rejectConfig(own);
             have |= 4;
         } else if (std.mem.eql(u8, k, "archive_name")) {
             t.archive_name = v;
             have |= 8;
         } else if (std.mem.eql(u8, k, "archive_size")) {
-            t.archive_size = std.fmt.parseInt(u64, v, 10) catch break;
+            t.archive_size = std.fmt.parseInt(u64, v, 10) catch return rejectConfig(own);
             have |= 16;
         } else if (std.mem.eql(u8, k, "archive_sha256")) {
-            if (v.len != 64) break;
-            _ = std.fmt.hexToBytes(&t.archive_sha256, v) catch break;
+            if (v.len != 64) return rejectConfig(own);
+            _ = std.fmt.hexToBytes(&t.archive_sha256, v) catch return rejectConfig(own);
             have |= 32;
         } else if (std.mem.eql(u8, k, "plain_http")) {
             t.plain_http = std.mem.eql(u8, v, "1");
+        } else if (std.mem.eql(u8, k, "request_timeout_ms")) {
+            t.timings.request_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return rejectConfig(own);
+        } else if (std.mem.eql(u8, k, "stall_ms")) {
+            t.timings.stall_ms = std.fmt.parseInt(u32, v, 10) catch return rejectConfig(own);
+        } else if (std.mem.eql(u8, k, "archive_deadline_ms")) {
+            t.timings.archive_deadline_ms = std.fmt.parseInt(u64, v, 10) catch return rejectConfig(own);
         }
     }
-    if (have != 63) {
-        gpa.free(own);
-        return false;
-    }
+    if (have != 63) return rejectConfig(own);
     if (test_config) |old| gpa.free(old.text);
     test_config = t;
     return true;
@@ -836,4 +912,23 @@ test "toolchain lock wait stops at editor exit" {
     other.release();
     var mine = try lockToolchains(io, p);
     mine.release();
+}
+
+test "reasons are cut on a character boundary" {
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("abc", fitUtf8(&buf, "abc", false));
+    // "aé" + "€€": the cut falls inside the first euro sign.
+    try std.testing.expectEqualStrings("a\u{e9}\u{2026}", fitUtf8(&buf, "a\u{e9}\u{20ac}\u{20ac}", false));
+    // Already cut by the formatter: the ellipsis is added.
+    try std.testing.expectEqualStrings("ab\u{2026}", fitUtf8(&buf, "ab", true));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(fitUtf8(&buf, "\u{20ac}\u{20ac}\u{20ac}\u{20ac}", false)));
+}
+
+test "archive deadline" {
+    const t: Timings = .{};
+    // The pinned x86_64-linux size at 32 KiB/s: about 29 minutes.
+    try std.testing.expectEqual(@as(u64, 1749_000), archiveDeadlineMs(t, 57_332_648));
+    // Small archives get the minimum.
+    try std.testing.expectEqual(@as(u64, 300_000), archiveDeadlineMs(t, 1000));
+    try std.testing.expectEqual(@as(u64, 1234), archiveDeadlineMs(.{ .archive_deadline_ms = 1234 }, 57_332_648));
 }

@@ -1806,7 +1806,7 @@ fn setupDownload(p: *Project, case: []const u8, mirrors: []const []const u8, off
     tampered[tampered.len / 2] ^= 0x55;
 
     const sig_name = dl_archive ++ ".minisig";
-    for ([_][]const u8{ "good", "redirect", "truncated", "slow" }) |m| {
+    for ([_][]const u8{ "good", "redirect", "truncated", "slow", "trickle", "slowsig" }) |m| {
         try writeIn(www, try std.fs.path.join(a, &.{ m, sig_name }), good_sig);
     }
     try writeIn(www, "good/" ++ dl_archive, archive);
@@ -1820,6 +1820,10 @@ fn setupDownload(p: *Project, case: []const u8, mirrors: []const []const u8, off
     try writeIn(www, "truncated/" ++ dl_archive ++ ".truncate", "");
     try writeIn(www, "slow/" ++ dl_archive, archive);
     try writeIn(www, "slow/" ++ dl_archive ++ ".slow", "");
+    try writeIn(www, "trickle/" ++ dl_archive, archive);
+    try writeIn(www, "trickle/" ++ dl_archive ++ ".trickle", "");
+    try writeIn(www, "slowsig/" ++ dl_archive, archive);
+    try writeIn(www, "slowsig/" ++ sig_name ++ ".slow", "");
     try writeIn(www, "oldsig/" ++ dl_archive, archive);
     try writeIn(www, "oldsig/" ++ sig_name, old_sig);
 
@@ -1849,6 +1853,15 @@ fn setupDownload(p: *Project, case: []const u8, mirrors: []const []const u8, off
     };
     try d.setList(p, mirrors);
     return d;
+}
+
+/// Adds `key=value` lines to the test overrides of `setupDownload`.
+fn appendCfg(p: *Project, lines: []const u8) !void {
+    const a = p.arena_state.allocator();
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+    defer dir.close(io);
+    const old = try dir.readFileAlloc(io, "download_cfg.txt", a, .limited(64 * 1024));
+    try dir.writeFile(io, .{ .sub_path = "download_cfg.txt", .data = try std.mem.concat(a, u8, &.{ old, lines }) });
 }
 
 /// Fails when a download or install temporary is left in `toolchains`.
@@ -2012,6 +2025,122 @@ test "download: second click while downloading is ignored" {
     try testing.expectEqual(@as(usize, 1), d.server.count("/community-mirrors.txt"));
     try testing.expectEqual(@as(usize, 1), d.server.countExact("/slow/" ++ dl_archive ++ ".minisig"));
     try testing.expectEqual(@as(usize, 1), d.server.countExact("/slow/" ++ dl_archive));
+}
+
+/// One bad mirror whose failure needs a short time limit (`cfg`), then
+/// the ziglang.org stand-in: the mirror is logged with `reason` and the
+/// download installs from ziglang.org.
+fn downloadLimitCase(mirror: []const u8, cfg: []const u8, reason: []const u8) !void {
+    var p: Project = undefined;
+    try p.initProbe("highlighter");
+    defer p.deinit();
+    var d = try setupDownload(&p, "installs", &.{mirror}, true);
+    defer d.deinit();
+    errdefer d.server.dump();
+    try appendCfg(&p, cfg);
+    const a = p.arena_state.allocator();
+    var expect: std.ArrayList([]const u8) = .empty;
+    try expect.appendSlice(a, &dl_installs_expect);
+    try expect.append(a, try std.fmt.allocPrint(a, "{s}{s}/{s}: {s}", .{ dl_mirror_prefix, d.base, mirror, reason }));
+    try expect.append(a, try std.fmt.allocPrint(a, "Ziggurat installed Zig 0.17.0 from {s}/official", .{d.base}));
+    try p.runEditorChecked("10000000", .{ .expect = expect.items, .reject = &.{"ZTEST FAIL"} });
+    try expectNoTemp(d.toolchains);
+}
+
+test "download: a trickling mirror misses its deadline" {
+    try requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    // One byte every 100 ms: the 388-byte fixture would take 39 s.
+    try downloadLimitCase("trickle", "archive_deadline_ms=2000\n", "too slow: ");
+}
+
+test "download: a signature request times out" {
+    try requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    try downloadLimitCase("slowsig", "request_timeout_ms=2000\n", "the request timed out");
+}
+
+test "download: a stalled archive transfer" {
+    try requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    try downloadLimitCase("slow", "stall_ms=1500\n", "no data for 1500 ms");
+}
+
+test "download: Zig already installed" {
+    try requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("highlighter");
+    defer p.deinit();
+    var d = try setupDownload(&p, "installs", &.{"good"}, true);
+    defer d.deinit();
+    errdefer d.server.dump();
+    const a = p.arena_state.allocator();
+    // A working zig-0.17.0 (it answers `version`).
+    const zig_dir = try std.fs.path.join(a, &.{ d.toolchains, "zig-0.17.0" });
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ zig_dir, "lib" }));
+    try writeIn(zig_dir, "zig", "#!/bin/sh\necho 0.17.0\n");
+    const chmod = try std.process.run(a, io, .{ .argv = &.{ "chmod", "755", try std.fs.path.join(a, &.{ zig_dir, "zig" }) } });
+    if (!chmod.term.success()) return error.ChmodFailed;
+    var expect: std.ArrayList([]const u8) = .empty;
+    try expect.appendSlice(a, &dl_installs_expect);
+    try expect.append(a, "Zig 0.17.0 is already installed in ");
+    try p.runEditorChecked("10000000", .{ .expect = expect.items, .reject = &.{"ZTEST FAIL"} });
+    // Nothing was downloaded.
+    try testing.expectEqual(@as(usize, 0), d.server.count("/"));
+}
+
+test "download: editor exit during a transfer" {
+    try requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("highlighter");
+    defer p.deinit();
+    var d = try setupDownload(&p, "exit", &.{"slow"}, false);
+    defer d.deinit();
+    errdefer d.server.dump();
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS download_configured",
+            "ZTEST PASS download_menu",
+            "ZTEST PASS download_exit_transfer",
+            "ZTEST DONE",
+            "build service stopped (0 threads left)",
+        },
+        .reject = &.{"ZTEST FAIL"},
+    });
+    try expectNoTemp(d.toolchains);
+    const a = p.arena_state.allocator();
+    try testing.expect(!fileExists(try std.fs.path.join(a, &.{ d.toolchains, "zig-0.17.0" })));
+}
+
+test "download: editor exit while the check waits for the toolchain lock" {
+    try requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("highlighter");
+    defer p.deinit();
+    var d = try setupDownload(&p, "exit_lock", &.{"good"}, false);
+    defer d.deinit();
+    errdefer d.server.dump();
+    const a = p.arena_state.allocator();
+    // Another editor's install holds the lock for the whole run.
+    try Io.Dir.cwd().createDirPath(io, d.toolchains);
+    const lock_path = try std.fs.path.join(a, &.{ d.toolchains, ".install.lock" });
+    var held = try platform.lock.FileLock.acquire(io, .fromTrusted(lock_path), .exclusive, 0);
+    defer held.release();
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS download_configured",
+            "ZTEST PASS download_menu",
+            "ZTEST PASS download_exit_checking",
+            "ZTEST DONE",
+            "build service stopped (0 threads left)",
+        },
+        .reject = &.{"ZTEST FAIL"},
+    });
+    try expectNoTemp(d.toolchains);
+    try testing.expect(!fileExists(try std.fs.path.join(a, &.{ d.toolchains, "zig-0.17.0" })));
 }
 
 test "download: mirror list cache" {
