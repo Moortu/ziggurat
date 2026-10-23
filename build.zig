@@ -804,9 +804,10 @@ fn addTestSet(
 
     // The host's language helpers that import only std: the global class
     // scan, the template text, the diagnostics cache and the main-thread
-    // queue (the last two lock with the C-allocated process Io).
-    var host_std: [4]*std.Build.Module = undefined;
-    for (&host_std, [_][]const u8{ "global_class", "template", "diag_cache", "main_queue" }) |*m, name| {
+    // queue (the last two lock with the C-allocated process Io), and the
+    // Zig syntax colours of the script editor.
+    var host_std: [5]*std.Build.Module = undefined;
+    for (&host_std, [_][]const u8{ "global_class", "template", "diag_cache", "main_queue", "highlight" }) |*m, name| {
         m.* = b.createModule(.{
             .root_source_file = b.path(b.fmt("src/host/{s}.zig", .{name})),
             .target = target,
@@ -825,7 +826,7 @@ fn addTestSet(
         .imports = &.{.{ .name = "ziggurat_platform", .module = platform }},
     });
 
-    for ([_]*std.Build.Module{ platform, build_mod, abi, snake, fmtlog, host_version, output_scan, host_std[0], host_std[1], host_std[2], host_std[3], host_manifest }) |mod| {
+    for ([_]*std.Build.Module{ platform, build_mod, abi, snake, fmtlog, host_version, output_scan, host_std[0], host_std[1], host_std[2], host_std[3], host_std[4], host_manifest }) |mod| {
         const t = b.addTest(.{ .root_module = mod });
         if (run) {
             step.dependOn(&b.addRunArtifact(t).step);

@@ -1549,6 +1549,30 @@ test "editor plugin is present" {
     });
 }
 
+test "zig tab uses the Zig highlighter" {
+    try requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.init("highlighter");
+    defer p.deinit();
+    try isolateUserFolders(&p);
+    // No Zig: the build at open fails at once and builds nothing.
+    try pathWithoutZig(&p);
+    try p.addAutoloadCheck("highlighter.gd");
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS highlighter_current",
+            "ZTEST PASS highlighter_name_zig",
+            "ZTEST PASS highlighter_pub_keyword",
+            "ZTEST PASS highlighter_doc_comment",
+            "ZTEST PASS highlighter_code_point_columns",
+            "ZTEST PASS highlighter_per_tab",
+            "ZTEST DONE",
+        },
+        .reject = &.{"ZTEST FAIL"},
+    });
+}
+
 test "no plugin in a game" {
     try requireIntegration();
     var p: Project = undefined;

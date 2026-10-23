@@ -17,9 +17,11 @@
 //! build outcome was applied (`editor_build.outcomes_applied`) or a build
 //! started or ended; then it updates the panel and pushes the outcome's
 //! toast. It also adds the debugger plugin (debugger_plugin.zig), which
-//! tells running games to reload after each manifest write. When it leaves
-//! the tree it takes the menu items, the panel and the debugger plugin
-//! back. The download builds on it (editor_build.zig has the build API).
+//! tells running games to reload after each manifest write, and gives the
+//! script editor the Zig syntax highlighter (highlighter.zig; the script
+//! editor exists from here on, not at EDITOR init). When it leaves the tree
+//! it takes the menu items, the panel, the debugger plugin and the
+//! highlighter back. The download builds on it (editor_build.zig has the build API).
 //!
 //! Build on Play (`_build`: Godot calls it on the main thread when Play is
 //! pressed, after it saved the open scenes and scripts, and the run waits
@@ -40,6 +42,7 @@ const host_options = @import("host_options");
 const editor_build = @import("editor_build.zig");
 const editor_panel = @import("editor_panel.zig");
 const debugger_plugin = @import("debugger_plugin.zig");
+const highlighter = @import("highlighter.zig");
 const host_callable = @import("host_callable.zig");
 const host_io = @import("host_io.zig");
 
@@ -93,11 +96,13 @@ pub const ZigEditorPlugin = struct {
         self.addMenuItem(menu_build, "build_menu");
         self.addMenuItem(menu_download, "download_menu");
         debugger_plugin.attach(self.base);
+        highlighter.attach();
         self.base.setProcess(true);
     }
 
     pub fn _exitTree(self: *ZigEditorPlugin) void {
         self.base.setProcess(false);
+        highlighter.detach();
         debugger_plugin.detach(self.base);
         inline for (.{ menu_build, menu_download }) |name| {
             var n = String.fromLatin1(name);
@@ -272,6 +277,7 @@ pub fn register(registry: *godot.extension.Registry) void {
     panel.addMethod("build_pressed", .auto);
     panel.addMethod("on_meta_clicked", .auto);
     debugger_plugin.register(registry);
+    highlighter.register(registry);
 }
 
 /// Hands the class to the editor (EDITOR init, after the class is
