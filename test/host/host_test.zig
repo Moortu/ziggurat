@@ -1511,6 +1511,102 @@ test "no builds in a non-interactive editor run" {
     }
 }
 
+// ------------------------------------------------------------ editor plugin
+
+/// Gives Godot per-user folders inside the test's folder (editor settings,
+/// data and the downloaded-Zig folder), so the user's own editor settings
+/// and toolchains play no part and are not changed.
+fn isolateUserFolders(p: *Project) !void {
+    const a = p.arena_state.allocator();
+    if (p.env == null) {
+        const env = try a.create(std.process.Environ.Map);
+        env.* = try testing.environ.createMap(testing.allocator);
+        p.env = env;
+    }
+    const root = try p.tmp.dir.realPathFileAlloc(io, ".", a);
+    inline for (.{ "config", "data" }) |sub| try p.tmp.dir.createDirPath(io, sub);
+    try p.env.?.put("XDG_CONFIG_HOME", try std.fs.path.join(a, &.{ root, "config" }));
+    try p.env.?.put("XDG_DATA_HOME", try std.fs.path.join(a, &.{ root, "data" }));
+}
+
+test "editor plugin is present" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("empty");
+    defer p.deinit();
+    try isolateUserFolders(&p);
+    try p.addAutoloadCheck("editor_plugin.gd");
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS editor_plugin_present",
+            "ZTEST PASS editor_plugin_is_editor_plugin",
+            "ZTEST PASS editor_plugin_callable",
+            "ZTEST PASS editor_setting_zig_path",
+        },
+    });
+}
+
+test "no plugin in a game" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("empty");
+    defer p.deinit();
+    try p.addCheck("no_plugin_game.gd");
+    try p.run(&.{ "script", "res://check.gd" }, .{
+        .expect = &.{ "ziggurat_host 0.1.0 ready", "ZTEST PASS no_plugin_in_game" },
+        .reject = &.{ "ERROR:", "ZigEditorPlugin" },
+    });
+}
+
+test "public build API" {
+    try requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("editor_build");
+    defer p.deinit();
+    const a = p.arena_state.allocator();
+    _ = try addZigWrapper(&p);
+    try isolateUserFolders(&p);
+    const root = try p.tmp.dir.realPathFileAlloc(io, ".", a);
+    // A Zig that reports another version.
+    const old_zig = try std.fs.path.join(a, &.{ root, "old-zig.sh" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = old_zig, .data = "#!/bin/sh\necho 0.16.0\n" });
+    const chmod = try std.process.run(a, io, .{ .argv = &.{ "chmod", "755", old_zig } });
+    if (!chmod.term.success()) return error.ChmodFailed;
+    const missing = try std.fs.path.join(a, &.{ root, "no-such-folder", "zig" });
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+    defer dir.close(io);
+    const wrapper = try std.fs.path.join(a, &.{ root, "zig-wrapper.sh" });
+    try dir.writeFile(io, .{ .sub_path = "zigs.txt", .data = try std.fmt.allocPrint(a, "{s}\n{s}\n{s}\n", .{ wrapper, old_zig, missing }) });
+    // `PATH` holds only `sleep` (the wrapper waits with it), so the locator
+    // finds no Zig there.
+    try p.tmp.dir.createDirPath(io, "bin");
+    const bin = try std.fs.path.join(a, &.{ root, "bin" });
+    const which = try std.process.run(a, io, .{ .argv = &.{ "sh", "-c", "command -v sleep" } });
+    const sleep = std.mem.trim(u8, which.stdout, " \t\r\n");
+    if (!which.term.success() or sleep.len == 0) return error.NoSleep;
+    try Io.Dir.cwd().symLink(io, sleep, try std.fs.path.join(a, &.{ bin, "sleep" }), .{});
+    try p.env.?.put("PATH", bin);
+    try p.addAutoloadCheck("editor_api.gd");
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS api_open_status",
+            "ZTEST PASS api_request_known_trigger",
+            "ZTEST PASS api_building",
+            "ZTEST PASS api_manual_outcome",
+            "ZTEST PASS api_zig_missing",
+            "ZTEST PASS api_zig_wrong_version",
+            "ZTEST PASS api_editor_setting_used",
+            "ZTEST PASS api_project_setting_wins",
+            "ZTEST PASS api_diagnostics",
+            "ZTEST PASS api_diagnostics_cleared",
+            "ZTEST PASS api_unknown_trigger",
+            "build service stopped (0 threads left)",
+        },
+        .deadline = build_deadline_s,
+    });
+}
+
 // ------------------------------------------------------------ game process
 
 /// The library name the editor's store gives generation `n`.
@@ -1951,6 +2047,22 @@ test "gui: save in the script editor reaches the running game" {
 /// Case-insensitive search.
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return std.ascii.findIgnoreCase(haystack, needle) != null;
+}
+
+test "export build has no editor plugin" {
+    try requireIntegration();
+    const a = testing.allocator;
+    const needle = "ZigEditorPlugin";
+    const export_lib = try Io.Dir.cwd().readFileAlloc(io, opts.export_host_lib, a, .limited(1 << 30));
+    defer a.free(export_lib);
+    if (std.mem.indexOf(u8, export_lib, needle) != null) {
+        std.debug.print("the export build holds '{s}'\n", .{needle});
+        return error.ExportBuildHasEditorPlugin;
+    }
+    // The ordinary host holds it, so the search can find it.
+    const host_lib = try Io.Dir.cwd().readFileAlloc(io, opts.host_lib, a, .limited(1 << 30));
+    defer a.free(host_lib);
+    if (std.mem.indexOf(u8, host_lib, needle) == null) return error.SearchFindsNothing;
 }
 
 test "export build has no manifest path" {

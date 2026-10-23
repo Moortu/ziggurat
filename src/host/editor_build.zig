@@ -3,11 +3,21 @@
 //! editor and a game started from it need.
 //!
 //! - `start` (SCENE init, editor only) registers the project settings
-//!   `ziggurat/zig_path` (empty: the Zig locator searches) and
+//!   `ziggurat/zig_path` (the project's override of the Zig path) and
 //!   `ziggurat/dev/sdk_manifest` (absolute path of an SDK module manifest),
-//!   starts a `BuildService` for the project and requests the build at
-//!   project open. A missing or unusable setting is one log sentence that
-//!   names it; then nothing builds and scripts keep the descriptor cache.
+//!   starts a `BuildService` for the project and queues the build at
+//!   project open for the first frame (the editor setting can be read
+//!   only once the editor exists). A missing or unusable SDK manifest
+//!   setting is one log sentence that names it; then nothing builds and
+//!   scripts keep the descriptor cache.
+//! - The editor plugin registers the editor setting `ziggurat/zig_path`
+//!   (the per-user Zig path; `registerEditorSettings`).
+//! - Every build request (`requestBuild`: open, save, the plugin's
+//!   triggers) reads both Zig path settings again and hands them to the
+//!   service (`BuildService.setZigPaths`): the project setting wins when
+//!   set, then the editor setting, the downloaded toolchain and `PATH`
+//!   (the Zig locator's order). A relative path is one log sentence, and
+//!   that request builds nothing.
 //! - Every successful save of a `.zig` file (`resource.on_saved`, any
 //!   thread) queues a save request for the main thread.
 //! - The service calls `onOutcome` on its build thread. It copies the
@@ -41,6 +51,10 @@
 //!   diagnostics, its placeholders (`_update_exports`), a tool script's
 //!   placeholders become real instances, and a script whose file changed
 //!   outside the editor gets the new text (checked on every outcome).
+//! - The public build API for the editor plugin: `requestBuild`, `status`
+//!   (whether a build runs, and a summary of the last applied outcome),
+//!   `diagnosticsCopy` (that outcome's diagnostics per file) and
+//!   `applyFinished` (runs queued outcomes now). All main thread.
 //! - `stop` (SCENE exit, before the main-thread queue closes and the
 //!   language is destroyed) clears the save hook and stops the service,
 //!   which kills a running compiler and joins the service's threads.
@@ -68,12 +82,16 @@ const Allocator = std.mem.Allocator;
 const OsPath = platform.path.OsPath;
 const BuildService = zbuild.service.BuildService;
 const Outcome = zbuild.service.Outcome;
-const Trigger = zbuild.service.Trigger;
-const BuildPath = zbuild.service.BuildPath;
+pub const Trigger = zbuild.service.Trigger;
+pub const BuildPath = zbuild.service.BuildPath;
+pub const ZigProblem = zbuild.service.ZigProblem;
 const String = godot.builtin.String;
+const StringName = godot.builtin.StringName;
 const Variant = godot.builtin.Variant;
 const Dictionary = godot.builtin.Dictionary;
 const ProjectSettings = godot.class.ProjectSettings;
+const EditorInterface = godot.class.EditorInterface;
+const Engine = godot.class.Engine;
 const Os = godot.class.Os;
 
 pub const setting_zig_path = "ziggurat/zig_path";
@@ -131,6 +149,217 @@ pub var outcomes_applied: std.atomic.Value(u32) = .init(0);
 /// next outcome can mark them clean again. Main thread.
 var diag_files: std.StringHashMapUnmanaged(void) = .empty;
 
+/// Outcomes copied off the build thread and not yet applied or dropped,
+/// so `status` says `building` until the newest outcome is applied.
+var queued_outcomes: std.atomic.Value(u32) = .init(0);
+
+/// What `status` and `diagnosticsCopy` report: the last applied outcome
+/// (C allocator). Main thread.
+var last_applied: ?LastStore = null;
+
+// ------------------------------------------------------------ public API
+
+/// A summary of one applied build outcome (`status`).
+pub const Last = struct {
+    /// The generation the build staged, or null when it staged none.
+    n: ?u32,
+    /// True when the editor took the build into use: it staged a
+    /// generation, its load checks passed and its library and defaults
+    /// were accepted.
+    ok: bool,
+    trigger: Trigger,
+    path: BuildPath,
+    /// Wall time of the whole build.
+    ms: u64,
+    /// The outcome's one sentence (`Outcome.message`), or null. Owned here:
+    /// valid until the next outcome is applied (main thread).
+    message: ?[]const u8,
+    /// Compile errors plus load-check findings.
+    error_count: u32,
+    /// Scan problems (they do not fail a build by themselves).
+    warning_count: u32,
+    zig_problem: ZigProblem,
+};
+
+pub const Status = struct {
+    /// A build runs, one is pending, or an outcome waits to be applied.
+    building: bool,
+    /// The last applied outcome, or null before the first.
+    last: ?Last,
+};
+
+/// The diagnostics of one file (`diagnosticsCopy`).
+pub const FileDiagnostics = struct {
+    /// Project-relative path with `/` separators (as in `res://<rel>`),
+    /// or "" for diagnostics outside the project's files.
+    rel: []const u8,
+    /// 1-based line and column; both 0 without a place in the file.
+    items: []diag_cache.Diagnostic,
+};
+
+/// Asks for a build. Reads the Zig path settings again first (the project
+/// setting `ziggurat/zig_path`, then the editor setting of the same name),
+/// so a changed path or a downloaded Zig is used without a restart. Does
+/// nothing when the project has no build service (see `start`). Main
+/// thread.
+pub fn requestBuild(t: Trigger) void {
+    const st = if (state) |*s| s else return;
+    if (!passZigPaths(st)) return;
+    st.svc.request(t);
+}
+
+/// Whether a build runs and the last applied outcome. Main thread; the
+/// `message` slice stays valid until the next outcome is applied.
+pub fn status() Status {
+    const st = state orelse return .{ .building = false, .last = null };
+    const building = st.svc.busy() or queued_outcomes.load(.acquire) != 0;
+    return .{ .building = building, .last = if (last_applied) |l| l.info else null };
+}
+
+/// A copy of the last applied outcome's diagnostics, grouped per file in
+/// the order the build reported them: compile errors, scan problems and
+/// load-check findings. Empty before the first outcome. Free it with
+/// `freeDiagnostics(a, list)`. Main thread.
+pub fn diagnosticsCopy(a: Allocator) Allocator.Error![]FileDiagnostics {
+    const l = last_applied orelse return a.alloc(FileDiagnostics, 0);
+    return copyFileDiagnostics(a, l.files);
+}
+
+pub fn freeDiagnostics(a: Allocator, list: []FileDiagnostics) void {
+    for (list) |f| freeFile(a, f);
+    a.free(list);
+}
+
+fn freeFile(a: Allocator, f: FileDiagnostics) void {
+    for (f.items) |d| a.free(d.message);
+    a.free(f.items);
+    a.free(f.rel);
+}
+
+/// Runs what waits in the main-thread queue now (one `main_queue.drain`),
+/// so an outcome the service has published is applied before the caller
+/// goes on. Main thread; inside a running drain it does nothing.
+pub fn applyFinished() void {
+    _ = main_queue.drain();
+}
+
+/// Registers the editor setting `ziggurat/zig_path` (the per-user Zig
+/// path, empty by default, with a file picker). Main thread, once the
+/// editor exists (the editor plugin's `_enter_tree`). A value equal to the
+/// default is not written to the editor settings file.
+pub fn registerEditorSettings() void {
+    const es = editorSettings() orelse return;
+    defer releaseRef(es);
+    var n = String.fromLatin1(setting_zig_path);
+    defer n.deinit();
+    var empty = String.fromLatin1("");
+    defer empty.deinit();
+    const v = Variant.init(String, empty);
+    defer v.deinit();
+    if (!es.hasSetting(n)) es.setSetting(n, v);
+    es.setInitialValue(.fromComptimeLatin1(setting_zig_path), v, false);
+    var info = Dictionary.init();
+    defer info.deinit();
+    putInfo(&info, "name", Variant.init(String, n));
+    putInfo(&info, "type", Variant.init(i64, type_string));
+    putInfo(&info, "hint", Variant.init(i64, hint_global_file));
+    putInfo(&info, "hint_string", Variant.init(String, empty));
+    es.addPropertyInfo(info);
+}
+
+/// The editor's settings, or null while the editor does not exist yet.
+/// Godot returns them with a reference for the caller (a `Ref` return):
+/// release it with `releaseRef`.
+fn editorSettings() ?*godot.class.EditorSettings {
+    if (!Engine.hasSingleton(.fromComptimeLatin1("EditorInterface"))) return null;
+    return EditorInterface.getEditorSettings();
+}
+
+/// Drops the reference a `Ref` return gave the caller.
+fn releaseRef(obj: anytype) void {
+    const rc = godot.class.RefCounted.upcast(obj);
+    if (rc.unreference()) godot.raw.objectDestroy(@ptrCast(rc));
+}
+
+/// Reads both Zig path settings and hands them to the service. False (and
+/// one log sentence) when one is set but not an absolute path, or out of
+/// memory.
+fn passZigPaths(st: *State) bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const project = settingText(a, setting_zig_path) catch return oom();
+    const editor = editorSettingText(a, setting_zig_path) catch return oom();
+    if (project.len != 0 and !isAbsolute(project)) {
+        log("Ziggurat does not build Zig scripts: the project setting " ++ setting_zig_path ++ " ({s}) is not usable, because it is not an absolute path.", .{project});
+        return false;
+    }
+    if (editor.len != 0 and !isAbsolute(editor)) {
+        log("Ziggurat does not build Zig scripts: the editor setting " ++ setting_zig_path ++ " ({s}) is not usable, because it is not an absolute path.", .{editor});
+        return false;
+    }
+    st.svc.setZigPaths(if (project.len != 0) project else null, if (editor.len != 0) editor else null) catch return oom();
+    return true;
+}
+
+fn oom() bool {
+    logError("Ziggurat cannot build Zig scripts: out of memory.", .{});
+    return false;
+}
+
+/// The text of the editor setting `name`, allocated with `a`; empty when
+/// the editor does not exist yet, or the setting is unset or not a string.
+fn editorSettingText(a: Allocator, comptime name: []const u8) Allocator.Error![]const u8 {
+    const es = editorSettings() orelse return "";
+    defer releaseRef(es);
+    var n = String.fromLatin1(name);
+    defer n.deinit();
+    if (!es.hasSetting(n)) return "";
+    const v = es.getSetting(n);
+    defer v.deinit();
+    var s = v.as(String) orelse return "";
+    defer s.deinit();
+    const text = try props.utf8Alloc(a, &s);
+    return std.mem.trim(u8, text, " \t\r\n");
+}
+
+/// The last applied outcome, owned (C allocator).
+const LastStore = struct {
+    info: Last,
+    files: []FileDiagnostics,
+
+    fn deinit(l: LastStore) void {
+        if (l.info.message) |m| gpa.free(m);
+        freeDiagnostics(gpa, l.files);
+    }
+};
+
+fn copyFileDiagnostics(a: Allocator, from: []const FileDiagnostics) Allocator.Error![]FileDiagnostics {
+    const list = try a.alloc(FileDiagnostics, from.len);
+    var n: usize = 0;
+    errdefer {
+        for (list[0..n]) |f| freeFile(a, f);
+        a.free(list);
+    }
+    while (n < from.len) : (n += 1) {
+        const f = from[n];
+        const rel = try a.dupe(u8, f.rel);
+        errdefer a.free(rel);
+        const items = try a.alloc(diag_cache.Diagnostic, f.items.len);
+        var k: usize = 0;
+        errdefer {
+            for (items[0..k]) |d| a.free(d.message);
+            a.free(items);
+        }
+        while (k < f.items.len) : (k += 1) {
+            const d = f.items[k];
+            items[k] = .{ .line = d.line, .column = d.column, .message = try a.dupe(u8, d.message) };
+        }
+        list[n] = .{ .rel = rel, .items = items };
+    }
+    return list;
+}
+
 // ------------------------------------------------------------ start, stop
 
 /// Registers the settings, installs the save hook and starts the service
@@ -168,9 +397,13 @@ pub fn stop() void {
     while (it.next()) |k| gpa.free(k.*);
     diag_files.deinit(gpa);
     diag_files = .empty;
+    if (last_applied) |l| l.deinit();
+    last_applied = null;
+    open_pending = false;
 }
 
 /// True while a requested build runs a compiler (for the host tests).
+/// `status().building` is the plugin's view.
 /// Main thread.
 pub fn busy() bool {
     const st = state orelse return false;
@@ -255,8 +488,8 @@ fn readCmdline(buf: []u8) ?[]const u8 {
     return buf[0..n];
 }
 
-/// Adds both settings with an empty default, so they show in Project
-/// Settings with a file picker.
+/// Adds both project settings with an empty default, so they show in
+/// Project Settings with a file picker.
 fn registerSettings() void {
     inline for (.{ setting_zig_path, setting_sdk_manifest }) |name| {
         var n = String.fromLatin1(name);
@@ -322,11 +555,6 @@ fn startService() Allocator.Error!void {
         log("Ziggurat does not build Zig scripts: the project setting " ++ setting_sdk_manifest ++ " ({s}) is not usable, because it is not an absolute path.", .{sdk_path});
         return;
     }
-    const zig_path = try settingText(a, setting_zig_path);
-    if (zig_path.len != 0 and !isAbsolute(zig_path)) {
-        log("Ziggurat does not build Zig scripts: the project setting " ++ setting_zig_path ++ " ({s}) is not usable, because it is not an absolute path.", .{zig_path});
-        return;
-    }
     var msg: std.ArrayList(u8) = .empty;
     defer msg.deinit(gpa);
     var sdk = zbuild.sdk_manifest.load(gpa, io, .fromTrusted(sdk_path), &msg) catch |err| switch (err) {
@@ -373,8 +601,9 @@ fn startService() Allocator.Error!void {
     var diag: [256]u8 = undefined;
     const svc = BuildService.initDiag(gpa, io, .{
         .paths = paths,
+        // The configured paths come with each request (`passZigPaths`).
         .locate = .{
-            .configured = if (zig_path.len != 0) .fromTrusted(zig_path) else null,
+            .configured = null,
             .toolchain_dir = toolchain,
             .env = env,
         },
@@ -399,7 +628,42 @@ fn startService() Allocator.Error!void {
         .svc = svc,
         .store = .init(gpa, io, .fromTrusted(store_root), @import("builtin").os.tag, zbuild.service.lib_stem, .{}),
     };
-    svc.request(.open);
+    // The build at open. The project setting wins over the editor setting,
+    // so when it is set the build starts now. Otherwise the editor setting
+    // is needed, which exists only once the editor does: the editor plugin
+    // requests the build when it enters the tree (`editorReady`), and the
+    // first frame does if the plugin never does.
+    open_pending = true;
+    if (projectZigSet()) {
+        requestOpen(null);
+    } else {
+        main_queue.push(requestOpen, null, null) catch requestOpen(null);
+    }
+}
+
+/// Set while the build at open is not requested yet. Main thread.
+var open_pending = false;
+
+/// True when the project setting `ziggurat/zig_path` is not empty.
+fn projectZigSet() bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const text = settingText(arena_state.allocator(), setting_zig_path) catch return false;
+    return text.len != 0;
+}
+
+fn requestOpen(_: ?*anyopaque) void {
+    if (!open_pending) return;
+    open_pending = false;
+    requestBuild(.open);
+}
+
+/// The editor exists (the editor plugin entered the tree): registers the
+/// editor setting and requests the build at open if it still waits for
+/// the editor setting. Main thread.
+pub fn editorReady() void {
+    registerEditorSettings();
+    requestOpen(null);
 }
 
 /// The per-user folders and `PATH` as the Zig locator and the path service
@@ -436,7 +700,7 @@ fn onSaved(_: []const u8) void {
 }
 
 fn requestSave(_: ?*anyopaque) void {
-    if (state) |st| st.svc.request(.save);
+    requestBuild(.save);
 }
 
 // ------------------------------------------------------------ outcomes
@@ -453,12 +717,22 @@ const Msg = struct {
     diags: []Diag = &.{},
     /// A copy of `Outcome.snapshot`.
     snap: ?abi.Snapshot = null,
+    zig_problem: ZigProblem = .none,
+    /// How many of `diags`, at the end, are scan problems.
+    scan_problems: u32 = 0,
 
     const Diag = struct { rel: ?[]u8, line: u32, column: u32, message: []u8 };
 
     fn copy(o: *const Outcome) Allocator.Error!*Msg {
         const m = try gpa.create(Msg);
-        m.* = .{ .trigger = o.trigger, .ok = o.ok, .path = o.path, .ms = o.ms };
+        m.* = .{
+            .trigger = o.trigger,
+            .ok = o.ok,
+            .path = o.path,
+            .ms = o.ms,
+            .zig_problem = o.zig_problem,
+            .scan_problems = @intCast(@min(o.scan_problems, o.diagnostics.len)),
+        };
         errdefer m.free();
         if (o.generation) |g| {
             m.gen_n = g.n;
@@ -505,12 +779,16 @@ const Msg = struct {
 /// again).
 fn onOutcome(_: ?*anyopaque, o: *const Outcome) void {
     const m = Msg.copy(o) catch return;
+    // Counted while the service still counts the build as running, so
+    // `status` never shows a gap between the two.
+    _ = queued_outcomes.fetchAdd(1, .acq_rel);
     main_queue.push(apply, m, drop) catch {};
 }
 
 fn drop(ctx: ?*anyopaque) void {
     const m: *Msg = @ptrCast(@alignCast(ctx.?));
     m.free();
+    _ = queued_outcomes.fetchSub(1, .acq_rel);
 }
 
 /// Diagnostics per project-relative file, for one outcome.
@@ -519,6 +797,7 @@ const Files = std.StringArrayHashMapUnmanaged(std.ArrayList(diag_cache.Diagnosti
 /// Handles one outcome on the main thread (see the file comment).
 fn apply(ctx: ?*anyopaque) void {
     const m: *Msg = @ptrCast(@alignCast(ctx.?));
+    defer _ = queued_outcomes.fetchSub(1, .acq_rel);
     defer m.free();
     if (state == null) return;
     applyMsg(m) catch logError("Ziggurat could not record a build result: out of memory.", .{});
@@ -536,20 +815,26 @@ fn applyMsg(m: *const Msg) Allocator.Error!void {
     }
 
     var files: Files = .empty;
+    // Every diagnostic of this outcome, also those outside the project's
+    // files (key ""), for `diagnosticsCopy`.
+    var all: Files = .empty;
     var file_diags = false;
     for (m.diags) |d| {
         printDiagnostic(d.rel, d.line, d.column, d.message);
+        const dg: diag_cache.Diagnostic = .{ .line = d.line, .column = d.column, .message = d.message };
+        try addDiagnostic(a, &all, d.rel orelse "", dg);
         const rel = d.rel orelse continue;
         file_diags = true;
-        try addDiagnostic(a, &files, rel, .{ .line = d.line, .column = d.column, .message = d.message });
+        try addDiagnostic(a, &files, rel, dg);
     }
 
-    var checked = false;
+    var use: Use = .not_used;
     if (m.ok and m.lib != null) {
-        checked = try applyGood(a, st, m, &files);
+        use = try applyGood(a, st, m, &files, &all);
     } else {
         log("ziggurat: build failed ({t}, {d} ms); the last good build stays in use", .{ m.trigger, m.ms });
     }
+    const checked = use != .not_used;
 
     // Only a build that reached the compiler's verdict replaces what is
     // known about the files: a checked good build (with or without
@@ -560,12 +845,57 @@ fn applyMsg(m: *const Msg) Allocator.Error!void {
     const verdict = checked or (!m.ok and file_diags);
     if (verdict) try recordDiagnostics(&files);
     updateScripts(if (verdict) &files else null);
+    try recordLast(m, use, &all);
 }
 
-/// A good build (see the file comment). True when its checks ran (it was
-/// used, or the load checks failed it); false when its library was refused
-/// or its defaults were stale (`staleDefaults`).
-fn applyGood(a: Allocator, st: *State, m: *const Msg, files: *Files) Allocator.Error!bool {
+/// What the editor did with a good build (`applyGood`).
+const Use = enum {
+    /// Loaded (or, without tool scripts, its snapshot installed) and the
+    /// manifest written.
+    used,
+    /// Its load checks found problems; it is never used.
+    failed_checks,
+    /// Its library was refused or its defaults were stale; the checks
+    /// gave no verdict on the files.
+    not_used,
+};
+
+/// Keeps a summary and the diagnostics of `m` for `status` and
+/// `diagnosticsCopy`; replaces the previous one.
+fn recordLast(m: *const Msg, use: Use, all: *const Files) Allocator.Error!void {
+    var findings: u32 = 0;
+    if (use == .failed_checks) {
+        var total: usize = 0;
+        for (all.values()) |list| total += list.items.len;
+        findings = @intCast(total -| m.diags.len);
+    }
+    const compile_errors: u32 = @intCast(m.diags.len - m.scan_problems);
+    var views = try gpa.alloc(FileDiagnostics, all.count());
+    defer gpa.free(views);
+    for (all.keys(), all.values(), 0..) |rel, list, i| views[i] = .{ .rel = rel, .items = list.items };
+    const files = try copyFileDiagnostics(gpa, views);
+    errdefer freeDiagnostics(gpa, files);
+    const message: ?[]const u8 = if (m.message) |t| try gpa.dupe(u8, t) else null;
+    if (last_applied) |old| old.deinit();
+    last_applied = .{
+        .info = .{
+            .n = if (m.lib != null) m.gen_n else null,
+            .ok = use == .used,
+            .trigger = m.trigger,
+            .path = m.path,
+            .ms = m.ms,
+            .message = message,
+            .error_count = compile_errors + findings,
+            .warning_count = m.scan_problems,
+            .zig_problem = m.zig_problem,
+        },
+        .files = files,
+    };
+}
+
+/// A good build (see the file comment). `all` also gets the load-check
+/// findings.
+fn applyGood(a: Allocator, st: *State, m: *const Msg, files: *Files, all: *Files) Allocator.Error!Use {
     const io = host_io.get();
     const lib = m.lib.?;
     const snap: ?*const abi.Snapshot = if (m.snap) |*sn| sn else null;
@@ -574,9 +904,9 @@ fn applyGood(a: Allocator, st: *State, m: *const Msg, files: *Files) Allocator.E
     if (snap) |sn| {
         const findings = try load_checks.runSnapshot(a, sn);
         if (findings.len != 0) {
-            for (findings) |f| try addFinding(a, files, sn.scripts[f.script].path, f.message);
+            for (findings) |f| try addFinding(a, files, all, sn.scripts[f.script].path, f.message);
             logFailedChecks(m);
-            return true;
+            return .failed_checks;
         }
     }
 
@@ -604,7 +934,7 @@ fn applyGood(a: Allocator, st: *State, m: *const Msg, files: *Files) Allocator.E
             writeManifest(st, m.gen_n, lib);
             log("ziggurat: build {d} ready ({t}, {t}, {d} ms); the editor did not load it, because the project has no tool scripts", .{ m.gen_n, m.trigger, m.path, m.ms });
             warnSize(st);
-            return true;
+            return .used;
         }
     }
 
@@ -612,24 +942,24 @@ fn applyGood(a: Allocator, st: *State, m: *const Msg, files: *Files) Allocator.E
     const g = runtime.load(gpa, .fromTrusted(lib), m.gen_n, &diag) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         // `load` logged it already.
-        error.NotMainThread => return false,
+        error.NotMainThread => return .not_used,
         error.Refused => {
             logError("{s}", .{std.mem.sliceTo(&diag, 0)});
-            return false;
+            return .not_used;
         },
     };
     notePinned(st, g.n);
     if (snap == null) {
         const findings = try load_checks.run(a, g);
         if (findings.len != 0) {
-            for (findings) |f| try addFinding(a, files, props.text(g.scripts()[f.script].path), f.message);
+            for (findings) |f| try addFinding(a, files, all, props.text(g.scripts()[f.script].path), f.message);
             // Loaded but never handed to the swap engine: new instances
             // keep the previous generation, the game the previous manifest.
             logFailedChecks(m);
-            return true;
+            return .failed_checks;
         }
     } else {
-        if (try staleDefaults(a, st, m, g, snap.?)) return false;
+        if (try staleDefaults(a, st, m, g, snap.?)) return .not_used;
         installSnapshot(g.n, snap.?);
     }
     // The swap runs at a later frame; until then the snapshot describes
@@ -644,7 +974,7 @@ fn applyGood(a: Allocator, st: *State, m: *const Msg, files: *Files) Allocator.E
     writeManifest(st, g.n, lib);
     log("ziggurat: build {d} loaded ({t}, {t}, {d} ms)", .{ g.n, m.trigger, m.path, m.ms });
     warnSize(st);
-    return true;
+    return .used;
 }
 
 /// TEST ONLY (probe `default_mismatch_once`): the next `staleDefaults`
@@ -676,9 +1006,10 @@ fn staleDefaults(a: Allocator, st: *State, m: *const Msg, g: *const runtime.Gene
     return true;
 }
 
-fn addFinding(a: Allocator, files: *Files, rel: []const u8, message: []const u8) Allocator.Error!void {
+fn addFinding(a: Allocator, files: *Files, all: *Files, rel: []const u8, message: []const u8) Allocator.Error!void {
     printDiagnostic(rel, 0, 0, message);
     try addDiagnostic(a, files, rel, .{ .line = 0, .column = 0, .message = message });
+    try addDiagnostic(a, all, rel, .{ .line = 0, .column = 0, .message = message });
 }
 
 fn logFailedChecks(m: *const Msg) void {

@@ -21,7 +21,12 @@ pub const ZigInstall = struct {
 };
 
 pub const LocateConfig = struct {
+    /// The project's override (project setting `ziggurat/zig_path`); it
+    /// comes first.
     configured: ?OsPath,
+    /// The per-user choice (editor setting `ziggurat/zig_path`); it comes
+    /// after the project's override.
+    configured_editor: ?OsPath = null,
     /// The per-user folder of downloaded Zigs, or null when there is none
     /// (no home folder); then that candidate is skipped.
     toolchain_dir: ?OsPath,
@@ -59,7 +64,20 @@ fn isVersion(text: []const u8) bool {
 }
 
 const not_usable_head = "Ziggurat needs Zig " ++ pins.zig_version ++ ", but ";
-const not_usable_tail = ". Set the project setting ziggurat/zig_path to a Zig " ++ pins.zig_version ++ " executable.";
+const not_usable_tail = ". Set the editor setting ziggurat/zig_path to a Zig " ++ pins.zig_version ++ " executable.";
+
+/// Why no usable Zig was found, for a caller that offers a remedy (the
+/// editor offers the download) without reading the sentence.
+pub const ZigProblem = enum {
+    none,
+    /// No candidate exists as a file.
+    missing,
+    /// The first existing candidate reports another version.
+    wrong_version,
+    /// The first existing candidate did not print a version (it timed out,
+    /// failed, or printed something else).
+    no_answer,
+};
 
 fn fail(a: std.mem.Allocator, msg: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !ZigInstall {
     msg.clearRetainingCapacity();
@@ -70,13 +88,22 @@ fn fail(a: std.mem.Allocator, msg: *std.ArrayList(u8), comptime fmt: []const u8,
 }
 
 /// Finds a Zig that reports `pins.zig_version`. Search order: the configured
-/// path, `<toolchain_dir>/zig-<pin>/zig` (when there is a toolchain folder),
+/// path (the project's override), the editor's configured path,
+/// `<toolchain_dir>/zig-<pin>/zig` (when there is a toolchain folder),
 /// then each `PATH` entry. The first
 /// candidate that exists as a file is run with `zig version`; later
 /// candidates are not tried. Empty and relative `PATH` entries are skipped. On failure `msg` holds one plain sentence for
 /// the user (replacing any old text) and the error is `error.ZigNotUsable`. The caller calls
 /// `ZigInstall.deinit` on success.
 pub fn locate(a: std.mem.Allocator, io: std.Io, cfg: LocateConfig, msg: *std.ArrayList(u8)) !ZigInstall {
+    var problem: ZigProblem = .none;
+    return locateProblem(a, io, cfg, msg, &problem);
+}
+
+/// As `locate`, and `problem` says why no Zig is usable: `.none` on success,
+/// the kind of failure with `error.ZigNotUsable`.
+pub fn locateProblem(a: std.mem.Allocator, io: std.Io, cfg: LocateConfig, msg: *std.ArrayList(u8), problem: *ZigProblem) !ZigInstall {
+    problem.* = .none;
     const os = cfg.env.os;
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
@@ -84,6 +111,7 @@ pub fn locate(a: std.mem.Allocator, io: std.Io, cfg: LocateConfig, msg: *std.Arr
 
     var candidates: std.ArrayList(OsPath) = .empty;
     if (cfg.configured) |c| try candidates.append(arena, c);
+    if (cfg.configured_editor) |c| try candidates.append(arena, c);
     const pin_dir = "zig-" ++ pins.zig_version;
     if (cfg.toolchain_dir) |dir| try candidates.append(arena, try path.joinFor(os, arena, dir, &.{ pin_dir, exeName(os) }));
     if (cfg.env.path) |list| {
@@ -111,21 +139,32 @@ pub fn locate(a: std.mem.Allocator, io: std.Io, cfg: LocateConfig, msg: *std.Arr
             if (i != 0) try list.appendSlice(arena, ", ");
             try list.appendSlice(arena, c.bytes);
         }
+        problem.* = .missing;
         return fail(a, msg, "no zig was found (checked: {s})", .{list.items});
     };
 
     const r = process.runCapture(a, io, &.{ exe.bytes, "version" }, null, 5000, 256) catch |err| switch (err) {
-        error.Timeout => return fail(a, msg, "{s} did not answer \"zig version\" within 5 seconds", .{exe.bytes}),
         error.OutOfMemory => return error.OutOfMemory,
-        else => return fail(a, msg, "{s} did not print a version", .{exe.bytes}),
+        error.Timeout => {
+            problem.* = .no_answer;
+            return fail(a, msg, "{s} did not answer \"zig version\" within 5 seconds", .{exe.bytes});
+        },
+        else => {
+            problem.* = .no_answer;
+            return fail(a, msg, "{s} did not print a version", .{exe.bytes});
+        },
     };
     defer a.free(r.stdout);
     defer a.free(r.stderr);
     const text = std.mem.trim(u8, r.stdout, " \t\r\n");
-    if (!r.term.success() or !isVersion(text))
+    if (!r.term.success() or !isVersion(text)) {
+        problem.* = .no_answer;
         return fail(a, msg, "{s} did not print a version", .{exe.bytes});
-    if (!std.mem.eql(u8, text, pins.zig_version))
+    }
+    if (!std.mem.eql(u8, text, pins.zig_version)) {
+        problem.* = .wrong_version;
         return fail(a, msg, "{s} is Zig {s}", .{ exe.bytes, text });
+    }
 
     const exe_owned = try a.dupe(u8, exe.bytes);
     errdefer a.free(exe_owned);
@@ -205,7 +244,7 @@ test "locator_rejects_bad_zig: wrong version" {
     try std.testing.expect(!p.ok);
     try std.testing.expect(std.mem.indexOf(u8, p.msg, "is Zig 0.16.0") != null);
     try std.testing.expect(std.mem.startsWith(u8, p.msg, "Ziggurat needs Zig 0.17.0, but "));
-    try std.testing.expect(std.mem.endsWith(u8, p.msg, ". Set the project setting ziggurat/zig_path to a Zig 0.17.0 executable."));
+    try std.testing.expect(std.mem.endsWith(u8, p.msg, ". Set the editor setting ziggurat/zig_path to a Zig 0.17.0 executable."));
 }
 
 test "locator_rejects_bad_zig: 300 bytes" {
@@ -373,24 +412,25 @@ test "locator: full message bytes" {
     }, &msg));
     try std.testing.expectEqualStrings(
         "Ziggurat needs Zig 0.17.0, but no zig was found (checked: /nonexistent-tc/zig-0.17.0/zig, /nonexistent-p1/zig, /nonexistent-p2/zig). " ++
-            "Set the project setting ziggurat/zig_path to a Zig 0.17.0 executable.",
+            "Set the editor setting ziggurat/zig_path to a Zig 0.17.0 executable.",
         msg.items,
     );
 }
 
-test "locator: without a toolchain folder only the configured path and PATH are checked" {
+test "locator: without a toolchain folder only the configured paths and PATH are checked" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var msg: std.ArrayList(u8) = .empty;
     defer msg.deinit(a);
     try std.testing.expectError(error.ZigNotUsable, locate(a, io, .{
         .configured = OsPath.fromTrusted("/nonexistent-cfg/zig"),
+        .configured_editor = OsPath.fromTrusted("/nonexistent-ed/zig"),
         .toolchain_dir = null,
         .env = .{ .os = .linux, .home = null, .path = "/nonexistent-p1" },
     }, &msg));
     try std.testing.expectEqualStrings(
-        "Ziggurat needs Zig 0.17.0, but no zig was found (checked: /nonexistent-cfg/zig, /nonexistent-p1/zig). " ++
-            "Set the project setting ziggurat/zig_path to a Zig 0.17.0 executable.",
+        "Ziggurat needs Zig 0.17.0, but no zig was found (checked: /nonexistent-cfg/zig, /nonexistent-ed/zig, /nonexistent-p1/zig). " ++
+            "Set the editor setting ziggurat/zig_path to a Zig 0.17.0 executable.",
         msg.items,
     );
 }
@@ -407,6 +447,65 @@ test "locator: relative and empty PATH entries are skipped" {
     }, &msg));
     try std.testing.expect(std.mem.indexOf(u8, msg.items, "rel_dir_x") == null);
     try std.testing.expect(std.mem.indexOf(u8, msg.items, "/nonexistent-p1/zig") != null);
+}
+
+test "locator order: project setting, then editor setting" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project_exe = try fakeZig(tmp, "project", "#!/bin/sh\necho " ++ pins.zig_version ++ "\n");
+    defer a.free(project_exe);
+    const editor_exe = try fakeZig(tmp, "editor", "#!/bin/sh\necho " ++ pins.zig_version ++ "\n");
+    defer a.free(editor_exe);
+    const tool_exe = try fakeZig(tmp, "zig-" ++ pins.zig_version, "#!/bin/sh\necho " ++ pins.zig_version ++ "\n");
+    defer a.free(tool_exe);
+    const tc = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(tc);
+    const env: HostEnv = .{ .os = builtin.os.tag, .home = null, .path = "" };
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(a);
+    // Both set: the project setting wins.
+    const both = try locate(a, io, .{ .configured = .fromTrusted(project_exe), .configured_editor = .fromTrusted(editor_exe), .toolchain_dir = .fromTrusted(tc), .env = env }, &msg);
+    defer both.deinit(a);
+    try std.testing.expectEqualStrings(project_exe, both.exe.bytes);
+    // Only the editor setting: it beats the toolchain folder.
+    const editor = try locate(a, io, .{ .configured = null, .configured_editor = .fromTrusted(editor_exe), .toolchain_dir = .fromTrusted(tc), .env = env }, &msg);
+    defer editor.deinit(a);
+    try std.testing.expectEqualStrings(editor_exe, editor.exe.bytes);
+}
+
+test "locator problem kinds" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const good = try fakeZig(tmp, "good", "#!/bin/sh\necho " ++ pins.zig_version ++ "\n");
+    defer a.free(good);
+    const old = try fakeZig(tmp, "old", "#!/bin/sh\necho 0.16.0\n");
+    defer a.free(old);
+    const mute = try fakeZig(tmp, "mute", "#!/bin/sh\nexit 3\n");
+    defer a.free(mute);
+    const env: HostEnv = .{ .os = builtin.os.tag, .home = null, .path = "" };
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(a);
+    const Case = struct { exe: ?[]const u8, want: ZigProblem };
+    const cases = [_]Case{
+        .{ .exe = null, .want = .missing },
+        .{ .exe = old, .want = .wrong_version },
+        .{ .exe = mute, .want = .no_answer },
+        .{ .exe = good, .want = .none },
+    };
+    for (cases) |case| {
+        var problem: ZigProblem = .wrong_version;
+        const cfg: LocateConfig = .{ .configured = if (case.exe) |e| .fromTrusted(e) else null, .toolchain_dir = null, .env = env };
+        if (locateProblem(a, io, cfg, &msg, &problem)) |inst| {
+            inst.deinit(a);
+        } else |err| try std.testing.expectEqual(error.ZigNotUsable, err);
+        try std.testing.expectEqual(case.want, problem);
+    }
 }
 
 test "isVersion" {

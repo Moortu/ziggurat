@@ -23,6 +23,8 @@ const editor_build = @import("editor_build.zig");
 const gate = @import("gate.zig");
 const registry = @import("registry.zig");
 const swap = @import("swap.zig");
+const editor_plugin = @import("editor_plugin.zig");
+const host_callable = @import("host_callable.zig");
 const Callable = godot.builtin.Callable;
 const PackedStringArray = godot.builtin.PackedStringArray;
 
@@ -565,6 +567,76 @@ pub const ZigguratTestProbe = struct {
         return editor_build.busy();
     }
 
+    /// `editor_build.requestBuild` with the trigger named `trigger`
+    /// (`open`, `save`, `play`, `manual`, `watcher`); false for another
+    /// name.
+    pub fn editorBuildRequest(_: *ZigguratTestProbe, trigger: String) bool {
+        var buf: [32]u8 = undefined;
+        const t = std.meta.stringToEnum(editor_build.Trigger, trigger.toUtf8Buf(&buf)) orelse return false;
+        editor_build.requestBuild(t);
+        return true;
+    }
+
+    /// `editor_build.status` as a Dictionary: `building`, `has_last`, and
+    /// the last outcome's `n` (-1 for none), `ok`, `trigger`, `path`, `ms`,
+    /// `message` ("" for none), `error_count`, `warning_count` and
+    /// `zig_problem` (enum tags as text).
+    pub fn editorBuildStatus(_: *ZigguratTestProbe) Dictionary {
+        var d: Dictionary = .init();
+        const st = editor_build.status();
+        dictSet(&d, "building", .init(bool, st.building));
+        dictSet(&d, "has_last", .init(bool, st.last != null));
+        const l = st.last orelse return d;
+        dictSet(&d, "n", .init(i64, if (l.n) |n| n else -1));
+        dictSet(&d, "ok", .init(bool, l.ok));
+        dictSetText(&d, "trigger", @tagName(l.trigger));
+        dictSetText(&d, "path", @tagName(l.path));
+        dictSet(&d, "ms", .init(i64, @intCast(@min(l.ms, std.math.maxInt(i64)))));
+        dictSetText(&d, "message", l.message orelse "");
+        dictSet(&d, "error_count", .init(i64, l.error_count));
+        dictSet(&d, "warning_count", .init(i64, l.warning_count));
+        dictSetText(&d, "zig_problem", @tagName(l.zig_problem));
+        return d;
+    }
+
+    /// `editor_build.diagnosticsCopy` flattened: one Dictionary per
+    /// diagnostic with `rel`, `line`, `column` and `message`.
+    pub fn editorBuildDiagnostics(_: *ZigguratTestProbe) Array {
+        var out = Array.init();
+        const a = std.heap.c_allocator;
+        const list = editor_build.diagnosticsCopy(a) catch return out;
+        defer editor_build.freeDiagnostics(a, list);
+        for (list) |f| for (f.items) |dg| {
+            var d: Dictionary = .init();
+            dictSetText(&d, "rel", f.rel);
+            dictSet(&d, "line", .init(i64, dg.line));
+            dictSet(&d, "column", .init(i64, dg.column));
+            dictSetText(&d, "message", dg.message);
+            const v = Variant.init(Dictionary, d);
+            out.pushBack(v);
+            v.deinit();
+            d.deinit();
+        };
+        return out;
+    }
+
+    /// Connects `signal` of `source` to the bound test method of the editor
+    /// plugin `plugin` through a Callable made in Zig
+    /// (`host_callable.callable`). False when an argument is missing or
+    /// the connection fails.
+    pub fn editorPluginConnect(_: *ZigguratTestProbe, plugin: ?*Object, source: ?*Object, signal: StringName) bool {
+        const p = plugin orelse return false;
+        const src = source orelse return false;
+        var c = host_callable.callable(p, "test_ping");
+        defer c.deinit();
+        return src.connectRaw(signal, c, .{}) == .ok;
+    }
+
+    /// Calls of the editor plugin's test method so far.
+    pub fn editorPluginPings(_: *ZigguratTestProbe) i64 {
+        return editor_plugin.test_pings;
+    }
+
     /// The gate depth of the calling thread.
     pub fn gateDepth(_: *ZigguratTestProbe) i64 {
         return gate.depth();
@@ -769,6 +841,23 @@ pub const ZigguratTestProbe = struct {
     }
 };
 
+/// Sets d[key] = value and releases `value`.
+fn dictSet(d: *Dictionary, comptime key: []const u8, value: Variant) void {
+    var ks: String = .fromLatin1(key);
+    defer ks.deinit();
+    const k = Variant.init(String, ks);
+    defer k.deinit();
+    defer value.deinit();
+    _ = d.set(k, value);
+}
+
+/// Sets d[key] = the String of UTF-8 `value`.
+fn dictSetText(d: *Dictionary, comptime key: []const u8, value: []const u8) void {
+    var s = String.fromUtf8(value) catch String.fromLatin1("");
+    defer s.deinit();
+    dictSet(d, key, .init(String, s));
+}
+
 var hook_callable: ?Callable = null;
 
 fn runHook(_: ?*anyopaque) void {
@@ -851,28 +940,30 @@ fn cachedScript(rel: String) ?*const desc_cache.Script {
 }
 
 pub const method_names = [_][:0]const u8{
-    "property_list",            "method_list",                 "signal_list",             "default_text",
-    "cache_write",              "cache_read",                  "cache_rejections",        "cached_property_list",
-    "cached_method_list",       "cached_signal_list",          "cached_default_text",     "cached_layout_hash",
-    "layout_hash",              "cached_generation",           "roundtrip_default",       "stored_default",
-    "cache_drops",              "load_module",                 "current_generation",      "was_ever_current",
-    "init_calls",               "find_script",                 "method_index",            "property_index",
-    "method_count",             "method_name",                 "property_count",          "property_name",
-    "property_is_group",        "api_log",                     "api_request_swap",        "script_is_valid",
-    "script_fallback_enabled",  "script_members",              "script_member_line",      "script_method_info",
-    "script_has_default",       "script_update_exports",       "script_method_arg_count", "live_instances",
-    "live_bytes",               "call_error",                  "property_state",          "script_placeholder_count",
-    "script_set_build_failed",  "language_validate",           "language_global_class",   "language_complete_code",
-    "language_lookup_code",     "set_diagnostics",             "has_global_constant",     "queue_push",
-    "queue_runs",               "saved_hook_install",          "saved_hook_clear",        "saved_hook_paths",
-    "language_reload_scripts",  "language_reload_tool_script", "editor_build_outcomes",   "editor_build_busy",
-    "cache_write_snapshot",     "gate_depth",                  "gate_try_swap",           "gate_test_swap",
-    "gate_migrate_probe",       "registry_count",              "runtime_shutdown",        "stage_module",
-    "gate_swap_begin",          "gate_swap_end",               "instance_generation",     "swap_request",
-    "swap_outcome",             "swaps_done",                  "fail_allocation",         "instance_data",
-    "swap_hook",                "game_polling",                "set_size_warning_bytes",  "loaded_generations",
-    "generation_loaded",        "language_frame",              "language_stack_info",     "queue_pending",
-    "queue_nested_frame_check", "language_nested_frames",      "gate_hold",               "default_mismatch_once",
+    "property_list",            "method_list",                 "signal_list",              "default_text",
+    "cache_write",              "cache_read",                  "cache_rejections",         "cached_property_list",
+    "cached_method_list",       "cached_signal_list",          "cached_default_text",      "cached_layout_hash",
+    "layout_hash",              "cached_generation",           "roundtrip_default",        "stored_default",
+    "cache_drops",              "load_module",                 "current_generation",       "was_ever_current",
+    "init_calls",               "find_script",                 "method_index",             "property_index",
+    "method_count",             "method_name",                 "property_count",           "property_name",
+    "property_is_group",        "api_log",                     "api_request_swap",         "script_is_valid",
+    "script_fallback_enabled",  "script_members",              "script_member_line",       "script_method_info",
+    "script_has_default",       "script_update_exports",       "script_method_arg_count",  "live_instances",
+    "live_bytes",               "call_error",                  "property_state",           "script_placeholder_count",
+    "script_set_build_failed",  "language_validate",           "language_global_class",    "language_complete_code",
+    "language_lookup_code",     "set_diagnostics",             "has_global_constant",      "queue_push",
+    "queue_runs",               "saved_hook_install",          "saved_hook_clear",         "saved_hook_paths",
+    "language_reload_scripts",  "language_reload_tool_script", "editor_build_outcomes",    "editor_build_busy",
+    "cache_write_snapshot",     "gate_depth",                  "gate_try_swap",            "gate_test_swap",
+    "gate_migrate_probe",       "registry_count",              "runtime_shutdown",         "stage_module",
+    "gate_swap_begin",          "gate_swap_end",               "instance_generation",      "swap_request",
+    "swap_outcome",             "swaps_done",                  "fail_allocation",          "instance_data",
+    "swap_hook",                "game_polling",                "set_size_warning_bytes",   "loaded_generations",
+    "generation_loaded",        "language_frame",              "language_stack_info",      "queue_pending",
+    "queue_nested_frame_check", "language_nested_frames",      "gate_hold",                "default_mismatch_once",
+    "editor_build_request",     "editor_build_status",         "editor_build_diagnostics", "editor_plugin_connect",
+    "editor_plugin_pings",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

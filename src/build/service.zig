@@ -93,6 +93,9 @@ const FileLock = platform.lock.FileLock;
 
 pub const Trigger = enum { open, save, play, manual, watcher };
 
+/// Why the Zig locator found no usable Zig (`Outcome.zig_problem`).
+pub const ZigProblem = platform.zig_locator.ZigProblem;
+
 /// Which compiler served a build.
 pub const BuildPath = enum { full, incremental };
 
@@ -121,6 +124,12 @@ pub const Outcome = struct {
     /// full and the incremental path). The outcome owns it; `freeOutcome`
     /// frees it.
     snapshot: ?abi.Snapshot = null,
+    /// Why no usable Zig was found (the locator's kind of failure; `message`
+    /// holds its sentence), or `.none`.
+    zig_problem: ZigProblem = .none,
+    /// How many of `diagnostics`, at the end of the list, are scan problems
+    /// (the rest are compile errors).
+    scan_problems: u32 = 0,
 };
 
 pub const WarmState = enum {
@@ -165,6 +174,26 @@ var live_threads: std.atomic.Value(u32) = .init(0);
 pub fn liveThreads() u32 {
     return live_threads.load(.acquire);
 }
+
+/// Configured Zig paths (`BuildService.setZigPaths`), owned.
+const ZigPaths = struct {
+    project: ?[]const u8 = null,
+    editor: ?[]const u8 = null,
+
+    fn deinit(p: ZigPaths, a: std.mem.Allocator) void {
+        if (p.project) |x| a.free(x);
+        if (p.editor) |x| a.free(x);
+    }
+
+    fn eql(p: ZigPaths, q: ZigPaths) bool {
+        return optEql(p.project, q.project) and optEql(p.editor, q.editor);
+    }
+
+    fn optEql(x: ?[]const u8, y: ?[]const u8) bool {
+        if (x == null or y == null) return x == null and y == null;
+        return std.mem.eql(u8, x.?, y.?);
+    }
+};
 
 /// Everything is borrowed: the slices and paths must outlive the service.
 pub const Config = struct {
@@ -254,6 +283,10 @@ pub const BuildService = struct {
     store: GenerationStore,
     /// Used by the build thread only.
     zig: ?ZigInstall = null,
+    /// The configured Zig paths the build thread locates with, once
+    /// `setZigPaths` was called (before that, `Config.locate`'s). Build
+    /// thread only.
+    zig_paths: ?ZigPaths = null,
 
     /// Guards every field below up to `session_mu`. Held only briefly, so
     /// `request` never waits for a build.
@@ -303,6 +336,9 @@ pub const BuildService = struct {
     last_build_id: ?[16]u8 = null,
     /// See `Stats.table_check_us`. Guarded by `mu`.
     table_check_us: u64 = 0,
+    /// The newest `setZigPaths` paths, until the build thread takes them.
+    /// Guarded by `mu`.
+    new_zig_paths: ?ZigPaths = null,
     /// The table snapshot and file fingerprints of the last build whose
     /// table was checked and validated. Build thread only.
     prev: ?Prev = null,
@@ -344,6 +380,30 @@ pub const BuildService = struct {
         if (self.stopping) return;
         self.pending = t;
         self.cond.broadcast(self.io);
+    }
+
+    /// Replaces the configured Zig paths of `Config.locate` (`configured`,
+    /// the project's override, and `configured_editor`) with copies of
+    /// these; null clears one. Safe from any thread; never waits for a
+    /// build. The next build that starts uses them, and when they differ
+    /// from the paths it located with, it locates Zig again. For a host
+    /// that reads its settings at each request: call it before `request`.
+    pub fn setZigPaths(self: *BuildService, project: ?[]const u8, editor: ?[]const u8) std.mem.Allocator.Error!void {
+        var paths: ZigPaths = .{};
+        errdefer paths.deinit(self.a);
+        if (project) |p| paths.project = try self.a.dupe(u8, p);
+        if (editor) |e| paths.editor = try self.a.dupe(u8, e);
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        if (self.new_zig_paths) |old| old.deinit(self.a);
+        self.new_zig_paths = paths;
+    }
+
+    /// True while a build runs or one is pending. Any thread.
+    pub fn busy(self: *BuildService) bool {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        return self.building or self.pending != null;
     }
 
     /// As `request`, and that build takes the full path: the incremental
@@ -452,6 +512,8 @@ pub const BuildService = struct {
         if (self.warm_argv) |v| workspace.Workspace.freeArgv(self.a, v);
         if (self.full_slot) |*s| s.deinit();
         if (self.zig) |z| z.deinit(self.a);
+        if (self.zig_paths) |p| p.deinit(self.a);
+        if (self.new_zig_paths) |p| p.deinit(self.a);
         if (self.last_outcome) |o| freeOutcome(self.a, o);
         if (self.prev) |p| p.deinit(self.a);
         self.scan_cache.deinit();
@@ -594,6 +656,7 @@ pub const BuildService = struct {
         if (o.ok) self.last_build_id = sc.build_id;
         if (o.ok) if (o.snapshot) |*snap| self.remember(sc, snap);
         try appendProblems(a, o, sc.problems);
+        o.scan_problems = @intCast(sc.problems.len);
         if (stale.found) {
             try addStaleNote(a, o);
             stale.noted = true;
@@ -687,15 +750,47 @@ pub const BuildService = struct {
     }
 
     fn locateZig(self: *BuildService, o: *Outcome) !ZigInstall {
+        self.takeZigPaths();
         if (self.zig) |z| return z;
+        var cfg = self.cfg.locate;
+        if (self.zig_paths) |p| {
+            cfg.configured = if (p.project) |x| .fromTrusted(x) else null;
+            cfg.configured_editor = if (p.editor) |x| .fromTrusted(x) else null;
+        }
         var msg: std.ArrayList(u8) = .empty;
         defer msg.deinit(self.a);
-        const z = platform.zig_locator.locate(self.a, self.io, self.cfg.locate, &msg) catch |err| {
-            if (err == error.ZigNotUsable) o.message = try self.a.dupe(u8, msg.items);
+        var problem: ZigProblem = .none;
+        const z = platform.zig_locator.locateProblem(self.a, self.io, cfg, &msg, &problem) catch |err| {
+            if (err == error.ZigNotUsable) {
+                o.zig_problem = problem;
+                o.message = try self.a.dupe(u8, msg.items);
+            }
             return err;
         };
         self.zig = z;
         return z;
+    }
+
+    /// Takes the paths of the newest `setZigPaths`; when they differ from
+    /// the ones in use, the located Zig is dropped, so it is located again.
+    fn takeZigPaths(self: *BuildService) void {
+        const new = blk: {
+            self.mu.lockUncancelable(self.io);
+            defer self.mu.unlock(self.io);
+            const n = self.new_zig_paths orelse return;
+            self.new_zig_paths = null;
+            break :blk n;
+        };
+        const cur: ZigPaths = self.zig_paths orelse .{
+            .project = if (self.cfg.locate.configured) |c| c.bytes else null,
+            .editor = if (self.cfg.locate.configured_editor) |c| c.bytes else null,
+        };
+        const same = cur.eql(new);
+        if (self.zig_paths) |old| old.deinit(self.a);
+        self.zig_paths = new;
+        if (same) return;
+        if (self.zig) |z| z.deinit(self.a);
+        self.zig = null;
     }
 
     /// `Workspace.prepare`, waiting for `build.lock` in short slices so that
@@ -1421,6 +1516,91 @@ test "waitIdle from the callback is refused" {
     try svc.waitIdle(10_000);
     try testing.expectEqual(@as(u8, 2), probe.wait_result.load(.acquire));
     try testing.expect(!svc.last().?.ok);
+}
+
+/// Requests a build and returns a deep copy of its outcome.
+fn buildOnce(svc: *BuildService, a: std.mem.Allocator, t: Trigger) !Outcome {
+    svc.request(t);
+    try svc.waitIdle(30_000);
+    return (try svc.lastCopy(a)).?;
+}
+
+test "outcomes carry the Zig problem, and new Zig paths are used at the next build" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+    try tmp.dir.writeFile(io, .{ .sub_path = "old-zig", .data = "#!/bin/sh\necho 0.16.0\n", .flags = .{ .permissions = .executable_file } });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mute-zig", .data = "#!/bin/sh\nexit 3\n", .flags = .{ .permissions = .executable_file } });
+    const old = try std.fs.path.join(a, &.{ base, "old-zig" });
+    defer a.free(old);
+    const mute = try std.fs.path.join(a, &.{ base, "mute-zig" });
+    defer a.free(mute);
+    // No Zig anywhere in this configuration.
+    const svc = try BuildService.init(a, io, testConfig(base, &.{.{ .name = "ziggurat", .root = .fromTrusted(base), .deps = &.{} }}));
+    defer svc.deinit();
+
+    const missing = try buildOnce(svc, a, .manual);
+    defer freeOutcome(a, missing);
+    try testing.expect(!missing.ok);
+    try testing.expectEqual(Trigger.manual, missing.trigger);
+    try testing.expectEqual(ZigProblem.missing, missing.zig_problem);
+
+    // The editor setting alone.
+    try svc.setZigPaths(null, old);
+    const wrong = try buildOnce(svc, a, .manual);
+    defer freeOutcome(a, wrong);
+    try testing.expectEqual(ZigProblem.wrong_version, wrong.zig_problem);
+    try testing.expect(std.mem.indexOf(u8, wrong.message.?, "is Zig 0.16.0") != null);
+
+    // The project setting comes first.
+    try svc.setZigPaths(mute, old);
+    const silent = try buildOnce(svc, a, .save);
+    defer freeOutcome(a, silent);
+    try testing.expectEqual(ZigProblem.no_answer, silent.zig_problem);
+
+    // Cleared again: nothing is found.
+    try svc.setZigPaths(null, null);
+    const gone = try buildOnce(svc, a, .manual);
+    defer freeOutcome(a, gone);
+    try testing.expectEqual(ZigProblem.missing, gone.zig_problem);
+    try testing.expect(!svc.busy());
+}
+
+test "a located Zig is located again when the paths change" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+    // Reports the pinned version, then fails every other command at once.
+    try tmp.dir.writeFile(io, .{ .sub_path = "good-zig", .data = "#!/bin/sh\nif [ \"$1\" = version ]; then echo " ++ platform.pins.zig_version ++ "; exit 0; fi\nexit 1\n", .flags = .{ .permissions = .executable_file } });
+    try tmp.dir.writeFile(io, .{ .sub_path = "old-zig", .data = "#!/bin/sh\necho 0.16.0\n", .flags = .{ .permissions = .executable_file } });
+    const good = try std.fs.path.join(a, &.{ base, "good-zig" });
+    defer a.free(good);
+    const old = try std.fs.path.join(a, &.{ base, "old-zig" });
+    defer a.free(old);
+    const svc = try BuildService.init(a, io, testConfig(base, &.{.{ .name = "ziggurat", .root = .fromTrusted(base), .deps = &.{} }}));
+    defer svc.deinit();
+
+    try svc.setZigPaths(good, null);
+    const first = try buildOnce(svc, a, .manual);
+    defer freeOutcome(a, first);
+    try testing.expectEqual(ZigProblem.none, first.zig_problem);
+    // Same paths again: the located Zig stays.
+    try svc.setZigPaths(good, null);
+    const same = try buildOnce(svc, a, .manual);
+    defer freeOutcome(a, same);
+    try testing.expectEqual(ZigProblem.none, same.zig_problem);
+    try svc.setZigPaths(old, null);
+    const changed = try buildOnce(svc, a, .manual);
+    defer freeOutcome(a, changed);
+    try testing.expectEqual(ZigProblem.wrong_version, changed.zig_problem);
 }
 
 fn testConfig(base: []const u8, sdk: []const workspace.ModuleDep) Config {

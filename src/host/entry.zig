@@ -10,9 +10,13 @@
 //! created and registered at SCENE init and unregistered and destroyed at
 //! SCENE exit, which is what keeps Godot's ObjectDB leak check quiet at exit.
 //! In the editor the build service starts at SCENE init (editor_build.zig);
-//! in a game the generation the editor built is loaded (game.zig). An export
-//! build (`host_options.export_build`) has neither: its game runs without a
-//! generation manifest.
+//! in a game the generation the editor built is loaded (game.zig). The
+//! editor classes (`ZigEditorPlugin`, editor_plugin.zig) are registered at
+//! EDITOR init, where their parents exist, and the plugin is handed to the
+//! editor there; a game started from an editor binary registers the class
+//! but adds no plugin. An export build (`host_options.export_build`) has
+//! none of this: no editor classes, and its game runs without a generation
+//! manifest.
 const std = @import("std");
 const godot = @import("gdzig");
 const version = @import("version.zig");
@@ -28,6 +32,7 @@ const instance = @import("instance.zig");
 const placeholder = @import("placeholder.zig");
 const resource = @import("resource.zig");
 const editor_build = @import("editor_build.zig");
+const editor_plugin = @import("editor_plugin.zig");
 const game = @import("game.zig");
 
 const c = godot.c;
@@ -90,6 +95,7 @@ export fn ziggurat_host_init(
     registry.addClass(script.ZigScript, registry.allocator, .auto);
     registry.addClass(resource.ZigLoader, registry.allocator, .auto);
     registry.addClass(resource.ZigSaver, registry.allocator, .auto);
+    if (comptime !host_options.export_build) editor_plugin.register(&registry);
     if (host_options.test_probe) {
         const probe = registry.createClass(test_probe.ZigguratTestProbe, registry.allocator, .auto);
         inline for (test_probe.method_names) |name| probe.addMethod(name, .auto);
@@ -140,6 +146,12 @@ fn ignoreLevel(_: ?*anyopaque, _: c.GDExtensionInitializationLevel) callconv(.c)
 
 const Lifecycle = struct {
     pub fn enter(_: *Lifecycle, level: godot.extension.InitializationLevel) void {
+        // The editor classes are registered by now (the registry commits
+        // a level's classes before its callbacks).
+        if (level == .editor) {
+            if (comptime !host_options.export_build) editor_plugin.addToEditor();
+            return;
+        }
         if (level != .scene) return;
         script.setEditorHint(Engine.isEditorHint());
         var alloc = godot.engine_allocator;
@@ -170,6 +182,10 @@ const Lifecycle = struct {
     }
 
     pub fn exit(_: *Lifecycle, level: godot.extension.InitializationLevel) void {
+        if (level == .editor) {
+            if (comptime !host_options.export_build) editor_plugin.removeFromEditor();
+            return;
+        }
         if (level != .scene) return;
         // Order: the language goes first, then the module names. Godot has
         // deleted the main loop and its scene tree before this point
@@ -327,4 +343,6 @@ test {
     _ = @import("load_checks.zig");
     _ = editor_build;
     _ = game;
+    _ = @import("host_callable.zig");
+    _ = editor_plugin;
 }
