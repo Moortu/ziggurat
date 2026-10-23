@@ -345,4 +345,5 @@ test {
     _ = game;
     _ = @import("host_callable.zig");
     _ = editor_plugin;
+    _ = @import("editor_panel.zig");
 }

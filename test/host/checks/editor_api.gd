@@ -7,7 +7,7 @@ extends Node
 # holds three lines: the wrapper, a fake Zig that reports another version,
 # and a path where no file exists. `PATH` has no Zig and the per-user
 # folders are inside the test's folder, so the settings decide which Zig is
-# found. The check drives `editor_build.requestBuild` and reads
+# found. A relative Zig path is a failed outcome. The check drives `editor_build.requestBuild` and reads
 # `editor_build.status` and `diagnosticsCopy` through the probe. Settings
 # are read again at each request. Prints one ZTEST line per case, then
 # ZTEST DONE, and quits the editor.
@@ -110,6 +110,20 @@ func run() -> void:
 	ProjectSettings.set_setting(SETTING, wrapper)
 	st = await build("manual")
 	report("api_project_setting_wins", st.ok and st.zig_problem == "none", str(st))
+	settings.set_setting(SETTING, "")
+
+	# A relative path builds nothing, but it is a failed outcome that names
+	# the setting, so the status shows it.
+	ProjectSettings.set_setting(SETTING, "relative/zig")
+	st = await build("manual")
+	report("api_relative_path", not st.ok and st.trigger == "manual" and st.zig_problem == "missing" and st.n == -1 and str(st.message).contains("project setting ziggurat/zig_path (relative/zig)") and str(st.message).contains("not an absolute path"), str(st))
+	# A relative editor setting does not matter while the project setting
+	# is set.
+	ProjectSettings.set_setting(SETTING, wrapper)
+	settings.set_setting(SETTING, "relative/zig")
+	var before: int = probe.editor_build_outcomes()
+	st = await build("manual")
+	report("api_relative_editor_ignored", probe.editor_build_outcomes() > before and st.ok and st.zig_problem == "none", str(st))
 	settings.set_setting(SETTING, "")
 
 	# A compile error: counted, and listed per file by `diagnosticsCopy`.

@@ -1578,15 +1578,7 @@ test "public build API" {
     defer dir.close(io);
     const wrapper = try std.fs.path.join(a, &.{ root, "zig-wrapper.sh" });
     try dir.writeFile(io, .{ .sub_path = "zigs.txt", .data = try std.fmt.allocPrint(a, "{s}\n{s}\n{s}\n", .{ wrapper, old_zig, missing }) });
-    // `PATH` holds only `sleep` (the wrapper waits with it), so the locator
-    // finds no Zig there.
-    try p.tmp.dir.createDirPath(io, "bin");
-    const bin = try std.fs.path.join(a, &.{ root, "bin" });
-    const which = try std.process.run(a, io, .{ .argv = &.{ "sh", "-c", "command -v sleep" } });
-    const sleep = std.mem.trim(u8, which.stdout, " \t\r\n");
-    if (!which.term.success() or sleep.len == 0) return error.NoSleep;
-    try Io.Dir.cwd().symLink(io, sleep, try std.fs.path.join(a, &.{ bin, "sleep" }), .{});
-    try p.env.?.put("PATH", bin);
+    try pathWithoutZig(&p);
     try p.addAutoloadCheck("editor_api.gd");
     try p.runEditorChecked("10000000", .{
         .expect = &.{
@@ -1598,9 +1590,61 @@ test "public build API" {
             "ZTEST PASS api_zig_wrong_version",
             "ZTEST PASS api_editor_setting_used",
             "ZTEST PASS api_project_setting_wins",
+            "ZTEST PASS api_relative_path",
+            "ZTEST PASS api_relative_editor_ignored",
             "ZTEST PASS api_diagnostics",
             "ZTEST PASS api_diagnostics_cleared",
             "ZTEST PASS api_unknown_trigger",
+            "build service stopped (0 threads left)",
+        },
+        .deadline = build_deadline_s,
+    });
+}
+
+/// Sets Godot's `PATH` to a folder that holds only `sleep` (the Zig
+/// wrapper waits with it), so the locator finds no Zig there.
+fn pathWithoutZig(p: *Project) !void {
+    const a = p.arena_state.allocator();
+    const root = try p.tmp.dir.realPathFileAlloc(io, ".", a);
+    try p.tmp.dir.createDirPath(io, "bin");
+    const bin = try std.fs.path.join(a, &.{ root, "bin" });
+    const which = try std.process.run(a, io, .{ .argv = &.{ "sh", "-c", "command -v sleep" } });
+    const sleep = std.mem.trim(u8, which.stdout, " \t\r\n");
+    if (!which.term.success() or sleep.len == 0) return error.NoSleep;
+    try Io.Dir.cwd().symLink(io, sleep, try std.fs.path.join(a, &.{ bin, "sleep" }), .{});
+    try p.env.?.put("PATH", bin);
+}
+
+test "zig panel" {
+    try requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("editor_panel");
+    defer p.deinit();
+    const a = p.arena_state.allocator();
+    _ = try addZigWrapper(&p);
+    try isolateUserFolders(&p);
+    try pathWithoutZig(&p);
+    const root = try p.tmp.dir.realPathFileAlloc(io, ".", a);
+    const wrapper = try std.fs.path.join(a, &.{ root, "zig-wrapper.sh" });
+    const missing = try std.fs.path.join(a, &.{ root, "no-such-folder", "zig" });
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+    defer dir.close(io);
+    try dir.writeFile(io, .{ .sub_path = "zigs.txt", .data = try std.fmt.allocPrint(a, "{s}\n{s}\n", .{ wrapper, missing }) });
+    try p.addAutoloadCheck("editor_panel.gd");
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS panel_dock",
+            "ZTEST PASS panel_shows_build",
+            "ZTEST PASS panel_download_menu_item",
+            "ZTEST PASS panel_build_menu_item",
+            "ZTEST PASS panel_build_button",
+            "ZTEST PASS panel_failed_status",
+            "ZTEST PASS panel_lists_errors",
+            "ZTEST PASS panel_link_opens_script",
+            "ZTEST PASS panel_failure_toast",
+            "ZTEST PASS panel_missing_zig_toast",
+            "ZTEST PASS panel_repaired",
             "build service stopped (0 threads left)",
         },
         .deadline = build_deadline_s,

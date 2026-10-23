@@ -24,6 +24,7 @@ const gate = @import("gate.zig");
 const registry = @import("registry.zig");
 const swap = @import("swap.zig");
 const editor_plugin = @import("editor_plugin.zig");
+const editor_panel = @import("editor_panel.zig");
 const host_callable = @import("host_callable.zig");
 const Callable = godot.builtin.Callable;
 const PackedStringArray = godot.builtin.PackedStringArray;
@@ -632,6 +633,20 @@ pub const ZigguratTestProbe = struct {
         return src.connectRaw(signal, c, .{}) == .ok;
     }
 
+    /// The toasts the Zig panel pushed so far, as `<severity>: <text>`
+    /// (`editor_panel.toast_log`).
+    pub fn editorPanelToasts(_: *ZigguratTestProbe) Array {
+        var out = Array.init();
+        for (0..editor_panel.toast_count) |i| {
+            var s = String.fromUtf8(editor_panel.toast_log[i][0..editor_panel.toast_log_len[i]]) catch continue;
+            defer s.deinit();
+            const v = Variant.init(String, s);
+            out.pushBack(v);
+            v.deinit();
+        }
+        return out;
+    }
+
     /// Calls of the editor plugin's test method so far.
     pub fn editorPluginPings(_: *ZigguratTestProbe) i64 {
         return editor_plugin.test_pings;
@@ -963,7 +978,7 @@ pub const method_names = [_][:0]const u8{
     "generation_loaded",        "language_frame",              "language_stack_info",      "queue_pending",
     "queue_nested_frame_check", "language_nested_frames",      "gate_hold",                "default_mismatch_once",
     "editor_build_request",     "editor_build_status",         "editor_build_diagnostics", "editor_plugin_connect",
-    "editor_plugin_pings",
+    "editor_plugin_pings",      "editor_panel_toasts",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

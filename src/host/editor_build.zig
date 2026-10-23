@@ -5,19 +5,24 @@
 //! - `start` (SCENE init, editor only) registers the project settings
 //!   `ziggurat/zig_path` (the project's override of the Zig path) and
 //!   `ziggurat/dev/sdk_manifest` (absolute path of an SDK module manifest),
-//!   starts a `BuildService` for the project and queues the build at
-//!   project open for the first frame (the editor setting can be read
-//!   only once the editor exists). A missing or unusable SDK manifest
-//!   setting is one log sentence that names it; then nothing builds and
-//!   scripts keep the descriptor cache.
+//!   starts a `BuildService` for the project and requests the build at
+//!   project open: at once when the project setting `ziggurat/zig_path` is
+//!   set (it wins over the editor setting), otherwise when the editor
+//!   plugin enters the tree (`editorReady`; the editor setting can be read
+//!   only once the editor exists), with the first frame as the fallback. A
+//!   missing or unusable SDK manifest setting is one log sentence that
+//!   names it; then nothing builds and scripts keep the descriptor cache.
 //! - The editor plugin registers the editor setting `ziggurat/zig_path`
 //!   (the per-user Zig path; `registerEditorSettings`).
 //! - Every build request (`requestBuild`: open, save, the plugin's
 //!   triggers) reads both Zig path settings again and hands them to the
 //!   service (`BuildService.setZigPaths`): the project setting wins when
 //!   set, then the editor setting, the downloaded toolchain and `PATH`
-//!   (the Zig locator's order). A relative path is one log sentence, and
-//!   that request builds nothing.
+//!   (the Zig locator's order). The editor setting is checked only while
+//!   the project setting is empty (otherwise a relative one is left out).
+//!   A relative path that is checked builds nothing: the
+//!   request gives a failed outcome at once (`zig_problem` `missing`, its
+//!   message names the setting), so `status` and the Zig panel show it.
 //! - Every successful save of a `.zig` file (`resource.on_saved`, any
 //!   thread) queues a save request for the main thread.
 //! - The service calls `onOutcome` on its build thread. It copies the
@@ -157,6 +162,9 @@ var queued_outcomes: std.atomic.Value(u32) = .init(0);
 /// (C allocator). Main thread.
 var last_applied: ?LastStore = null;
 
+/// `Status.good_n`. Main thread.
+var good_n: ?u32 = null;
+
 // ------------------------------------------------------------ public API
 
 /// A summary of one applied build outcome (`status`).
@@ -186,6 +194,9 @@ pub const Status = struct {
     building: bool,
     /// The last applied outcome, or null before the first.
     last: ?Last,
+    /// The generation of the last build the editor took into use in this
+    /// session (`Last.ok`), or null before the first.
+    good_n: ?u32 = null,
 };
 
 /// The diagnostics of one file (`diagnosticsCopy`).
@@ -204,8 +215,12 @@ pub const FileDiagnostics = struct {
 /// thread.
 pub fn requestBuild(t: Trigger) void {
     const st = if (state) |*s| s else return;
-    if (!passZigPaths(st)) return;
-    st.svc.request(t);
+    var buf: [max_path_bytes + 256]u8 = undefined;
+    switch (passZigPaths(st, &buf)) {
+        .ok => st.svc.request(t),
+        .unusable => |text| failNow(t, text),
+        .out_of_memory => {},
+    }
 }
 
 /// Whether a build runs and the last applied outcome. Main thread; the
@@ -213,7 +228,7 @@ pub fn requestBuild(t: Trigger) void {
 pub fn status() Status {
     const st = state orelse return .{ .building = false, .last = null };
     const building = st.svc.busy() or queued_outcomes.load(.acquire) != 0;
-    return .{ .building = building, .last = if (last_applied) |l| l.info else null };
+    return .{ .building = building, .last = if (last_applied) |l| l.info else null, .good_n = good_n };
 }
 
 /// A copy of the last applied outcome's diagnostics, grouped per file in
@@ -276,35 +291,61 @@ fn editorSettings() ?*godot.class.EditorSettings {
 }
 
 /// Drops the reference a `Ref` return gave the caller.
-fn releaseRef(obj: anytype) void {
+pub fn releaseRef(obj: anytype) void {
     const rc = godot.class.RefCounted.upcast(obj);
     if (rc.unreference()) godot.raw.objectDestroy(@ptrCast(rc));
 }
 
-/// Reads both Zig path settings and hands them to the service. False (and
-/// one log sentence) when one is set but not an absolute path, or out of
-/// memory.
-fn passZigPaths(st: *State) bool {
+const PathCheck = union(enum) {
+    ok,
+    /// The sentence that names the unusable setting (in the caller's
+    /// buffer).
+    unusable: []const u8,
+    out_of_memory,
+};
+
+/// Reads both Zig path settings and hands them to the service. A relative
+/// project setting is `unusable`, with one sentence that names it written
+/// to `buf`. The editor setting is checked only while the project setting
+/// is empty: then a relative one is `unusable` too; while the project
+/// setting is set (it wins), a relative editor setting is left out and an
+/// absolute one stays the locator's next candidate.
+fn passZigPaths(st: *State, buf: []u8) PathCheck {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const project = settingText(a, setting_zig_path) catch return oom();
     const editor = editorSettingText(a, setting_zig_path) catch return oom();
-    if (project.len != 0 and !isAbsolute(project)) {
-        log("Ziggurat does not build Zig scripts: the project setting " ++ setting_zig_path ++ " ({s}) is not usable, because it is not an absolute path.", .{project});
-        return false;
-    }
-    if (editor.len != 0 and !isAbsolute(editor)) {
-        log("Ziggurat does not build Zig scripts: the editor setting " ++ setting_zig_path ++ " ({s}) is not usable, because it is not an absolute path.", .{editor});
-        return false;
-    }
-    st.svc.setZigPaths(if (project.len != 0) project else null, if (editor.len != 0) editor else null) catch return oom();
-    return true;
+    if (project.len != 0 and !isAbsolute(project)) return unusable(buf, "project", project);
+    if (project.len == 0 and editor.len != 0 and !isAbsolute(editor)) return unusable(buf, "editor", editor);
+    const editor_path: ?[]const u8 = if (editor.len != 0 and isAbsolute(editor)) editor else null;
+    st.svc.setZigPaths(if (project.len != 0) project else null, editor_path) catch return oom();
+    return .ok;
 }
 
-fn oom() bool {
+fn unusable(buf: []u8, comptime kind: []const u8, value: []const u8) PathCheck {
+    const fmt = "Ziggurat does not build Zig scripts: the " ++ kind ++ " setting " ++ setting_zig_path ++ " ({s}) is not usable, because it is not an absolute path.";
+    return .{ .unusable = std.fmt.bufPrint(buf, fmt, .{value}) catch
+        std.fmt.bufPrint(buf, fmt, .{"too long"}) catch unreachable };
+}
+
+fn oom() PathCheck {
     logError("Ziggurat cannot build Zig scripts: out of memory.", .{});
-    return false;
+    return .out_of_memory;
+}
+
+/// A request that builds nothing because a Zig path setting is unusable:
+/// a failed outcome with `message` is queued for the main thread, as the
+/// service's outcomes are, so `status` and the panel show it.
+fn failNow(t: Trigger, message: []const u8) void {
+    const m = gpa.create(Msg) catch return logError("{s}", .{message});
+    m.* = .{ .trigger = t, .ok = false, .path = .full, .ms = 0, .zig_problem = .missing };
+    m.message = gpa.dupe(u8, message) catch {
+        m.free();
+        return logError("{s}", .{message});
+    };
+    _ = queued_outcomes.fetchAdd(1, .acq_rel);
+    main_queue.push(apply, m, drop) catch {};
 }
 
 /// The text of the editor setting `name`, allocated with `a`; empty when
@@ -399,6 +440,7 @@ pub fn stop() void {
     diag_files = .empty;
     if (last_applied) |l| l.deinit();
     last_applied = null;
+    good_n = null;
     open_pending = false;
 }
 
@@ -876,6 +918,7 @@ fn recordLast(m: *const Msg, use: Use, all: *const Files) Allocator.Error!void {
     const files = try copyFileDiagnostics(gpa, views);
     errdefer freeDiagnostics(gpa, files);
     const message: ?[]const u8 = if (m.message) |t| try gpa.dupe(u8, t) else null;
+    if (use == .used) good_n = m.gen_n;
     if (last_applied) |old| old.deinit();
     last_applied = .{
         .info = .{
