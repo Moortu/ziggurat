@@ -39,6 +39,7 @@
 const std = @import("std");
 const godot = @import("gdzig");
 const abi = @import("ziggurat_abi");
+const platform = @import("ziggurat_platform");
 const snake = @import("snake");
 const runtime = @import("runtime.zig");
 const props = @import("props.zig");
@@ -130,17 +131,20 @@ pub fn dropStartupCache() void {
 /// Descriptors made from one build's table snapshot.
 const SnapCache = struct {
     cache: desc_cache.Cache,
+    /// Every allocation of `cache` goes through it (`desc_cache.parseCounted`).
+    counter: platform.counting_allocator.CountingAllocator,
     /// The build's generation number.
     n: u32,
     /// Hash of the descriptors (the cache file bytes without the number).
     hash: u64,
-    /// The cache file bytes' length: a measure of what the parsed cache
-    /// holds (the parsed form is of the same order).
+    /// What the parsed cache holds, exactly (`counter.live` after the
+    /// parse; nothing allocates through it later).
     bytes: u64,
 };
 
-/// What the snapshot caches hold: their `SnapCache.bytes`, and how many
-/// are for builds that are not loaded. Main thread.
+/// What the snapshot caches hold, exactly (the sum of their
+/// `SnapCache.bytes`), and how many are for builds that are not loaded.
+/// Main thread.
 pub fn snapshotsHeld() struct { bytes: u64, unloaded_builds: u32 } {
     var bytes: u64 = 0;
     var unloaded: u32 = 0;
@@ -171,15 +175,18 @@ pub fn installSnapshot(n: u32, snap: *const abi.Snapshot) error{ OutOfMemory, Re
     if (newest_snap.load(.acquire)) |cur| {
         if (cur.hash == hash) return;
     }
+    // The counter lives in the `SnapCache`, which must not move while the
+    // cache does (the cache frees through it).
+    const sc = try a.create(SnapCache);
+    errdefer a.destroy(sc);
+    sc.* = .{ .cache = undefined, .counter = .init(a), .n = n, .hash = hash, .bytes = 0 };
     var diag: [256]u8 = undefined;
-    var cache = desc_cache.parse(a, bytes, &diag) catch |err| switch (err) {
+    sc.cache = desc_cache.parseCounted(&sc.counter, bytes, &diag) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Rejected, error.FileNotFound => return error.Rejected,
     };
-    errdefer cache.deinit();
-    const sc = try a.create(SnapCache);
-    errdefer a.destroy(sc);
-    sc.* = .{ .cache = cache, .n = n, .hash = hash, .bytes = bytes.len };
+    errdefer sc.cache.deinit();
+    sc.bytes = sc.counter.live;
     try snap_caches.append(a, sc);
     newest_snap.store(sc, .release);
 }

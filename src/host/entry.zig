@@ -214,6 +214,8 @@ const Lifecycle = struct {
             lang.destroy(&alloc);
             zig_language = null;
         }
+        // The queue is closed: every outcome it held was dropped.
+        if (comptime host_options.test_probe and !host_options.export_build) editor_build.reportExitLocks();
         const left = instance.live.load(.acquire);
         if (left != 0) log("ziggurat_host: {d} Zig script instance(s) still alive at exit (leaked objects)", .{left});
         // Module names are engine StringNames; Godot reports any still held.

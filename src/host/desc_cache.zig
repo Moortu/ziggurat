@@ -488,6 +488,14 @@ pub var rejections_logged: std.atomic.Value(u32) = .init(0);
 /// How many "dropped defaults" lines `read` has logged (for tests).
 pub var drops_logged: std.atomic.Value(u32) = .init(0);
 
+/// `parse` with every allocation through `counter`, so `counter.live` is
+/// then exactly what the parsed cache holds (spec section 6: the editor's
+/// memory figures). `counter` must not move while the cache lives:
+/// `Cache.deinit` frees through it.
+pub fn parseCounted(counter: *platform.counting_allocator.CountingAllocator, bytes: []const u8, diag: *[256]u8) ReadError!Cache {
+    return parse(counter.allocator(), bytes, diag);
+}
+
 /// Parses cache file bytes. On `error.Rejected` `diag` holds the reason, a
 /// clause that completes "the file ...". Pure: no engine calls.
 pub fn parse(a: Allocator, bytes: []const u8, diag: *[256]u8) ReadError!Cache {
@@ -1017,4 +1025,51 @@ test "a default with deep nesting rejects the file without recursion" {
 test "the printable path hides control bytes" {
     var buf: [64]u8 = undefined;
     try testing.expectEqualStrings("a?b?c?", printable(&buf, "a\nb\x00c\xff"));
+}
+
+test "snapshot bytes are exact" {
+    // The shape Stage 4 measured (research log, 300 scripts of 31
+    // properties and 30 methods): the parsed cache held 7,801,740 bytes for
+    // a 3,651,083-byte file. The figure the editor keeps must be the parsed
+    // size within 1 %, not the file length (about 47 % of it).
+    const measured_parse_bytes: u64 = 7_801_740;
+    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const ar = arena_state.allocator();
+    const n_scripts = 300;
+    const scripts = try ar.alloc(abi.snapshot.ScriptSnap, n_scripts);
+    for (scripts, 0..) |*s, k| {
+        const pl = try ar.alloc(abi.snapshot.PropertySnap, 31);
+        for (pl[0..30], 0..) |*p, f| {
+            const v: i64 = @intCast((k + f) % 97);
+            p.* = .{ .name = try std.fmt.allocPrint(ar, "f{d}", .{f}), .usage = 4102, .has_field = true, .variant_type = switch (f % 3) {
+                0 => default_value.t_int,
+                1 => default_value.t_float,
+                else => default_value.t_bool,
+            }, .default = switch (f % 3) {
+                0 => .{ .int = v },
+                1 => .{ .float = @as(f64, @floatFromInt(v)) + 0.5 },
+                else => .{ .boolean = @rem(v, 2) == 0 },
+            } };
+        }
+        pl[30] = .{ .name = "title", .usage = 4102, .has_field = true, .variant_type = default_value.t_string, .default = .string_empty };
+        const methods = try ar.alloc(abi.snapshot.MethodSnap, 30);
+        for (methods, 0..) |*m, j| m.* = .{ .name = try std.fmt.allocPrint(ar, "m{d}", .{j}), .flags = 1 };
+        s.* = .{ .path = try std.fmt.allocPrint(ar, "s{d}/script{d}.zig", .{ k % 10, k }), .base_class = "Node", .layout_hash = k, .properties = pl, .methods = methods };
+    }
+    const snap: abi.snapshot.Snapshot = .{ .build_id = "0123456789abcdef", .scripts = scripts };
+
+    // The editor's allocator for snapshot caches (script.installSnapshot).
+    const a = std.heap.c_allocator;
+    const bytes = try fromSnapshot(a, 0, &snap);
+    defer a.free(bytes);
+    var counter: platform.counting_allocator.CountingAllocator = .init(a);
+    var diag: [256]u8 = undefined;
+    var cache = try parseCounted(&counter, bytes, &diag);
+    const held = counter.live;
+    const diff = if (held > measured_parse_bytes) held - measured_parse_bytes else measured_parse_bytes - held;
+    try testing.expect(diff * 100 <= measured_parse_bytes);
+    try testing.expect(held > bytes.len * 2);
+    cache.deinit();
+    try testing.expectEqual(@as(u64, 0), counter.live);
 }

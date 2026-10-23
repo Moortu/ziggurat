@@ -35,6 +35,10 @@
 //! - The service calls `onOutcome` on its build thread. It copies the
 //!   outcome and pushes it onto the main-thread queue (`main_queue`), which
 //!   `ZigLanguage._frame` drains. `apply` then runs on the main thread.
+//!   A staged build arrives pinned (`Outcome.pin`, taken when the service
+//!   staged it), so no sweep deletes it while its outcome waits (spec risk
+//!   20); `apply` moves that pin into the editor's own pins, and an outcome
+//!   that is dropped or rejected releases it.
 //!   A good build's load checks (`load_checks`) run on the table snapshot
 //!   the service took (`Outcome.snapshot`), before anything is loaded; a
 //!   finding fails the build and nothing is loaded. Then the editor
@@ -53,9 +57,11 @@
 //!   loses its last tool script keeps loading while instances of the old
 //!   tool scripts are alive (so open tool nodes get the newest code), then
 //!   stops; nothing is ever unloaded. The loaded libraries' allocated bytes
-//!   and the kept snapshot descriptors are summed, and above
-//!   `size_warning_bytes` one warning per session suggests a restart. A
-//!   failed build keeps the last good one.
+//!   and the kept snapshot descriptors (the scripts' parsed ones and the
+//!   service's, both counted exactly) are summed (`memory`, shown on the
+//!   Zig panel by `memoryText`), and above `size_warning_bytes` one warning
+//!   per session suggests a restart. A failed build keeps the last good
+//!   one.
 //!   Either way each diagnostic is printed as one line through Godot's error
 //!   printing (`<file>:<line>:<column>: <message>`, or `<file>: <message>`
 //!   without a line) and stored per file for `_validate` (`diag_cache`), and
@@ -95,6 +101,7 @@ const Allocator = std.mem.Allocator;
 const OsPath = platform.path.OsPath;
 const BuildService = zbuild.service.BuildService;
 const Outcome = zbuild.service.Outcome;
+const FileLock = platform.generation_store.FileLock;
 pub const Trigger = zbuild.service.Trigger;
 pub const BuildPath = zbuild.service.BuildPath;
 pub const ZigProblem = zbuild.service.ZigProblem;
@@ -578,6 +585,12 @@ pub fn stop() void {
         for (st.pins.items) |*l| l.release();
         st.pins.deinit(gpa);
         if (st.manifest_pin) |*l| l.release();
+        if (comptime @import("host_options").test_probe) {
+            if (st.store_root.len <= exit_root_buf.len) {
+                @memcpy(exit_root_buf[0..st.store_root.len], st.store_root);
+                exit_root_len = st.store_root.len;
+            }
+        }
         st.sdk.deinit(gpa);
         st.arena.deinit();
         state = null;
@@ -941,10 +954,19 @@ const Msg = struct {
     zig_problem: ZigProblem = .none,
     /// How many of `diags`, at the end, are scan problems.
     scan_problems: u32 = 0,
+    /// The outcome's staging pin on `gen_n` (`Outcome.pin`), so no sweep
+    /// deletes the build before `apply` loads it (spec risk 20).
+    /// `applyGood` moves it into the editor's pins (`notePinned`, or
+    /// `writeManifest` when the build is not loaded); `free` releases it
+    /// when it is still here: the outcome was dropped (queue closed, out of
+    /// memory, no service) or the build was rejected.
+    pin: ?FileLock = null,
 
     const Diag = struct { rel: ?[]u8, line: u32, column: u32, message: []u8 };
 
-    fn copy(o: *const Outcome) Allocator.Error!*Msg {
+    /// Takes the outcome's staging pin (the outcome is the service's, on the
+    /// build thread); everything else is copied.
+    fn copy(o: *Outcome) Allocator.Error!*Msg {
         const m = try gpa.create(Msg);
         m.* = .{
             .trigger = o.trigger,
@@ -977,6 +999,9 @@ const Msg = struct {
             list.appendAssumeCapacity(.{ .rel = rel, .line = d.line, .column = d.column, .message = text });
         }
         m.diags = try list.toOwnedSlice(gpa);
+        // Last, after everything that can fail: out of memory, the outcome
+        // keeps its pin and the service releases it.
+        m.pin = o.takePin();
         return m;
     }
 
@@ -986,6 +1011,7 @@ const Msg = struct {
     }
 
     fn free(m: *Msg) void {
+        if (m.pin) |*l| l.release();
         if (m.lib) |l| gpa.free(l);
         if (m.message) |t| gpa.free(t);
         if (m.snap) |sn| sn.deinit(gpa);
@@ -998,7 +1024,7 @@ const Msg = struct {
 /// The service's `on_outcome`: build thread. Copies the outcome for the
 /// main thread; out of memory, the outcome is lost (the next build reports
 /// again).
-fn onOutcome(_: ?*anyopaque, o: *const Outcome) void {
+fn onOutcome(_: ?*anyopaque, o: *Outcome) void {
     const m = Msg.copy(o) catch return;
     // Counted while the service still counts the build as running, so
     // `status` never shows a gap between the two.
@@ -1026,7 +1052,7 @@ fn apply(ctx: ?*anyopaque) void {
     _ = outcomes_applied.fetchAdd(1, .release);
 }
 
-fn applyMsg(m: *const Msg) Allocator.Error!void {
+fn applyMsg(m: *Msg) Allocator.Error!void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1118,7 +1144,7 @@ fn recordLast(m: *const Msg, use: Use, all: *const Files) Allocator.Error!void {
 
 /// A good build (see the file comment). `all` also gets the load-check
 /// findings.
-fn applyGood(a: Allocator, st: *State, m: *const Msg, files: *Files, all: *Files) Allocator.Error!Use {
+fn applyGood(a: Allocator, st: *State, m: *Msg, files: *Files, all: *Files) Allocator.Error!Use {
     const io = host_io.get();
     const lib = m.lib.?;
     const snap: ?*const abi.Snapshot = if (m.snap) |*sn| sn else null;
@@ -1154,7 +1180,7 @@ fn applyGood(a: Allocator, st: *State, m: *const Msg, files: *Files, all: *Files
                 desc_cache.writeSnapshot(gpa, io, .fromTrusted(path), m.gen_n, sn) catch |err|
                     logError("Ziggurat could not write the descriptor cache {s} ({s}).", .{ path, @errorName(err) });
             }
-            writeManifest(st, m.gen_n, lib);
+            writeManifest(st, m.gen_n, lib, &m.pin);
             log("ziggurat: build {d} ready ({t}, {t}, {d} ms); the editor did not load it, because the project has no tool scripts", .{ m.gen_n, m.trigger, m.path, m.ms });
             warnSize(st);
             return .used;
@@ -1171,7 +1197,7 @@ fn applyGood(a: Allocator, st: *State, m: *const Msg, files: *Files, all: *Files
             return .not_used;
         },
     };
-    notePinned(st, g.n);
+    notePinned(st, g.n, &m.pin);
     if (snap == null) {
         const findings = try load_checks.run(a, g);
         if (findings.len != 0) {
@@ -1194,7 +1220,7 @@ fn applyGood(a: Allocator, st: *State, m: *const Msg, files: *Files, all: *Files
         desc_cache.write(gpa, io, .fromTrusted(path), g) catch |err|
             logError("Ziggurat could not write the descriptor cache {s} ({s}).", .{ path, @errorName(err) });
     }
-    writeManifest(st, g.n, lib);
+    writeManifest(st, g.n, lib, &m.pin);
     log("ziggurat: build {d} loaded ({t}, {t}, {d} ms)", .{ g.n, m.trigger, m.path, m.ms });
     warnSize(st);
     return .used;
@@ -1252,14 +1278,18 @@ fn installSnapshot(n: u32, sn: *const abi.Snapshot) void {
         logError("Ziggurat could not use the descriptors of build {d} ({s}); the scripts keep the earlier ones.", .{ n, @errorName(err) });
 }
 
-/// Pins generation `n`, writes the manifest naming it, then releases the
-/// pin of the generation the previous manifest named (`State.manifest_pin`).
-/// A pin that fails is logged; the manifest is still written.
-fn writeManifest(st: *State, n: u32, lib: []const u8) void {
-    var lock: ?platform.generation_store.FileLock = st.store.pin(n) catch |err| blk: {
+/// Pins generation `n` (taking `staged`, the outcome's staging pin, when it
+/// is still there), writes the manifest naming it, then releases the pin of
+/// the generation the previous manifest named (`State.manifest_pin`). A pin
+/// that fails is logged; the manifest is still written. Then running games
+/// are told to reload (`debugger_plugin.sendReload`).
+fn writeManifest(st: *State, n: u32, lib: []const u8, staged: *?FileLock) void {
+    const taken = staged.*;
+    staged.* = null;
+    var lock: ?FileLock = taken orelse (st.store.pin(n) catch |err| blk: {
         logError("Ziggurat could not pin generation {d} in {s} ({s}); a later sweep may delete the build the manifest names.", .{ n, st.store_root, @errorName(err) });
         break :blk null;
-    };
+    });
     manifest.write(gpa, host_io.get(), .fromTrusted(st.store_root), n, std.fs.path.basename(lib)) catch |err| {
         logError("Ziggurat could not write the generation manifest in {s} ({s}).", .{ st.store_root, @errorName(err) });
         if (lock) |*l| l.release();
@@ -1274,19 +1304,102 @@ fn writeManifest(st: *State, n: u32, lib: []const u8) void {
 /// Warns once per session when what the editor holds of its builds exceeds
 /// `size_warning_bytes` (spec section 6): the loaded generations' bytes on
 /// disk (none is ever unloaded, and on Linux a mapped file frees nothing
-/// until the editor exits) plus the descriptors kept from snapshots
-/// (`script.snapshotsHeld`). `<n>` counts the builds held either way.
+/// until the editor exits) plus the descriptor snapshots: the parsed ones
+/// the scripts keep (`script.snapshotsHeld`) and the one the build service
+/// keeps (`Memory`; all exact). `<n>` counts the builds held either way.
 fn warnSize(st: *State) void {
     if (st.size_warned) return;
-    const held = script.snapshotsHeld();
-    const bytes = runtime.loadedBytes() +| held.bytes;
+    const mem = memory();
+    const bytes = mem.total();
     if (bytes <= size_warning_bytes) return;
     st.size_warned = true;
     var size_buf: [32]u8 = undefined;
     var buf: [256]u8 = undefined;
-    const msg = std.fmt.bufPrintSentinel(&buf, "Ziggurat has loaded {d} builds ({s}) in this editor session; restart the editor to free them.", .{ st.loaded_count + held.unloaded_builds, sizeText(&size_buf, bytes) }, 0) catch return;
+    const msg = std.fmt.bufPrintSentinel(&buf, "Ziggurat has loaded {d} builds ({s}) in this editor session; restart the editor to free them.", .{ st.loaded_count + mem.unloaded_builds, sizeText(&size_buf, bytes) }, 0) catch return;
     godot.raw.printWarning(msg.ptr, "Zig build", "src/host/editor_build.zig", @src().line, 1);
 }
+
+/// What the editor holds of its builds (spec section 6). Exact figures:
+/// `loaded_bytes` sums the loaded libraries' allocated bytes on disk
+/// (`runtime.loadedBytes`); `snapshot_bytes` is what the parsed snapshot
+/// descriptors hold (`script.snapshotsHeld`), and `service_snapshot_bytes`
+/// the table snapshot the build service keeps to compare the next build
+/// with, both counted when allocated.
+pub const Memory = struct {
+    loaded_builds: u32,
+    loaded_bytes: u64,
+    snapshot_bytes: u64,
+    service_snapshot_bytes: u64,
+    /// Builds whose snapshot descriptors are kept but which are not loaded.
+    unloaded_builds: u32,
+
+    /// What the size warning compares with `size_warning_bytes`.
+    pub fn total(m: Memory) u64 {
+        return m.loaded_bytes +| m.snapshot_bytes +| m.service_snapshot_bytes;
+    }
+
+    /// The descriptor snapshots' bytes: the editor's and the service's.
+    pub fn descriptorBytes(m: Memory) u64 {
+        return m.snapshot_bytes +| m.service_snapshot_bytes;
+    }
+};
+
+/// The editor's `Memory` now. Main thread.
+pub fn memory() Memory {
+    const held = script.snapshotsHeld();
+    return .{
+        .loaded_builds = runtime.loadedCount(),
+        .loaded_bytes = runtime.loadedBytes(),
+        .snapshot_bytes = held.bytes,
+        .service_snapshot_bytes = if (state) |st| st.svc.keptSnapshotBytes() else 0,
+        .unloaded_builds = held.unloaded_builds,
+    };
+}
+
+/// The Zig panel's memory line,
+/// `Loaded builds: <n> (<size>); descriptor snapshots: <size>`, in `buf`
+/// (128 bytes are enough); empty without a build service. Main thread.
+pub fn memoryText(buf: []u8) []const u8 {
+    if (state == null) return "";
+    const m = memory();
+    var loaded_buf: [32]u8 = undefined;
+    var snap_buf: [32]u8 = undefined;
+    return std.fmt.bufPrint(buf, "Loaded builds: {d} ({s}); descriptor snapshots: {s}", .{
+        m.loaded_builds, sizeText(&loaded_buf, m.loaded_bytes), sizeText(&snap_buf, m.descriptorBytes()),
+    }) catch "";
+}
+
+/// TEST ONLY (probe `editor_build_set_store_caps`): waits until the
+/// service is idle, then gives its generation store `caps`. Main thread.
+pub fn setStoreCapsForTest(caps: platform.generation_store.Caps) bool {
+    const st = &(state orelse return false);
+    st.svc.waitIdle(60_000) catch return false;
+    // The build thread waits for a request; the next `request` takes the
+    // service's lock, which orders this write before its next sweep.
+    st.svc.store.caps = caps;
+    return true;
+}
+
+/// TEST ONLY, probe builds: the store folder of the stopped service, kept
+/// by `stop` for `reportExitLocks`.
+var exit_root_buf: [max_path_bytes]u8 = undefined;
+var exit_root_len: usize = 0;
+
+/// TEST ONLY, probe builds, at SCENE exit after the main-thread queue
+/// closed: logs how many generations of the project's store are still
+/// pinned by anyone (`GenerationStore.heldPins`). Every pin of this editor
+/// is released by then: loaded builds and the manifest's at `stop`, a
+/// queued outcome's staging pin by the queue's drop hook.
+pub fn reportExitLocks() void {
+    if (exit_root_len == 0) return;
+    const root: OsPath = .fromTrusted(exit_root_buf[0..exit_root_len]);
+    exit_root_len = 0;
+    var store = platform.generation_store.GenerationStore.init(gpa, host_io.get(), root, builtin_os, zbuild.service.lib_stem, .{});
+    const held = store.heldPins() catch |err| return log("ziggurat: generation locks after exit unknown ({s})", .{@errorName(err)});
+    log("ziggurat: generation locks held after exit: {d}", .{held});
+}
+
+const builtin_os = @import("builtin").os.tag;
 
 /// `bytes` with one decimal in the largest binary unit it reaches
 /// ("2.1 GiB", "340.0 MiB", "12 bytes").
@@ -1304,15 +1417,18 @@ fn sizeText(buf: []u8, bytes: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d} bytes", .{bytes}) catch "";
 }
 
-/// Pins generation `n` and counts it (spec section 6: the host counts the
-/// generations it loaded; none is ever unloaded).
-fn notePinned(st: *State, n: u32) void {
+/// Pins generation `n` until SCENE exit and counts it (spec section 6: the
+/// host counts the generations it loaded; none is ever unloaded). The pin
+/// is `staged`, the outcome's staging pin, when it is still there.
+fn notePinned(st: *State, n: u32, staged: *?FileLock) void {
     st.loaded_count += 1;
     log("ziggurat: {d} generations loaded in this editor session", .{st.loaded_count});
-    const lock = st.store.pin(n) catch |err| {
+    const taken = staged.*;
+    staged.* = null;
+    const lock = taken orelse (st.store.pin(n) catch |err| {
         logError("Ziggurat could not pin generation {d} in {s} ({s}); a later sweep may delete its files.", .{ n, st.store_root, @errorName(err) });
         return;
-    };
+    });
     st.pins.append(gpa, lock) catch {
         var l = lock;
         l.release();

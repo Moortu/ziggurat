@@ -7,7 +7,9 @@
 //!   last applied build: `Build <n> ok (<trigger>, <path>, <ms> ms)` or
 //!   `Build failed: <e> errors, <w> warnings (<ms> ms); build <n> stays in
 //!   use`;
-//! - a memory line (hidden until `setMemory` gives it text);
+//! - a memory line, `Loaded builds: <n> (<size>); descriptor snapshots:
+//!   <size>` (`editor_build.memoryText`, refreshed by `update`; hidden
+//!   while the text is empty, that is without a build service);
 //! - a download row (hidden until `showDownload` shows it): the Zig
 //!   download's line and a Cancel button while it transfers;
 //! - a `RichTextLabel` of the last build's diagnostics. Each diagnostic in
@@ -167,6 +169,8 @@ pub const ZigPanel = struct {
         var buf: [256]u8 = undefined;
         const line = if (st.last) |l| statusLine(&buf, l, st.good_n) else "No build yet";
         setText(Label, self.status, "setText", line);
+        var memory_buf: [256]u8 = undefined;
+        self.setMemory(editor_build.memoryText(&memory_buf));
 
         const rt = self.diagnostics;
         rt.clear();

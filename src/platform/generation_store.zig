@@ -4,8 +4,11 @@
 //!
 //! Layout under `root`: `store.lock`, `gen/<n>/<libName>`, `gen/<n>/.lock`.
 //! `stage` and `sweep` hold `store.lock` exclusive. A running game pins a
-//! generation by holding `gen/<n>/.lock` shared (`pin`); `sweep` deletes a
-//! generation only when it can take that lock exclusive without waiting.
+//! generation by holding `gen/<n>/.lock` shared (`pin`); `stage` returns
+//! the new generation already pinned, so it survives every sweep until its
+//! user has loaded it; `sweep` deletes a generation only when it can take
+//! that lock exclusive without waiting, and pinned generations do not
+//! count toward the byte cap.
 const std = @import("std");
 const builtin = @import("builtin");
 const path = @import("path.zig");
@@ -28,6 +31,14 @@ pub const Generation = struct {
         a.free(self.dir.bytes);
         a.free(self.lib.bytes);
     }
+};
+
+/// A generation `stage` just made, with a shared lock on its `.lock`
+/// (what `pin` returns). Free `gen` with `deinit`; release `pin` once the
+/// generation is loaded and pinned elsewhere, or not needed.
+pub const Staged = struct {
+    gen: Generation,
+    pin: FileLock,
 };
 
 /// Generation sizes are allocated bytes (`allocatedBytes`), not apparent
@@ -100,8 +111,11 @@ pub const GenerationStore = struct {
     /// highest existing generation plus one, and copies each of `extras` into
     /// the same folder under its own file name. On an ELF target the built file
     /// is checked with `elf.checkComplete` first. On any error no `gen/<n>`
-    /// folder is left behind. The caller frees the result with `deinit`.
-    pub fn stage(self: *GenerationStore, built: OsPath, extras: []const OsPath) !Generation {
+    /// folder is left behind. The new generation comes back pinned
+    /// (`Staged.pin`, taken before `store.lock` is released), so no sweep can
+    /// delete it before its user loads it (spec risk 20). The caller frees
+    /// `Staged.gen` with `deinit` and releases `Staged.pin`.
+    pub fn stage(self: *GenerationStore, built: OsPath, extras: []const OsPath) !Staged {
         var diag: [256]u8 = undefined;
         return self.stageDiag(built, extras, &diag);
     }
@@ -109,7 +123,7 @@ pub const GenerationStore = struct {
     /// Like `stage`, and on any failure `diag` holds one NUL-terminated
     /// sentence (read it with `elf.diagText`): the ELF check's text, or a
     /// generic sentence naming the error and the built file.
-    pub fn stageDiag(self: *GenerationStore, built: OsPath, extras: []const OsPath, diag: *[256]u8) !Generation {
+    pub fn stageDiag(self: *GenerationStore, built: OsPath, extras: []const OsPath, diag: *[256]u8) !Staged {
         @memset(diag, 0);
         return self.stageInner(built, extras, diag) catch |e| {
             if (diag[0] == 0)
@@ -118,7 +132,7 @@ pub const GenerationStore = struct {
         };
     }
 
-    fn stageInner(self: *GenerationStore, built: OsPath, extras: []const OsPath, diag: *[256]u8) !Generation {
+    fn stageInner(self: *GenerationStore, built: OsPath, extras: []const OsPath, diag: *[256]u8) !Staged {
         const a = self.a;
         const io = self.io;
         const gen_root = try path.join(a, self.root, &.{"gen"});
@@ -168,8 +182,11 @@ pub const GenerationStore = struct {
         defer a.free(lock_path.bytes);
         const lf = try Dir.cwd().createFile(io, lock_path.bytes, .{ .truncate = false });
         lf.close(io);
+        // `store.lock` is held exclusive, so `pin` would wait for it; take the
+        // shared lock directly. Nothing else knows the generation yet.
+        const pin_lock = try FileLock.acquire(io, lock_path, .shared, pin_timeout_ms);
 
-        return .{ .n = n, .dir = dir, .lib = lib };
+        return .{ .gen = .{ .n = n, .dir = dir, .lib = lib }, .pin = pin_lock };
     }
 
     /// Deletes generation `n`, which nothing may have pinned (the build
@@ -197,9 +214,12 @@ pub const GenerationStore = struct {
         return FileLock.acquire(self.io, lock_path, .shared, pin_timeout_ms);
     }
 
-    /// Keeps the newest `caps.max_count` generations, then drops older ones
-    /// (oldest first) while their total allocated bytes exceed
-    /// `caps.max_bytes`. Never deletes
+    /// Keeps the newest `caps.max_count` generations (pinned ones count),
+    /// then drops older unpinned ones (oldest first) while the unpinned
+    /// generations' total allocated bytes exceed `caps.max_bytes`. Pinned
+    /// generations are in use (loaded by an editor or a game, or staged and
+    /// not loaded yet) and deleting others frees none of their bytes, so
+    /// they do not count toward `max_bytes` (spec risk 20). Never deletes
     /// the newest generation or a pinned one.
     pub fn sweep(self: *GenerationStore) !SweepReport {
         const a = self.a;
@@ -215,10 +235,18 @@ pub const GenerationStore = struct {
         defer a.free(gens);
         const sizes = try a.alloc(u64, gens.len);
         defer a.free(sizes);
+        const pinned = try a.alloc(bool, gens.len);
+        defer a.free(pinned);
+        // `store.lock` is held exclusive, so no generation is pinned or
+        // unpinned through `pin` while this runs (a process can still
+        // release a pin; such a generation stays until the next sweep).
         var total: u64 = 0;
-        for (gens, sizes) |n, *sz| {
+        var unpinned_total: u64 = 0;
+        for (gens, sizes, pinned) |n, *sz, *pn| {
             sz.* = try self.genBytes(n);
+            pn.* = try self.isPinned(n);
             total += sz.*;
+            if (!pn.*) unpinned_total += sz.*;
         }
 
         const over_count: usize = if (gens.len > self.caps.max_count) gens.len - self.caps.max_count else 0;
@@ -226,8 +254,9 @@ pub const GenerationStore = struct {
         var failed: u32 = 0;
         // The last entry is the newest: never a candidate.
         const candidates = if (gens.len == 0) 0 else gens.len - 1;
-        for (gens[0..candidates], sizes[0..candidates], 0..) |n, sz, i| {
-            if (i >= over_count and total <= self.caps.max_bytes) continue;
+        for (gens[0..candidates], sizes[0..candidates], pinned[0..candidates], 0..) |n, sz, pn, i| {
+            if (pn) continue;
+            if (i >= over_count and unpinned_total <= self.caps.max_bytes) continue;
             const gone = self.deleteIfUnpinned(n) catch {
                 failed += 1;
                 continue;
@@ -235,6 +264,7 @@ pub const GenerationStore = struct {
             if (gone) {
                 deleted += 1;
                 total -= sz;
+                unpinned_total -= sz;
             }
         }
         return .{
@@ -243,6 +273,37 @@ pub const GenerationStore = struct {
             .bytes_kept = total,
             .failed = failed,
         };
+    }
+
+    /// How many generations are pinned now, by this process or another
+    /// (their `.lock` cannot be taken exclusive without waiting). For checks
+    /// and tests; deletes nothing.
+    pub fn heldPins(self: *GenerationStore) !u32 {
+        const a = self.a;
+        const gen_root = try path.join(a, self.root, &.{"gen"});
+        defer a.free(gen_root.bytes);
+        var store_lock = try self.lockStore(.exclusive);
+        defer store_lock.release();
+        const gens = try self.listGens(gen_root);
+        defer a.free(gens);
+        var held: u32 = 0;
+        for (gens) |n| {
+            if (try self.isPinned(n)) held += 1;
+        }
+        return held;
+    }
+
+    /// True when `gen/<n>/.lock` cannot be taken exclusive without waiting.
+    /// Hold `store.lock` exclusive, so no `pin` slips in after the check.
+    fn isPinned(self: *GenerationStore, n: u32) !bool {
+        const lp = try self.genLockPath(n);
+        defer self.a.free(lp.bytes);
+        var l = FileLock.acquire(self.io, lp, .exclusive, 0) catch |e| switch (e) {
+            error.Timeout => return true,
+            else => return e,
+        };
+        l.release();
+        return false;
     }
 
     fn lockStore(self: *GenerationStore, mode: lock.Mode) !FileLock {
@@ -437,13 +498,12 @@ const Fixture = struct {
     }
 };
 
+/// Stages `built` and releases the staging pin at once.
 fn stageOne(a: Allocator, s: *GenerationStore, built: OsPath) !u32 {
-    const g = try s.stage(built, &.{});
-    defer {
-        a.free(g.dir.bytes);
-        a.free(g.lib.bytes);
-    }
-    return g.n;
+    var st = try s.stage(built, &.{});
+    st.pin.release();
+    defer st.gen.deinit(a);
+    return st.gen.n;
 }
 
 fn rmGen(a: Allocator, f: *Fixture, n: u32) !void {
@@ -513,9 +573,10 @@ test "stage copies, never moves" {
     defer a.free(extra.bytes);
     try f.tmp.dir.writeFile(io, .{ .sub_path = "extra.txt", .data = "xtra" });
     var s = f.store(a, .{});
-    const g = try s.stage(built, &.{extra});
-    defer a.free(g.dir.bytes);
-    defer a.free(g.lib.bytes);
+    var st = try s.stage(built, &.{extra});
+    defer st.gen.deinit(a);
+    defer st.pin.release();
+    const g = st.gen;
     try std.testing.expectEqual(@as(u32, 1), g.n);
     const orig = try f.tmp.dir.readFileAlloc(io, "built.so", a, .limited(1 << 20));
     defer a.free(orig);
@@ -550,9 +611,10 @@ test "stage keeps holes" {
     const built = try f.p(a, &.{"built.so"});
     defer a.free(built.bytes);
     var s = f.store(a, .{});
-    const g = try s.stage(built, &.{});
-    defer a.free(g.dir.bytes);
-    defer a.free(g.lib.bytes);
+    var st = try s.stage(built, &.{});
+    defer st.gen.deinit(a);
+    defer st.pin.release();
+    const g = st.gen;
     const file = try std.Io.Dir.cwd().openFile(io, g.lib.bytes, .{});
     defer file.close(io);
     try std.testing.expectEqual(@as(u64, 64 << 20), try file.length(io));
@@ -777,6 +839,76 @@ test "sweep by bytes keeps a pinned oldest" {
     try std.testing.expect(!try genExists(a, &f, 2));
     try std.testing.expect(!try genExists(a, &f, 3));
     try std.testing.expect(try genExists(a, &f, 4));
+}
+
+test "staged build survives a sweep before load" {
+    const a = std.testing.allocator;
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    try f.writeElf("built.so", "hello");
+    const built = try f.p(a, &.{"built.so"});
+    defer a.free(built.bytes);
+    // Spec risk 20: build 1 is staged and its outcome waits for the main
+    // thread while two more builds stage and sweep with room for one.
+    var s = f.store(a, .{ .max_count = 1 });
+    var first = try s.stage(built, &.{});
+    defer first.gen.deinit(a);
+    for (0..2) |_| {
+        _ = try stageOne(a, &s, built);
+        _ = try s.sweep();
+    }
+    try std.testing.expect(try genExists(a, &f, first.gen.n));
+    try std.testing.expect(!try genExists(a, &f, 2));
+    try std.testing.expectEqual(@as(u32, 1), try s.heldPins());
+    // The load reads the staged file; then the pin can go.
+    const lib = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, first.gen.lib.bytes, a, .limited(1 << 20));
+    a.free(lib);
+    first.pin.release();
+    try std.testing.expectEqual(@as(u32, 0), try s.heldPins());
+    _ = try s.sweep();
+    try std.testing.expect(!try genExists(a, &f, first.gen.n));
+}
+
+test "pinned bytes do not evict" {
+    if (os_tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    // A tool project in the editor: three loaded (pinned) builds hold far
+    // more than the byte cap; the unpinned builds are small.
+    try f.writeElf("small.so", "hello");
+    const big_payload = try a.alloc(u8, 256 << 10);
+    defer a.free(big_payload);
+    @memset(big_payload, 0xAB);
+    try f.writeElf("big.so", big_payload);
+    const small = try f.p(a, &.{"small.so"});
+    defer a.free(small.bytes);
+    const big = try f.p(a, &.{"big.so"});
+    defer a.free(big.bytes);
+    var s = f.store(a, .{ .max_count = 5, .max_bytes = 128 << 10 });
+    _ = try stageOne(a, &s, small);
+    var pins: [3]FileLock = undefined;
+    for (&pins) |*l| {
+        var st = try s.stage(big, &.{});
+        st.gen.deinit(a);
+        l.* = st.pin;
+    }
+    defer for (&pins) |*l| l.release();
+    for (0..3) |_| _ = try stageOne(a, &s, small);
+    // gen 1 small, 2-4 pinned big, 5-7 small (7 newest). Seven is two over
+    // max_count: the oldest two are over the count, and of those only the
+    // unpinned gen 1 goes. The pinned bytes alone are over max_bytes, but
+    // they do not count, so 5 and 6 stay.
+    const rep = try s.sweep();
+    try std.testing.expectEqual(@as(u32, 1), rep.deleted);
+    try std.testing.expectEqual(@as(u32, 0), rep.failed);
+    try std.testing.expect(!try genExists(a, &f, 1));
+    for ([_]u32{ 2, 3, 4, 5, 6, 7 }) |n| try std.testing.expect(try genExists(a, &f, n));
+    try std.testing.expectEqual(@as(u32, 3), try s.heldPins());
+    // A second sweep finds nothing more to delete: the unpinned bytes are
+    // within the cap and the count is.
+    const rep2 = try s.sweep();
+    try std.testing.expectEqual(@as(u32, 0), rep2.deleted);
 }
 
 test "folders with non-canonical names are ignored" {

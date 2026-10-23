@@ -627,6 +627,44 @@ pub const ZigguratTestProbe = struct {
         return editor_build.busy();
     }
 
+    /// `editor_build.waitIdle(ms)`: blocks the main thread until the
+    /// service is idle; true when it is.
+    pub fn editorBuildWaitIdle(_: *ZigguratTestProbe, ms: i64) bool {
+        return editor_build.waitIdle(std.math.cast(u32, ms) orelse return false);
+    }
+
+    /// Gives the editor's generation store the caps `max_count` and
+    /// `max_bytes` (`editor_build.setStoreCapsForTest`).
+    pub fn editorBuildSetStoreCaps(_: *ZigguratTestProbe, max_count: i64, max_bytes: i64) bool {
+        return editor_build.setStoreCapsForTest(.{
+            .max_count = std.math.cast(u32, max_count) orelse return false,
+            .max_bytes = std.math.cast(u64, max_bytes) orelse return false,
+        });
+    }
+
+    /// While `hold` is set, `ZigLanguage._frame` does not drain the
+    /// main-thread queue (`language.test_hold_queue`).
+    pub fn editorBuildHoldQueue(_: *ZigguratTestProbe, hold: bool) void {
+        language.test_hold_queue = hold;
+    }
+
+    /// `editor_build.memory()` as a Dictionary: `loaded_builds`,
+    /// `loaded_bytes`, `snapshot_bytes`, `service_snapshot_bytes`, `total`
+    /// (what the size warning compares) and `text` (the panel's line).
+    pub fn editorBuildMemory(_: *ZigguratTestProbe) Dictionary {
+        var d: Dictionary = .init();
+        const m = editor_build.memory();
+        const big = std.math.maxInt(i64);
+        dictSet(&d, "loaded_builds", .init(i64, m.loaded_builds));
+        dictSet(&d, "loaded_bytes", .init(i64, @intCast(@min(m.loaded_bytes, big))));
+        dictSet(&d, "snapshot_bytes", .init(i64, @intCast(@min(m.snapshot_bytes, big))));
+        dictSet(&d, "service_snapshot_bytes", .init(i64, @intCast(@min(m.service_snapshot_bytes, big))));
+        dictSet(&d, "total", .init(i64, @intCast(@min(m.total(), big))));
+        var buf: [256]u8 = undefined;
+        dictSetText(&d, "text", editor_build.memoryText(&buf));
+        return d;
+    }
+
     /// `editor_build.requestBuild` with the trigger named `trigger`
     /// (`open`, `save`, `play`, `manual`, `watcher`); false for another
     /// name.
@@ -1094,7 +1132,8 @@ pub const method_names = [_][:0]const u8{
     "editor_plugin_pings",      "editor_panel_toasts",         "editor_plugin_play",       "game_capture",
     "game_capture_registered",  "debugger_reload_last",        "debugger_reload_sends",    "debugger_sessions",
     "debugger_started",         "editor_build_checks",         "zig_download_configure",   "zig_download_state",
-    "zig_download_cancel",      "zig_download_requests",
+    "zig_download_cancel",      "zig_download_requests",       "editor_build_wait_idle",   "editor_build_set_store_caps",
+    "editor_build_hold_queue",  "editor_build_memory",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

@@ -11,8 +11,12 @@ extends Node
 # - nine saves whose builds fail the load checks stage nine newer
 #   generations, more than the store keeps: the build the manifest names
 #   (3) is still on disk, because the editor pins it.
-# The size warning's threshold is lowered to 1 byte, so the first build's
-# kept descriptors trigger it; the host test checks it appears once. After
+# After build 1 the editor's memory figures are exact: the descriptors
+# parsed from the snapshot hold more than the cache file's length, the
+# build service's kept snapshot counts too, and the Zig panel's memory line
+# shows them. The size warning's threshold is then set to that exact total,
+# so build 2's new descriptors trigger it; the host test checks it appears
+# once. After
 # this editor run the host test plays saved.tscn as a game from the
 # manifest. Prints one ZTEST line per case, then ZTEST DONE, and quits the
 # editor.
@@ -57,6 +61,14 @@ func property_names(o: Object) -> Array:
 	return names
 
 
+func memory_line() -> String:
+	for d in get_tree().root.find_children("*", "EditorDock", true, false):
+		var label: Label = d.find_child("Memory", true, false)
+		if label != null:
+			return label.text if label.visible else "(hidden) " + label.text
+	return "(no panel)"
+
+
 func nothing_loaded() -> bool:
 	return probe.loaded_generations() == 0 and probe.current_generation() == 0
 
@@ -70,7 +82,6 @@ func _ready() -> void:
 		get_tree().quit()
 		return
 	probe = ClassDB.instantiate("ZigguratTestProbe")
-	probe.set_size_warning_bytes(1)
 	await run()
 	print("ZTEST DONE")
 	get_tree().quit()
@@ -88,6 +99,17 @@ func run() -> void:
 		and walker_s.get_property_default_value("speed") == 5.0 and probe.script_placeholder_count(walker_s) == 1
 		and walker.get("speed") == 5.0,
 		"loaded %d current %d valid %s default %s placeholders %d" % [probe.loaded_generations(), probe.current_generation(), probe.script_is_valid(walker_s), walker_s.get_property_default_value("speed"), probe.script_placeholder_count(walker_s)])
+
+	# ---- exact memory figures
+	for i in 3:
+		await get_tree().process_frame
+	var mem: Dictionary = probe.editor_build_memory()
+	var file_len := FileAccess.get_file_as_bytes(CACHE).size()
+	report("plain_memory_exact", mem.loaded_builds == 0 and mem.loaded_bytes == 0 and mem.snapshot_bytes > file_len
+		and mem.service_snapshot_bytes > 0 and mem.total == mem.snapshot_bytes + mem.service_snapshot_bytes
+		and mem.text.begins_with("Loaded builds: 0 (0 bytes); descriptor snapshots: ") and memory_line() == mem.text,
+		"memory %s cache file %d panel %s" % [mem, file_len, memory_line()])
+	probe.set_size_warning_bytes(mem.total)
 
 	# ---- a new default
 	walker_s.source_code = text.replace("speed: f32 = 5,", "speed: f32 = 7,")

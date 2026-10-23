@@ -286,7 +286,7 @@ const Counter = struct {
     calls: std.atomic.Value(u32) = .init(0),
     tid: std.atomic.Value(u64) = .init(0),
 
-    fn onOutcome(ctx: ?*anyopaque, o: *const Outcome) void {
+    fn onOutcome(ctx: ?*anyopaque, o: *Outcome) void {
         _ = o;
         const self: *Counter = @ptrCast(@alignCast(ctx.?));
         _ = self.calls.fetchAdd(1, .acq_rel);

@@ -138,6 +138,25 @@ pub const Outcome = struct {
     /// How many of `diagnostics`, at the end of the list, are scan problems
     /// (the rest are compile errors).
     scan_problems: u32 = 0,
+    /// A shared lock on `generation`, taken when it was staged
+    /// (`GenerationStore.stage`), so no sweep deletes it before the host
+    /// loads it (spec risk 20). The outcome owns it until someone takes it
+    /// (`takePin`, from `Config.on_outcome`); `freeOutcome` releases it if
+    /// not. A copy (`lastCopy`) has none.
+    pin: ?FileLock = null,
+
+    /// Moves the staging pin out of the outcome; the caller releases it.
+    pub fn takePin(self: *Outcome) ?FileLock {
+        const l = self.pin;
+        self.pin = null;
+        return l;
+    }
+
+    /// Same as `freeOutcome(a, self)`: frees what the outcome owns and
+    /// releases its pin if nobody took it.
+    pub fn deinit(self: Outcome, a: std.mem.Allocator) void {
+        freeOutcome(a, self);
+    }
 };
 
 pub const WarmState = enum {
@@ -229,11 +248,13 @@ pub const Config = struct {
     update_timeout_ms: u32 = 600000,
     /// Called on the build thread after each build (not for a build cut short
     /// by `deinit`). The pointer is valid only during the call; copy what must
-    /// live longer. During the call the build still counts as running, so:
-    /// `last()` still returns the previous outcome, `waitIdle` returns
+    /// live longer. The callback may take the staging pin
+    /// (`Outcome.takePin`); it must change nothing else. During the call the
+    /// build still counts as running, so: `last()` still returns the
+    /// previous outcome, `waitIdle` returns
     /// `error.CalledFromCallback`, and calling `deinit` is illegal (a debug
     /// assertion catches it). `request` is fine.
-    on_outcome: ?*const fn (ctx: ?*anyopaque, o: *const Outcome) void = null,
+    on_outcome: ?*const fn (ctx: ?*anyopaque, o: *Outcome) void = null,
     on_outcome_ctx: ?*anyopaque = null,
     /// Check the table of every update before handing it out (see the file
     /// comment). Needs the real SDK: the stub SDK's table has
@@ -362,6 +383,10 @@ pub const BuildService = struct {
     /// The table snapshot and file fingerprints of the last build whose
     /// table was checked and validated. Build thread only.
     prev: ?Prev = null,
+    /// The bytes `prev` holds (its snapshot copy and file list), counted
+    /// when it is made (`remember`). Written on the build thread, read on
+    /// any (`keptSnapshotBytes`).
+    prev_bytes: std.atomic.Value(u64) = .init(0),
     /// `ScanResult.build_id` of the last build's scan (or of the check that
     /// started it), what `requestIfChanged` compares with. Build thread only.
     seen_id: ?[16]u8 = null,
@@ -517,6 +542,13 @@ pub const BuildService = struct {
         return try cloneOutcome(a, o);
     }
 
+    /// The bytes of the table snapshot (and file list) the service keeps
+    /// from the last checked build to compare the next one with (0 when it
+    /// keeps none). Exact: counted when it was allocated. Any thread.
+    pub fn keptSnapshotBytes(self: *BuildService) u64 {
+        return self.prev_bytes.load(.acquire);
+    }
+
     pub fn stats(self: *BuildService) Stats {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
@@ -625,7 +657,8 @@ pub const BuildService = struct {
         return true;
     }
 
-    fn publish(self: *BuildService, o: Outcome) void {
+    fn publish(self: *BuildService, outcome: Outcome) void {
+        var o = outcome;
         const io = self.io;
         const keep = blk: {
             self.mu.lockUncancelable(io);
@@ -772,9 +805,14 @@ pub const BuildService = struct {
     /// Keeps a copy of `snap` and the file fingerprints of `sc` for the next
     /// comparison. On out-of-memory the comparison is simply skipped once.
     fn remember(self: *BuildService, sc: scan_mod.ScanResult, snap: *const abi.Snapshot) void {
-        const a = self.a;
-        if (self.prev) |p| p.deinit(a);
+        if (self.prev) |p| p.deinit(self.a);
         self.prev = null;
+        self.prev_bytes.store(0, .release);
+        // Allocated through a counter so the editor's memory figures are
+        // exact; `Prev.deinit` frees through the service's allocator, which
+        // the counter passes every call to.
+        var counter: platform.counting_allocator.CountingAllocator = .init(self.a);
+        const a = counter.allocator();
         const copy = snap.clone(a) catch return;
         const files = a.alloc(Prev.FileFp, sc.scripts.len + sc.helper_paths.len) catch {
             copy.deinit(a);
@@ -794,6 +832,7 @@ pub const BuildService = struct {
             }
         }
         self.prev = .{ .snap = copy, .files = files, .helpers = sc.helper_paths.len };
+        self.prev_bytes.store(counter.live, .release);
     }
 
     /// After an incremental build: one sentence per script whose layout hash
@@ -1041,6 +1080,11 @@ pub const BuildService = struct {
     /// and marks the build failed.
     fn discardGeneration(self: *BuildService, o: *Outcome) void {
         const gen = o.generation.?;
+        // The staging pin would keep `remove` from deleting it.
+        if (o.takePin()) |l| {
+            var pin = l;
+            pin.release();
+        }
         self.store.remove(gen.n) catch {};
         gen.deinit(self.a);
         o.generation = null;
@@ -1129,11 +1173,12 @@ pub const BuildService = struct {
             return;
         };
         var diag: [256]u8 = undefined;
-        const gen = self.store.stageDiag(out, &.{}, &diag) catch {
+        const staged = self.store.stageDiag(out, &.{}, &diag) catch {
             o.message = try stagingMessage(a, out.bytes, platform.elf.diagText(&diag));
             return;
         };
-        o.generation = gen;
+        o.generation = staged.gen;
+        o.pin = staged.pin;
         o.ok = true;
         // A failed sweep only leaves old generations on disk.
         _ = self.store.sweep() catch {};
@@ -1386,7 +1431,13 @@ fn argvEql(x: []const []const u8, y: []const []const u8) bool {
 }
 
 /// Frees an outcome from `BuildService.lastCopy` (with the same allocator).
+/// Also frees an outcome the service made, and releases its staging pin
+/// when nobody took it.
 pub fn freeOutcome(a: std.mem.Allocator, o: Outcome) void {
+    if (o.pin) |l| {
+        var pin = l;
+        pin.release();
+    }
     if (o.generation) |g| g.deinit(a);
     diagnostics.free(a, o.diagnostics);
     if (o.message) |m| a.free(m);
@@ -1418,6 +1469,7 @@ fn cloneDiag(a: std.mem.Allocator, d: Diagnostic) !Diagnostic {
 /// A deep copy of `o`, allocated from `a`; free it with `freeOutcome`.
 fn cloneOutcome(a: std.mem.Allocator, o: Outcome) !Outcome {
     var c = o;
+    c.pin = null;
     c.generation = null;
     c.diagnostics = &.{};
     c.message = null;
@@ -1563,7 +1615,7 @@ const CallbackProbe = struct {
     svc: std.atomic.Value(?*BuildService) = .init(null),
     wait_result: std.atomic.Value(u8) = .init(0),
 
-    fn onOutcome(ctx: ?*anyopaque, o: *const Outcome) void {
+    fn onOutcome(ctx: ?*anyopaque, o: *Outcome) void {
         _ = o;
         const self: *CallbackProbe = @ptrCast(@alignCast(ctx.?));
         const svc = self.svc.load(.acquire).?;

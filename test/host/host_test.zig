@@ -1337,6 +1337,7 @@ test "editor reload: no tool scripts loads nothing" {
     try p.runEditorChecked("10000000", .{
         .expect = &.{
             "ZTEST PASS plain_build_1",
+            "ZTEST PASS plain_memory_exact",
             "ZTEST PASS plain_build_2",
             "ZTEST PASS plain_build_3",
             "ZTEST PASS snapshot_scene_opened",
@@ -1348,7 +1349,7 @@ test "editor reload: no tool scripts loads nothing" {
             "ziggurat: build 12 failed the load checks (save, ",
         },
         .once = &.{
-            "Ziggurat has loaded 1 builds (",
+            "Ziggurat has loaded 2 builds (",
             "in this editor session; restart the editor to free them.",
         },
         .reject = &.{ " loaded (", "generations loaded in this editor session", "swapped to build", "could not pin" },
@@ -1362,6 +1363,29 @@ test "editor reload: no tool scripts loads nothing" {
             "[ziggurat] walker ready speed=9\n",
         },
         .reject = &.{ refused_prefix, "ziggurat: build" },
+    });
+}
+
+test "staged builds stay pinned until the editor loads them; a dropped outcome releases its pin" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.initProbe("editor_reload");
+    defer p.deinit();
+    try addBuildSettings(&p);
+    try p.addAutoloadCheck("store_pins.gd");
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS pins_build_1",
+            "ZTEST PASS pins_staged_kept",
+            "ZTEST PASS pins_staged_builds_load",
+            "ZTEST PASS pins_outcome_queued_at_quit",
+            "ziggurat: build 2 loaded (manual, ",
+            "ziggurat: build 3 loaded (manual, ",
+            "ziggurat: build 4 loaded (manual, ",
+        },
+        .once = &.{"ziggurat: generation locks held after exit: 0\n"},
+        .reject = &.{ "ziggurat: build 5", "could not pin" },
+        .deadline = build_deadline_s,
     });
 }
 

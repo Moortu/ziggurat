@@ -75,6 +75,10 @@ var in_frame = false;
 /// Nested `_frame` calls in this process (main thread only), for the host
 /// tests (`nestedFrames`).
 var nested_frames: u64 = 0;
+/// TEST ONLY, read only in probe builds (probe `editor_build_hold_queue`):
+/// `_frame` leaves the main-thread queue alone, so what waits there stays
+/// queued until the editor exits. Main thread.
+pub var test_hold_queue = false;
 
 /// Nested `_frame` calls so far (see `ZigLanguage._frame`). Main thread.
 pub fn nestedFrames() u64 {
@@ -181,7 +185,7 @@ pub const ZigLanguage = struct {
         }
         in_frame = true;
         defer in_frame = false;
-        _ = main_queue.drain();
+        if (!(host_options.test_probe and test_hold_queue)) _ = main_queue.drain();
         game.frame();
         _ = swap.runPending();
     }
