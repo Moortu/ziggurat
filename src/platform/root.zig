@@ -12,6 +12,9 @@ pub const safe_open = @import("safe_open.zig");
 pub const generation_store = @import("generation_store.zig");
 pub const process = @import("process.zig");
 pub const zig_locator = @import("zig_locator.zig");
+pub const minisign = @import("minisign.zig");
+pub const mirrors = @import("mirrors.zig");
+pub const toolchain_install = @import("toolchain_install.zig");
 pub const testing_support = @import("testing_support.zig");
 
 test {
@@ -24,6 +27,10 @@ test {
     std.testing.refAllDecls(generation_store);
     std.testing.refAllDecls(process);
     std.testing.refAllDecls(zig_locator);
+    std.testing.refAllDecls(pins);
+    std.testing.refAllDecls(minisign);
+    std.testing.refAllDecls(mirrors);
+    std.testing.refAllDecls(toolchain_install);
 }
 
 test "pins" {

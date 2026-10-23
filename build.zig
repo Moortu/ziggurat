@@ -682,6 +682,16 @@ fn addTestSet(
     options.addOption([]const u8, "zig_exe", zig_exe);
     options.addOption(bool, "run_integration", run_integration);
     options.addOptionPath("stub_sdk_path", b.path("test/stub_sdk/ziggurat.zig"));
+    // Toolchain install fixtures (test/fixtures/toolchain/make.sh).
+    for ([_][2][]const u8{
+        .{ "toolchain_good_tar", "zig-x86_64-linux-0.17.0.tar.xz" },
+        .{ "toolchain_good_zip", "zig-x86_64-linux-0.17.0.zip" },
+        .{ "toolchain_bad_version", "bad-version.tar.xz" },
+        .{ "toolchain_two_top", "two-top.tar.xz" },
+        .{ "toolchain_real_minisig", "zig-x86_64-linux-0.17.0.tar.xz.minisig" },
+    }) |f| {
+        options.addOptionPath(f[0], b.path(b.fmt("test/fixtures/toolchain/{s}", .{f[1]})));
+    }
     if (sdk_manifest) |m| {
         options.addOptionPath("sdk_manifest_path", m);
     } else {

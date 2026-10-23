@@ -1,2 +1,70 @@
 //! Pinned versions. Single source of truth for the Zig version.
+const std = @import("std");
+
 pub const zig_version = "0.17.0";
+
+/// The Zig Software Foundation's minisign public key, as published on
+/// https://ziglang.org/download/. Every downloaded Zig archive must carry a
+/// signature from this key.
+pub const zig_minisign_key = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U";
+
+/// A CPU and OS pair, as in the release file names (`zig-<arch>-<os>-<version>`).
+pub const Target = struct {
+    arch: std.Target.Cpu.Arch,
+    os: std.Target.Os.Tag,
+
+    pub fn of(t: std.Target) Target {
+        return .{ .arch = t.cpu.arch, .os = t.os.tag };
+    }
+};
+
+/// One official release archive: file name, exact size in bytes and SHA-256,
+/// copied from https://ziglang.org/download/index.json. They are checked in
+/// addition to the minisign signature.
+pub const Archive = struct {
+    name: []const u8,
+    size: u64,
+    sha256: [32]u8,
+};
+
+const Entry = struct {
+    target: Target,
+    archive: Archive,
+    /// False for targets that are listed but not offered yet (Stage 7).
+    active: bool,
+};
+
+fn entry(arch: std.Target.Cpu.Arch, os: std.Target.Os.Tag, name: []const u8, size: u64, comptime sha_hex: []const u8, active: bool) Entry {
+    var sha: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&sha, sha_hex) catch unreachable;
+    return .{ .target = .{ .arch = arch, .os = os }, .archive = .{ .name = name, .size = size, .sha256 = sha }, .active = active };
+}
+
+const archives = [_]Entry{
+    entry(.x86_64, .linux, "zig-x86_64-linux-0.17.0.tar.xz", 57332648, "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026", true),
+    entry(.aarch64, .linux, "zig-aarch64-linux-0.17.0.tar.xz", 52877280, "9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8", false),
+    entry(.x86_64, .windows, "zig-x86_64-windows-0.17.0.zip", 100268137, "b5663f69581dcf391293fbf16c06cb80d81d806545ce618b4d0bab7f0eb8c428", false),
+    entry(.aarch64, .macos, "zig-aarch64-macos-0.17.0.tar.xz", 53985220, "b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a", false),
+    entry(.x86_64, .macos, "zig-x86_64-macos-0.17.0.tar.xz", 59317572, "4f9a1c5269aa17ebda5e6d3c2b89d6cbf36f7d2b22a0306e9ab98f25f95529c6", false),
+};
+
+/// The pinned Zig release archive for `target`, or null when Ziggurat does
+/// not offer a download for it (yet).
+pub fn zig_archive(target: Target) ?Archive {
+    for (archives) |e| {
+        if (e.active and e.target.arch == target.arch and e.target.os == target.os) return e.archive;
+    }
+    return null;
+}
+
+test "pins: archive for x86_64-linux only" {
+    const a = zig_archive(.{ .arch = .x86_64, .os = .linux }).?;
+    try std.testing.expectEqualStrings("zig-x86_64-linux-0.17.0.tar.xz", a.name);
+    try std.testing.expectEqual(@as(u64, 57332648), a.size);
+    try std.testing.expectEqual(@as(u8, 0x1c), a.sha256[0]);
+    try std.testing.expectEqual(@as(u8, 0x26), a.sha256[31]);
+    try std.testing.expect(zig_archive(.{ .arch = .x86_64, .os = .windows }) == null);
+    try std.testing.expect(zig_archive(.{ .arch = .riscv64, .os = .linux }) == null);
+    // Every listed name has the pinned version.
+    for (archives) |e| try std.testing.expect(std.mem.indexOf(u8, e.archive.name, "-" ++ zig_version ++ ".") != null);
+}
