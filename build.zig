@@ -40,6 +40,8 @@ pub fn build(b: *std.Build) void {
     const host_test_step = b.step("test-host", "Run the host tests in a headless Godot (needs Godot)");
     const gui_test_step = b.step("test-gui", "Run the GUI editor test under Xvfb (needs Godot and xvfb-run); not part of test");
     const stress_step = b.step("test-stress", "Run the reload stress test with 300 edits in a headless editor (needs Godot); not part of test");
+    const package_test_step = b.step("test-package", "Run the release package tests (part of test)");
+    const package_step = b.step("package", "Write the release package <prefix>/ziggurat-" ++ sdk_version ++ ".zip (the release download and the Asset Store upload)");
 
     const sdk = addSdk(b, target, optimize, godot_path);
     const manifest_tool = b.addExecutable(.{
@@ -144,7 +146,22 @@ pub fn build(b: *std.Build) void {
         .use_llvm = true,
         .strip = true,
     });
-    archive_step.dependOn(&b.addInstallArtifact(export_host_archive, .{}).step);
+    // Zig names the archive's member after its cache folder, which differs
+    // between checkouts; the shipped archive gets a fixed name.
+    const shipped_archive = blk: {
+        const tool = b.addExecutable(.{
+            .name = "ar_normalize",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/ar_normalize.zig"),
+                .target = b.graph.host,
+                .optimize = .ReleaseSafe,
+            }),
+        });
+        const run = b.addRunArtifact(tool);
+        run.addArtifactArg(export_host_archive);
+        break :blk run.addOutputFileArg("libziggurat_host_export.a");
+    };
+    archive_step.dependOn(&b.addInstallFileWithDir(shipped_archive, .lib, "libziggurat_host_export.a").step);
     // The game library of a project without Zig scripts (the export plugin
     // ships it instead of building one): the empty generated root linked
     // with the export host archive, built as an export build builds.
@@ -155,8 +172,49 @@ pub fn build(b: *std.Build) void {
     });
     // The add-on's export inputs go next to the editor library, where the
     // export plugin looks for them.
-    host_step.dependOn(&b.addInstallFileWithDir(export_host_archive.getEmittedBin(), addon_bin_dir, "libziggurat_host_export.a").step);
+    host_step.dependOn(&b.addInstallFileWithDir(shipped_archive, addon_bin_dir, "libziggurat_host_export.a").step);
     host_step.dependOn(&b.addInstallFileWithDir(game_empty.getEmittedBin(), addon_bin_dir, "libziggurat_game_empty.so").step);
+
+    // The release package (spec section 1): the add-on folder in one
+    // deterministic zip. Its editor library is built like the export
+    // host: ReleaseSafe, the pinned glibc, no debug information (it would
+    // carry this checkout's paths).
+    const release_host = addHost(b, export_target, .ReleaseSafe, godot_path, zig_exe, export_sdk_options, .{
+        .use_llvm = true,
+        .strip = true,
+    });
+    const package_tool = b.addExecutable(.{
+        .name = "package",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/package.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const package_name = "ziggurat-" ++ sdk_version ++ ".zip";
+    // Two runs on the same inputs (the output names differ, so the cache
+    // keeps them apart); the tests compare them.
+    var packages: [2]std.Build.LazyPath = undefined;
+    for (&packages, [_][]const u8{ package_name, "again-" ++ package_name }) |*out, name| {
+        const run = b.addRunArtifact(package_tool);
+        out.* = run.addOutputFileArg(name);
+        for ([_]struct { []const u8, std.Build.LazyPath }{
+            .{ "LICENSE", b.path("LICENSE") },
+            .{ "THIRD_PARTY_LICENSES.md", b.path("THIRD_PARTY_LICENSES.md") },
+            .{ "README.md", b.path("addons/ziggurat/README.md") },
+            .{ "ziggurat.gdextension", gdextension_file },
+            .{ "bin/libziggurat_host.so", release_host.getEmittedBin() },
+            .{ "bin/libziggurat_host_export.a", shipped_archive },
+            .{ "bin/libziggurat_game_empty.so", game_empty.getEmittedBin() },
+        }) |f| {
+            run.addArg(b.fmt("addons/ziggurat/{s}", .{f[0]}));
+            run.addFileArg(f[1]);
+        }
+        run.addArg("addons/ziggurat/sdk");
+        run.addDirectoryArg(staged_sdk);
+    }
+    package_step.dependOn(&b.addInstallFile(packages[0], package_name).step);
+
     if (godot_found == null) {
         host_test_step.dependOn(&b.addFail("test-host needs Godot on PATH or -Dgodot-path=<absolute path>").step);
         gui_test_step.dependOn(&b.addFail("test-gui needs Godot on PATH or -Dgodot-path=<absolute path>").step);
@@ -186,15 +244,15 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(host_test_step);
 
     // Native: integration on for `test`, off for `test-unit`.
-    addTestSet(b, test_step, target, optimize, zig_exe, true, true, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) }, sdk_options, sdk, export_host_archive, staged_sdk);
-    addTestSet(b, unit_step, target, optimize, zig_exe, false, true, null, null, sdk_options, sdk, null, null);
+    addTestSet(b, test_step, target, optimize, zig_exe, true, true, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) }, sdk_options, sdk, export_host_archive, staged_sdk, .{ .zips = packages, .step = package_test_step });
+    addTestSet(b, unit_step, target, optimize, zig_exe, false, true, null, null, sdk_options, sdk, null, null, null);
 
     // Cross: compile only.
     for (cross_targets) |triple| {
         const query = std.Target.Query.parse(.{ .arch_os_abi = triple }) catch
             @panic("bad cross target triple");
         const resolved = b.resolveTargetQuery(query);
-        addTestSet(b, cross_step, resolved, optimize, zig_exe, false, false, null, null, sdk_options, sdk, null, null);
+        addTestSet(b, cross_step, resolved, optimize, zig_exe, false, false, null, null, sdk_options, sdk, null, null, null);
     }
 }
 
@@ -925,6 +983,13 @@ fn sdkModules(b: *std.Build, sdk: *std.Build.Module) std.StringArrayHashMapUnman
 
 const ProbeSdks = struct { debug: *std.Build.Module, safe: *std.Build.Module };
 
+const PackageTests = struct {
+    /// The package from two packager runs on the same inputs.
+    zips: [2]std.Build.LazyPath,
+    /// `test-package`, which runs only these tests.
+    step: *std.Build.Step,
+};
+
 fn addTestSet(
     b: *std.Build,
     step: *std.Build.Step,
@@ -949,6 +1014,9 @@ fn addTestSet(
     /// The staged SDK the shipped-SDK tests read (native sets that run
     /// integration tests only).
     staged: ?std.Build.LazyPath,
+    /// The release package from two packager runs (native sets that run
+    /// integration tests only).
+    package: ?PackageTests,
 ) void {
     const options = b.addOptions();
     options.addOption([]const u8, "zig_exe", zig_exe);
@@ -1113,6 +1181,13 @@ fn addTestSet(
         });
     }
 
+    // The package tool's archive rewrite imports only std.
+    const ar_normalize = b.createModule(.{
+        .root_source_file = b.path("tools/ar_normalize.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // gdzig's class checks (vendor/gdzig/PATCHES.md, patch 4) import only
     // std; their tests also cover gdzig's singleton-owner lookup.
     const class_kind = b.createModule(.{
@@ -1131,7 +1206,7 @@ fn addTestSet(
         .imports = &.{.{ .name = "ziggurat_platform", .module = platform }},
     });
 
-    for ([_]*std.Build.Module{ platform, build_mod, abi, snake, fmtlog, host_version, output_scan, host_std[0], host_std[1], host_std[2], host_std[3], host_std[4], host_manifest, class_kind }) |mod| {
+    for ([_]*std.Build.Module{ platform, build_mod, abi, snake, fmtlog, host_version, output_scan, host_std[0], host_std[1], host_std[2], host_std[3], host_std[4], host_manifest, class_kind, ar_normalize }) |mod| {
         const t = b.addTest(.{ .root_module = mod });
         if (run) {
             step.dependOn(&b.addRunArtifact(t).step);
@@ -1173,5 +1248,28 @@ fn addTestSet(
         // build system cannot see; track the sources so an edit reruns it.
         addSourceInputs(b, sdk_run, &.{ "sdk", "src/abi" });
         step.dependOn(&sdk_run.step);
+
+        if (package) |pkg| {
+            const zips = pkg.zips;
+            const package_options = b.addOptions();
+            package_options.addOptionPath("package_zip", zips[0]);
+            package_options.addOptionPath("package_zip_again", zips[1]);
+            package_options.addOptionPath("staged_sdk_manifest", staged.?.path(b, "sdk-manifest.json"));
+            package_options.addOption([]const u8, "build_machine_repo", b.root.joinString(b.allocator, "") catch @panic("OOM"));
+            package_options.addOptionPathUntracked("build_machine_local_cache", .{ .relative = .{ .base = .local_cache } });
+            package_options.addOptionPathUntracked("build_machine_global_cache", .{ .relative = .{ .base = .global_cache } });
+            const package_mod = b.createModule(.{
+                .root_source_file = b.path("test/package.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            });
+            package_mod.addImport("package_options", package_options.createModule());
+            package_mod.addImport("ziggurat_platform", platform);
+            package_mod.addImport("ziggurat_build", build_mod);
+            const package_run = b.addRunArtifact(b.addTest(.{ .root_module = package_mod }));
+            step.dependOn(&package_run.step);
+            pkg.step.dependOn(&package_run.step);
+        }
     }
 }
