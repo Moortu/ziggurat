@@ -358,6 +358,7 @@ test {
     _ = @import("host_callable.zig");
     _ = editor_plugin;
     _ = @import("debugger_plugin.zig");
+    _ = @import("export_plugin.zig");
     _ = @import("editor_panel.zig");
     _ = @import("zig_download.zig");
 }

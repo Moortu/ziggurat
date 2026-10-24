@@ -1,0 +1,10 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://main.gd" id="1_main"]
+[ext_resource type="Script" uid="uid://cgr8lnhtluchh" path="res://wrong.zig" id="2_hero"]
+
+[node name="Main" type="Node"]
+script = ExtResource("1_main")
+
+[node name="Hero" type="Node2D" parent="."]
+script = ExtResource("2_hero")

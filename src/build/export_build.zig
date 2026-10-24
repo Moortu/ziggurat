@@ -70,7 +70,8 @@ pub const Options = struct {
     /// editor builds.
     cache_dir: OsPath,
     script_dirs: []const []const u8 = scan_mod.default_script_dirs,
-    /// How long the build waits for another build's `build.lock`.
+    /// How long the build waits for another build's `build.lock` (an
+    /// editor build of the same project).
     lock_timeout_ms: u32 = 30000,
     /// Longest compiler run before the compiler is killed.
     update_timeout_ms: u32 = 600000,
@@ -86,8 +87,8 @@ pub const Result = struct {
     diagnostics: []Diagnostic,
     /// One sentence when the build failed for a reason other than compile
     /// errors: another build holds `build.lock`, the compiler could not
-    /// start, stopped or timed out, the library failed its check, or it could
-    /// not be written.
+    /// start, stopped, timed out or sent an unreadable error report, the
+    /// library failed its check, or it could not be written.
     message: ?[]const u8,
 
     pub fn deinit(self: Result, a: std.mem.Allocator) void {
@@ -130,7 +131,9 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options, diag: *[256]u8) !Res
         .lock_timeout_ms = opts.lock_timeout_ms,
         .build_id = build_id,
     }, &msg) catch |err| {
-        if (err == error.Timeout) return out.fail("{s}", .{msg.items});
+        // The lock holder is usually this editor's own build, so the
+        // workspace's "another editor" sentence would mislead.
+        if (err == error.Timeout) return out.fail("A Zig build of this project still ran after the export waited {d} s for it, so the export did not build; export again when it is done.", .{opts.lock_timeout_ms / 1000});
         setDiag(diag, "Preparing the build folder for {s} failed: {t}.", .{ opts.project_root.bytes, err });
         return err;
     };
@@ -162,7 +165,10 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options, diag: *[256]u8) !Res
     };
     defer r.deinit(a);
     if (r.bundle.errorMessageCount() > 0) {
-        out.compile = try diagnostics.decode(a, io, r.bundle, &ws);
+        out.compile = diagnostics.decode(a, io, r.bundle, &ws) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.MalformedBundle => return out.fail("The Zig compiler {s} reported errors in a form Ziggurat cannot read.", .{opts.zig.exe.bytes}),
+        };
         return out.finish(false);
     }
     const built = r.output orelse
@@ -182,6 +188,9 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options, diag: *[256]u8) !Res
         },
     }) |sentence| return out.fail("{s}", .{sentence});
 
+    // Atomic: `Dir.copyFile` writes a temporary file in the destination's
+    // folder and renames it over `out_path` (Zig 0.17 `createFileAtomic`
+    // and `File.Atomic.replace`), so a reader never sees half a library.
     cwd.copyFile(built.bytes, cwd, opts.out_path.bytes, io, .{ .make_path = true, .replace = true }) catch |err|
         return out.fail("Writing the export library {s} failed: {t}.", .{ opts.out_path.bytes, err });
     return out.finish(true);
@@ -330,6 +339,12 @@ test "glibcAbove finds a version newer than the pin" {
     try testing.expectEqualStrings("GLIBC_PRIVATE", glibcAbove(&private, "2.28").?);
     // The pin itself parses.
     try testing.expect(parseVersion(pins.export_glibc) != null);
+}
+
+test "the empty game root is the generated root of no scripts" {
+    const text = try @import("rootgen.zig").generateRoot(testing.allocator, .linux, &.{}, build_id);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings(text, @import("empty_root.zig").text);
 }
 
 test "the version script exports only the entry point" {

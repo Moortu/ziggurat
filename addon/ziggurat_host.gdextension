@@ -1,8 +1,0 @@
-; The Ziggurat host. `zig build host` puts the library next to this file.
-[configuration]
-entry_symbol = "ziggurat_host_init"
-compatibility_minimum = "4.7"
-compatibility_maximum = "4.7"
-
-[libraries]
-linux.x86_64 = "libziggurat_host.so"

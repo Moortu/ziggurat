@@ -1,0 +1,14 @@
+; Ziggurat. `zig build host -p <project>` puts the editor library into bin/.
+; An exported game loads the library the export plugin builds from the
+; project's Zig scripts (res://.godot/ziggurat/export/...); Godot copies it
+; next to the game. A game started with Play from the editor has the
+; `editor` feature too, so it keeps the editor library.
+[configuration]
+entry_symbol = "ziggurat_host_init"
+compatibility_minimum = "4.7"
+compatibility_maximum = "4.7"
+
+[libraries]
+linux.editor.x86_64 = "bin/libziggurat_host.so"
+linux.template_debug.x86_64 = "res://.godot/ziggurat/export/linux.x86_64/libziggurat_game.so"
+linux.template_release.x86_64 = "res://.godot/ziggurat/export/linux.x86_64/libziggurat_game.so"

@@ -74,6 +74,11 @@
 //!   `diagnosticsCopy` (that outcome's diagnostics per file) and
 //!   `applyFinished` (runs queued outcomes now, only at a safe point). All
 //!   main thread.
+//! - For the export plugin (export_plugin.zig): `projectRoot` (the
+//!   project folder as editor builds key their cache by it) and
+//!   `exportInputs` (the Zig located as editor builds locate it, the SDK
+//!   modules and the per-user cache folder). Both work without a service:
+//!   an `--export-*` run starts none.
 //! - `stop` (SCENE exit, before the main-thread queue closes and the
 //!   language is destroyed) clears the save hook and stops the service,
 //!   which kills a running compiler and joins the service's threads.
@@ -808,16 +813,12 @@ fn startService() Allocator.Error!void {
 
     // The project folder as a realpath (the cache folder and `build.lock`
     // are keyed by it).
-    var res = String.fromLatin1("res://");
-    defer res.deinit();
-    var abs = ProjectSettings.globalizePath(res);
-    defer abs.deinit();
-    const globalized = try props.utf8Alloc(a, &abs);
-    const trimmed = if (globalized.len > 1) std.mem.trimEnd(u8, globalized, "/\\") else globalized;
-    const project = std.Io.Dir.cwd().realPathFileAlloc(io, trimmed, a) catch |err| switch (err) {
+    var root_msg: std.ArrayList(u8) = .empty;
+    defer root_msg.deinit(a);
+    const project = projectRoot(a, &root_msg) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            logError("Ziggurat cannot build Zig scripts: the project folder {s} cannot be resolved ({s}).", .{ trimmed, @errorName(err) });
+        error.Unusable => {
+            logError("Ziggurat cannot build Zig scripts: {s}", .{root_msg.items});
             return;
         },
     };
@@ -878,6 +879,110 @@ fn startService() Allocator.Error!void {
     } else {
         main_queue.push(requestOpen, null, null) catch requestOpen(null);
     }
+}
+
+/// The project folder as a realpath (`res://` globalized, without a
+/// trailing separator), allocated with `a`. Editor builds and export
+/// builds key the per-user cache folder and `build.lock` by it, so both
+/// must use this. On `error.Unusable` `msg` holds one sentence. Main thread.
+pub fn projectRoot(a: Allocator, msg: *std.ArrayList(u8)) error{ OutOfMemory, Unusable }![]const u8 {
+    var res = String.fromLatin1("res://");
+    defer res.deinit();
+    var abs = ProjectSettings.globalizePath(res);
+    defer abs.deinit();
+    const globalized = try props.utf8Alloc(a, &abs);
+    const trimmed = if (globalized.len > 1) std.mem.trimEnd(u8, globalized, "/\\") else globalized;
+    return std.Io.Dir.cwd().realPathFileAlloc(host_io.get(), trimmed, a) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            msg.clearRetainingCapacity();
+            try msg.print(a, "the project folder {s} cannot be resolved ({t}).", .{ trimmed, err });
+            return error.Unusable;
+        },
+    };
+}
+
+/// What an export build needs from the editor's build setup
+/// (`exportInputs`); everything is allocated in the caller's allocator.
+pub const ExportInputs = struct {
+    /// Located as editor builds locate it: the project setting
+    /// `ziggurat/zig_path`, the editor setting, the downloaded toolchain,
+    /// then `PATH`.
+    zig: platform.zig_locator.ZigInstall,
+    /// The SDK modules: the running service's, else the manifest the
+    /// project setting `ziggurat/dev/sdk_manifest` names.
+    sdk: []const zbuild.workspace.ModuleDep,
+    /// The per-user cache folder (`PathService.dir(.cache)`), as editor
+    /// builds use it, so both take turns on the project's `build.lock`.
+    cache_dir: OsPath,
+};
+
+/// The located Zig, the SDK modules and the per-user cache folder for an
+/// export build of the project `project` (`projectRoot`), allocated with
+/// `a` (an arena: nothing is freed piecemeal). It works without a build
+/// service (an `--export-*` run starts none). On `error.Unusable` `msg`
+/// holds one sentence that names what is missing. Main thread.
+pub fn exportInputs(a: Allocator, project: []const u8, msg: *std.ArrayList(u8)) error{ OutOfMemory, Unusable }!ExportInputs {
+    const io = host_io.get();
+    msg.clearRetainingCapacity();
+    const sdk: []const zbuild.workspace.ModuleDep = if (state) |*st| st.sdk.modules else blk: {
+        const sdk_path = try settingText(a, setting_sdk_manifest);
+        if (sdk_path.len == 0) {
+            try msg.appendSlice(a, "the project setting " ++ setting_sdk_manifest ++ " is not set (it needs the absolute path of an SDK module manifest).");
+            return error.Unusable;
+        }
+        if (!isAbsolute(sdk_path)) {
+            try msg.print(a, "the project setting " ++ setting_sdk_manifest ++ " ({s}) is not an absolute path.", .{sdk_path});
+            return error.Unusable;
+        }
+        var why: std.ArrayList(u8) = .empty;
+        const m = zbuild.sdk_manifest.load(a, io, .fromTrusted(sdk_path), &why) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                try msg.print(a, "the project setting " ++ setting_sdk_manifest ++ " is not usable: {s}", .{if (why.items.len != 0) why.items else @errorName(err)});
+                return error.Unusable;
+            },
+        };
+        break :blk m.modules;
+    };
+
+    const env = try hostEnv(a);
+    const paths: platform.path.PathService = .init(.{ .project = .fromTrusted(project) }, env);
+    const cache_dir = paths.dir(.cache, a) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try msg.print(a, "there is no per-user cache folder for the build ({t}).", .{err});
+            return error.Unusable;
+        },
+    };
+    const toolchain: ?OsPath = paths.dir(.toolchain, a) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => null,
+    };
+    // The Zig path settings as `passZigPaths` reads them.
+    const project_zig = try settingText(a, setting_zig_path);
+    const editor_zig = try editorSettingText(a, setting_zig_path);
+    if (project_zig.len != 0 and !isAbsolute(project_zig)) {
+        try msg.print(a, "the project setting " ++ setting_zig_path ++ " ({s}) is not an absolute path.", .{project_zig});
+        return error.Unusable;
+    }
+    if (project_zig.len == 0 and editor_zig.len != 0 and !isAbsolute(editor_zig)) {
+        try msg.print(a, "the editor setting " ++ setting_zig_path ++ " ({s}) is not an absolute path.", .{editor_zig});
+        return error.Unusable;
+    }
+    const zig = platform.zig_locator.locate(a, io, .{
+        .configured = if (project_zig.len != 0) .fromTrusted(project_zig) else null,
+        .configured_editor = if (editor_zig.len != 0 and isAbsolute(editor_zig)) .fromTrusted(editor_zig) else null,
+        .toolchain_dir = toolchain,
+        .env = env,
+    }, msg) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            if (msg.items.len == 0) try msg.print(a, "no usable Zig was found ({t}).", .{err});
+            return error.Unusable;
+        },
+    };
+    return .{ .zig = zig, .sdk = sdk, .cache_dir = cache_dir };
 }
 
 /// Set while the build at open is not requested yet. Main thread.

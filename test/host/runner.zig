@@ -6,6 +6,9 @@
 //!   runner <godot> <project dir> editor <quit-after frames> <deadline s> [--expect <text>]...
 //!   runner <godot> <project dir> game <scene> <deadline s> [--expect <text>]...
 //!   runner <godot> <project dir> build <quit-after frames> <deadline s> [--exit-code <n>] [--expect <text>]...
+//!   runner <godot> <project dir> export <preset> <out> <deadline s> [--exit-code <n>] [--expect <text>]...
+//!   runner <godot> <project dir> export-pack <preset> <out> <deadline s> [--exit-code <n>] [--expect <text>]...
+//!   runner <godot> <project dir> run <exe> <deadline s> [--exit-code <n>] [--expect <text>]...
 //!
 //! Writes `<project>/.godot/extension_list.cfg` with every `.gdextension`
 //! file of the project (Godot #111645), then runs
@@ -13,9 +16,15 @@
 //! `--editor --quit-after <frames>`, the same with `--build-solutions` for
 //! `build`, which calls the editor plugins' `_build` on the first frame and
 //! exits with status 1 when one returns false, or the scene path for a game
-//! run of that scene) with stdin from /dev/null and one
-//! deadline for the whole run. The run fails when Godot times out or exits
-//! with another status than `--exit-code` (default 0), the output has no `ZTEST DONE` line, has a `ZTEST FAIL` line,
+//! run of that scene, or `--export-release <preset> <out>` for `export` and
+//! `--export-pack <preset> <out>` for `export-pack`) with stdin from
+//! /dev/null and one deadline for the whole run. `run` starts an exported
+//! game instead: `<exe> --headless --verbose`, with no project folder
+//! (`<project dir>` is not touched; a release template refuses `--path`
+//! and `--main-pack`, so the game loads the `<exe>.pck` next to it), and
+//! `<godot>` is not used. The run fails when Godot times out or exits
+//! with another status than `--exit-code` (default 0), the output has no `ZTEST DONE` line (not asked of
+//! the export modes, which run no check script), has a `ZTEST FAIL` line,
 //! lacks an `--expect` text, has an `--expect-once` text other than exactly
 //! once, has a `--reject` text, or has one of Godot's leak or crash reports
 //! (`test/godot/output_scan.zig`). An `--allow-report` line is left out of
@@ -48,6 +57,9 @@ const usage =
     \\       runner <godot> <project dir> editor <quit-after frames> <deadline s> [--expect[-once] <text> | --reject <text> | --allow-report <line> | --echo <prefix>]...
     \\       runner <godot> <project dir> game <scene> <deadline s> [--expect[-once] <text> | --reject <text> | --allow-report <line> | --echo <prefix>]...
     \\       runner <godot> <project dir> build <quit-after frames> <deadline s> [--exit-code <n> | --expect[-once] <text> | --reject <text> | --allow-report <line> | --echo <prefix>]...
+    \\       runner <godot> <project dir> export <preset> <out> <deadline s> [--exit-code <n> | --expect[-once] <text> | --reject <text> | --allow-report <line> | --echo <prefix>]...
+    \\       runner <godot> <project dir> export-pack <preset> <out> <deadline s> [--exit-code <n> | --expect[-once] <text> | --reject <text> | --allow-report <line> | --echo <prefix>]...
+    \\       runner <godot> <project dir> run <exe> <deadline s> [--exit-code <n> | --expect[-once] <text> | --reject <text> | --allow-report <line> | --echo <prefix>]...
     \\
 ;
 
@@ -64,8 +76,16 @@ pub fn main(init: std.process.Init) !u8 {
     const project = args[2];
     const mode = args[3];
     const mode_arg = args[4];
-    const deadline_s = std.fmt.parseInt(u32, args[5], 10) catch {
-        std.debug.print("runner: deadline '{s}' is not a whole number of seconds\n{s}", .{ args[5], usage });
+    const is_export = std.mem.eql(u8, mode, "export") or std.mem.eql(u8, mode, "export-pack");
+    // The export modes take two arguments: the preset and the output path.
+    const first_opt: usize = if (is_export) 7 else 6;
+    if (args.len < first_opt) {
+        std.debug.print(usage, .{});
+        return 2;
+    }
+    const deadline_arg = args[first_opt - 1];
+    const deadline_s = std.fmt.parseInt(u32, deadline_arg, 10) catch {
+        std.debug.print("runner: deadline '{s}' is not a whole number of seconds\n{s}", .{ deadline_arg, usage });
         return 2;
     };
     var expects: std.ArrayList([]const u8) = .empty;
@@ -74,7 +94,7 @@ pub fn main(init: std.process.Init) !u8 {
     var allowed: std.ArrayList([]const u8) = .empty;
     var echoes: std.ArrayList([]const u8) = .empty;
     var exit_code: u8 = 0;
-    var i: usize = 6;
+    var i: usize = first_opt;
     while (i < args.len) : (i += 2) {
         if (std.mem.eql(u8, args[i], "--exit-code") and i + 1 < args.len) {
             exit_code = std.fmt.parseInt(u8, args[i + 1], 10) catch {
@@ -102,9 +122,18 @@ pub fn main(init: std.process.Init) !u8 {
         try list.?.append(arena, args[i + 1]);
     }
 
+    const is_run = std.mem.eql(u8, mode, "run");
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(arena, &.{ godot, "--headless", "--verbose", "--path", project });
-    if (std.mem.eql(u8, mode, "script")) {
+    if (is_run) {
+        try argv.appendSlice(arena, &.{ mode_arg, "--headless", "--verbose" });
+    } else {
+        try argv.appendSlice(arena, &.{ godot, "--headless", "--verbose", "--path", project });
+    }
+    if (is_run) {
+        // The exported game: nothing more.
+    } else if (is_export) {
+        try argv.appendSlice(arena, &.{ if (std.mem.eql(u8, mode, "export")) "--export-release" else "--export-pack", mode_arg, args[5] });
+    } else if (std.mem.eql(u8, mode, "script")) {
         try argv.appendSlice(arena, &.{ "--script", mode_arg });
     } else if (std.mem.eql(u8, mode, "editor") or std.mem.eql(u8, mode, "build")) {
         _ = std.fmt.parseInt(u32, mode_arg, 10) catch {
@@ -121,7 +150,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     }
 
-    try writeExtensionList(arena, io, project);
+    if (!is_run) try writeExtensionList(arena, io, project);
 
     const deadline: Io.Clock.Timestamp = .fromNow(io, .{ .raw = .fromSeconds(deadline_s), .clock = .awake });
     const result = std.process.run(arena, io, .{
@@ -133,7 +162,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     };
     const out = try std.mem.concat(arena, u8, &.{ result.stdout, result.stderr });
-    const stock: []const scan.StockOrphan = if (std.mem.eql(u8, mode, "script") or std.mem.eql(u8, mode, "game")) &.{} else &editor_stock;
+    const stock: []const scan.StockOrphan = if (std.mem.eql(u8, mode, "script") or std.mem.eql(u8, mode, "game") or is_run) &.{} else &editor_stock;
 
     var problems: std.ArrayList([]const u8) = .empty;
     const exited_as_expected = switch (result.term) {
@@ -141,7 +170,7 @@ pub fn main(init: std.process.Init) !u8 {
         else => false,
     };
     if (!exited_as_expected) try problems.append(arena, try std.fmt.allocPrint(arena, "Godot did not exit with status {d} ({any})", .{ exit_code, result.term }));
-    try scan.checkTestMarkers(arena, out, &problems);
+    if (!is_export) try scan.checkTestMarkers(arena, out, &problems);
     // A run that already failed may have stopped early, with fewer of the
     // events an allowed report counts: an allowed line then matches with
     // any count, so the earlier problem is the one reported.

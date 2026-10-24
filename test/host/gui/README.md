@@ -54,7 +54,7 @@ nix shell 'github:silversquirl/zig-flake/compat#"0.17.0"' nixpkgs#godot
    printf '\n[ziggurat]\n\nzig_path="%s"\ndev/sdk_manifest="/tmp/ziggurat-e2e-sdk.json"\n' "$(command -v zig)" \
        >> /tmp/ziggurat-e2e/project.godot
    mkdir -p /tmp/ziggurat-e2e/.godot
-   echo 'res://addon/ziggurat_host.gdextension' > /tmp/ziggurat-e2e/.godot/extension_list.cfg
+   echo 'res://addons/ziggurat/ziggurat.gdextension' > /tmp/ziggurat-e2e/.godot/extension_list.cfg
    ```
 
 2. Open the editor: `ZTEST_GUI=1 godot --editor --path /tmp/ziggurat-e2e`

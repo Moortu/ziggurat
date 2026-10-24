@@ -17,11 +17,14 @@
 //! build outcome was applied (`editor_build.outcomes_applied`) or a build
 //! started or ended; then it updates the panel and pushes the outcome's
 //! toast. It also adds the debugger plugin (debugger_plugin.zig), which
-//! tells running games to reload after each manifest write, and gives the
+//! tells running games to reload after each manifest write, the export
+//! plugin (export_plugin.zig), which builds an exported game's library
+//! from the project's Zig scripts and leaves `.zig` files out of the
+//! export, and gives the
 //! script editor the Zig syntax highlighter (highlighter.zig; the script
 //! editor exists from here on, not at EDITOR init). When it leaves the tree
-//! it takes the menu items, the panel, the debugger plugin, the
-//! highlighter and its signal connections back (editor_build.zig has the
+//! it takes the menu items, the panel, the debugger and export plugins,
+//! the highlighter and its signal connections back (editor_build.zig has the
 //! build API).
 //!
 //! Zig download (zig_download.zig): `Download Zig 0.17.0` starts it. Its
@@ -76,6 +79,7 @@ const host_options = @import("host_options");
 const editor_build = @import("editor_build.zig");
 const editor_panel = @import("editor_panel.zig");
 const debugger_plugin = @import("debugger_plugin.zig");
+const export_plugin = @import("export_plugin.zig");
 const highlighter = @import("highlighter.zig");
 const zig_download = @import("zig_download.zig");
 const host_callable = @import("host_callable.zig");
@@ -153,6 +157,7 @@ pub const ZigEditorPlugin = struct {
         self.seen_completions = zig_download.completions;
         self.seen_failures = zig_download.failures;
         debugger_plugin.attach(self.base);
+        export_plugin.attach(self.base);
         highlighter.attach();
         self.connectSignals(true);
         self.readSettings();
@@ -167,6 +172,7 @@ pub const ZigEditorPlugin = struct {
         zig_download.detach();
         self.connectSignals(false);
         highlighter.detach();
+        export_plugin.detach(self.base);
         debugger_plugin.detach(self.base);
         inline for (.{ menu_build, menu_download }) |name| {
             var n = String.fromLatin1(name);
@@ -591,6 +597,7 @@ pub fn register(registry: *godot.extension.Registry) void {
     panel.addMethod("on_meta_clicked", .auto);
     panel.addMethod("download_cancel_pressed", .auto);
     debugger_plugin.register(registry);
+    export_plugin.register(registry);
     highlighter.register(registry);
 }
 
