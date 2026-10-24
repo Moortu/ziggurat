@@ -3042,31 +3042,17 @@ test "linked library loads nothing at run time" {
 }
 
 /// The names of the ELF64 little-endian file's dynamic symbols (`.dynsym`),
-/// each between NUL bytes, allocated with `a`.
+/// each between NUL bytes, allocated with `a`. A malformed file fails with
+/// the ELF reader's error (every offset and size is range-checked).
 fn dynamicSymbolNames(a: std.mem.Allocator, elf: []const u8) ![]u8 {
-    if (elf.len < 64 or !std.mem.eql(u8, elf[0..4], "\x7fELF") or elf[4] != 2 or elf[5] != 1) return error.NotElf64;
-    const shoff = std.mem.readInt(u64, elf[0x28..][0..8], .little);
-    const shentsize = std.mem.readInt(u16, elf[0x3a..][0..2], .little);
-    const shnum = std.mem.readInt(u16, elf[0x3c..][0..2], .little);
+    const syms = try platform.elf.dynamicSymbols(a, elf);
+    defer a.free(syms);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
     try out.append(a, 0);
-    for (0..shnum) |i| {
-        const sh = elf[shoff + i * shentsize ..][0..64];
-        const sh_type = std.mem.readInt(u32, sh[4..8], .little);
-        if (sh_type != 11) continue; // SHT_DYNSYM
-        const off = std.mem.readInt(u64, sh[0x18..0x20], .little);
-        const size = std.mem.readInt(u64, sh[0x20..0x28], .little);
-        const link = std.mem.readInt(u32, sh[0x28..0x2c], .little);
-        const entsize = std.mem.readInt(u64, sh[0x38..0x40], .little);
-        const str_sh = elf[shoff + link * shentsize ..][0..64];
-        const str_off = std.mem.readInt(u64, str_sh[0x18..0x20], .little);
-        var at: u64 = 0;
-        while (at + entsize <= size) : (at += entsize) {
-            const name = std.mem.readInt(u32, elf[off + at ..][0..4], .little);
-            try out.appendSlice(a, std.mem.sliceTo(elf[str_off + name ..], 0));
-            try out.append(a, 0);
-        }
+    for (syms) |s| {
+        try out.appendSlice(a, s.name);
+        try out.append(a, 0);
     }
     return out.toOwnedSlice(a);
 }

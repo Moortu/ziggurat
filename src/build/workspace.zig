@@ -33,7 +33,24 @@ pub const BuildMode = struct {
     optimize: std.builtin.OptimizeMode,
 };
 
-pub const PrepareOptions = struct { lock_timeout_ms: u32 = 30000 };
+pub const PrepareOptions = struct {
+    lock_timeout_ms: u32 = 30000,
+    /// The build id written into the generated root; null: the scan's id.
+    build_id: ?[]const u8 = null,
+};
+
+/// What `Workspace.exportArgv` adds for an exported game's library: one
+/// shared library of the scripts and the export host archive.
+pub const ExportLink = struct {
+    /// `-target` value for every module, e.g. `platform.pins.export_target`.
+    target: []const u8,
+    /// The export host archive (`libziggurat_host_export.a`).
+    host_archive: OsPath,
+    /// A linker version script that exports only `ziggurat_host_init`.
+    version_script: OsPath,
+    /// Library name: the compiler writes `lib<name>.so`.
+    name: []const u8,
+};
 
 pub const Workspace = struct {
     cache_dir: OsPath,
@@ -64,43 +81,74 @@ pub const Workspace = struct {
     pub fn argv(self: Workspace, a: std.mem.Allocator, zig: ZigInstall, mode: BuildMode) ![]const []const u8 {
         var out: std.ArrayList([]const u8) = .empty;
         errdefer freeArgv(a, out.items);
-        const zig_cache = try platform.path.joinFor(self.os, a, self.cache_dir, &.{"zig-cache"});
-        defer a.free(zig_cache.bytes);
-        const root = try platform.path.joinFor(self.os, a, self.source_root, &.{rootgen.root_file_name});
-        defer a.free(root.bytes);
-
         try push(a, &out, "{s}", .{zig.exe.bytes});
         try push(a, &out, "build-lib", .{});
         try push(a, &out, "-dynamic", .{});
         try push(a, &out, "-lc", .{});
-        const opt = switch (mode.optimize) {
-            .Debug => "-ODebug",
-            .ReleaseSafe => "-OReleaseSafe",
-            .ReleaseFast => "-OReleaseFast",
-            .ReleaseSmall => "-OReleaseSmall",
-        };
         if (mode.use_llvm) try push(a, &out, "-fllvm", .{}) else try push(a, &out, "-fno-llvm", .{});
         if (mode.incremental) try push(a, &out, "-fincremental", .{});
-        try push(a, &out, "--name", .{});
-        try push(a, &out, "zmod", .{});
-        try push(a, &out, "--cache-dir", .{});
-        try push(a, &out, "{s}", .{zig_cache.bytes});
-        try push(a, &out, "--listen=-", .{});
+        try self.pushOutput(a, &out, "zmod");
         // `-O` is a per-module option: each `-M` gets its own, so no module
         // depends on how the compiler fills in a missing one.
-        try push(a, &out, "{s}", .{opt});
-        try push(a, &out, "--dep", .{});
-        try push(a, &out, "ziggurat", .{});
-        try push(a, &out, "-Mroot={s}", .{root.bytes});
-        for (self.sdk) |m| {
-            try push(a, &out, "{s}", .{opt});
-            for (m.deps) |d| {
-                try push(a, &out, "--dep", .{});
-                try push(a, &out, "{s}", .{d});
-            }
-            try push(a, &out, "-M{s}={s}", .{ m.name, m.root.bytes });
-        }
+        try self.pushModules(a, &out, &.{optFlag(mode.optimize)});
         return out.toOwnedSlice(a);
+    }
+
+    /// The compiler command line of an exported game's library (spec
+    /// section 10): the generated root and the SDK compiled for
+    /// `link.target`, non-incremental, LLVM, ReleaseSafe, without debug
+    /// information (it holds absolute paths, so the same project in two
+    /// folders would give different bytes), linked with the export host
+    /// archive into one shared library that exports only
+    /// `ziggurat_host_init`. Run it with `build_dir` as the working folder.
+    /// Free with `freeArgv`, or use an arena.
+    pub fn exportArgv(self: Workspace, a: std.mem.Allocator, zig: ZigInstall, link: ExportLink) ![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        errdefer freeArgv(a, out.items);
+        try push(a, &out, "{s}", .{zig.exe.bytes});
+        try push(a, &out, "build-lib", .{});
+        try push(a, &out, "-dynamic", .{});
+        try push(a, &out, "-lc", .{});
+        try push(a, &out, "-fllvm", .{});
+        try self.pushOutput(a, &out, link.name);
+        try push(a, &out, "--version-script", .{});
+        try push(a, &out, "{s}", .{link.version_script.bytes});
+        // Nothing in the scripts refers to Godot's entry point, so the
+        // archive member that defines it is pulled in by name.
+        try push(a, &out, "--force_undefined", .{});
+        try push(a, &out, "ziggurat_host_init", .{});
+        try push(a, &out, "{s}", .{link.host_archive.bytes});
+        // `-target`, `-O` and `-fstrip` are per-module options.
+        try self.pushModules(a, &out, &.{ "-target", link.target, optFlag(.ReleaseSafe), "-fstrip" });
+        return out.toOwnedSlice(a);
+    }
+
+    fn pushOutput(self: Workspace, a: std.mem.Allocator, out: *std.ArrayList([]const u8), name: []const u8) !void {
+        const zig_cache = try platform.path.joinFor(self.os, a, self.cache_dir, &.{"zig-cache"});
+        defer a.free(zig_cache.bytes);
+        try push(a, out, "--name", .{});
+        try push(a, out, "{s}", .{name});
+        try push(a, out, "--cache-dir", .{});
+        try push(a, out, "{s}", .{zig_cache.bytes});
+        try push(a, out, "--listen=-", .{});
+    }
+
+    /// The root module, then every SDK module, each preceded by `per_module`.
+    fn pushModules(self: Workspace, a: std.mem.Allocator, out: *std.ArrayList([]const u8), per_module: []const []const u8) !void {
+        const root = try platform.path.joinFor(self.os, a, self.source_root, &.{rootgen.root_file_name});
+        defer a.free(root.bytes);
+        for (per_module) |f| try push(a, out, "{s}", .{f});
+        try push(a, out, "--dep", .{});
+        try push(a, out, "ziggurat", .{});
+        try push(a, out, "-Mroot={s}", .{root.bytes});
+        for (self.sdk) |m| {
+            for (per_module) |f| try push(a, out, "{s}", .{f});
+            for (m.deps) |d| {
+                try push(a, out, "--dep", .{});
+                try push(a, out, "{s}", .{d});
+            }
+            try push(a, out, "-M{s}={s}", .{ m.name, m.root.bytes });
+        }
     }
 
     pub fn freeArgv(a: std.mem.Allocator, v: []const []const u8) void {
@@ -136,6 +184,15 @@ pub const Workspace = struct {
         return try std.mem.join(a, "/", parts.items[root_parts.items.len..]);
     }
 };
+
+fn optFlag(mode: std.builtin.OptimizeMode) []const u8 {
+    return switch (mode) {
+        .Debug => "-ODebug",
+        .ReleaseSafe => "-OReleaseSafe",
+        .ReleaseFast => "-OReleaseFast",
+        .ReleaseSmall => "-OReleaseSmall",
+    };
+}
 
 fn push(a: std.mem.Allocator, out: *std.ArrayList([]const u8), comptime fmt: []const u8, args: anytype) !void {
     const item = try std.fmt.allocPrint(a, fmt, args);
@@ -209,10 +266,26 @@ pub fn prepare(
     opts: PrepareOptions,
     msg: *std.ArrayList(u8),
 ) !Workspace {
-    const os = ps.env.os;
-    const cwd = std.Io.Dir.cwd();
     const cache_root = try ps.dir(.cache, a);
     defer a.free(cache_root.bytes);
+    return prepareIn(a, io, ps, cache_root, scan, sdk, opts, msg);
+}
+
+/// `prepare` with the per-user cache folder given: the workspace is
+/// `<cache_root>/projects/<ps.projectId()>/`. `ps.env` is read only for its
+/// `os`.
+pub fn prepareIn(
+    a: std.mem.Allocator,
+    io: std.Io,
+    ps: PathService,
+    cache_root: OsPath,
+    scan: ScanResult,
+    sdk: []const ModuleDep,
+    opts: PrepareOptions,
+    msg: *std.ArrayList(u8),
+) !Workspace {
+    const os = ps.env.os;
+    const cwd = std.Io.Dir.cwd();
     const id = ps.projectId();
     const cache_dir = try platform.path.joinFor(os, a, cache_root, &.{ "projects", &id });
     errdefer a.free(cache_dir.bytes);
@@ -231,7 +304,7 @@ pub fn prepare(
     };
     errdefer lock.release();
 
-    const root_text = try rootgen.generateRoot(a, os, scan.scripts, &scan.build_id);
+    const root_text = try rootgen.generateRoot(a, os, scan.scripts, opts.build_id orelse &scan.build_id);
     defer a.free(root_text);
 
     var mirrored = false;
@@ -600,6 +673,61 @@ test "argv repeats optimize" {
     }
     try testing.expectEqual(@as(usize, 4), m_count);
     try testing.expectEqual(m_count, o_count);
+}
+
+test "export argv golden" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const deps = [_]ModuleDep{
+        .{ .name = "ziggurat", .root = .fromTrusted("/sdk/ziggurat.zig"), .deps = &.{"gdzig"} },
+        .{ .name = "gdzig", .root = .fromTrusted("/g/gdzig.zig"), .deps = &.{} },
+    };
+    const ws: Workspace = .{
+        .cache_dir = .fromTrusted("/c/projects/p"),
+        .build_dir = .fromTrusted("/c/projects/p/build"),
+        .source_root = .fromTrusted("/proj"),
+        .mirrored = false,
+        .os = builtin.os.tag,
+        .sdk = &deps,
+        .lock = undefined,
+    };
+    const got = try ws.exportArgv(arena, dummyZig(), .{
+        .target = "x86_64-linux-gnu.2.28",
+        .host_archive = .fromTrusted("/a/libziggurat_host_export.a"),
+        .version_script = .fromTrusted("/c/projects/p/build/export.map"),
+        .name = "ziggurat_game",
+    });
+    const want: []const []const u8 = &.{
+        "/opt/zig/zig",          "build-lib",                       "-dynamic",          "-lc",                          "-fllvm",
+        "--name",                "ziggurat_game",                   "--cache-dir",       "/c/projects/p/zig-cache",      "--listen=-",
+        "--version-script",      "/c/projects/p/build/export.map",  "--force_undefined", "ziggurat_host_init",           "/a/libziggurat_host_export.a",
+        "-target",               "x86_64-linux-gnu.2.28",           "-OReleaseSafe",     "-fstrip",                      "--dep",
+        "ziggurat",              "-Mroot=/proj/.ziggurat_root.zig", "-target",           "x86_64-linux-gnu.2.28",        "-OReleaseSafe",
+        "-fstrip",               "--dep",                           "gdzig",             "-Mziggurat=/sdk/ziggurat.zig", "-target",
+        "x86_64-linux-gnu.2.28", "-OReleaseSafe",                   "-fstrip",           "-Mgdzig=/g/gdzig.zig",
+    };
+    try expectArgv(want, got);
+    // Never incremental.
+    for (got) |arg| try testing.expect(!std.mem.eql(u8, arg, "-fincremental"));
+}
+
+test "prepare writes the given build id" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fx = try Fixture.init(arena);
+    defer fx.tmp.cleanup();
+    try fx.put("a/x.zig", "pub const extends = \"Node\";\n");
+    const sc = try fx.scan(arena);
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(testing.allocator);
+    var ws = try prepare(testing.allocator, testing.io, fx.ps, sc, &.{}, .{ .build_id = "export" }, &msg);
+    defer ws.deinit(testing.allocator);
+    const want = try rootgen.generateRoot(arena, builtin.os.tag, sc.scripts, "export");
+    const got = try std.Io.Dir.cwd().readFileAlloc(testing.io, try std.fs.path.join(arena, &.{ ws.source_root.bytes, rootgen.root_file_name }), arena, .limited(1 << 20));
+    try testing.expectEqualStrings(want, got);
 }
 
 fn expectArgv(want: []const []const u8, got: []const []const u8) !void {

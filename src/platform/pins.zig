@@ -3,6 +3,16 @@ const std = @import("std");
 
 pub const zig_version = "0.17.0";
 
+/// The newest glibc symbol version an exported game's library may need: the
+/// highest `GLIBC_` version the official Godot 4.7.2 `linux_release.x86_64`
+/// export template needs (`readelf -V`), so the library runs wherever the
+/// template runs.
+pub const export_glibc = "2.28";
+
+/// The target an exported game's library and the export host archive are
+/// built for (baseline CPU).
+pub const export_target = "x86_64-linux-gnu." ++ export_glibc;
+
 /// The Zig Software Foundation's minisign public key, as published on
 /// https://ziglang.org/download/. Every downloaded Zig archive must carry a
 /// signature from this key.
@@ -67,4 +77,12 @@ test "pins: archive for x86_64-linux only" {
     try std.testing.expect(zig_archive(.{ .arch = .riscv64, .os = .linux }) == null);
     // Every listed name has the pinned version.
     for (archives) |e| try std.testing.expect(std.mem.indexOf(u8, e.archive.name, "-" ++ zig_version ++ ".") != null);
+}
+
+test "pins: export target parses with the pinned glibc" {
+    const q = try std.Target.Query.parse(.{ .arch_os_abi = export_target });
+    try std.testing.expectEqual(std.Target.Cpu.Arch.x86_64, q.cpu_arch.?);
+    try std.testing.expectEqual(std.Target.Os.Tag.linux, q.os_tag.?);
+    try std.testing.expectEqual(std.Target.Abi.gnu, q.abi.?);
+    try std.testing.expectEqual(std.SemanticVersion{ .major = 2, .minor = 28, .patch = 0 }, q.glibc_version.?);
 }

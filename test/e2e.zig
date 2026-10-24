@@ -1,6 +1,7 @@
 //! End-to-end tests for Stage 1: the build service driving the real Zig
-//! compiler on generated projects with the stub SDK. Every test here spawns
-//! the compiler, so all are `integration:` tests.
+//! compiler on generated projects with the stub SDK, and (Stage 6) the
+//! export build with the real SDK and the export host archive. Every test
+//! here spawns the compiler, so all are `integration:` tests.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -742,4 +743,287 @@ test "integration: lost fast path is reported once after the second server death
     const o4 = try build(svc, .save);
     try expectOk(o4);
     try testing.expect(o4.message == null);
+}
+
+// ------------------------------------------------ export build (Stage 6)
+//
+// `export_build.run` compiling a project against the real SDK (module list
+// from the SDK manifest) and linking it with the export host archive
+// (`zig build host-archive`), as an exported game's library.
+
+const export_build = zbuild.export_build;
+
+const alpha_source =
+    \\const z = @import("ziggurat");
+    \\const g = z.godot;
+    \\
+    \\pub const extends = g.Node2D;
+    \\
+    \\base: *g.Node2D,
+    \\speed: f32 = 3,
+    \\
+    \\pub fn _ready(self: *@This()) void {
+    \\    z.log(.info, "alpha ready speed={d}", .{self.speed});
+    \\}
+    \\
+;
+
+const beta_source =
+    \\const z = @import("ziggurat");
+    \\const g = z.godot;
+    \\
+    \\pub const extends = g.Node;
+    \\
+    \\base: *g.Node,
+    \\
+    \\pub fn _ready(_: *@This()) void {
+    \\    z.log(.info, "beta ready", .{});
+    \\}
+    \\
+;
+
+/// Temporary projects, one cache and the SDK manifest for export builds.
+const ExportFx = struct {
+    arena_state: std.heap.ArenaAllocator,
+    tmp: testing.TmpDir,
+    base: []const u8,
+    cache: []const u8,
+    manifest: zbuild.sdk_manifest.Manifest,
+    archive: []const u8,
+
+    fn init(fx: *ExportFx) !void {
+        fx.arena_state = .init(testing.allocator);
+        errdefer fx.arena_state.deinit();
+        const a = fx.arena_state.allocator();
+        var msg: std.ArrayList(u8) = .empty;
+        defer msg.deinit(testing.allocator);
+        const manifest_path = try std.Io.Dir.cwd().realPathFileAlloc(io, build_options.sdk_manifest_path, a);
+        fx.manifest = zbuild.sdk_manifest.load(testing.allocator, io, .fromTrusted(manifest_path), &msg) catch |err| {
+            std.debug.print("manifest: {s}\n", .{msg.items});
+            return err;
+        };
+        errdefer fx.manifest.deinit(testing.allocator);
+        fx.archive = try std.Io.Dir.cwd().realPathFileAlloc(io, build_options.export_host_archive, a);
+        fx.tmp = testing.tmpDir(.{});
+        errdefer fx.tmp.cleanup();
+        try fx.tmp.dir.createDirPath(io, "cache");
+        fx.base = try fx.tmp.dir.realPathFileAlloc(io, ".", a);
+        fx.cache = try fx.tmp.dir.realPathFileAlloc(io, "cache", a);
+    }
+
+    fn deinit(fx: *ExportFx) void {
+        fx.tmp.cleanup();
+        fx.manifest.deinit(testing.allocator);
+        fx.arena_state.deinit();
+    }
+
+    /// Creates project folder `sub` (relative to the temp folder) holding
+    /// `files`; returns its absolute path.
+    fn project(fx: *ExportFx, sub: []const u8, files: []const File) ![]const u8 {
+        const a = fx.arena_state.allocator();
+        try fx.tmp.dir.createDirPath(io, sub);
+        var d = try fx.tmp.dir.openDir(io, sub, .{});
+        defer d.close(io);
+        for (files) |f| {
+            if (std.fs.path.dirname(f.rel)) |p| try d.createDirPath(io, p);
+            try d.writeFile(io, .{ .sub_path = f.rel, .data = f.data });
+        }
+        return fx.tmp.dir.realPathFileAlloc(io, sub, a);
+    }
+
+    fn options(fx: *ExportFx, project_root: []const u8, out_path: []const u8) export_build.Options {
+        return .{
+            .zig = .{ .exe = .fromTrusted(build_options.zig_exe), .version = platform.pins.zig_version },
+            .project_root = .fromTrusted(project_root),
+            .sdk = fx.manifest.modules,
+            .host_archive = .fromTrusted(fx.archive),
+            .out_path = .fromTrusted(out_path),
+            .cache_dir = .fromTrusted(fx.cache),
+        };
+    }
+
+    fn out(fx: *ExportFx, name: []const u8) ![]const u8 {
+        return std.fs.path.join(fx.arena_state.allocator(), &.{ fx.base, name, export_build.lib_file });
+    }
+
+    /// Runs the export build; prints why it failed.
+    fn build(fx: *ExportFx, project_root: []const u8, out_path: []const u8) !export_build.Result {
+        var diag: [256]u8 = undefined;
+        return export_build.run(testing.allocator, io, fx.options(project_root, out_path), &diag) catch |err| {
+            std.debug.print("export build error {t}: {s}\n", .{ err, platform.elf.diagText(&diag) });
+            return err;
+        };
+    }
+};
+
+const File = struct { rel: []const u8, data: []const u8 };
+
+const two_scripts = [_]File{ .{ .rel = "alpha.zig", .data = alpha_source }, .{ .rel = "sub/beta.zig", .data = beta_source } };
+
+fn expectExportOk(r: export_build.Result) !void {
+    if (!r.ok) {
+        std.debug.print("export build failed: {?s}\n", .{r.message});
+        for (r.diagnostics) |d| std.debug.print("  {?s}:{d}:{d}: {s}\n", .{ d.rel, d.line, d.column, d.message });
+        return error.BuildFailed;
+    }
+}
+
+fn readAll(p: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, p, testing.allocator, .limited(1 << 30));
+}
+
+test "integration: export build links one library" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var fx: ExportFx = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const proj = try fx.project("proj", &two_scripts);
+    const out_path = try fx.out("out");
+    const r = try fx.build(proj, out_path);
+    defer r.deinit(testing.allocator);
+    try expectExportOk(r);
+
+    const lib = try readAll(out_path);
+    defer testing.allocator.free(lib);
+    const syms = try platform.elf.dynamicSymbols(testing.allocator, lib);
+    defer testing.allocator.free(syms);
+    // Exported (`nm -D --defined-only`): only Godot's entry point. Imported:
+    // no dlopen, so nothing is loaded at run time.
+    var exported: usize = 0;
+    var has_entry = false;
+    for (syms) |s| {
+        if (s.name.len == 0) continue;
+        if (s.defined) {
+            exported += 1;
+            if (std.mem.eql(u8, s.name, "ziggurat_host_init")) has_entry = true;
+            try testing.expect(!std.mem.eql(u8, s.name, "ziggurat_describe"));
+            try testing.expect(!std.mem.eql(u8, s.name, "ziggurat_init"));
+        } else {
+            try testing.expect(!std.mem.eql(u8, s.name, "dlopen"));
+        }
+    }
+    try testing.expect(has_entry);
+    try testing.expectEqual(@as(usize, 1), exported);
+    // `readelf -V`: no GLIBC version above the pin, and the pin itself is
+    // what the template needs, so a library needing it is still fine.
+    const vers = try platform.elf.neededVersions(testing.allocator, lib);
+    defer testing.allocator.free(vers);
+    try testing.expect(vers.len > 0);
+    if (export_build.glibcAbove(vers, platform.pins.export_glibc)) |v| {
+        std.debug.print("the library needs {s}\n", .{v});
+        return error.GlibcTooNew;
+    }
+}
+
+test "integration: export build two folders give identical bytes" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var fx: ExportFx = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const p1 = try fx.project("one/proj", &two_scripts);
+    const p2 = try fx.project("two dir \u{e4}\u{f6}/\u{30d7}\u{30ed} ject", &two_scripts);
+    const o1 = try fx.out("one");
+    const o2 = try fx.out("two dir \u{e4}\u{f6}");
+    const r1 = try fx.build(p1, o1);
+    defer r1.deinit(testing.allocator);
+    try expectExportOk(r1);
+    const r2 = try fx.build(p2, o2);
+    defer r2.deinit(testing.allocator);
+    try expectExportOk(r2);
+    const b1 = try readAll(o1);
+    defer testing.allocator.free(b1);
+    const b2 = try readAll(o2);
+    defer testing.allocator.free(b2);
+    try testing.expect(std.mem.eql(u8, b1, b2));
+    // No absolute path: neither project's folder, nor the SDK's, nor the
+    // compiler's library folder.
+    const sdk_dir = std.fs.path.dirname(fx.manifest.modules[0].root.bytes).?;
+    for ([_][]const u8{ fx.base, "\u{30d7}\u{30ed}", sdk_dir, "/nix/store/", "/lib/std/" }) |needle| {
+        if (std.mem.indexOf(u8, b1, needle) != null) {
+            std.debug.print("the library holds '{s}'\n", .{needle});
+            return error.AbsolutePathInLibrary;
+        }
+    }
+}
+
+test "integration: export build id is fixed" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var fx: ExportFx = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const proj = try fx.project("proj", &two_scripts);
+    const r = try fx.build(proj, try fx.out("out"));
+    defer r.deinit(testing.allocator);
+    try expectExportOk(r);
+    // The root the library was compiled from carries the fixed id, not the
+    // scan's (which hashes modification times and inodes).
+    const a = fx.arena_state.allocator();
+    const root = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ proj, zbuild.rootgen.root_file_name }), a, .limited(1 << 20));
+    try testing.expectEqualStrings("export", export_build.build_id);
+    try testing.expect(std.mem.indexOf(u8, root, "ziggurat.tableOf(scripts, \"export\");") != null);
+    const sc = try zbuild.scan.scan(a, io, .fromTrusted(proj), zbuild.scan.default_script_dirs);
+    try testing.expectEqualStrings(try zbuild.rootgen.generateRoot(a, builtin.os.tag, sc.scripts, "export"), root);
+}
+
+test "integration: export build broken script fails" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var fx: ExportFx = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const broken =
+        \\const z = @import("ziggurat");
+        \\pub const extends = z.godot.Node;
+        \\base: *z.godot.Node,
+        \\pub fn _ready(_: *@This()) void {
+        \\    const n: u32 = "not a number";
+        \\    _ = n;
+        \\}
+        \\
+    ;
+    const proj = try fx.project("proj", &.{ .{ .rel = "alpha.zig", .data = alpha_source }, .{ .rel = "game/broken.zig", .data = broken } });
+    const out_path = try fx.out("out");
+    const r = try fx.build(proj, out_path);
+    defer r.deinit(testing.allocator);
+    try testing.expect(!r.ok);
+    var found = false;
+    for (r.diagnostics) |d| {
+        const rel = d.rel orelse continue;
+        if (std.mem.eql(u8, rel, "game/broken.zig") and d.line == 5) found = true;
+    }
+    if (!found) {
+        for (r.diagnostics) |d| std.debug.print("  {?s}:{d}:{d}: {s}\n", .{ d.rel, d.line, d.column, d.message });
+        return error.DiagnosticNotMapped;
+    }
+    // No library is written.
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, out_path, .{}));
+}
+
+test "integration: export build of a read-only project goes through the mirror" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    // Root ignores file modes.
+    if (std.c.geteuid() == 0) return error.SkipZigTest;
+    var fx: ExportFx = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const proj = try fx.project("proj", &two_scripts);
+    const sub_z = try fx.arena_state.allocator().dupeSentinel(u8, try std.fs.path.join(fx.arena_state.allocator(), &.{ proj, "sub" }), 0);
+    const proj_z = try fx.arena_state.allocator().dupeSentinel(u8, proj, 0);
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(sub_z, 0o555));
+    defer _ = std.c.chmod(sub_z, 0o755);
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(proj_z, 0o555));
+    defer _ = std.c.chmod(proj_z, 0o755);
+    const out_path = try fx.out("out");
+    const r = try fx.build(proj, out_path);
+    defer r.deinit(testing.allocator);
+    try expectExportOk(r);
+    try std.Io.Dir.cwd().access(io, out_path, .{});
+    // The generated root went to the mirror, not into the project.
+    var d = try std.Io.Dir.cwd().openDir(io, proj, .{});
+    defer d.close(io);
+    try testing.expectError(error.FileNotFound, d.access(io, zbuild.rootgen.root_file_name, .{}));
 }
