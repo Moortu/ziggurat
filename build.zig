@@ -834,14 +834,7 @@ fn addSourceInputs(b: *std.Build, run: *std.Build.Step.Run, dirs: []const []cons
 /// compiler command line has one flat module namespace, so two different
 /// modules with the same import name are a configuration error.
 fn addManifestModules(b: *std.Build, run: *std.Build.Step.Run, sdk: *std.Build.Module) void {
-    run.addArg(sdk_version);
-    const seen = sdkModules(b, sdk);
-    for (seen.keys(), seen.values()) |name, mod| {
-        run.addArg(name);
-        const root = mod.root_source_file orelse std.debug.panic("SDK module \"{s}\" has no root source file", .{name});
-        run.addFileArg2(root, .{ .make_absolute = true });
-        run.addArg(std.mem.join(b.allocator, ",", mod.import_table.keys()) catch @panic("OOM"));
-    }
+    addModuleArgs(b, run, sdk, false);
 }
 
 /// Arguments of tools/sdk_stage.zig after its output folder: the SDK
@@ -850,6 +843,17 @@ fn addManifestModules(b: *std.Build, run: *std.Build.Step.Run, sdk: *std.Build.M
 /// and Godot's documentation text); the translate-c output loses its line
 /// comments (source locations that name this machine's headers).
 fn addStageModules(b: *std.Build, run: *std.Build.Step.Run, sdk: *std.Build.Module) void {
+    addModuleArgs(b, run, sdk, true);
+}
+
+/// `<sdk_version>`, then per SDK module `<name> <root> <deps>`, and with
+/// `stage` also `<strip>`. With `stage` every file in the folder of each
+/// source root becomes an input of `run`: the stage tool reads the files
+/// the root imports, which the build system cannot see. That covers this
+/// checkout's folders, the path dependency `vendor/gdzig` (its `common`
+/// package) and fetched packages; generated roots come with the step that
+/// makes them.
+fn addModuleArgs(b: *std.Build, run: *std.Build.Step.Run, sdk: *std.Build.Module, stage: bool) void {
     run.addArg(sdk_version);
     const seen = sdkModules(b, sdk);
     for (seen.keys(), seen.values()) |name, mod| {
@@ -857,6 +861,7 @@ fn addStageModules(b: *std.Build, run: *std.Build.Step.Run, sdk: *std.Build.Modu
         const root = mod.root_source_file orelse std.debug.panic("SDK module \"{s}\" has no root source file", .{name});
         run.addFileArg2(root, .{ .make_absolute = true });
         run.addArg(std.mem.join(b.allocator, ",", mod.import_table.keys()) catch @panic("OOM"));
+        if (!stage) continue;
         const strip = if (std.mem.eql(u8, name, "gdzig"))
             "docs"
         else if (std.mem.eql(u8, name, "gdextension"))
@@ -864,16 +869,35 @@ fn addStageModules(b: *std.Build, run: *std.Build.Step.Run, sdk: *std.Build.Modu
         else
             "none";
         run.addArg(strip);
-        // The tool reads every file the root imports, which the build
-        // system cannot see; a source folder's edits must rerun it.
         switch (root) {
-            // This checkout's folders (sdk/, src/abi/); packages do not
-            // change under the same hash, and generated roots come with
-            // the step that makes them.
-            .src_path => |sp| if (sp.owner == b) {
-                const dir = std.fs.path.dirname(sp.sub_path) orelse ".";
-                addSourceInputs(b, run, &.{dir});
-            },
+            .src_path => |sp| addTreeInputs(b, run, sp.owner, std.fs.path.dirname(sp.sub_path) orelse ""),
+            else => {},
+        }
+    }
+}
+
+/// Makes every file under folder `sub` of `owner`'s build root (any
+/// package's builder) an input of `run`, and a new or removed file there
+/// repeat configuration.
+fn addTreeInputs(b: *std.Build, run: *std.Build.Step.Run, owner: *std.Build, sub: []const u8) void {
+    const io = b.graph.io;
+    const abs = owner.root.joinString(b.allocator, sub) catch @panic("OOM");
+    var dir = std.Io.Dir.cwd().openDir(io, abs, .{ .iterate = true }) catch |err|
+        std.debug.panic("cannot open {s}: {t}", .{ abs, err });
+    defer dir.close(io);
+    const lazy = struct {
+        fn at(o: *std.Build, base: []const u8, rel: []const u8) std.Build.LazyPath {
+            const p = if (base.len == 0) rel else if (rel.len == 0) base else o.fmt("{s}/{s}", .{ base, rel });
+            return .{ .src_path = .{ .owner = o, .sub_path = if (p.len == 0) "." else p } };
+        }
+    };
+    b.dependOnDirectoryContents(lazy.at(owner, sub, ""));
+    var walker = dir.walk(b.allocator) catch @panic("OOM");
+    defer walker.deinit();
+    while (walker.next(io) catch |err| std.debug.panic("cannot walk {s}: {t}", .{ abs, err })) |entry| {
+        switch (entry.kind) {
+            .directory => b.dependOnDirectoryContents(lazy.at(owner, sub, entry.path)),
+            .file => run.addFileInput(lazy.at(owner, sub, entry.path)),
             else => {},
         }
     }

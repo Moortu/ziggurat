@@ -901,8 +901,11 @@ fn sdkManifest(ga: Allocator, a: Allocator, msg: *std.ArrayList(u8)) error{ OutO
             try msg.print(ga, "the shipped SDK's manifest {s} has no absolute path ({s}), and the project setting " ++ setting_sdk_manifest ++ " is not set.", .{ shipped_sdk_manifest, shipped });
             return error.Unusable;
         }
-        std.Io.Dir.cwd().access(io, shipped, .{}) catch {
-            try msg.appendSlice(ga, "there is no SDK at " ++ shipped_sdk_manifest ++ " (the add-on's sdk folder is missing), and the project setting " ++ setting_sdk_manifest ++ " is not set.");
+        std.Io.Dir.cwd().access(io, shipped, .{}) catch |err| {
+            switch (err) {
+                error.FileNotFound => try msg.appendSlice(ga, "there is no SDK at " ++ shipped_sdk_manifest ++ " (the add-on's sdk folder is missing), and the project setting " ++ setting_sdk_manifest ++ " is not set."),
+                else => try msg.print(ga, "the shipped SDK's manifest {s} cannot be read ({t}), and the project setting " ++ setting_sdk_manifest ++ " is not set.", .{ shipped, err }),
+            }
             return error.Unusable;
         };
         break :blk shipped;

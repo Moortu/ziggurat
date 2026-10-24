@@ -54,7 +54,10 @@ const Raw = struct {
 /// root is resolved against the manifest's folder and must stay inside it
 /// (checked on the text: `..` may not climb out, and the root may not be
 /// the folder itself); the manifest's own path must then be absolute. The
-/// returned roots are absolute.
+/// check reads only the text, so a symbolic link inside the SDK folder is
+/// followed wherever it points (the SDK folder is one the user installed).
+/// Every root, absolute or relative, must end in a file name: not a
+/// separator, `.` or `..`. The returned roots are absolute.
 pub fn load(a: std.mem.Allocator, io: std.Io, path: OsPath, msg: *std.ArrayList(u8)) !Manifest {
     msg.clearRetainingCapacity();
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path.bytes, a, .limited(max_bytes)) catch |err| switch (err) {
@@ -97,6 +100,10 @@ pub fn load(a: std.mem.Allocator, io: std.Io, path: OsPath, msg: *std.ArrayList(
             try msg.print(a, "The SDK manifest lists the module \"{s}\" twice.", .{m.name});
             return error.InvalidManifest;
         };
+        if (!endsInName(m.root)) {
+            try msg.print(a, "The SDK manifest gives module \"{s}\" the root \"{s}\", which names a folder, not a file.", .{ m.name, m.root });
+            return error.InvalidManifest;
+        }
         if (!std.fs.path.isAbsolute(m.root)) {
             if (!insideFolder(m.root)) {
                 try msg.print(a, "The SDK manifest gives module \"{s}\" the root \"{s}\", which is outside the manifest's folder.", .{ m.name, m.root });
@@ -147,6 +154,16 @@ pub fn load(a: std.mem.Allocator, io: std.Io, path: OsPath, msg: *std.ArrayList(
         done += 1;
     }
     return .{ .zig_version = zig_version, .sdk_version = sdk_version, .modules = modules };
+}
+
+/// The last segment of `p` is a name: `p` is not empty, does not end in a
+/// separator, and its last segment is not `.` or `..`.
+fn endsInName(p: []const u8) bool {
+    if (p.len == 0 or std.fs.path.isSep(p[p.len - 1])) return false;
+    var i = p.len;
+    while (i > 0 and !std.fs.path.isSep(p[i - 1])) i -= 1;
+    const last = p[i..];
+    return !std.mem.eql(u8, last, ".") and !std.mem.eql(u8, last, "..");
 }
 
 /// The relative path `rel` names something inside its base folder: it has
@@ -423,7 +440,7 @@ test "relative roots resolve" {
 }
 
 test "roots outside the manifest folder are refused" {
-    for ([_][]const u8{ "../ziggurat.zig", "a/../../ziggurat.zig", "..", ".", "a/..", "" }) |bad| {
+    for ([_][]const u8{ "../ziggurat.zig", "a/../../ziggurat.zig", "a/../../b/../ziggurat.zig" }) |bad| {
         const json = try std.fmt.allocPrint(testing.allocator,
             \\{{"zig_version":"0.17.0","sdk_version":"0.1.0","modules":[
             \\{{"name":"ziggurat","root":"{s}","deps":[]}}]}}
@@ -438,5 +455,19 @@ test "roots outside the manifest folder are refused" {
         try expectRejected(
             \\{"zig_version":"0.17.0","sdk_version":"0.1.0","modules":[{"name":"ziggurat","root":"C:z.zig","deps":[]}]}
         , "outside the manifest's folder");
+    }
+}
+
+test "roots that name a folder are refused" {
+    for ([_][]const u8{ "gdzig/", "gdzig/.", "a/..", "..", ".", "", abs ++ "gdzig/", abs ++ "." }) |bad| {
+        const json = try std.fmt.allocPrint(testing.allocator,
+            \\{{"zig_version":"0.17.0","sdk_version":"0.1.0","modules":[
+            \\{{"name":"ziggurat","root":"{s}","deps":[]}}]}}
+        , .{bad});
+        defer testing.allocator.free(json);
+        expectRejected(json, "names a folder") catch |err| {
+            std.debug.print("root \"{s}\" was not refused\n", .{bad});
+            return err;
+        };
     }
 }
