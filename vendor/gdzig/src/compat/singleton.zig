@@ -3,7 +3,7 @@
 pub fn owner(comptime T: type) ?type {
     @setEvalBranchQuota(10000);
     if (T == void) return null;
-    inline for (oopz.selfAndAncestorsOf(T)) |Ancestor| {
+    inline for (class_kind.selfAndAncestorsOf(T)) |Ancestor| {
         if (@hasDecl(Ancestor, "instance")) return Ancestor;
     }
     return null;
@@ -37,4 +37,4 @@ test "singleton descendants use the nearest storage owner" {
 
 const std = @import("std");
 
-const oopz = @import("oopz");
+const class_kind = @import("../class_kind.zig");

@@ -1113,6 +1113,14 @@ fn addTestSet(
         });
     }
 
+    // gdzig's class checks (vendor/gdzig/PATCHES.md, patch 4) import only
+    // std; their tests also cover gdzig's singleton-owner lookup.
+    const class_kind = b.createModule(.{
+        .root_source_file = b.path("vendor/gdzig/src/class_kind.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // The generation manifest's writer and reader import std and the
     // platform layer only.
     const host_manifest = b.createModule(.{
@@ -1123,7 +1131,7 @@ fn addTestSet(
         .imports = &.{.{ .name = "ziggurat_platform", .module = platform }},
     });
 
-    for ([_]*std.Build.Module{ platform, build_mod, abi, snake, fmtlog, host_version, output_scan, host_std[0], host_std[1], host_std[2], host_std[3], host_std[4], host_manifest }) |mod| {
+    for ([_]*std.Build.Module{ platform, build_mod, abi, snake, fmtlog, host_version, output_scan, host_std[0], host_std[1], host_std[2], host_std[3], host_std[4], host_manifest, class_kind }) |mod| {
         const t = b.addTest(.{ .root_module = mod });
         if (run) {
             step.dependOn(&b.addRunArtifact(t).step);

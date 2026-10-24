@@ -1097,7 +1097,7 @@ test "integration: shipped SDK has no absolute paths" {
     const Raw = struct { modules: []const struct { name: []const u8, root: []const u8 } };
     const parsed = try std.json.parseFromSlice(Raw, a, json, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    try testing.expectEqual(@as(usize, 12), parsed.value.modules.len);
+    try testing.expectEqual(@as(usize, 11), parsed.value.modules.len);
     for (parsed.value.modules) |m| {
         try testing.expect(!std.fs.path.isAbsolute(m.root));
         try testing.expect(std.mem.startsWith(u8, m.root, m.name));

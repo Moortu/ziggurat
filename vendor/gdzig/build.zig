@@ -26,7 +26,6 @@ pub fn build(b: *Build) !void {
     //
 
     const casez = b.dependency("casez", .{});
-    const oopz = b.dependency("oopz", .{});
 
     //
     // Godot
@@ -118,15 +117,16 @@ pub fn build(b: *Build) !void {
     test_step.dependOn(&run_tests_protocol.step);
     b.step("test-protocol", "Run integration-test IPC unit tests").dependOn(&run_tests_protocol.step);
 
+    // Ziggurat patch 4 (vendor/gdzig/PATCHES.md): gdzig's own class checks;
+    // their tests also run the singleton-owner tests.
     const tests_singleton = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("src/compat/singleton.zig"),
-        .imports = &.{.{ .name = "oopz", .module = oopz.module("oopz") }},
+        .root_source_file = b.path("src/class_kind.zig"),
         .target = b.graph.host,
         .optimize = optimize,
     }) });
     const run_tests_singleton = b.addRunArtifact(tests_singleton);
     test_step.dependOn(&run_tests_singleton.step);
-    b.step("test-singleton", "Run singleton-owner lookup tests").dependOn(&run_tests_singleton.step);
+    b.step("test-singleton", "Run class check and singleton-owner lookup tests").dependOn(&run_tests_singleton.step);
 
     const bindings = bindgen.run(b, bindgen_exe, .{
         .headers = headers,
@@ -158,7 +158,6 @@ pub fn build(b: *Build) !void {
             .{ .name = "casez", .module = casez.module("casez") },
             .{ .name = "gdextension", .module = gdextension_mod },
             .{ .name = "common", .module = common_mod },
-            .{ .name = "oopz", .module = oopz.module("oopz") },
         },
     });
     gdzig_mod.addImport("gdzig", gdzig_mod);

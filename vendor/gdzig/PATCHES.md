@@ -3,7 +3,7 @@
 This folder is a copy of the gdzig package pinned by Stage 2
 (`git+https://github.com/gdzig/gdzig#c8e0768c9eb768827163f0ac893a5038bda799cb`,
 package hash `godot-0.0.0-dev-q0GYjsfPwgCDsHpBgBeKR6ph6EbtJLqaMCY7waAmKGty`),
-with the three changes below and this file. Everything else is unchanged, but
+with the four changes below and this file. Everything else is unchanged, but
 gdzig's own `example/.gitignore` keeps two ignored items of its example
 project out of the repository: `example/project/.godot/imported/` and
 `example/project/.godot/global_script_class_cache.cfg`
@@ -11,7 +11,8 @@ project out of the repository: `example/project/.godot/imported/` and
 is in `LICENSE`.
 
 Patch 3 adds a build option that withholds the Object helpers (see its
-section). Patches 1 and 2 each raise a comptime branch quota. gdzig builds
+section). Patch 4 replaces the unlicensed package `oopz` with gdzig's own
+class checks (see its section). Patches 1 and 2 each raise a comptime branch quota. gdzig builds
 the virtual method table of a user class at compile time:
 `virtualMethodNames` lists the class's `_`-prefixed functions, and
 `VTable.findMethod` looks each name up and builds its wrapper. The work
@@ -205,9 +206,104 @@ Tests: `integration: scripts cannot call object helpers` in
 block in `src/host/test_probe.zig` that names all six helpers on the
 host's gdzig.
 
+## Patch 4: own class checks instead of `oopz`
+
+Upstream gdzig imports the package `oopz`
+(`git+https://github.com/gdzig/oopz#2a9fac7d3ffe134608ed56d3b49211f546c0b729`)
+for its class checks and `upcast`. That repository has no licence, so it
+may not be redistributed; it was compiled into the host, every exported
+game and the shipped SDK. The patch removes the dependency and adds
+`src/class_kind.zig` (MIT, as gdzig), written from how gdzig and Ziggurat
+call these functions and from gdzig's class model, without reference to
+the `oopz` source. Its doc comments give each function's contract.
+
+- `src/class_kind.zig` (new): `isOpaqueClass`, `isStructClass`, `isClass`,
+  `isClassPtr`, `isOpaqueClassPtr`, `isStructClassPtr`, `BaseOf`,
+  `ancestorsOf`, `selfAndAncestorsOf`, `depthOf`, `isA`, `isAny`,
+  `assertIsA`, `assertIsAny` and `upcast`, with unit tests. Its last test
+  block also pulls in the tests of `src/compat/singleton.zig`.
+- `src/class.mixin.zig`: the re-exports take these names from
+  `class_kind.zig` instead of `oopz`. The public names in `gdzig.class` do
+  not change.
+- `src/compat/singleton.zig`: `@import("../class_kind.zig")` instead of
+  `@import("oopz")`.
+- `build.zig`: no `oopz` dependency and no `oopz` import on the `gdzig`
+  module. The `test-singleton` step is rooted at `src/class_kind.zig`
+  (a module rooted at `src/compat/singleton.zig` cannot import a file in
+  `src/`), so it runs both sets of tests.
+- `build.zig.zon`: the `oopz` dependency entry is removed.
+
+```diff
+--- a/build.zig
++++ b/build.zig
+@@ -26,7 +26,6 @@
+     const casez = b.dependency("casez", .{});
+-    const oopz = b.dependency("oopz", .{});
+@@ -118,15 +117,16 @@
++    // Ziggurat patch 4 (vendor/gdzig/PATCHES.md): gdzig's own class checks;
++    // their tests also run the singleton-owner tests.
+     const tests_singleton = b.addTest(.{ .root_module = b.createModule(.{
+-        .root_source_file = b.path("src/compat/singleton.zig"),
+-        .imports = &.{.{ .name = "oopz", .module = oopz.module("oopz") }},
++        .root_source_file = b.path("src/class_kind.zig"),
+@@ -158,7 +158,6 @@
+             .{ .name = "common", .module = common_mod },
+-            .{ .name = "oopz", .module = oopz.module("oopz") },
+--- a/build.zig.zon
++++ b/build.zig.zon
+@@ -27,10 +27,6 @@
+-        .oopz = .{
+-            .url = "git+https://github.com/gdzig/oopz#2a9fac7d3ffe134608ed56d3b49211f546c0b729",
+-            .hash = "oopz-0.0.0-pFJy_QxZAABRjZk6dXmOZYLL8qIS-6guAChEFOP9BqTf",
+-        },
+--- a/src/class.mixin.zig
++++ b/src/class.mixin.zig
+@@ -1,22 +1,23 @@
+-// oopz re-exports
+-const oopz = @import("oopz");
+-pub const assertIsA = oopz.assertIsA;
++// Class checks. Ziggurat patch 4 (vendor/gdzig/PATCHES.md): class_kind.zig
++// replaces upstream's class check package, which has no licence.
++const class_kind = @import("class_kind.zig");
++pub const assertIsA = class_kind.assertIsA;
+ (likewise for the other fourteen names)
+--- a/src/compat/singleton.zig
++++ b/src/compat/singleton.zig
+-    inline for (oopz.selfAndAncestorsOf(T)) |Ancestor| {
++    inline for (class_kind.selfAndAncestorsOf(T)) |Ancestor| {
+-const oopz = @import("oopz");
++const class_kind = @import("../class_kind.zig");
+```
+
+The class model `class_kind.zig` checks: an engine class is an `opaque`
+type that declares `Base` (its parent engine class, or `void` for
+`Object`); a user class is a `struct` whose field `base` is a mutable
+single-item pointer to a class (`base: *Node`) or an embedded user class
+(`base: ClassA`). `isA(Base, T)` is true when `Base` is `T` or an ancestor,
+and false (not a compile error) for non-classes, because `isRefCountedPtr`
+asks it about any pointer type. The `...Ptr` checks take single-item
+pointers, const or not, and never optionals (`isNullableClassPtr` unwraps
+those). `upcast(*Target, value)` keeps an engine class pointer's address,
+takes the address of an embedded parent, and reads a `base` pointer; it
+refuses at compile time a target that is not an ancestor, an optional
+value, and a const value with a non-const target.
+
+Tests: the unit tests in `src/class_kind.zig` (plus the singleton test)
+run in Ziggurat's `zig build test-unit` and `zig build test`, which also
+compile the host, SDK and test classes against the new file. The shipped
+SDK has one module fewer (`test/e2e.zig`, "shipped SDK has no absolute
+paths").
+
 ## Updating gdzig
 
-Copy the new package over this folder, apply the three patches again (drop
+Copy the new package over this folder, apply the four patches again (drop
 patches 1 and 2 if upstream raised the quotas or made the lookup cheaper),
 repeat the measurement with `zig build host`, and run `zig build test`
-(it covers patch 3).
+(it covers patches 3 and 4). For patch 4: delete the `oopz` entry from
+`build.zig.zon` and every `oopz` import and dependency from `build.zig`,
+copy `src/class_kind.zig` back, point `src/class.mixin.zig` and
+`src/compat/singleton.zig` at it as above, and root `test-singleton` at it.
+If upstream calls a class check that `class_kind.zig` lacks, write it from
+the call sites and add tests; do not copy it from `oopz` unless that
+package has gained a licence that allows it. `grep -rn oopz vendor/gdzig`
+must then find only this file.
