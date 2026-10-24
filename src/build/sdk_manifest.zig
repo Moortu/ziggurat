@@ -1,5 +1,7 @@
 //! SDK module manifest (L2): the JSON file that lists the SDK's modules for
-//! `BuildService.Config.sdk`. `zig build sdk-manifest` writes it.
+//! `BuildService.Config.sdk`. `zig build sdk-manifest` writes it with
+//! absolute roots; `zig build sdk-stage` writes the shipped SDK's, whose
+//! roots are relative to the manifest's folder.
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("ziggurat_platform");
@@ -48,7 +50,11 @@ const Raw = struct {
 };
 
 /// Reads and checks the manifest at `path`. On `error.InvalidManifest`,
-/// `msg` holds one sentence that names the bad value.
+/// `msg` holds one sentence that names the bad value. A relative module
+/// root is resolved against the manifest's folder and must stay inside it
+/// (checked on the text: `..` may not climb out, and the root may not be
+/// the folder itself); the manifest's own path must then be absolute. The
+/// returned roots are absolute.
 pub fn load(a: std.mem.Allocator, io: std.Io, path: OsPath, msg: *std.ArrayList(u8)) !Manifest {
     msg.clearRetainingCapacity();
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path.bytes, a, .limited(max_bytes)) catch |err| switch (err) {
@@ -92,8 +98,14 @@ pub fn load(a: std.mem.Allocator, io: std.Io, path: OsPath, msg: *std.ArrayList(
             return error.InvalidManifest;
         };
         if (!std.fs.path.isAbsolute(m.root)) {
-            try msg.print(a, "The SDK manifest gives module \"{s}\" the relative root \"{s}\"; roots must be absolute.", .{ m.name, m.root });
-            return error.InvalidManifest;
+            if (!insideFolder(m.root)) {
+                try msg.print(a, "The SDK manifest gives module \"{s}\" the root \"{s}\", which is outside the manifest's folder.", .{ m.name, m.root });
+                return error.InvalidManifest;
+            }
+            if (!std.fs.path.isAbsolute(path.bytes)) {
+                try msg.print(a, "The SDK manifest {s} has relative module roots, so its own path must be absolute.", .{path.bytes});
+                return error.InvalidManifest;
+            }
         }
         if (std.mem.eql(u8, m.name, "ziggurat")) has_ziggurat = true;
     }
@@ -124,11 +136,40 @@ pub fn load(a: std.mem.Allocator, io: std.Io, path: OsPath, msg: *std.ArrayList(
         for (modules[0..done]) |m| freeModule(a, m);
         a.free(modules);
     }
+    const folder = std.fs.path.dirname(path.bytes) orelse ".";
     for (raw.modules, modules) |src, *dst| {
-        dst.* = try dupeModule(a, src.name, src.root, src.deps);
+        const root = if (std.fs.path.isAbsolute(src.root))
+            try a.dupe(u8, src.root)
+        else
+            try std.fs.path.resolve(a, &.{ folder, src.root });
+        defer a.free(root);
+        dst.* = try dupeModule(a, src.name, root, src.deps);
         done += 1;
     }
     return .{ .zig_version = zig_version, .sdk_version = sdk_version, .modules = modules };
+}
+
+/// The relative path `rel` names something inside its base folder: it has
+/// no drive, at least one name, and no `..` that climbs above the base.
+fn insideFolder(rel: []const u8) bool {
+    if (std.fs.path.isAbsolute(rel)) return false;
+    if (builtin.os.tag == .windows and std.fs.path.diskDesignator(rel).len != 0) return false;
+    var depth: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= rel.len) : (i += 1) {
+        if (i < rel.len and !std.fs.path.isSep(rel[i])) continue;
+        const part = rel[start..i];
+        start = i + 1;
+        if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
+        if (std.mem.eql(u8, part, "..")) {
+            if (depth == 0) return false;
+            depth -= 1;
+        } else {
+            depth += 1;
+        }
+    }
+    return depth != 0;
 }
 
 /// Module names reach the compiler command line (`-M<name>=`, `--dep <name>`),
@@ -211,12 +252,6 @@ test "manifest rejects" {
     ++ abs ++
         \\y.zig","deps":[]}]}
     , "\"ziggurat\" twice");
-    // Relative root.
-    try expectRejected(
-        \\{"zig_version":"0.17.0","sdk_version":"0.1.0","modules":[
-    ++
-        \\{"name":"ziggurat","root":"sdk/ziggurat.zig","deps":[]}]}
-    , "sdk/ziggurat.zig");
     // A dep that names no listed module.
     try expectRejected(
         \\{"zig_version":"0.17.0","sdk_version":"0.1.0","modules":[
@@ -342,3 +377,66 @@ test "manifest loads a self-dependency" {
 }
 
 const abs_plain = if (builtin.os.tag == .windows) "C:\\sdk\\" else "/sdk/";
+
+/// Writes `json` as `m.json` into a fresh folder and loads it; `dir_out`
+/// gets that folder's real path (allocated with the testing allocator).
+fn loadIn(tmp: *testing.TmpDir, json: []const u8, dir_out: *[:0]u8) !Manifest {
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "m.json", .data = json });
+    dir_out.* = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    errdefer testing.allocator.free(dir_out.*);
+    const p = try std.fs.path.join(testing.allocator, &.{ dir_out.*, "m.json" });
+    defer testing.allocator.free(p);
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(testing.allocator);
+    return load(testing.allocator, testing.io, .fromTrusted(p), &msg) catch |err| {
+        std.debug.print("load failed: {s}\n", .{msg.items});
+        return err;
+    };
+}
+
+test "relative roots resolve" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const json =
+        \\{"zig_version":"0.17.0","sdk_version":"0.1.0","modules":[
+    ++
+        \\{"name":"ziggurat","root":"ziggurat/ziggurat.zig","deps":["gdzig"]},
+    ++
+        \\{"name":"gdzig","root":"./gdzig/sub/../gdzig.zig","deps":[]},
+    ++
+        \\{"name":"abs","root":"
+    ++ abs ++
+        \\a.zig","deps":[]}]}
+    ;
+    var dir: [:0]u8 = undefined;
+    var m = try loadIn(&tmp, json, &dir);
+    defer testing.allocator.free(dir);
+    defer m.deinit(testing.allocator);
+    const want_z = try std.fs.path.join(testing.allocator, &.{ dir, "ziggurat", "ziggurat.zig" });
+    defer testing.allocator.free(want_z);
+    const want_g = try std.fs.path.join(testing.allocator, &.{ dir, "gdzig", "gdzig.zig" });
+    defer testing.allocator.free(want_g);
+    try testing.expectEqualStrings(want_z, m.modules[0].root.bytes);
+    try testing.expectEqualStrings(want_g, m.modules[1].root.bytes);
+    // Absolute roots stay as they are.
+    try testing.expectEqualStrings(abs_plain ++ "a.zig", m.modules[2].root.bytes);
+}
+
+test "roots outside the manifest folder are refused" {
+    for ([_][]const u8{ "../ziggurat.zig", "a/../../ziggurat.zig", "..", ".", "a/..", "" }) |bad| {
+        const json = try std.fmt.allocPrint(testing.allocator,
+            \\{{"zig_version":"0.17.0","sdk_version":"0.1.0","modules":[
+            \\{{"name":"ziggurat","root":"{s}","deps":[]}}]}}
+        , .{bad});
+        defer testing.allocator.free(json);
+        expectRejected(json, "outside the manifest's folder") catch |err| {
+            std.debug.print("root \"{s}\" was not refused\n", .{bad});
+            return err;
+        };
+    }
+    if (builtin.os.tag == .windows) {
+        try expectRejected(
+            \\{"zig_version":"0.17.0","sdk_version":"0.1.0","modules":[{"name":"ziggurat","root":"C:z.zig","deps":[]}]}
+        , "outside the manifest's folder");
+    }
+}

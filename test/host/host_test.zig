@@ -3369,3 +3369,82 @@ test "export: project without Zig scripts exports" {
     try testing.expect(try projectFileExists(&p, "out/libziggurat_game.so"));
     try runExported(&p, .{ .once = &.{ "ziggurat: 0 scripts linked", "export check: main ready" }, .reject = &.{ "ERROR:", "WARNING:" } });
 }
+
+// ------------------------------------------------------------ shipped SDK
+
+/// The staged SDK folder: the one holding `opts.staged_sdk_manifest`.
+fn stagedDir() []const u8 {
+    return std.fs.path.dirname(opts.staged_sdk_manifest) orelse ".";
+}
+
+/// Copies the staged SDK (`stagedDir`) into the project as
+/// res://addons/ziggurat/sdk/, the folder the host uses when the project
+/// setting `ziggurat/dev/sdk_manifest` is empty.
+fn addStagedSdk(p: *Project) !void {
+    const a = p.arena_state.allocator();
+    const cwd = Io.Dir.cwd();
+    var src = try cwd.openDir(io, stagedDir(), .{ .iterate = true });
+    defer src.close(io);
+    var proj = try cwd.openDir(io, p.path, .{});
+    defer proj.close(io);
+    try proj.createDirPath(io, "addons/ziggurat/sdk");
+    var dst = try proj.openDir(io, "addons/ziggurat/sdk", .{});
+    defer dst.close(io);
+    var walker = try src.walk(a);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        switch (entry.kind) {
+            .directory => try dst.createDirPath(io, entry.path),
+            .file => try src.copyFile(entry.path, dst, entry.path, io, .{}),
+            else => {},
+        }
+    }
+}
+
+test "staged SDK builds a project" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try p.init("export");
+    defer p.deinit();
+    const a = p.arena_state.allocator();
+    const cwd = Io.Dir.cwd();
+    var dir = try cwd.openDir(io, p.path, .{});
+    defer dir.close(io);
+    try cwd.copyFile(opts.export_host_archive, dir, "addons/ziggurat/bin/libziggurat_host_export.a", io, .{});
+    try cwd.copyFile(opts.game_empty_lib, dir, "addons/ziggurat/bin/libziggurat_game_empty.so", io, .{});
+    try addStagedSdk(&p);
+    // Only the Zig path is set: the SDK is the one in the add-on folder.
+    const old = try dir.readFileAlloc(io, "project.godot", a, .limited(64 * 1024));
+    try dir.writeFile(io, .{ .sub_path = "project.godot", .data = try std.fmt.allocPrint(a, "{s}\n[ziggurat]\n\nzig_path=\"{s}\"\n", .{ old, opts.zig_exe }) });
+    try isolateUserFolders(&p);
+    try p.tmp.dir.createDirPath(io, "cache");
+    try p.env.?.put("XDG_CACHE_HOME", try p.tmp.dir.realPathFileAlloc(io, "cache", a));
+    try p.addAutoloadCheck("staged_sdk.gd");
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS staged_sdk_built",
+            "ZTEST PASS staged_sdk_addon_scanned",
+            "ZTEST PASS staged_sdk_not_scanned",
+            "ZTEST PASS staged_sdk_on_disk",
+            "ziggurat: build 1 ",
+        },
+        .reject = &.{ "is not set", "is not usable", "ZTEST FAIL" },
+        .deadline = build_deadline_s,
+    });
+    // The export plugin takes the same SDK.
+    if (opts.export_templates.len == 0) {
+        try requireTemplates();
+        return;
+    }
+    const presets = try dir.readFileAlloc(io, "export_presets.cfg", a, .limited(64 * 1024));
+    try dir.writeFile(io, .{ .sub_path = "export_presets.cfg", .data = try std.mem.replaceOwned(u8, a, presets, "@TEMPLATES@", opts.export_templates) });
+    try dir.createDirPath(io, "out");
+    try exportGame(&p, .{ .once = &.{export_building}, .reject = &.{ "ERROR:", "is not set", "is not usable" } });
+    // The SDK (over 100 MB) is not in the pack: the editor never scanned it.
+    const pck = try dir.statFile(io, "out/game.pck", .{});
+    if (pck.size > 4 * 1024 * 1024) {
+        std.debug.print("out/game.pck is {d} bytes\n", .{pck.size});
+        return error.TestUnexpectedResult;
+    }
+    try runExported(&p, .{ .once = &export_game_lines, .reject = &.{ "ERROR:", "WARNING:" } });
+}

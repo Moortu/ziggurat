@@ -690,3 +690,21 @@ test "file fingerprints change with the file and only then" {
     try testing.expectEqual(r1.scripts[0].fingerprint, r3.scripts[0].fingerprint);
     try testing.expect(r1.helper_paths[0].fingerprint != r3.helper_paths[0].fingerprint);
 }
+
+test "generator skips addons" {
+    // The shipped SDK sits in the project at addons/ziggurat/sdk/, with
+    // files that declare `extends`; none of them is a script or a helper.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try put(tmp, "hero.zig", "pub const extends = \"Node\";\n");
+    try put(tmp, "addons/ziggurat/sdk/.gdignore", "");
+    try put(tmp, "addons/ziggurat/sdk/ziggurat/ziggurat.zig", "pub const extends = 1;\n");
+    try put(tmp, "addons/ziggurat/sdk/gdzig/class/node.zig", "pub const extends = 1;\n");
+    const res = try scan(a, testing.io, try tmpProject(tmp, a), default_script_dirs);
+    try testing.expectEqual(@as(usize, 1), res.scripts.len);
+    try testing.expectEqualStrings("hero.zig", res.scripts[0].rel);
+    try testing.expectEqual(@as(u32, 0), res.helpers);
+}

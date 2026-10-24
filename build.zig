@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) void {
     const godot_found = godot_opt orelse b.findProgram(.{ .names = &.{"godot"} });
     const godot_path = godot_found orelse "godot";
     const manifest_out = b.option([]const u8, "manifest-out", "Absolute path the sdk-manifest step writes the SDK module manifest to");
+    const sdk_out = b.option([]const u8, "sdk-out", "Absolute path of the empty or missing folder the sdk-stage step writes the shipped SDK into");
     const host_test_filter = b.option([]const u8, "host-test-filter", "Run only the host tests whose name contains this text");
     const export_templates = b.option([]const u8, "export-templates", "Folder with Godot 4.7.2's export templates (linux_release.x86_64); the host export tests skip without it");
 
@@ -32,6 +33,7 @@ pub fn build(b: *std.Build) void {
     const unit_step = b.step("test-unit", "Run unit tests only (spawns no compiler)");
     const cross_step = b.step("cross", "Compile test binaries for Windows and macOS (not run)");
     const manifest_step = b.step("sdk-manifest", "Write the SDK module manifest to -Dmanifest-out=<absolute path>");
+    const stage_step = b.step("sdk-stage", "Write the shipped SDK (sources and a manifest with relative roots) into -Dsdk-out=<absolute path>");
     const godot_step = b.step("test-godot", "Run the SDK tests inside a headless Godot (needs Godot)");
     const host_step = b.step("host", "Install the host library and its .gdextension into <prefix>/addons/ziggurat (zig build host -p <project>)");
     const archive_step = b.step("host-archive", "Install the export host archive <prefix>/lib/libziggurat_host_export.a (ReleaseSafe, " ++ pins.export_target ++ ")");
@@ -64,6 +66,36 @@ pub fn build(b: *std.Build) void {
         manifest_step.dependOn(&b.addFail("sdk-manifest needs -Dmanifest-out=<absolute path>").step);
     }
 
+    // The shipped SDK (spec section 1): every file a script build needs,
+    // with a manifest whose roots are relative to it. `sdk-stage` writes it
+    // to the folder the user gave; tests and `host` use the cached copy.
+    const stage_tool = b.addExecutable(.{
+        .name = "sdk_stage",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/sdk_stage.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const staged_sdk = blk: {
+        const run = b.addRunArtifact(stage_tool);
+        const out = run.addOutputDirectoryArg("sdk");
+        addStageModules(b, run, sdk);
+        break :blk out;
+    };
+    if (sdk_out) |out| {
+        if (std.fs.path.isAbsolute(out)) {
+            const run = b.addRunArtifact(stage_tool);
+            run.addArg(out);
+            run.has_side_effects = true;
+            addStageModules(b, run, sdk);
+            stage_step.dependOn(&run.step);
+        } else {
+            stage_step.dependOn(&b.addFail("-Dsdk-out must be an absolute path").step);
+        }
+    } else {
+        stage_step.dependOn(&b.addFail("sdk-stage needs -Dsdk-out=<absolute path>").step);
+    }
     // The manifest for `test`: written into the cache.
     const test_manifest = blk: {
         const run = b.addRunArtifact(manifest_tool);
@@ -90,6 +122,13 @@ pub fn build(b: *std.Build) void {
     const addon_bin_dir: std.Build.InstallDir = .{ .custom = "addons/ziggurat/bin" };
     host_step.dependOn(&b.addInstallFileWithDir(host.getEmittedBin(), addon_bin_dir, "libziggurat_host.so").step);
     host_step.dependOn(&b.addInstallFileWithDir(gdextension_file, addon_dir, "ziggurat.gdextension").step);
+    // The shipped SDK, where the host looks for it when the project setting
+    // `ziggurat/dev/sdk_manifest` is empty.
+    host_step.dependOn(&b.addInstallDirectory(.{
+        .source_dir = staged_sdk,
+        .install_dir = .{ .custom = "addons/ziggurat/sdk" },
+        .install_subdir = "",
+    }).step);
 
     // The export host (spec section 10): a static archive that the export
     // build links with the scripts into an exported game's library. Built
@@ -137,6 +176,7 @@ pub fn build(b: *std.Build) void {
             .godot_exe = godot_found.?,
             .zig_exe = zig_exe,
             .sdk_manifest = test_manifest,
+            .staged_sdk = staged_sdk,
             .sdk_options = sdk_options,
             .filter = host_test_filter,
             .gui_step = gui_test_step,
@@ -146,15 +186,15 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(host_test_step);
 
     // Native: integration on for `test`, off for `test-unit`.
-    addTestSet(b, test_step, target, optimize, zig_exe, true, true, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) }, sdk_options, sdk, export_host_archive);
-    addTestSet(b, unit_step, target, optimize, zig_exe, false, true, null, null, sdk_options, sdk, null);
+    addTestSet(b, test_step, target, optimize, zig_exe, true, true, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) }, sdk_options, sdk, export_host_archive, staged_sdk);
+    addTestSet(b, unit_step, target, optimize, zig_exe, false, true, null, null, sdk_options, sdk, null, null);
 
     // Cross: compile only.
     for (cross_targets) |triple| {
         const query = std.Target.Query.parse(.{ .arch_os_abi = triple }) catch
             @panic("bad cross target triple");
         const resolved = b.resolveTargetQuery(query);
-        addTestSet(b, cross_step, resolved, optimize, zig_exe, false, false, null, null, sdk_options, sdk, null);
+        addTestSet(b, cross_step, resolved, optimize, zig_exe, false, false, null, null, sdk_options, sdk, null, null);
     }
 }
 
@@ -352,6 +392,8 @@ const HostTestInputs = struct {
     zig_exe: []const u8,
     /// The SDK manifest the tests build fixture modules with.
     sdk_manifest: std.Build.LazyPath,
+    /// The shipped SDK folder (`sdk-stage`).
+    staged_sdk: std.Build.LazyPath,
     sdk_options: *std.Build.Module,
     /// Runs only the host tests whose name contains this text.
     filter: ?[]const u8 = null,
@@ -427,6 +469,7 @@ fn addHostTests(
     options.addOption([]const u8, "zig_exe", in.zig_exe);
     options.addOptionPath("stub_sdk_path", b.path("test/stub_sdk/ziggurat.zig"));
     options.addOptionPath("sdk_manifest_path", in.sdk_manifest);
+    options.addOptionPath("staged_sdk_manifest", in.staged_sdk.path(b, "sdk-manifest.json"));
     const options_mod = options.createModule();
 
     const platform = b.createModule(.{
@@ -792,6 +835,53 @@ fn addSourceInputs(b: *std.Build, run: *std.Build.Step.Run, dirs: []const []cons
 /// modules with the same import name are a configuration error.
 fn addManifestModules(b: *std.Build, run: *std.Build.Step.Run, sdk: *std.Build.Module) void {
     run.addArg(sdk_version);
+    const seen = sdkModules(b, sdk);
+    for (seen.keys(), seen.values()) |name, mod| {
+        run.addArg(name);
+        const root = mod.root_source_file orelse std.debug.panic("SDK module \"{s}\" has no root source file", .{name});
+        run.addFileArg2(root, .{ .make_absolute = true });
+        run.addArg(std.mem.join(b.allocator, ",", mod.import_table.keys()) catch @panic("OOM"));
+    }
+}
+
+/// Arguments of tools/sdk_stage.zig after its output folder: the SDK
+/// version, then name, root, deps and what to strip of each module. The
+/// generated gdzig tree loses its `///` doc comments (most of its size,
+/// and Godot's documentation text); the translate-c output loses its line
+/// comments (source locations that name this machine's headers).
+fn addStageModules(b: *std.Build, run: *std.Build.Step.Run, sdk: *std.Build.Module) void {
+    run.addArg(sdk_version);
+    const seen = sdkModules(b, sdk);
+    for (seen.keys(), seen.values()) |name, mod| {
+        run.addArg(name);
+        const root = mod.root_source_file orelse std.debug.panic("SDK module \"{s}\" has no root source file", .{name});
+        run.addFileArg2(root, .{ .make_absolute = true });
+        run.addArg(std.mem.join(b.allocator, ",", mod.import_table.keys()) catch @panic("OOM"));
+        const strip = if (std.mem.eql(u8, name, "gdzig"))
+            "docs"
+        else if (std.mem.eql(u8, name, "gdextension"))
+            "comments"
+        else
+            "none";
+        run.addArg(strip);
+        // The tool reads every file the root imports, which the build
+        // system cannot see; a source folder's edits must rerun it.
+        switch (root) {
+            // This checkout's folders (sdk/, src/abi/); packages do not
+            // change under the same hash, and generated roots come with
+            // the step that makes them.
+            .src_path => |sp| if (sp.owner == b) {
+                const dir = std.fs.path.dirname(sp.sub_path) orelse ".";
+                addSourceInputs(b, run, &.{dir});
+            },
+            else => {},
+        }
+    }
+}
+
+/// The SDK module `ziggurat` and every module it imports, by name, in the
+/// order they are first reached.
+fn sdkModules(b: *std.Build, sdk: *std.Build.Module) std.StringArrayHashMapUnmanaged(*std.Build.Module) {
     var seen: std.StringArrayHashMapUnmanaged(*std.Build.Module) = .empty;
     seen.put(b.allocator, "ziggurat", sdk) catch @panic("OOM");
     var i: usize = 0;
@@ -806,12 +896,7 @@ fn addManifestModules(b: *std.Build, run: *std.Build.Step.Run, sdk: *std.Build.M
             }
         }
     }
-    for (seen.keys(), seen.values()) |name, mod| {
-        run.addArg(name);
-        const root = mod.root_source_file orelse std.debug.panic("SDK module \"{s}\" has no root source file", .{name});
-        run.addFileArg2(root, .{ .make_absolute = true });
-        run.addArg(std.mem.join(b.allocator, ",", mod.import_table.keys()) catch @panic("OOM"));
-    }
+    return seen;
 }
 
 const ProbeSdks = struct { debug: *std.Build.Module, safe: *std.Build.Module };
@@ -837,6 +922,9 @@ fn addTestSet(
     /// The export host archive the export build tests link (native sets
     /// that run integration tests only).
     export_host_archive: ?*std.Build.Step.Compile,
+    /// The staged SDK the shipped-SDK tests read (native sets that run
+    /// integration tests only).
+    staged: ?std.Build.LazyPath,
 ) void {
     const options = b.addOptions();
     options.addOption([]const u8, "zig_exe", zig_exe);
@@ -862,6 +950,16 @@ fn addTestSet(
     } else {
         options.addOption([]const u8, "export_host_archive", "");
     }
+    // The shipped-SDK tests look in the staged SDK for this checkout's
+    // paths and its caches' (`build_machine_*`).
+    if (staged) |dir| {
+        options.addOptionPath("staged_sdk_manifest", dir.path(b, "sdk-manifest.json"));
+    } else {
+        options.addOption([]const u8, "staged_sdk_manifest", "");
+    }
+    options.addOption([]const u8, "build_machine_repo", b.root.joinString(b.allocator, "") catch @panic("OOM"));
+    options.addOptionPathUntracked("build_machine_local_cache", .{ .relative = .{ .base = .local_cache } });
+    options.addOptionPathUntracked("build_machine_global_cache", .{ .relative = .{ .base = .global_cache } });
 
     const abi_for_probe = addAbi(b, target, optimize);
     const probe_platform = b.createModule(.{

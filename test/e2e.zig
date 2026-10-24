@@ -1027,3 +1027,112 @@ test "integration: export build of a read-only project goes through the mirror" 
     defer d.close(io);
     try testing.expectError(error.FileNotFound, d.access(io, zbuild.rootgen.root_file_name, .{}));
 }
+
+// ------------------------------------------------------------ shipped SDK
+
+/// The staged SDK folder: the one holding `build_options.staged_sdk_manifest`.
+fn stagedDir() []const u8 {
+    return std.fs.path.dirname(build_options.staged_sdk_manifest) orelse ".";
+}
+
+/// Calls `f(ctx, rel, bytes)` for every file of the staged SDK
+/// (`stagedDir`), `rel` relative to its folder.
+fn eachStagedFile(a: std.mem.Allocator, ctx: anytype, comptime f: fn (@TypeOf(ctx), []const u8, []const u8) anyerror!void) !usize {
+    var dir = try std.Io.Dir.cwd().openDir(io, stagedDir(), .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(a);
+    defer walker.deinit();
+    var n: usize = 0;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const bytes = try dir.readFileAlloc(io, entry.path, a, .unlimited);
+        defer a.free(bytes);
+        try f(ctx, entry.path, bytes);
+        n += 1;
+    }
+    return n;
+}
+
+/// What the staged SDK must not contain: the real paths of this checkout,
+/// its local cache and the global cache, the Nix store, and the names of the cache and package folders.
+fn buildMachinePaths(a: std.mem.Allocator) ![]const []const u8 {
+    const list = try a.alloc([]const u8, 6);
+    const cwd = std.Io.Dir.cwd();
+    list[0] = try cwd.realPathFileAlloc(io, build_options.build_machine_repo, a);
+    list[1] = try cwd.realPathFileAlloc(io, build_options.build_machine_local_cache, a);
+    list[2] = try cwd.realPathFileAlloc(io, build_options.build_machine_global_cache, a);
+    list[3] = "/nix/store";
+    list[4] = ".zig-cache";
+    list[5] = "zig-pkg";
+    return list;
+}
+
+test "integration: shipped SDK has no absolute paths" {
+    try platform.testing_support.requireIntegration();
+    const a = testing.allocator;
+    const Ctx = struct {
+        hits: usize = 0,
+        needles: []const []const u8,
+        fn check(c: *@This(), rel: []const u8, bytes: []const u8) anyerror!void {
+            for (c.needles) |needle| {
+                if (std.mem.indexOf(u8, bytes, needle)) |at| {
+                    if (c.hits < 10) std.debug.print("{s}: byte {d} holds \"{s}\"\n", .{ rel, at, needle });
+                    c.hits += 1;
+                }
+            }
+        }
+    };
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    var ctx: Ctx = .{ .needles = try buildMachinePaths(arena_state.allocator()) };
+    const n = try eachStagedFile(a, &ctx, Ctx.check);
+    try testing.expect(n > 12);
+    try testing.expectEqual(@as(usize, 0), ctx.hits);
+
+    // Every module root in the manifest is relative to its folder.
+    var dir = try std.Io.Dir.cwd().openDir(io, stagedDir(), .{});
+    defer dir.close(io);
+    const json = try dir.readFileAlloc(io, "sdk-manifest.json", a, .limited(1 << 20));
+    defer a.free(json);
+    const Raw = struct { modules: []const struct { name: []const u8, root: []const u8 } };
+    const parsed = try std.json.parseFromSlice(Raw, a, json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 12), parsed.value.modules.len);
+    for (parsed.value.modules) |m| {
+        try testing.expect(!std.fs.path.isAbsolute(m.root));
+        try testing.expect(std.mem.startsWith(u8, m.root, m.name));
+        dir.access(io, m.root, .{}) catch |err| {
+            std.debug.print("module {s}: root {s}: {t}\n", .{ m.name, m.root, err });
+            return err;
+        };
+    }
+}
+
+test "integration: doc comments stripped" {
+    try platform.testing_support.requireIntegration();
+    const a = testing.allocator;
+    const Ctx = struct {
+        gdzig_files: usize = 0,
+        doc_lines: usize = 0,
+        fn check(c: *@This(), rel: []const u8, bytes: []const u8) anyerror!void {
+            if (!std.mem.startsWith(u8, rel, "gdzig" ++ std.fs.path.sep_str)) return;
+            c.gdzig_files += 1;
+            var lines = std.mem.splitScalar(u8, bytes, '\n');
+            while (lines.next()) |line| {
+                const t = std.mem.trimStart(u8, line, " \t");
+                if (std.mem.startsWith(u8, t, "///") and !std.mem.startsWith(u8, t, "////")) {
+                    if (c.doc_lines < 5) std.debug.print("{s}: {s}\n", .{ rel, line });
+                    c.doc_lines += 1;
+                }
+            }
+        }
+    };
+    var ctx: Ctx = .{};
+    _ = try eachStagedFile(a, &ctx, Ctx.check);
+    try testing.expect(ctx.gdzig_files > 1000);
+    try testing.expectEqual(@as(usize, 0), ctx.doc_lines);
+    // The editor does not scan or import the SDK folder.
+    var dir = try std.Io.Dir.cwd().openDir(io, stagedDir(), .{});
+    defer dir.close(io);
+    try dir.access(io, ".gdignore", .{});
+}

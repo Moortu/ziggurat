@@ -4,14 +4,17 @@
 //!
 //! - `start` (SCENE init, editor only) registers the project settings
 //!   `ziggurat/zig_path` (the project's override of the Zig path) and
-//!   `ziggurat/dev/sdk_manifest` (absolute path of an SDK module manifest),
+//!   `ziggurat/dev/sdk_manifest` (absolute path of an SDK module manifest;
+//!   a developer override: when it is empty, the shipped SDK's manifest
+//!   `res://addons/ziggurat/sdk/sdk-manifest.json` is used, `sdkManifest`),
 //!   starts a `BuildService` for the project and requests the build at
 //!   project open: at once when the project setting `ziggurat/zig_path` is
 //!   set (it wins over the editor setting), otherwise when the editor
 //!   plugin enters the tree (`editorReady`; the editor setting can be read
 //!   only once the editor exists), with the first frame as the fallback. A
-//!   missing or unusable SDK manifest setting is one log sentence that
-//!   names it; then nothing builds and scripts keep the descriptor cache.
+//!   missing or unusable SDK manifest (neither the setting nor the shipped
+//!   SDK) is one log sentence that names it; then nothing builds and
+//!   scripts keep the descriptor cache.
 //! - The editor plugin registers the editor settings (per user;
 //!   `registerEditorSettings`): `ziggurat/zig_path` (the Zig path),
 //!   `ziggurat/editor/indent_with_spaces` (`.zig` tabs indent with spaces)
@@ -123,6 +126,8 @@ const Os = godot.class.Os;
 
 pub const setting_zig_path = "ziggurat/zig_path";
 pub const setting_sdk_manifest = "ziggurat/dev/sdk_manifest";
+/// The shipped SDK's manifest, used when `setting_sdk_manifest` is empty.
+pub const shipped_sdk_manifest = "res://addons/ziggurat/sdk/sdk-manifest.json";
 /// Whether Play builds the Zig scripts first (the editor plugin's
 /// `_build`); a bool, true by default.
 pub const setting_build_on_play = "ziggurat/build/build_on_play";
@@ -790,21 +795,12 @@ fn startService() Allocator.Error!void {
     const a = arena_state.allocator();
     const io = host_io.get();
 
-    const sdk_path = try settingText(a, setting_sdk_manifest);
-    if (sdk_path.len == 0) {
-        log("Ziggurat does not build Zig scripts: the project setting " ++ setting_sdk_manifest ++ " is not set (it needs the absolute path of an SDK module manifest).", .{});
-        return;
-    }
-    if (!isAbsolute(sdk_path)) {
-        log("Ziggurat does not build Zig scripts: the project setting " ++ setting_sdk_manifest ++ " ({s}) is not usable, because it is not an absolute path.", .{sdk_path});
-        return;
-    }
     var msg: std.ArrayList(u8) = .empty;
     defer msg.deinit(gpa);
-    var sdk = zbuild.sdk_manifest.load(gpa, io, .fromTrusted(sdk_path), &msg) catch |err| switch (err) {
+    var sdk = sdkManifest(gpa, a, &msg) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            log("Ziggurat does not build Zig scripts: the project setting " ++ setting_sdk_manifest ++ " is not usable: {s}", .{if (msg.items.len != 0) msg.items else @errorName(err)});
+        error.Unusable => {
+            log("Ziggurat does not build Zig scripts: {s}", .{msg.items});
             return;
         },
     };
@@ -881,6 +877,48 @@ fn startService() Allocator.Error!void {
     }
 }
 
+/// Loads the SDK manifest builds use: the one the project setting
+/// `ziggurat/dev/sdk_manifest` names (absolute), else the shipped SDK's
+/// (`shipped_sdk_manifest`, globalized) when that file exists. The
+/// manifest is allocated with `ga`, scratch text with `a`. On
+/// `error.Unusable` `msg` (allocated with `ga`) holds one sentence that
+/// starts in lower case and names what is missing or wrong. Main thread.
+fn sdkManifest(ga: Allocator, a: Allocator, msg: *std.ArrayList(u8)) error{ OutOfMemory, Unusable }!zbuild.sdk_manifest.Manifest {
+    const io = host_io.get();
+    msg.clearRetainingCapacity();
+    const set = try settingText(a, setting_sdk_manifest);
+    if (set.len != 0 and !isAbsolute(set)) {
+        try msg.print(ga, "the project setting " ++ setting_sdk_manifest ++ " ({s}) is not usable, because it is not an absolute path.", .{set});
+        return error.Unusable;
+    }
+    const path = if (set.len != 0) set else blk: {
+        var res = String.fromLatin1(shipped_sdk_manifest);
+        defer res.deinit();
+        var abs = ProjectSettings.globalizePath(res);
+        defer abs.deinit();
+        const shipped = try props.utf8Alloc(a, &abs);
+        if (!isAbsolute(shipped)) {
+            try msg.print(ga, "the shipped SDK's manifest {s} has no absolute path ({s}), and the project setting " ++ setting_sdk_manifest ++ " is not set.", .{ shipped_sdk_manifest, shipped });
+            return error.Unusable;
+        }
+        std.Io.Dir.cwd().access(io, shipped, .{}) catch {
+            try msg.appendSlice(ga, "there is no SDK at " ++ shipped_sdk_manifest ++ " (the add-on's sdk folder is missing), and the project setting " ++ setting_sdk_manifest ++ " is not set.");
+            return error.Unusable;
+        };
+        break :blk shipped;
+    };
+    var why: std.ArrayList(u8) = .empty;
+    defer why.deinit(ga);
+    return zbuild.sdk_manifest.load(ga, io, .fromTrusted(path), &why) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            const what = if (set.len != 0) "the project setting " ++ setting_sdk_manifest else "the shipped SDK";
+            try msg.print(ga, "{s} is not usable: {s}", .{ what, if (why.items.len != 0) why.items else @errorName(err) });
+            return error.Unusable;
+        },
+    };
+}
+
 /// The project folder as a realpath (`res://` globalized, without a
 /// trailing separator), allocated with `a`. Editor builds and export
 /// builds key the per-user cache folder and `build.lock` by it, so both
@@ -910,7 +948,8 @@ pub const ExportInputs = struct {
     /// then `PATH`.
     zig: platform.zig_locator.ZigInstall,
     /// The SDK modules: the running service's, else the manifest the
-    /// project setting `ziggurat/dev/sdk_manifest` names.
+    /// project setting `ziggurat/dev/sdk_manifest` names, else the shipped
+    /// SDK's (`sdkManifest`).
     sdk: []const zbuild.workspace.ModuleDep,
     /// The per-user cache folder (`PathService.dir(.cache)`), as editor
     /// builds use it, so both take turns on the project's `build.lock`.
@@ -926,23 +965,7 @@ pub fn exportInputs(a: Allocator, project: []const u8, msg: *std.ArrayList(u8)) 
     const io = host_io.get();
     msg.clearRetainingCapacity();
     const sdk: []const zbuild.workspace.ModuleDep = if (state) |*st| st.sdk.modules else blk: {
-        const sdk_path = try settingText(a, setting_sdk_manifest);
-        if (sdk_path.len == 0) {
-            try msg.appendSlice(a, "the project setting " ++ setting_sdk_manifest ++ " is not set (it needs the absolute path of an SDK module manifest).");
-            return error.Unusable;
-        }
-        if (!isAbsolute(sdk_path)) {
-            try msg.print(a, "the project setting " ++ setting_sdk_manifest ++ " ({s}) is not an absolute path.", .{sdk_path});
-            return error.Unusable;
-        }
-        var why: std.ArrayList(u8) = .empty;
-        const m = zbuild.sdk_manifest.load(a, io, .fromTrusted(sdk_path), &why) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => {
-                try msg.print(a, "the project setting " ++ setting_sdk_manifest ++ " is not usable: {s}", .{if (why.items.len != 0) why.items else @errorName(err)});
-                return error.Unusable;
-            },
-        };
+        const m = try sdkManifest(a, a, msg);
         break :blk m.modules;
     };
 
