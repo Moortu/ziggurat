@@ -11,6 +11,11 @@
 //! never closed (spec section 6, unload policy): its code may still be on a
 //! stack or in a Godot callback, and its static data backs the table.
 //!
+//! `loadLinked` is the exported game's variant (spec section 10): the
+//! module is linked into the host's own library, so there is nothing to
+//! open; the two entry points are given as function pointers, and the table
+//! is checked and initialised exactly as `load` does, as generation 1.
+//!
 //! Threads: `load`, `shutdown` and `ScriptNames` construction run
 //! on the main thread (`load` refuses any other). The `HostApi` functions run
 //! on any thread: `mu` (locked with the process Io, `host_io`) guards the
@@ -40,12 +45,15 @@ pub const expected_stamp: u64 = abi.expectedStamp(sdk_options);
 /// The prefix of every line a module logs through the `HostApi`.
 pub const log_prefix = "[ziggurat] ";
 
-/// One loaded generation of the user module. Created by `load`, never freed
-/// (its library is never closed); `shutdown` releases its engine names.
+/// One loaded generation of the user module. Created by `load` or
+/// `loadLinked`, never freed (its library is never closed); `shutdown`
+/// releases its engine names.
 pub const Generation = struct {
     n: u32,
-    lib: loader.Library,
-    /// Static data of `lib`, validated.
+    /// The opened library; null for the module linked into the host's own
+    /// library (`loadLinked`).
+    lib: ?loader.Library,
+    /// Static data of the module, validated.
     table: *const abi.Table,
     /// One per script, in table order. Empty after `shutdown`.
     names: []ScriptNames,
@@ -176,6 +184,53 @@ pub fn load(a: Allocator, path: OsPath, n: u32, diag: *[256]u8) LoadError!*Gener
         return refuse(diag, file, "it has no {s} function.", .{abi.describe_symbol});
     const init = loader.lookup(lib, abi.InitFn, abi.init_symbol) orelse
         return refuse(diag, file, "it has no {s} function.", .{abi.init_symbol});
+    const table = try validated(a, describe, file, diag);
+    // Everything that can fail happens before `ziggurat_init`, so a failure
+    // still closes the library.
+    const disk_bytes = platform.generation_store.allocatedBytesOfPath(io, path) catch 0;
+    const gen = try register(a, .{ .n = n, .lib = lib, .table = table, .names = &.{}, .by_path = .empty, .file = ident, .disk_bytes = disk_bytes }, io);
+    keep = true;
+    gen.init_calls += 1;
+    init(&host_api, n);
+    return gen;
+}
+
+/// The generation number of the module linked into the host's library.
+pub const linked_generation: u32 = 1;
+
+/// Takes the module linked into the host's own library (an exported game,
+/// spec section 10) as generation 1: `describe` and `init` are its
+/// `ziggurat_describe` and `ziggurat_init`. The table is validated exactly
+/// as `load` validates a library's; nothing is opened, so the generation's
+/// `lib` is null. As with `load`, the caller publishes it. It is the only
+/// generation of the process: there is no swap and no reload. Main thread.
+///
+/// On `error.Refused` nothing was initialised and `diag` holds one sentence
+/// with the validator's reason; the caller logs it. `error.NotMainThread`
+/// and `a` are as for `load`.
+pub fn loadLinked(a: Allocator, describe: abi.DescribeFn, init: abi.InitFn, diag: *[256]u8) LoadError!*Generation {
+    @memset(diag, 0);
+    const what = "linked into this game";
+    if (!onMainThread()) {
+        var w: std.Io.Writer = .fixed(diag[0..255]);
+        w.print("Ziggurat cannot load the module {s} from a thread other than the main thread.", .{what}) catch {};
+        const text = std.mem.sliceTo(diag, 0);
+        apiLog(@backingInt(abi.LogLevel.err), text.ptr, text.len);
+        return error.NotMainThread;
+    }
+    const n = linked_generation;
+    if (find(n) != null) return refuse(diag, what, "generation {d} is already loaded.", .{n});
+    const table = try validated(a, describe, what, diag);
+    const gen = try register(a, .{ .n = n, .lib = null, .table = table, .names = &.{}, .by_path = .empty }, host_io.get());
+    gen.init_calls += 1;
+    init(&host_api, n);
+    return gen;
+}
+
+/// The table `describe` returns, once `abi.validate` accepted it; otherwise
+/// `error.Refused` with the sentence for `file` in `diag`.
+fn validated(a: Allocator, describe: abi.DescribeFn, file: []const u8, diag: *[256]u8) LoadError!*const abi.Table {
+    var reason: [256]u8 = undefined;
     const table = describe();
     abi.validate(a, table, expected_stamp, .{}, &reason) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -184,13 +239,16 @@ pub fn load(a: Allocator, path: OsPath, n: u32, diag: *[256]u8) LoadError!*Gener
         }),
         else => return refuse(diag, file, "{s}", .{lowerFirst(&reason)}),
     };
+    return table;
+}
 
-    // Everything that can fail happens before `ziggurat_init`, so a failure
-    // still closes the library.
+/// Creates the generation `init_gen` describes (its table validated), with
+/// its path index and name maps, and appends it to the generation list. The
+/// caller calls `ziggurat_init` next; nothing after this can fail.
+fn register(a: Allocator, init_gen: Generation, io: std.Io) LoadError!*Generation {
     const gen = try a.create(Generation);
     errdefer a.destroy(gen);
-    gen.* = .{ .n = n, .lib = lib, .table = table, .names = &.{}, .by_path = .empty, .file = ident };
-    gen.disk_bytes = platform.generation_store.allocatedBytesOfPath(io, path) catch 0;
+    gen.* = init_gen;
     errdefer gen.by_path.deinit(a);
     const scripts = gen.scripts();
     try gen.by_path.ensureTotalCapacity(a, @intCast(scripts.len));
@@ -214,10 +272,6 @@ pub fn load(a: Allocator, path: OsPath, n: u32, diag: *[256]u8) LoadError!*Gener
     const appended = generations.append(list_allocator.?, gen);
     mu.unlock(io);
     try appended;
-
-    keep = true;
-    gen.init_calls += 1;
-    init(&host_api, n);
     return gen;
 }
 

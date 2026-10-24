@@ -24,7 +24,7 @@ pub fn build(b: *std.Build) void {
     const godot_path = godot_found orelse "godot";
     const manifest_out = b.option([]const u8, "manifest-out", "Absolute path the sdk-manifest step writes the SDK module manifest to");
     const host_test_filter = b.option([]const u8, "host-test-filter", "Run only the host tests whose name contains this text");
-    const export_build = b.option(bool, "export_build", "Build the host for an exported game: no generation manifest reader (spec section 6)") orelse false;
+    const export_build = b.option(bool, "export_build", "Build the host for an exported game: a static archive that is linked with the scripts (spec section 10)") orelse false;
 
     const test_step = b.step("test", "Run unit and integration tests");
     const unit_step = b.step("test-unit", "Run unit tests only (spawns no compiler)");
@@ -80,23 +80,29 @@ pub fn build(b: *std.Build) void {
     // stamp it accepts from the SDK's own `sdk_options`.
     const sdk_options = sdk.import_table.get("sdk_options").?;
     const host = addHost(b, target, optimize, godot_path, zig_exe, sdk_options, .{});
-    const installed_host = if (export_build) addHost(b, target, optimize, godot_path, zig_exe, sdk_options, .{ .export_build = true }) else host;
     const gdextension_file = b.path("addon/ziggurat_host.gdextension");
     // `zig build host -p <project>` makes <project>/addon/ a working addon folder.
     const addon_dir: std.Build.InstallDir = .{ .custom = "addon" };
-    host_step.dependOn(&b.addInstallFileWithDir(installed_host.getEmittedBin(), addon_dir, "libziggurat_host.so").step);
-    host_step.dependOn(&b.addInstallFileWithDir(gdextension_file, addon_dir, "ziggurat_host.gdextension").step);
+    if (export_build) {
+        // The export host needs the scripts' two entry points, so it is a
+        // static archive linked with them into the game's library.
+        host_step.dependOn(&b.addFail("-Dexport_build: the export host is a static archive linked with the scripts, not an addon library").step);
+    } else {
+        host_step.dependOn(&b.addInstallFileWithDir(host.getEmittedBin(), addon_dir, "libziggurat_host.so").step);
+        host_step.dependOn(&b.addInstallFileWithDir(gdextension_file, addon_dir, "ziggurat_host.gdextension").step);
+    }
     if (godot_found == null) {
         host_test_step.dependOn(&b.addFail("test-host needs Godot on PATH or -Dgodot-path=<absolute path>").step);
         gui_test_step.dependOn(&b.addFail("test-gui needs Godot on PATH or -Dgodot-path=<absolute path>").step);
         stress_step.dependOn(&b.addFail("test-stress needs Godot on PATH or -Dgodot-path=<absolute path>").step);
     } else {
         const probe_host = addHost(b, target, optimize, godot_path, zig_exe, sdk_options, .{ .test_probe = true });
-        const export_host = addHost(b, target, optimize, godot_path, zig_exe, sdk_options, .{ .export_build = true });
+        const export_archive = addHost(b, target, optimize, godot_path, zig_exe, sdk_options, .{ .export_build = true, .linkage = .static });
+        const linked_object = linkedFixtureObject(b, target, optimize, sdk);
         addHostTests(b, host_test_step, target, optimize, .{
             .host = host,
             .probe_host = probe_host,
-            .export_host = export_host,
+            .linked_host = linkedLibrary(b, linked_object, export_archive),
             .gdextension = gdextension_file,
             .godot_exe = godot_found.?,
             .zig_exe = zig_exe,
@@ -206,8 +212,13 @@ const HostVariant = struct {
     /// runtime with; the installed library never has it.
     test_probe: bool = false,
     /// An exported game's host: the generation manifest reader and the
-    /// editor's builds are compiled out (spec section 6).
+    /// editor's builds are compiled out (spec section 6), and the scripts'
+    /// `ziggurat_describe` and `ziggurat_init` are extern symbols that the
+    /// link with the scripts' object provides (spec section 10).
     export_build: bool = false,
+    /// `.static` builds the archive `libziggurat_host_<variant>.a`, compiled
+    /// as position-independent code so it can go into a shared library.
+    linkage: std.builtin.LinkMode = .dynamic,
 };
 
 /// The host library `ziggurat_host` (spec section 3). It imports gdzig, the
@@ -260,13 +271,14 @@ fn addHost(
         },
     });
     return b.addLibrary(.{
-        .linkage = .dynamic,
+        .linkage = variant.linkage,
         .name = if (variant.test_probe) "ziggurat_host_probe" else if (variant.export_build) "ziggurat_host_export" else "ziggurat_host",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/host/entry.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .pic = if (variant.linkage == .static) true else null,
             .imports = &.{
                 .{ .name = "gdzig", .module = gdzig.module("gdzig") },
                 .{ .name = "ziggurat_abi", .module = abi },
@@ -289,8 +301,9 @@ const HostTestInputs = struct {
     host: *std.Build.Step.Compile,
     /// The host built with `test_probe`.
     probe_host: *std.Build.Step.Compile,
-    /// The host built with `export_build`.
-    export_host: *std.Build.Step.Compile,
+    /// The export host archive linked with the linked fixture's module
+    /// object (`linkedLibrary`).
+    linked_host: *std.Build.Step.Compile,
     gdextension: std.Build.LazyPath,
     godot_exe: []const u8,
     zig_exe: []const u8,
@@ -357,7 +370,7 @@ fn addHostTests(
     options.addOptionPath("runner_exe", runner.getEmittedBin());
     options.addOptionPath("host_lib", in.host.getEmittedBin());
     options.addOptionPath("probe_host_lib", in.probe_host.getEmittedBin());
-    options.addOptionPath("export_host_lib", in.export_host.getEmittedBin());
+    options.addOptionPath("linked_host_lib", in.linked_host.getEmittedBin());
     options.addOptionPath("gdextension", in.gdextension);
     options.addOption([]const u8, "projects_dir", b.root.joinString(b.allocator, "test/host/projects") catch @panic("OOM"));
     options.addOption([]const u8, "checks_dir", b.root.joinString(b.allocator, "test/host/checks") catch @panic("OOM"));
@@ -472,6 +485,60 @@ fn hostTestRun(
     addSourceInputs(b, run, &.{ "test/host", "test/fixtures", "sdk", "src/abi" });
     run.addFileInput(.{ .cwd_relative = in.godot_exe });
     return run;
+}
+
+/// The linked fixture's module (test/fixtures/linked_project): its root
+/// file, written as a generated root, compiled on its own into an object
+/// with the SDK, so the root is `@import("root")` for the SDK.
+fn linkedFixtureObject(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    sdk: *std.Build.Module,
+) *std.Build.Step.Compile {
+    return b.addObject(.{
+        .name = "linked_fixture",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/fixtures/linked_project/linked_root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .pic = true,
+            .imports = &.{.{ .name = "ziggurat", .module = sdk }},
+        }),
+    });
+}
+
+/// One shared library of a module object (a generated root compiled with
+/// the SDK) and the export host archive (`addHost` with `export_build` and
+/// `.static`): the host's extern `ziggurat_describe` and `ziggurat_init`
+/// resolve to the module's, so nothing is loaded at run time. Godot's
+/// entry `ziggurat_host_init` is the only symbol the library exports.
+fn linkedLibrary(
+    b: *std.Build,
+    module_object: *std.Build.Step.Compile,
+    export_host_archive: *std.Build.Step.Compile,
+) *std.Build.Step.Compile {
+    const mod = module_object.root_module;
+    const lib = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "ziggurat_linked",
+        .root_module = b.createModule(.{
+            .target = mod.resolved_target,
+            .optimize = mod.optimize,
+            .link_libc = true,
+        }),
+    });
+    lib.root_module.addObject(module_object);
+    lib.root_module.linkLibrary(export_host_archive);
+    // Nothing in the module object refers to the entry point, so the
+    // archive member that defines it is pulled in by name.
+    lib.forceUndefinedSymbol("ziggurat_host_init");
+    // The module's `ziggurat_describe` and `ziggurat_init` resolve inside
+    // the library and are not exported.
+    const files = b.addWriteFiles();
+    lib.setVersionScript(files.add("exports.map", "{ global: ziggurat_host_init; local: *; };\n"));
+    return lib;
 }
 
 /// A fixture script as a module that imports the SDK.

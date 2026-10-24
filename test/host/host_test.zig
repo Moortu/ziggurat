@@ -2884,6 +2884,118 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return std.ascii.findIgnoreCase(haystack, needle) != null;
 }
 
+/// The export host linked with test/fixtures/linked_project: the line its
+/// game logs at start.
+const linked_line = "ziggurat: 2 scripts linked";
+
+/// A project with the linked library (export host archive and the linked
+/// fixture's module object, build.zig `linkedLibrary`) as its host,
+/// `res://check.gd` set to linked_game.gd for `case`, and no `.zig` file.
+fn initLinked(p: *Project, case: []const u8) !void {
+    try p.initWith("empty", opts.linked_host_lib);
+    errdefer p.deinit();
+    const a = p.arena_state.allocator();
+    try p.addCheck("linked_game.gd");
+    const env = try a.create(std.process.Environ.Map);
+    env.* = try testing.environ.createMap(testing.allocator);
+    p.env = env;
+    try env.put("ZTEST_LINKED_CASE", case);
+}
+
+/// Fails when the project folder holds a `.zig` file: the linked game must
+/// not need one.
+fn expectNoZigFiles(p: *Project) !void {
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(testing.allocator);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.path, ".zig")) {
+            std.debug.print("the linked project holds {s}\n", .{entry.path});
+            return error.ZigFileInProject;
+        }
+    }
+}
+
+test "linked game runs scripts" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try initLinked(&p, "ready");
+    defer p.deinit();
+    try expectNoZigFiles(&p);
+    try p.run(&.{ "script", "res://check.gd" }, .{
+        .once = &.{ linked_line, "[ziggurat] alpha ready speed=3", "[ziggurat] beta ready", "linked check: scripts running" },
+        .reject = &.{ "no module source yet", "is not part of this export" },
+    });
+}
+
+test "unknown path fails cleanly" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try initLinked(&p, "unknown");
+    defer p.deinit();
+    try p.run(&.{ "script", "res://check.gd" }, .{
+        .once = &.{ linked_line, "Ziggurat: res://nope.zig is not part of this export", "linked check: nope is null" },
+    });
+}
+
+test "exists answers from the table" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try initLinked(&p, "exists");
+    defer p.deinit();
+    try expectNoZigFiles(&p);
+    try p.run(&.{ "script", "res://check.gd" }, .{
+        .once = &.{ linked_line, "linked check: exists alpha=true beta=true nope=false file=false" },
+        .reject = &.{"is not part of this export"},
+    });
+}
+
+/// `uid://cgr8lnhtluchh` as Godot encodes the id (resource_uid.cpp).
+const alpha_uid_text = "uid://cgr8lnhtluchh";
+const alpha_uid: u64 = 0x4898933b48be1eed;
+
+test "uid-only scene runs" {
+    try requireIntegration();
+    var p: Project = undefined;
+    try initLinked(&p, "uid");
+    defer p.deinit();
+    const a = p.arena_state.allocator();
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+    defer dir.close(io);
+    // The scene names the script by uid; its text path is wrong, so only
+    // the uid finds it.
+    const scene = "[gd_scene load_steps=2 format=3]\n\n" ++
+        "[ext_resource type=\"Script\" uid=\"" ++ alpha_uid_text ++ "\" path=\"res://wrong.zig\" id=\"1_alpha\"]\n\n" ++
+        "[node name=\"Root\" type=\"Node2D\"]\nscript = ExtResource(\"1_alpha\")\n";
+    try dir.writeFile(io, .{ .sub_path = "uid_scene.tscn", .data = scene });
+    // `uid_cache.bin` as an export writes it (resource_uid.cpp
+    // `encode_binary_cache`): u32 count, then per entry u64 id, u32 length
+    // and the UTF-8 path, little-endian.
+    const path = "res://alpha.zig";
+    var cache: std.ArrayList(u8) = .empty;
+    var word: [8]u8 = undefined;
+    std.mem.writeInt(u32, word[0..4], 1, .little);
+    try cache.appendSlice(a, word[0..4]);
+    std.mem.writeInt(u64, &word, alpha_uid, .little);
+    try cache.appendSlice(a, &word);
+    std.mem.writeInt(u32, word[0..4], path.len, .little);
+    try cache.appendSlice(a, word[0..4]);
+    try cache.appendSlice(a, path);
+    try dir.createDirPath(io, ".godot");
+    try dir.writeFile(io, .{ .sub_path = ".godot/uid_cache.bin", .data = cache.items });
+    try expectNoZigFiles(&p);
+    try p.run(&.{ "script", "res://check.gd" }, .{
+        .once = &.{ linked_line, "[ziggurat] alpha ready speed=3", "linked check: uid scene script res://alpha.zig" },
+        .reject = &.{ "is not part of this export", "invalid UID" },
+    });
+}
+
+/// The bytes of the linked library (`linkedLibrary`), allocated with `a`.
+fn readLinkedLib(a: std.mem.Allocator) ![]u8 {
+    return Io.Dir.cwd().readFileAlloc(io, opts.linked_host_lib, a, .limited(1 << 30));
+}
+
 test "export build has no editor plugin" {
     try requireIntegration();
     const a = testing.allocator;
@@ -2891,7 +3003,7 @@ test "export build has no editor plugin" {
     // minisign check of the download and install (apart from the URL) and
     // the game's reload capture of editor messages.
     const needles = [_][]const u8{ "ZigEditorPlugin", platform.mirrors.list_url, "minisig", "ZigReloadCapture" };
-    const export_lib = try Io.Dir.cwd().readFileAlloc(io, opts.export_host_lib, a, .limited(1 << 30));
+    const export_lib = try readLinkedLib(a);
     defer a.free(export_lib);
     const host_lib = try Io.Dir.cwd().readFileAlloc(io, opts.host_lib, a, .limited(1 << 30));
     defer a.free(host_lib);
@@ -2905,6 +3017,60 @@ test "export build has no editor plugin" {
     }
 }
 
+test "linked library loads nothing at run time" {
+    try requireIntegration();
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = testing.allocator;
+    const lib = try readLinkedLib(a);
+    defer a.free(lib);
+    // The dynamic symbol table's names: no dlopen import. The ordinary host
+    // imports it (it loads each generation), so the search can find it.
+    const linked_names = try dynamicSymbolNames(a, lib);
+    defer a.free(linked_names);
+    if (std.mem.indexOf(u8, linked_names, "\x00dlopen\x00") != null) return error.LinkedLibraryImportsDlopen;
+    const host_lib = try Io.Dir.cwd().readFileAlloc(io, opts.host_lib, a, .limited(1 << 30));
+    defer a.free(host_lib);
+    const host_names = try dynamicSymbolNames(a, host_lib);
+    defer a.free(host_names);
+    if (std.mem.indexOf(u8, host_names, "\x00dlopen\x00") == null) return error.SearchFindsNothing;
+    // Godot's entry point is exported; the module's two entry points
+    // resolve inside the library and are not.
+    if (std.mem.indexOf(u8, linked_names, "\x00ziggurat_host_init\x00") == null) return error.NoEntryPoint;
+    for ([_][]const u8{ "\x00ziggurat_describe\x00", "\x00ziggurat_init\x00" }) |name| {
+        if (std.mem.indexOf(u8, linked_names, name) != null) return error.ModuleEntryExported;
+    }
+}
+
+/// The names of the ELF64 little-endian file's dynamic symbols (`.dynsym`),
+/// each between NUL bytes, allocated with `a`.
+fn dynamicSymbolNames(a: std.mem.Allocator, elf: []const u8) ![]u8 {
+    if (elf.len < 64 or !std.mem.eql(u8, elf[0..4], "\x7fELF") or elf[4] != 2 or elf[5] != 1) return error.NotElf64;
+    const shoff = std.mem.readInt(u64, elf[0x28..][0..8], .little);
+    const shentsize = std.mem.readInt(u16, elf[0x3a..][0..2], .little);
+    const shnum = std.mem.readInt(u16, elf[0x3c..][0..2], .little);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try out.append(a, 0);
+    for (0..shnum) |i| {
+        const sh = elf[shoff + i * shentsize ..][0..64];
+        const sh_type = std.mem.readInt(u32, sh[4..8], .little);
+        if (sh_type != 11) continue; // SHT_DYNSYM
+        const off = std.mem.readInt(u64, sh[0x18..0x20], .little);
+        const size = std.mem.readInt(u64, sh[0x20..0x28], .little);
+        const link = std.mem.readInt(u32, sh[0x28..0x2c], .little);
+        const entsize = std.mem.readInt(u64, sh[0x38..0x40], .little);
+        const str_sh = elf[shoff + link * shentsize ..][0..64];
+        const str_off = std.mem.readInt(u64, str_sh[0x18..0x20], .little);
+        var at: u64 = 0;
+        while (at + entsize <= size) : (at += entsize) {
+            const name = std.mem.readInt(u32, elf[off + at ..][0..4], .little);
+            try out.appendSlice(a, std.mem.sliceTo(elf[str_off + name ..], 0));
+            try out.append(a, 0);
+        }
+    }
+    return out.toOwnedSlice(a);
+}
+
 test "export build has no manifest path" {
     try requireIntegration();
     const a = testing.allocator;
@@ -2912,7 +3078,7 @@ test "export build has no manifest path" {
     // library holds counts, the way `strings` finds it: symbol names,
     // string literals and debug information alike.
     const needles = [_][]const u8{ "manifest", "readTrusted", "recheck", "loadFromStore" };
-    const export_lib = try Io.Dir.cwd().readFileAlloc(io, opts.export_host_lib, a, .limited(1 << 30));
+    const export_lib = try readLinkedLib(a);
     defer a.free(export_lib);
     for (needles) |n| {
         if (containsIgnoreCase(export_lib, n)) {
@@ -2930,21 +3096,21 @@ test "export build has no manifest path" {
         }
     }
 
-    // A game with the export host ignores a good manifest.
+    // A linked game ignores a good manifest and the generation it names:
+    // it runs its linked scripts.
     var p: Project = undefined;
-    try p.initWith("empty", opts.export_host_lib);
+    try initLinked(&p, "ready");
     defer p.deinit();
     const pa = p.arena_state.allocator();
     const store_path = try stageGameProject(&p);
+    // stageGameProject set its own check and copied the fixture's scripts.
+    try p.addCheck("linked_game.gd");
     var store = try Io.Dir.cwd().openDir(io, store_path, .{});
     defer store.close(io);
     var name_buf: [64]u8 = undefined;
     try writeGameManifest(&store, try std.fmt.allocPrint(pa, "gen=1\npath=gen/1/{s}\n", .{try genLibName(&name_buf, 1)}));
     try p.run(&.{ "script", "res://check.gd" }, .{
-        .once = &.{
-            "This export build of Ziggurat has no module source yet, so this game runs without Zig scripts.",
-            "game check: scripts absent",
-        },
-        .reject = &.{ "mover ready", "generation 1 loaded" },
+        .once = &.{ linked_line, "linked check: scripts running" },
+        .reject = &.{ "mover ready", "generation 1 loaded", "no module source yet" },
     });
 }

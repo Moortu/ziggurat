@@ -15,8 +15,9 @@
 //! EDITOR init, where their parents exist, and the plugin is handed to the
 //! editor there; a game started from an editor binary registers the class
 //! but adds no plugin. An export build (`host_options.export_build`) has
-//! none of this: no editor classes, and its game runs without a generation
-//! manifest.
+//! none of this: no editor classes, and its game runs the scripts linked
+//! into the same library (game.zig, spec section 10). It is a static
+//! archive; the library it is linked into exports only this entry point.
 const std = @import("std");
 const godot = @import("gdzig");
 const version = @import("version.zig");
@@ -173,7 +174,8 @@ const Lifecycle = struct {
         instance.warm(.upcast(lang.base));
         resource.register();
         log("ziggurat_host {s} ready", .{host_version});
-        // Builds run in the editor only; a game loads what the editor built.
+        // Builds run in the editor only; a game loads what the editor built
+        // (an exported game: the scripts linked into its library).
         if (Engine.isEditorHint()) {
             if (comptime host_options.export_build)
                 log("ziggurat_host: this export build does not build Zig scripts in the editor", .{})

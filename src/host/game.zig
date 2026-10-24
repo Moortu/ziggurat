@@ -17,12 +17,16 @@
 //! a save, before the build is staged) read the manifest quietly.
 //!
 //! An export build (`host_options.export_build`) compiles all of this out:
-//! no reader, no file name and no symbol of it remain in the library. Until
-//! scripts are linked into the export (Stage 6) such a game has no module
-//! source and says so.
+//! no reader, no file name and no symbol of it remain in the library. Its
+//! scripts are linked into the same library as the host (spec section 10):
+//! the host's extern `ziggurat_describe` and `ziggurat_init` are the
+//! module's, and `start` takes that module as generation 1
+//! (`runtime.loadLinked`) for the whole process, with no swap and no
+//! reload.
 const std = @import("std");
 const builtin = @import("builtin");
 const godot = @import("gdzig");
+const abi = @import("ziggurat_abi");
 const host_options = @import("host_options");
 const runtime = @import("runtime.zig");
 const host_io = @import("host_io.zig");
@@ -73,11 +77,38 @@ const capture_name = "ziggurat";
 /// (debugger_plugin.zig, `sessionStarted`).
 pub fn start() void {
     if (comptime host_options.export_build) {
-        log("This export build of Ziggurat has no module source yet, so this game runs without Zig scripts.", .{});
+        startLinked();
         return;
     }
     registerCapture();
     loadFromStore();
+}
+
+/// The module's entry points, provided by the scripts' object that is
+/// linked with the export host into one library. Only an export build
+/// refers to them.
+const linked = struct {
+    extern fn ziggurat_describe() callconv(.c) *const abi.Table;
+    extern fn ziggurat_init(api: *const abi.HostApi, gen: u32) callconv(.c) void;
+};
+
+/// An export build's start: the linked module becomes the current
+/// generation; a table the validator refuses is one error line, and the
+/// game runs on without Zig scripts.
+fn startLinked() void {
+    comptime std.debug.assert(host_options.export_build);
+    var diag: [256]u8 = undefined;
+    const gen = runtime.loadLinked(gpa, &linked.ziggurat_describe, &linked.ziggurat_init, &diag) catch |err| {
+        switch (err) {
+            error.OutOfMemory => logError("Ziggurat cannot load Zig scripts in this game: out of memory.", .{}),
+            // `loadLinked` logged it already.
+            error.NotMainThread => {},
+            error.Refused => logError("{s} This game runs without Zig scripts.", .{std.mem.sliceTo(&diag, 0)}),
+        }
+        return;
+    };
+    runtime.publish(gen);
+    log("ziggurat: {d} scripts linked", .{gen.table.script_count});
 }
 
 /// Releases the pins and the message capture. Main thread, SCENE exit.

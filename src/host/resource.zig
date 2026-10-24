@@ -13,6 +13,14 @@
 //! worker threads (threaded loads, the scan); it only uses `FileAccess`
 //! and creates one object.
 //!
+//! In an export build the `.zig` files are not in the game (spec section
+//! 10): the scripts are linked into the host's library, and the loader
+//! answers from the linked table instead of the file system. `_exists` is
+//! true exactly for the table's script paths, and `_load` returns a
+//! `ZigScript` with no source text for such a path without reading any
+//! file. Any other `.zig` path fails with `ERR_FILE_NOT_FOUND` and one
+//! error line.
+//!
 //! The saver writes the script's source text to a temporary file in the
 //! target's folder, flushes it, renames it over the target and flushes the
 //! folder, so a reader sees the old file or the new one, never half of
@@ -27,8 +35,10 @@
 const std = @import("std");
 const godot = @import("gdzig");
 const platform = @import("ziggurat_platform");
+const host_options = @import("host_options");
 const host_io = @import("host_io.zig");
 const props = @import("props.zig");
+const runtime = @import("runtime.zig");
 const script = @import("script.zig");
 
 const Allocator = std.mem.Allocator;
@@ -81,9 +91,33 @@ fn extensionList() PackedStringArray {
 }
 
 fn logError(comptime fmt: []const u8, args: anytype) void {
+    logErrorIn("ZigSaver", fmt, args);
+}
+
+fn logErrorIn(comptime function: [:0]const u8, comptime fmt: []const u8, args: anytype) void {
     var buf: [max_path_bytes + 256]u8 = undefined;
     const msg = std.fmt.bufPrintSentinel(&buf, fmt, args, 0) catch return;
-    godot.raw.printError(msg.ptr, "ZigSaver", "src/host/resource.zig", @src().line, 1);
+    godot.raw.printError(msg.ptr, function, "src/host/resource.zig", @src().line, 1);
+}
+
+/// What an export build's loader knows of a `.zig` path.
+const Linked = enum {
+    /// A script of the linked table.
+    script,
+    /// Not a script of the linked table (or not a project path).
+    unknown,
+    /// No linked generation is loaded: its table was refused.
+    not_loaded,
+};
+
+/// The answer for the `res://` path `res_path` from the linked generation
+/// `gen` (`runtime.current()`). The path is matched like a script's own
+/// path (`script.relPath`), byte for byte with the table's paths.
+fn linkedAnswer(gen: ?*const runtime.Generation, res_path: []const u8) Linked {
+    const g = gen orelse return .not_loaded;
+    var buf: [max_path_bytes]u8 = undefined;
+    const rel = script.relPath(res_path, &buf) orelse return .unknown;
+    return if (runtime.findScript(g, rel) != null) .script else .unknown;
 }
 
 // ------------------------------------------------------------ loader
@@ -125,8 +159,14 @@ pub const ZigLoader = struct {
     }
 
     /// True when the file can be opened; `FileAccess` also sees files in an
-    /// exported project's pack.
+    /// exported project's pack. In an export build: true exactly for the
+    /// linked table's script paths.
     pub fn _exists(_: *ZigLoader, path: String) bool {
+        if (comptime host_options.export_build) {
+            var buf: [max_path_bytes]u8 = undefined;
+            const p = props.stringText(&path, &buf) orelse return false;
+            return isZigPath(p) and linkedAnswer(runtime.current(), p) == .script;
+        }
         return FileAccess.fileExists(path);
     }
 
@@ -136,6 +176,7 @@ pub const ZigLoader = struct {
         var buf: [max_path_bytes]u8 = undefined;
         const p = props.stringText(&path, &buf) orelse return errorVariant(.err_file_bad_path);
         if (!isZigPath(p)) return errorVariant(.err_file_unrecognized);
+        if (comptime host_options.export_build) return loadLinked(path, p, original_path, cache_mode);
 
         var text = switch (script.readFileText(path)) {
             .text => |t| t,
@@ -151,6 +192,31 @@ pub const ZigLoader = struct {
         s.source = text;
         // Lets a later build notice an edit made outside the editor.
         s.noteDisk(FileAccess.getModifiedTime(path));
+        return scriptVariant(s, path, original_path, cache_mode);
+    }
+
+    /// An export build's `_load` of the `.zig` path `p` (the text of
+    /// `path`): a `ZigScript` with no source text for a script of the
+    /// linked table; no file is read.
+    fn loadLinked(path: String, p: []const u8, original_path: String, cache_mode: i64) Variant {
+        switch (linkedAnswer(runtime.current(), p)) {
+            .script => {},
+            .unknown => {
+                logErrorIn("ZigLoader", "Ziggurat: {s} is not part of this export", .{p});
+                return errorVariant(.err_file_not_found);
+            },
+            .not_loaded => {
+                logErrorIn("ZigLoader", "Ziggurat: {s} cannot be loaded because this export's Zig scripts did not load", .{p});
+                return errorVariant(.err_unavailable);
+            },
+        }
+        var alloc = godot.engine_allocator;
+        const s = ZigScript.create(&alloc) catch return errorVariant(.err_out_of_memory);
+        return scriptVariant(s, path, original_path, cache_mode);
+    }
+
+    /// The Variant `_load` returns for the new script `s`.
+    fn scriptVariant(s: *ZigScript, path: String, original_path: String, cache_mode: i64) Variant {
         // A load that skips the cache (IGNORE, IGNORE_DEEP) gets no path
         // from Godot, so give it one the way GDScript's loader does:
         // `set_path_cache` only remembers the path and never touches the
@@ -301,4 +367,20 @@ pub fn unregister() void {
 /// destroy runs gdzig's destroy callback, which frees the Zig struct.
 fn release(rc: *RefCounted) void {
     if (rc.unreference()) godot.raw.objectDestroy(@ptrCast(rc));
+}
+
+test "an export build's loader answers from the linked table's paths" {
+    const a = std.testing.allocator;
+    var g: runtime.Generation = .{ .n = 1, .lib = null, .table = undefined, .names = &.{}, .by_path = .empty };
+    defer g.by_path.deinit(a);
+    try g.by_path.put(a, "alpha.zig", 0);
+    try g.by_path.put(a, "sub/beta.zig", 1);
+    for ([_][]const u8{ "res://alpha.zig", "res://sub/beta.zig", "res://./alpha.zig", "res://sub/../alpha.zig", "res://sub//beta.zig" }) |p| {
+        try std.testing.expectEqual(Linked.script, linkedAnswer(&g, p));
+    }
+    // Paths are case-sensitive; only `res://` paths inside the project.
+    for ([_][]const u8{ "res://nope.zig", "res://Alpha.zig", "res://beta.zig", "res://sub", "user://alpha.zig", "alpha.zig", "res://../alpha.zig", "res://" }) |p| {
+        try std.testing.expectEqual(Linked.unknown, linkedAnswer(&g, p));
+    }
+    try std.testing.expectEqual(Linked.not_loaded, linkedAnswer(null, "res://alpha.zig"));
 }
