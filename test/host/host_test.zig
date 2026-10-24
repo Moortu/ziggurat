@@ -64,15 +64,7 @@ const Project = struct {
         try p.tmp.dir.createDirPath(io, "project");
         var dst = try p.tmp.dir.openDir(io, "project", .{});
         defer dst.close(io);
-        var walker = try src.walk(a);
-        defer walker.deinit();
-        while (try walker.next(io)) |entry| {
-            switch (entry.kind) {
-                .directory => try dst.createDirPath(io, entry.path),
-                .file => try src.copyFile(entry.path, dst, entry.path, io, .{}),
-                else => {},
-            }
-        }
+        try copyTree(a, src, dst);
 
         try dst.createDirPath(io, "addons/ziggurat/bin");
         try cwd.copyFile(host_lib, dst, "addons/ziggurat/bin/libziggurat_host.so", io, .{});
@@ -2411,6 +2403,30 @@ test "play without a service" {
     });
 }
 
+test "play without scripts and without Zig" {
+    try requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("empty");
+    defer p.deinit();
+    // The shipped SDK, so the editor runs a build service; no Zig setting,
+    // no downloaded Zig (isolated per-user folders) and no Zig on PATH.
+    try addStagedSdk(&p);
+    try isolateUserFolders(&p);
+    try p.env.?.put("PATH", "/nonexistent/ziggurat-test");
+    try writeProjectFile(&p, "main.gd", "extends Node\n");
+    try addPlayCheck(&p, "no_scripts");
+    try runPlay(&p, .{
+        .expect = &.{
+            "ZTEST PASS play_not_before_first_frame",
+            "ZTEST PASS play_called_once",
+            "ZTEST PASS play_no_scripts",
+            "build service stopped (0 threads left)",
+        },
+        .reject = &.{ play_cancelled, "found no usable Zig", "Ziggurat needs Zig" },
+    });
+}
+
 test "build on play off" {
     try requireIntegration();
     if (builtin.os.tag == .windows) return error.SkipZigTest;
@@ -3003,7 +3019,7 @@ test "export build has no editor plugin" {
     // The plugin's class name, the Zig download's mirror list URL, the
     // minisign check of the download and install (apart from the URL) and
     // the game's reload capture of editor messages.
-    const needles = [_][]const u8{ "ZigEditorPlugin", platform.mirrors.list_url, "minisig", "ZigReloadCapture" };
+    const needles = [_][]const u8{ "ZigEditorPlugin", "ZigExportPlugin", platform.mirrors.list_url, "minisig", "ZigReloadCapture" };
     const export_lib = try readLinkedLib(a);
     defer a.free(export_lib);
     const host_lib = try Io.Dir.cwd().readFileAlloc(io, opts.host_lib, a, .limited(1 << 30));
@@ -3118,18 +3134,15 @@ const game_lib_rel = ".godot/ziggurat/export/linux.x86_64/libziggurat_game.so";
 const export_platform_message = "Ziggurat exports Linux x86_64 only in this version";
 /// The plugin's progress line before an export build.
 const export_building = "Ziggurat: building the game library for the export";
+/// The end of every error after which the export fails.
+const export_incomplete = "the files in the export's output folder are incomplete";
 
-var export_skip_noted = false;
-
-/// Skips the test when `-Dexport-templates` is unset (ruling R3), with one
-/// line for the whole run.
+/// Skips the test when `-Dexport-templates` is unset (ruling R3). The test
+/// prints nothing (a passing test that writes to stderr is labelled
+/// "failed command"); build.zig prints one notice after the run.
 fn requireTemplates() !void {
     try requireIntegration();
     if (opts.export_templates.len != 0) return;
-    if (!export_skip_noted) {
-        export_skip_noted = true;
-        std.debug.print("host export tests skipped: pass -Dexport-templates=<folder with Godot 4.7.2's export templates>\n", .{});
-    }
     return error.SkipZigTest;
 }
 
@@ -3306,7 +3319,7 @@ test "export: export fails on a broken build" {
     try writeProjectFile(&p, "broken.zig", broken_script);
     try exportGame(&p, .{
         .once = &.{export_building},
-        .expect = &.{ "Ziggurat: res://broken.zig:5:5: ", "Ziggurat: The Zig build for the export failed" },
+        .expect = &.{ "Ziggurat: res://broken.zig:5:5: ", "Ziggurat: The Zig build for the export failed", export_incomplete },
         .exit_code = "1",
     });
     try testing.expect(!try projectFileExists(&p, game_lib_rel));
@@ -3323,6 +3336,82 @@ test "export: stale library is never shipped" {
     try exportGame(&p, .{ .once = &.{export_building}, .exit_code = "1" });
     try testing.expect(!try projectFileExists(&p, game_lib_rel));
     try testing.expect(!try projectFileExists(&p, "out/libziggurat_game.so"));
+}
+
+test "export: export fails without a usable Zig" {
+    try requireTemplates();
+    var p: Project = undefined;
+    // An existing file that is not Zig 0.17.0: the locator stops at the
+    // first candidate that exists, so no Zig on PATH is used instead.
+    var dir_tmp = testing.tmpDir(.{});
+    defer dir_tmp.cleanup();
+    try dir_tmp.dir.writeFile(io, .{ .sub_path = "old-zig", .data = "#!/bin/sh\necho 0.16.0\n", .flags = .{ .permissions = .executable_file } });
+    const bad = try dir_tmp.dir.realPathFileAlloc(io, "old-zig", testing.allocator);
+    defer testing.allocator.free(bad);
+    try initExport(&p, bad);
+    defer p.deinit();
+    try exportGame(&p, .{
+        .expect = &.{ "Ziggurat: Ziggurat cannot build the game library for the export:", "is Zig 0.16.0", export_incomplete },
+        .reject = &.{export_building},
+        .exit_code = "1",
+    });
+    try testing.expect(!try projectFileExists(&p, game_lib_rel));
+    try testing.expect(!try projectFileExists(&p, "out/libziggurat_game.so"));
+}
+
+test "export: an old library that cannot be deleted is emptied" {
+    try requireTemplates();
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var p: Project = undefined;
+    // No Zig scripts and no Zig: the export would copy the empty game
+    // library, but the old one is in a folder where nothing can be
+    // deleted or added.
+    try initExport(&p, "/nonexistent/ziggurat-test/zig");
+    defer p.deinit();
+    try removeExportScripts(&p);
+    const old = "an old game library";
+    try writeProjectFile(&p, game_lib_rel, old);
+    const a = p.arena_state.allocator();
+    const lib_dir = try std.fs.path.join(a, &.{ p.path, std.fs.path.dirname(game_lib_rel).? });
+    try setMode(lib_dir, 0o555);
+    defer setMode(lib_dir, 0o755) catch {};
+    // A user who may delete anyway (root) cannot run this test.
+    var probe_dir = try Io.Dir.cwd().openDir(io, lib_dir, .{});
+    defer probe_dir.close(io);
+    if (probe_dir.createFile(io, "probe", .{})) |f| {
+        f.close(io);
+        return error.SkipZigTest;
+    } else |_| {}
+    try exportGame(&p, .{ .expect = &.{ "Ziggurat: Ziggurat cannot delete the game library of an earlier export", "emptied it", export_incomplete } });
+    const left = try Io.Dir.cwd().statFile(io, try std.fs.path.join(a, &.{ p.path, game_lib_rel }), .{});
+    try testing.expectEqual(@as(u64, 0), left.size);
+    // What Godot copied is the emptied file, never the old library.
+    if (try projectFileExists(&p, "out/libziggurat_game.so")) {
+        const shipped = try Io.Dir.cwd().statFile(io, try std.fs.path.join(a, &.{ p.path, "out/libziggurat_game.so" }), .{});
+        try testing.expectEqual(@as(u64, 0), shipped.size);
+    }
+}
+
+/// Sets the permission bits of the folder `path`.
+fn setMode(path: []const u8, mode: std.posix.mode_t) !void {
+    return Io.Dir.cwd().setFilePermissions(io, path, .fromMode(mode), .{});
+}
+
+/// Turns the export fixture into a project without Zig scripts: the
+/// scripts go, and the main scene holds only main.gd.
+fn removeExportScripts(p: *Project) !void {
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+    defer dir.close(io);
+    for ([_][]const u8{ "hero.zig", "hero.zig.uid", "sub/sidekick.zig", "uid_main.tscn" }) |f| try dir.deleteFile(io, f);
+    try dir.writeFile(io, .{ .sub_path = "main.tscn", .data =
+        \\[gd_scene format=3]
+        \\
+        \\[ext_resource type="Script" path="res://main.gd" id="1_main"]
+        \\
+        \\[node name="Main" type="Node"]
+        \\script = ExtResource("1_main")
+        \\
+    });
 }
 
 test "export: non-Linux preset gives the error message" {
@@ -3345,18 +3434,7 @@ test "export: project without Zig scripts exports" {
     // No Zig at the configured path: the export must not need one.
     try initExport(&p, "/nonexistent/ziggurat-test/zig");
     defer p.deinit();
-    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
-    defer dir.close(io);
-    for ([_][]const u8{ "hero.zig", "hero.zig.uid", "sub/sidekick.zig", "uid_main.tscn" }) |f| try dir.deleteFile(io, f);
-    try dir.writeFile(io, .{ .sub_path = "main.tscn", .data =
-        \\[gd_scene format=3]
-        \\
-        \\[ext_resource type="Script" path="res://main.gd" id="1_main"]
-        \\
-        \\[node name="Main" type="Node"]
-        \\script = ExtResource("1_main")
-        \\
-    });
+    try removeExportScripts(&p);
     // The library it ships passes the checks of an export build's library.
     const a = p.arena_state.allocator();
     const empty = try Io.Dir.cwd().readFileAlloc(io, opts.game_empty_lib, a, .limited(1 << 30));
@@ -3368,6 +3446,101 @@ test "export: project without Zig scripts exports" {
     try exportGame(&p, .{ .reject = &.{ "ERROR:", export_building } });
     try testing.expect(try projectFileExists(&p, "out/libziggurat_game.so"));
     try runExported(&p, .{ .once = &.{ "ziggurat: 0 scripts linked", "export check: main ready" }, .reject = &.{ "ERROR:", "WARNING:" } });
+}
+
+// ------------------------------------------------------------ install
+
+/// A fresh project made the way a user makes one: the export fixture's
+/// own files (it has no add-on) in a folder whose path holds a space, and
+/// the release package (`zig build package`) unzipped into it. Nothing
+/// points at this checkout: no SDK manifest setting (the add-on's shipped
+/// SDK is used), a new build cache and new per-user folders inside the
+/// test's folder. Only the project setting `ziggurat/zig_path` is set.
+fn initInstalled(p: *Project) !void {
+    p.env = null;
+    p.arena_state = .init(testing.allocator);
+    errdefer p.arena_state.deinit();
+    const a = p.arena_state.allocator();
+    p.tmp = testing.tmpDir(.{});
+    errdefer p.tmp.cleanup();
+    const cwd = Io.Dir.cwd();
+    const folder = "my game";
+    try p.tmp.dir.createDirPath(io, folder);
+    var dst = try p.tmp.dir.openDir(io, folder, .{});
+    defer dst.close(io);
+    {
+        var projects = try cwd.openDir(io, opts.projects_dir, .{});
+        defer projects.close(io);
+        var src = try projects.openDir(io, "export", .{ .iterate = true });
+        defer src.close(io);
+        try copyTree(a, src, dst);
+    }
+    {
+        var zip = try cwd.openFile(io, opts.package_zip, .{});
+        defer zip.close(io);
+        var buf: [64 * 1024]u8 = undefined;
+        var reader = zip.reader(io, &buf);
+        try std.zip.extract(dst, &reader, .{});
+    }
+    p.path = try p.tmp.dir.realPathFileAlloc(io, folder, a);
+
+    const old = try dst.readFileAlloc(io, "project.godot", a, .limited(64 * 1024));
+    try dst.writeFile(io, .{ .sub_path = "project.godot", .data = try std.fmt.allocPrint(a, "{s}\n[ziggurat]\n\nzig_path=\"{s}\"\n", .{ old, opts.zig_exe }) });
+    const presets = try dst.readFileAlloc(io, "export_presets.cfg", a, .limited(64 * 1024));
+    try dst.writeFile(io, .{ .sub_path = "export_presets.cfg", .data = try std.mem.replaceOwned(u8, a, presets, "@TEMPLATES@", opts.export_templates) });
+    try dst.createDirPath(io, "out");
+    try isolateUserFolders(p);
+    try p.tmp.dir.createDirPath(io, "cache");
+    try p.env.?.put("XDG_CACHE_HOME", try p.tmp.dir.realPathFileAlloc(io, "cache", a));
+}
+
+/// Copies every folder and file below `src` into `dst`.
+fn copyTree(a: std.mem.Allocator, src: Io.Dir, dst: Io.Dir) !void {
+    var walker = try src.walk(a);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        switch (entry.kind) {
+            .directory => try dst.createDirPath(io, entry.path),
+            .file => try src.copyFile(entry.path, dst, entry.path, io, .{}),
+            else => {},
+        }
+    }
+}
+
+test "install from the zip" {
+    try requireTemplates();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var p: Project = undefined;
+    try initInstalled(&p);
+    defer p.deinit();
+    try testing.expect(std.mem.indexOfScalar(u8, p.path, ' ') != null);
+    {
+        // The add-on came from the zip, with its SDK and export inputs.
+        var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+        defer dir.close(io);
+        for ([_][]const u8{
+            "addons/ziggurat/ziggurat.gdextension",
+            "addons/ziggurat/bin/libziggurat_host.so",
+            "addons/ziggurat/bin/libziggurat_host_export.a",
+            "addons/ziggurat/bin/libziggurat_game_empty.so",
+            "addons/ziggurat/sdk/sdk-manifest.json",
+        }) |f| try dir.access(io, f, .{});
+        const settings = try dir.readFileAlloc(io, "project.godot", p.arena_state.allocator(), .limited(64 * 1024));
+        try testing.expect(std.mem.indexOf(u8, settings, "sdk_manifest") == null);
+    }
+    // Play's build in a headless editor (--build-solutions calls `_build`,
+    // and the editor exits with status 1 when it returns false), with the
+    // shipped SDK.
+    try p.addAutoloadCheck("export_editor.gd");
+    try p.run(&.{ "build", "30" }, .{
+        .expect = &.{ "ZTEST PASS export_editor_built", "ziggurat: build 1 " },
+        .reject = &.{ play_cancelled, "is not set", "is not usable" },
+        .deadline = build_deadline_s,
+    });
+    // The export with the real template, then the exported game.
+    try exportGame(&p, .{ .once = &.{export_building}, .reject = &.{ "ERROR:", "is not set", "is not usable" } });
+    try testing.expect(try projectFileExists(&p, "out/libziggurat_game.so"));
+    try runExported(&p, .{ .once = &export_game_lines, .reject = &.{ "ERROR:", "WARNING:" } });
 }
 
 // ------------------------------------------------------------ shipped SDK

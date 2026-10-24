@@ -23,6 +23,10 @@
 //!   build's scan. When they are equal nothing is built and no outcome is
 //!   published (`Stats.checks_skipped` counts it). A request made before the
 //!   check starts, or during it, is built as usual.
+//! - Every build scans the project first. A project without Zig scripts
+//!   gives a good outcome with no generation at once: nothing is generated
+//!   or compiled, and no Zig is located (a GDScript-only project plays
+//!   without Zig).
 //! - A requested build holds `build.lock` from `Workspace.prepare` until it
 //!   has staged its output, never for the life of the service.
 //! - An incremental server holds `<cache dir>/incremental.lock` (exclusive)
@@ -111,7 +115,9 @@ pub const BuildPath = enum { full, incremental };
 /// service; see `Config.on_outcome` and `BuildService.last` for how long.
 pub const Outcome = struct {
     trigger: Trigger,
-    /// True when a new generation was staged.
+    /// True when a new generation was staged, or when the project has no
+    /// Zig scripts (then `generation` is null: nothing was built, and no
+    /// Zig was needed).
     ok: bool,
     generation: ?Generation,
     /// Compile errors, then scan problems (those have line 0 and do not by
@@ -646,8 +652,8 @@ pub const BuildService = struct {
     /// For a `requestIfChanged` check: scans the project and compares the
     /// scan's id with the last build's (`seen_id`). True when they differ,
     /// when no build scanned yet and when the scan fails (the build then
-    /// reports why). Keeps the new id, so a build that fails before its own
-    /// scan (no Zig) is not repeated at every check. Build thread only.
+    /// reports why). Keeps the new id, so a build that fails after its scan
+    /// (no Zig) is not repeated at every check. Build thread only.
     fn treeChanged(self: *BuildService) bool {
         var arena_state = std.heap.ArenaAllocator.init(self.a);
         defer arena_state.deinit();
@@ -714,13 +720,23 @@ pub const BuildService = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        const zig = try self.locateZig(o);
+        // The scan comes first: a project without Zig scripts has nothing
+        // to build and needs no Zig (Play in a GDScript-only project).
         const project = self.cfg.paths.roots.project;
         const sc = scan_mod.scanCached(arena, self.io, project, self.cfg.script_dirs, &self.scan_cache) catch |err| {
             o.message = try std.fmt.allocPrint(a, "Scanning the project folder {s} failed: {t}.", .{ project.bytes, err });
             return err;
         };
         self.seen_id = sc.build_id;
+        if (sc.scripts.len == 0) {
+            // A good build with no generation: nothing is generated,
+            // compiled or staged, and the last generation stays as it is.
+            o.ok = true;
+            try appendProblems(a, o, sc.problems);
+            o.scan_problems = @intCast(sc.problems.len);
+            return;
+        }
+        const zig = try self.locateZig(o);
         var ws = try self.prepareWorkspace(sc, o);
         defer ws.deinit(a);
 
@@ -1644,6 +1660,7 @@ test "waitIdle from the callback is refused" {
     });
     defer svc.deinit();
     probe.svc.store(svc, .release);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.zig", .data = "pub const extends = \"Node\";\n" });
     svc.request(.manual);
     try svc.waitIdle(10_000);
     try testing.expectEqual(@as(u8, 2), probe.wait_result.load(.acquire));
@@ -1671,6 +1688,8 @@ test "outcomes carry the Zig problem, and new Zig paths are used at the next bui
     defer a.free(old);
     const mute = try std.fs.path.join(a, &.{ base, "mute-zig" });
     defer a.free(mute);
+    // A script, so every build needs Zig.
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "pub const extends = \"Node\";\n" });
     // No Zig anywhere in this configuration.
     const svc = try BuildService.init(a, io, testConfig(base, &.{.{ .name = "ziggurat", .root = .fromTrusted(base), .deps = &.{} }}));
     defer svc.deinit();
@@ -1717,6 +1736,8 @@ test "a located Zig is located again when the paths change" {
     defer a.free(good);
     const old = try std.fs.path.join(a, &.{ base, "old-zig" });
     defer a.free(old);
+    // A script, so every build needs Zig.
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "pub const extends = \"Node\";\n" });
     const svc = try BuildService.init(a, io, testConfig(base, &.{.{ .name = "ziggurat", .root = .fromTrusted(base), .deps = &.{} }}));
     defer svc.deinit();
 
@@ -1735,6 +1756,37 @@ test "a located Zig is located again when the paths change" {
     try testing.expectEqual(ZigProblem.wrong_version, changed.zig_problem);
 }
 
+test "a project without scripts builds without Zig" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+    // A helper is not a script; no Zig anywhere in this configuration.
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib.zig", .data = "pub fn f() void {}\n" });
+    const svc = try BuildService.init(a, io, testConfig(base, &.{.{ .name = "ziggurat", .root = .fromTrusted(base), .deps = &.{} }}));
+    defer svc.deinit();
+
+    const empty = try buildOnce(svc, a, .play);
+    defer freeOutcome(a, empty);
+    try testing.expect(empty.ok);
+    try testing.expect(empty.generation == null);
+    try testing.expect(empty.snapshot == null);
+    try testing.expectEqual(ZigProblem.none, empty.zig_problem);
+    try testing.expectEqual(@as(usize, 0), empty.diagnostics.len);
+    try testing.expect(empty.message == null);
+    // Nothing was generated or staged in the project.
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, @import("rootgen.zig").root_file_name, .{}));
+
+    // With a script, the build needs Zig again.
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "pub const extends = \"Node\";\n" });
+    const needs = try buildOnce(svc, a, .play);
+    defer freeOutcome(a, needs);
+    try testing.expect(!needs.ok);
+    try testing.expectEqual(ZigProblem.missing, needs.zig_problem);
+}
+
 test "requestIfChanged skips an unchanged tree" {
     const a = testing.allocator;
     const io = testing.io;
@@ -1743,8 +1795,8 @@ test "requestIfChanged skips an unchanged tree" {
     const base = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(base);
     try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "pub const extends = \"Node\";\n" });
-    // No Zig anywhere in this configuration: every build fails fast in the
-    // locator, which runs before the build's own scan.
+    // No Zig anywhere in this configuration: every build of this project
+    // (it has a script) fails fast in the locator, after the scan.
     const svc = try BuildService.init(a, io, testConfig(base, &.{.{ .name = "ziggurat", .root = .fromTrusted(base), .deps = &.{} }}));
     defer svc.deinit();
 

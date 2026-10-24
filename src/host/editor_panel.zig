@@ -327,6 +327,9 @@ fn noteToast(t: Toast) void {
 pub fn statusLine(buf: []u8, last: editor_build.Last, good_n: ?u32) []const u8 {
     if (last.ok) {
         if (last.n) |n| return std.fmt.bufPrint(buf, "Build {d} ok ({t}, {t}, {d} ms)", .{ n, last.trigger, last.path, last.ms }) catch "";
+        // A project without Zig scripts.
+        if (last.warning_count == 0) return "No Zig scripts; nothing to build";
+        return std.fmt.bufPrint(buf, "No Zig scripts; nothing to build ({d} warnings)", .{last.warning_count}) catch "";
     }
     if (good_n) |n|
         return std.fmt.bufPrint(buf, "Build failed: {d} errors, {d} warnings ({d} ms); build {d} stays in use", .{ last.error_count, last.warning_count, last.ms, n }) catch "";
@@ -398,6 +401,13 @@ test "status line" {
     failed.ms = 90;
     try std.testing.expectEqualStrings("Build failed: 2 errors, 1 warnings (90 ms); build 4 stays in use", statusLine(&buf, failed, 4));
     try std.testing.expectEqualStrings("Build failed: 2 errors, 1 warnings (90 ms); no build is in use", statusLine(&buf, failed, null));
+    // A project without Zig scripts: a good build with nothing built.
+    var empty = ok;
+    empty.n = null;
+    try std.testing.expectEqualStrings("No Zig scripts; nothing to build", statusLine(&buf, empty, null));
+    empty.warning_count = 2;
+    try std.testing.expectEqualStrings("No Zig scripts; nothing to build (2 warnings)", statusLine(&buf, empty, 4));
+    try std.testing.expect(toastFor(&buf, empty, null) == null);
 }
 
 test "toasts" {

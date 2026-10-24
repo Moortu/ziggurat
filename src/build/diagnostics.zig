@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("ziggurat_platform");
 const workspace = @import("workspace.zig");
+const rootgen = @import("rootgen.zig");
 const Workspace = workspace.Workspace;
 const ErrorBundle = std.zig.ErrorBundle;
 
@@ -141,7 +142,8 @@ const Frame = struct { rel: []const u8, line: u32, column: u32 };
 /// The first entry of the reference trace of source location `si` that lies
 /// in the project's files (1-based), or null. For an error outside the
 /// files, such as a withheld gdzig helper reported at gdzig's generated
-/// class file, this is the script line that named it. The compiler keeps
+/// class file, this is the script line that named it. Frames in the
+/// generated root (`rootgen.root_file_name`) are skipped. The compiler keeps
 /// two frames by default.
 fn firstProjectFrame(a: std.mem.Allocator, v: View, si: u32, ws: *const Workspace) error{ MalformedBundle, OutOfMemory }!?Frame {
     const loc = try v.sourceLocation(si);
@@ -155,6 +157,12 @@ fn firstProjectFrame(a: std.mem.Allocator, v: View, si: u32, ws: *const Workspac
             error.OutsideProject => continue,
             error.OutOfMemory => return error.OutOfMemory,
         };
+        // The generated root is hidden and rewritten by every build: never
+        // a link target.
+        if (std.mem.eql(u8, rel, rootgen.root_file_name)) {
+            a.free(rel);
+            continue;
+        }
         return .{ .rel = rel, .line = tl.line +| 1, .column = tl.column +| 1 };
     }
     return null;
@@ -522,6 +530,28 @@ test "an error outside the project takes the first project frame of its referenc
     const ds3 = try decode(a, testing.io, inside, &ws);
     try testing.expectEqualStrings("a.zig", ds3[0].rel.?);
     try testing.expectEqual(@as(u32, 4), ds3[0].line);
+}
+
+test "panel link never points at the generated root" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const ws = fakeWorkspace("/proj", "/cache/build");
+    const node: Src = .{ .path = "/sdk/gdzig/class/Node.zig", .line = 120, .column = 4 };
+    // The generated root's per-script `const` comes first in the trace:
+    // the script's own line is the link.
+    const eb = try buildTraced(a, "std trouble", node, &.{
+        .{ .path = "/proj/.ziggurat_root.zig", .line = 4, .column = 0 },
+        .{ .path = "/proj/scripts/hero.zig", .line = 7, .column = 13 },
+    });
+    const ds = try decode(a, testing.io, eb, &ws);
+    try testing.expectEqualStrings("scripts/hero.zig", ds[0].rel.?);
+    try testing.expectEqual(@as(u32, 8), ds[0].line);
+    // Only the generated root in the trace: no link.
+    const only_root = try buildTraced(a, "std trouble", node, &.{.{ .path = "/proj/.ziggurat_root.zig", .line = 4, .column = 0 }});
+    const ds2 = try decode(a, testing.io, only_root, &ws);
+    try testing.expect(ds2[0].rel == null);
+    try testing.expectEqual(@as(u32, 121), ds2[0].line);
 }
 
 test "decode of the empty bundle is empty" {

@@ -18,6 +18,10 @@ extends Node
 # - `timeout_none`: as `timeout_good` without a good build: false, and the
 #   panel shows.
 # - `no_service`: no SDK manifest setting: true at once.
+# - `no_scripts`: a project without Zig scripts, with the shipped SDK and
+#   no Zig anywhere: the build finds nothing to build and needs no Zig;
+#   true, a good build with no generation, and no error toast (checked
+#   ten frames later, after the panel's refresh).
 # - `off`: `build_on_play` is false (the build is held): true, nothing
 #   requested.
 # - `nested`: the build is held and `play_wait_seconds` is 5. The probe
@@ -42,6 +46,8 @@ var finished := false
 # `_build` calls made before Play's own one (the `nested` case).
 var base_calls := 0
 var base_requests := 0
+# The frame `_build` returned on (the `no_scripts` case waits after it).
+var play_frame := 0
 
 
 func report(name: String, ok: bool, why: String) -> void:
@@ -126,6 +132,11 @@ func _on_frame() -> void:
 			get_tree().quit()
 		return
 	# The first frame after `_build` returned true.
+	if case_name == "no_scripts":
+		if play_frame == 0:
+			play_frame = frame
+		if frame < play_frame + 10:
+			return
 	finished = true
 	var st: Dictionary = probe.editor_build_status()
 	report("play_called_once", play.calls == base_calls + 1, str(play))
@@ -143,6 +154,14 @@ func _on_frame() -> void:
 				"play %s, status %s, manifest %d, toasts %s" % [str(play), str(st), manifest_gen(), str(toasts)])
 		"no_service":
 			report("play_without_service", play.result and play.requested == 0 and not st.building and not st.has_last, "play %s, status %s" % [str(play), str(st)])
+		"no_scripts":
+			var errors := []
+			for t in probe.editor_panel_toasts():
+				if str(t).begins_with("error:"):
+					errors.append(t)
+			report("play_no_scripts",
+				play.result and play.requested == 1 and st.has_last and st.ok and st.n == -1 and st.zig_problem == "none" and errors.is_empty(),
+				"play %s, status %s, error toasts %s" % [str(play), str(st), str(errors)])
 		"off":
 			report("play_off", play.result and play.requested == 0 and st.building and not st.has_last, "play %s, status %s" % [str(play), str(st)])
 		"nested":

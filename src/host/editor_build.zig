@@ -218,7 +218,8 @@ pub const Last = struct {
     n: ?u32,
     /// True when the editor took the build into use: it staged a
     /// generation, its load checks passed and its library and defaults
-    /// were accepted.
+    /// were accepted. Also true, with `n` null, when the project has no Zig
+    /// scripts (nothing to build).
     ok: bool,
     trigger: Trigger,
     path: BuildPath,
@@ -1216,6 +1217,10 @@ fn applyMsg(m: *Msg) Allocator.Error!void {
     var use: Use = .not_used;
     if (m.ok and m.lib != null) {
         use = try applyGood(a, st, m, &files, &all);
+    } else if (m.ok) {
+        // No Zig scripts: nothing was built, and nothing changes.
+        use = .no_scripts;
+        log("ziggurat: no Zig scripts; nothing to build ({t}, {d} ms)", .{ m.trigger, m.ms });
     } else {
         log("ziggurat: build failed ({t}, {d} ms); the last good build stays in use", .{ m.trigger, m.ms });
     }
@@ -1243,6 +1248,9 @@ const Use = enum {
     /// Its library was refused or its defaults were stale; the checks
     /// gave no verdict on the files.
     not_used,
+    /// The project has no Zig scripts: a good build with no generation.
+    /// The build in use (if any) stays; Play proceeds.
+    no_scripts,
 };
 
 /// Keeps a summary and the diagnostics of `m` for `status` and
@@ -1266,7 +1274,7 @@ fn recordLast(m: *const Msg, use: Use, all: *const Files) Allocator.Error!void {
     last_applied = .{
         .info = .{
             .n = if (m.lib != null) m.gen_n else null,
-            .ok = use == .used,
+            .ok = use == .used or use == .no_scripts,
             .trigger = m.trigger,
             .path = m.path,
             .ms = m.ms,

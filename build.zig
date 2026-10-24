@@ -230,6 +230,8 @@ pub fn build(b: *std.Build) void {
             .export_host_archive = export_host_archive,
             .game_empty = game_empty,
             .export_templates = export_templates,
+            // Built only for a run that can export (the install test).
+            .package_zip = if (export_templates != null) packages[0] else null,
             .gdextension = gdextension_file,
             .godot_exe = godot_found.?,
             .zig_exe = zig_exe,
@@ -445,6 +447,9 @@ const HostTestInputs = struct {
     game_empty: *std.Build.Step.Compile,
     /// `-Dexport-templates`: the export tests skip when it is null.
     export_templates: ?[]const u8,
+    /// The release package (`zig build package`) the install test unzips
+    /// into a fresh project; null when the export tests skip.
+    package_zip: ?std.Build.LazyPath,
     gdextension: std.Build.LazyPath,
     godot_exe: []const u8,
     zig_exe: []const u8,
@@ -517,6 +522,7 @@ fn addHostTests(
     options.addOptionPath("export_host_archive", in.export_host_archive.getEmittedBin());
     options.addOptionPath("game_empty_lib", in.game_empty.getEmittedBin());
     options.addOption([]const u8, "export_templates", in.export_templates orelse "");
+    if (in.package_zip) |zip| options.addOptionPath("package_zip", zip) else options.addOption([]const u8, "package_zip", "");
     // The export tests' build cache (the Zig cache of their export builds):
     // kept in this build's cache folder, so later runs start warm.
     options.addOptionPathUntracked("export_test_cache", std.Build.LazyPath.cache_root.path(b, "ziggurat-export-tests"));
@@ -552,6 +558,22 @@ fn addHostTests(
     // `test-host` skips the GUI test; `test-gui` runs only that test.
     const headless = hostTestRun(b, target, optimize, in, options_mod, platform, build_mod, abi, .{ .run_gui = false, .filter = in.filter }, .short, null);
     step.dependOn(&headless.step);
+    // Without export templates the export tests skip. The notice is printed
+    // here once, by a step that inherits stdio: a passing test that writes
+    // to stderr is labelled "failed command" by the build runner.
+    if (in.export_templates == null) {
+        const notice_files = b.addWriteFiles();
+        const notice_name = "export-tests-skipped.txt";
+        _ = notice_files.add(notice_name, "host export tests skipped: pass -Dexport-templates=<folder with Godot 4.7.2's export templates>\n");
+        const notice = b.addRunArtifact(runner);
+        notice.addArg("--print");
+        notice.addDirectoryArg(notice_files.getDirectory());
+        notice.addArg(notice_name);
+        notice.stdio = .inherit;
+        notice.has_side_effects = true;
+        notice.step.dependOn(&headless.step);
+        step.dependOn(&notice.step);
+    }
     // The long stress run writes its timing lines to a file, and a second
     // step that inherits stdio prints it: the build runner labels a passing
     // test that wrote to stderr with "failed command".
