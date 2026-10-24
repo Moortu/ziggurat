@@ -97,6 +97,11 @@ fn decodeOne(a: std.mem.Allocator, io: std.Io, v: View, mi: u32, ws: *const Work
             error.OutsideProject => null,
             error.OutOfMemory => return error.OutOfMemory,
         };
+        // The generated root is not a project file: never a link target.
+        if (rel) |r| if (isGeneratedRoot(r)) {
+            a.free(r);
+            rel = null;
+        };
     }
     if (rel == null) {
         if (marker) |mk| {
@@ -137,6 +142,11 @@ fn decodeOne(a: std.mem.Allocator, io: std.Io, v: View, mi: u32, ws: *const Work
     return .{ .rel = rel, .line = line, .column = column, .message = message, .notes = notes };
 }
 
+/// True for the mapped path of the generated root (`rootgen.root_file_name`).
+fn isGeneratedRoot(rel: []const u8) bool {
+    return std.mem.eql(u8, rel, rootgen.root_file_name);
+}
+
 const Frame = struct { rel: []const u8, line: u32, column: u32 };
 
 /// The first entry of the reference trace of source location `si` that lies
@@ -159,7 +169,7 @@ fn firstProjectFrame(a: std.mem.Allocator, v: View, si: u32, ws: *const Workspac
         };
         // The generated root is hidden and rewritten by every build: never
         // a link target.
-        if (std.mem.eql(u8, rel, rootgen.root_file_name)) {
+        if (isGeneratedRoot(rel)) {
             a.free(rel);
             continue;
         }
@@ -552,6 +562,17 @@ test "panel link never points at the generated root" {
     const ds2 = try decode(a, testing.io, only_root, &ws);
     try testing.expect(ds2[0].rel == null);
     try testing.expectEqual(@as(u32, 121), ds2[0].line);
+    // An error in the generated root itself takes the script frame of its
+    // trace, or no link at all.
+    const in_root: Src = .{ .path = "/proj/.ziggurat_root.zig", .line = 9, .column = 2 };
+    const traced = try buildTraced(a, "root trouble", in_root, &.{.{ .path = "/proj/scripts/hero.zig", .line = 7, .column = 13 }});
+    const ds3 = try decode(a, testing.io, traced, &ws);
+    try testing.expectEqualStrings("scripts/hero.zig", ds3[0].rel.?);
+    try testing.expectEqual(@as(u32, 8), ds3[0].line);
+    const bare = try buildBundle(a, &.{.{ .msg = "root trouble", .src = in_root }});
+    const ds4 = try decode(a, testing.io, bare, &ws);
+    try testing.expect(ds4[0].rel == null);
+    try testing.expectEqual(@as(u32, 10), ds4[0].line);
 }
 
 test "decode of the empty bundle is empty" {

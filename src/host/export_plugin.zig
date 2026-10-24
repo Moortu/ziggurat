@@ -10,8 +10,9 @@
 //! For a preset whose features include `linux` and `x86_64` the plugin
 //! first deletes the game library `lib_res_path`, so a library of an
 //! earlier export can never ship (when the delete fails it empties the
-//! file, so the exported game fails at load; when that fails too, the
-//! error says the export would ship the old library), then:
+//! file and removes its permissions, so Godot cannot copy it and the
+//! export fails; when that fails too, the error says what the export
+//! ships), then:
 //!   - with Zig scripts (the build service's scan, which leaves out
 //!     `addons/`), it runs the export build (`export_build.run`, blocking,
 //!     with progress lines). The build uses the Zig and SDK editor builds
@@ -230,18 +231,29 @@ fn buildGameLibrary(a: Allocator, r: Reporter) Allocator.Error!void {
     }
 }
 
-/// An old game library that could not be deleted must not ship: it is
-/// emptied, so the exported game fails at load instead of running scripts
-/// of an earlier export. When even that fails, the message says the export
-/// would ship the old library.
+/// An old game library that could not be deleted must not ship. It is
+/// emptied, then all its permissions are removed (that needs ownership,
+/// not write access to the folder), so Godot's GDExtension export cannot
+/// copy it ("Failed to copy shared object") and the export fails, as on
+/// every other failure path. When the permissions stay, the message says
+/// plainly what this export ships instead.
 fn oldLibraryStays(r: Reporter, path: []const u8, err: anyerror) void {
     const io = host_io.get();
-    if (std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true })) |f| {
+    const cwd = std.Io.Dir.cwd();
+    const emptied: ?anyerror = if (cwd.createFile(io, path, .{ .truncate = true })) |f| blk: {
         f.close(io);
-        return r.fail("Ziggurat cannot delete the game library of an earlier export {s} ({t}), so it emptied it: the exported game cannot load its Zig scripts. Delete the file and export again.", .{ path, err });
-    } else |trunc_err| {
-        return r.fail("Ziggurat cannot delete or empty the game library of an earlier export {s} ({t}, {t}): this export would ship that old library with the scripts of an earlier export. Delete the file and export again.", .{ path, err, trunc_err });
+        break :blk null;
+    } else |e| e;
+    const locked: ?anyerror = if (cwd.setFilePermissions(io, path, .fromMode(0), .{})) |_| null else |e| e;
+    const head = "Ziggurat cannot delete the game library of an earlier export {s} ({t})";
+    if (locked == null) {
+        if (emptied == null)
+            return r.fail(head ++ ", so it emptied it and removed its permissions, so Godot cannot copy it. Delete the file and export again.", .{ path, err });
+        return r.fail(head ++ " or empty it ({t}), so it removed its permissions, so Godot cannot copy it. Delete the file and export again.", .{ path, err, emptied.? });
     }
+    if (emptied == null)
+        return r.err(head ++ ", so it emptied it, but it cannot remove its permissions ({t}): this export ships an empty game library, and the exported game cannot load its Zig scripts. Delete the file and export again.", .{ path, err, locked.? });
+    return r.err(head ++ ", empty it ({t}) or remove its permissions ({t}): this export ships that old library with the scripts of an earlier export. Delete the file and export again.", .{ path, err, emptied.?, locked.? });
 }
 
 /// The folder of the host's own library (`addons/ziggurat/bin`), allocated

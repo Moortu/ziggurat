@@ -3338,6 +3338,23 @@ test "export: stale library is never shipped" {
     try testing.expect(!try projectFileExists(&p, "out/libziggurat_game.so"));
 }
 
+test "export: export fails when Zig is missing" {
+    try requireTemplates();
+    var p: Project = undefined;
+    // A Zig path that does not exist, no Zig on PATH and no downloaded Zig
+    // (`initExport` gives the test its own per-user folders).
+    try initExport(&p, "/nonexistent/ziggurat-test/zig");
+    defer p.deinit();
+    try p.env.?.put("PATH", "/nonexistent/ziggurat-test");
+    try exportGame(&p, .{
+        .expect = &.{ "Ziggurat: Ziggurat cannot build the game library for the export:", "no zig was found", export_incomplete },
+        .reject = &.{export_building},
+        .exit_code = "1",
+    });
+    try testing.expect(!try projectFileExists(&p, game_lib_rel));
+    try testing.expect(!try projectFileExists(&p, "out/libziggurat_game.so"));
+}
+
 test "export: export fails without a usable Zig" {
     try requireTemplates();
     var p: Project = undefined;
@@ -3359,7 +3376,7 @@ test "export: export fails without a usable Zig" {
     try testing.expect(!try projectFileExists(&p, "out/libziggurat_game.so"));
 }
 
-test "export: an old library that cannot be deleted is emptied" {
+test "export: an old library that cannot be deleted fails the export" {
     try requireTemplates();
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var p: Project = undefined;
@@ -3382,14 +3399,15 @@ test "export: an old library that cannot be deleted is emptied" {
         f.close(io);
         return error.SkipZigTest;
     } else |_| {}
-    try exportGame(&p, .{ .expect = &.{ "Ziggurat: Ziggurat cannot delete the game library of an earlier export", "emptied it", export_incomplete } });
+    try exportGame(&p, .{
+        .expect = &.{ "Ziggurat: Ziggurat cannot delete the game library of an earlier export", "emptied it and removed its permissions", export_incomplete, "Failed to copy shared object" },
+        .exit_code = "1",
+    });
     const left = try Io.Dir.cwd().statFile(io, try std.fs.path.join(a, &.{ p.path, game_lib_rel }), .{});
     try testing.expectEqual(@as(u64, 0), left.size);
-    // What Godot copied is the emptied file, never the old library.
-    if (try projectFileExists(&p, "out/libziggurat_game.so")) {
-        const shipped = try Io.Dir.cwd().statFile(io, try std.fs.path.join(a, &.{ p.path, "out/libziggurat_game.so" }), .{});
-        try testing.expectEqual(@as(u64, 0), shipped.size);
-    }
+    try testing.expectEqual(@as(std.posix.mode_t, 0), left.permissions.toMode() & 0o777);
+    // Nothing was shipped: neither the old library nor the emptied file.
+    try testing.expect(!try projectFileExists(&p, "out/libziggurat_game.so"));
 }
 
 /// Sets the permission bits of the folder `path`.
