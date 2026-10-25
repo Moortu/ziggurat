@@ -26,8 +26,14 @@ const top_files = [_][]const u8{
     "bin/libziggurat_game_empty.so",
     "bin/libziggurat_host.so",
     "bin/libziggurat_host_export.a",
+    "gdzig-PATCHES.md",
     "ziggurat.gdextension",
 };
+
+/// gdzig's change list (vendor/gdzig/PATCHES.md), which THIRD_PARTY_LICENSES.md
+/// names. It describes the removal of `oopz`, so it is the one entry that may
+/// name it; it holds no code.
+const gdzig_patches = root ++ "gdzig-PATCHES.md";
 
 /// Folders that hold build machine paths on Linux: no package entry may
 /// name them. (`/usr/` is left out: Zig's standard library holds the
@@ -179,7 +185,7 @@ test "integration: package contents" {
             std.debug.print("unwanted file in the package: {s}\n", .{e.name});
             return error.UnwantedFile;
         };
-        if (std.mem.indexOf(u8, e.name, "oopz") != null or std.mem.indexOf(u8, e.data, "oopz") != null) {
+        if (!std.mem.eql(u8, e.name, gdzig_patches) and (std.mem.indexOf(u8, e.name, "oopz") != null or std.mem.indexOf(u8, e.data, "oopz") != null)) {
             std.debug.print("{s} names oopz\n", .{e.name});
             return error.Oopz;
         }
@@ -232,10 +238,14 @@ test "integration: package contents" {
     try testing.expect(find(entries, root ++ "sdk/.gdignore") != null);
     try testing.expect(find(entries, root ++ "sdk/sdk-manifest.json") != null);
 
+    // gdzig's change list is the repository's, byte for byte.
+    const patches_src = try std.fs.path.join(a, &.{ options.build_machine_repo, "vendor/gdzig/PATCHES.md" });
+    try testing.expectEqualSlices(u8, try std.Io.Dir.cwd().readFileAlloc(io, patches_src, a, .limited(max_size)), find(entries, gdzig_patches).?.data);
+
     // The licence files carry copyright lines.
     try testing.expect(std.mem.indexOf(u8, find(entries, root ++ "LICENSE").?.data, "Copyright (c) 2026 moortu") != null);
     const third = find(entries, root ++ "THIRD_PARTY_LICENSES.md").?.data;
-    for ([_][]const u8{ "Copyright (c) 2025 gdzig", "Copyright (c) Zig contributors", "Godot Engine contributors", "casez" }) |needle| {
+    for ([_][]const u8{ "Copyright (c) 2025 gdzig", "Copyright (c) Zig contributors", "Godot Engine contributors", "casez", "`gdzig-PATCHES.md`" }) |needle| {
         if (std.mem.indexOf(u8, third, needle) == null) {
             std.debug.print("THIRD_PARTY_LICENSES.md lacks \"{s}\"\n", .{needle});
             return error.MissingNotice;

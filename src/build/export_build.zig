@@ -308,6 +308,51 @@ fn parseVersion(s: []const u8) ?[3]u32 {
     return out;
 }
 
+/// What an export writes, from its output path, as Godot 4.7.2 routes it.
+pub const OutputKind = enum {
+    /// A full export: the game executable, its pack and the game library
+    /// next to it.
+    full,
+    /// A pack export (`.pck`, also as a patch): no executable and no shared
+    /// library.
+    pack,
+    /// A path ending in `zip`: a pack export to `.zip` (no shared library),
+    /// or a full Linux export that Godot zips (with the library). The zip
+    /// tells which (`zipHoldsLibrary`).
+    zip,
+};
+
+/// The kind of export that writes `path`. Godot compares case-sensitively:
+/// a pack export needs a path ending in `.pck` or `.zip` (`EditorNode`,
+/// `ProjectExportDialog`), and the Linux platform zips a full export whose
+/// path ends in `zip` (`EditorExportPlatformLinuxBSD::export_project`).
+pub fn outputKind(path: []const u8) OutputKind {
+    if (std.mem.endsWith(u8, path, ".pck")) return .pack;
+    if (std.mem.endsWith(u8, path, "zip")) return .zip;
+    return .full;
+}
+
+/// True when the zip at `path` has an entry named `lib_file` (in any
+/// folder): a full export that Godot zipped. Reads only the central
+/// directory.
+pub fn zipHoldsLibrary(io: std.Io, path: []const u8) !bool {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var reader = file.reader(io, &buf);
+    var it = try std.zip.Iterator.init(&reader);
+    var name_buf: [std.fs.max_path_bytes]u8 = undefined;
+    while (try it.next()) |entry| {
+        if (entry.filename_len > name_buf.len) continue;
+        const name = name_buf[0..entry.filename_len];
+        try reader.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+        try reader.interface.readSliceAll(name);
+        const base = if (std.mem.lastIndexOfAny(u8, name, "/\\")) |i| name[i + 1 ..] else name;
+        if (std.mem.eql(u8, base, lib_file)) return true;
+    }
+    return false;
+}
+
 const testing = std.testing;
 
 test "exportProblem accepts only the entry point and no dlopen" {
@@ -349,4 +394,93 @@ test "the empty game root is the generated root of no scripts" {
 
 test "the version script exports only the entry point" {
     try testing.expectEqualStrings("{ global: ziggurat_host_init; local: *; };\n", version_script);
+}
+
+test "outputKind follows Godot's routing by file name" {
+    try testing.expectEqual(OutputKind.full, outputKind("out/game.x86_64"));
+    try testing.expectEqual(OutputKind.full, outputKind("/abs/my game/game"));
+    try testing.expectEqual(OutputKind.pack, outputKind("out/game.pck"));
+    try testing.expectEqual(OutputKind.zip, outputKind("out/game.zip"));
+    // Godot compares case-sensitively: these are full exports whose
+    // executable has an odd name.
+    try testing.expectEqual(OutputKind.full, outputKind("out/game.PCK"));
+    try testing.expectEqual(OutputKind.full, outputKind("out/game.ZIP"));
+    // The Linux platform zips a full export whose path ends in "zip".
+    try testing.expectEqual(OutputKind.zip, outputKind("out/gamezip"));
+}
+
+/// A zip of empty stored files named `names`.
+fn testZip(a: std.mem.Allocator, names: []const []const u8) ![]u8 {
+    const zeros: [12]u8 = @splat(0);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    var offsets: std.ArrayList(u32) = .empty;
+    defer offsets.deinit(a);
+    for (names) |n| {
+        try offsets.append(a, @intCast(out.items.len));
+        try out.appendSlice(a, "PK\x03\x04");
+        // Version, flags, method, time, date; then CRC and sizes.
+        try out.appendSlice(a, &[_]u8{ 20, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+        try out.appendSlice(a, &zeros);
+        try appendInt(a, &out, u16, @intCast(n.len));
+        try appendInt(a, &out, u16, 0);
+        try out.appendSlice(a, n);
+    }
+    const cd_start: u32 = @intCast(out.items.len);
+    for (names, offsets.items) |n, off| {
+        try out.appendSlice(a, "PK\x01\x02");
+        // Made by, needed, flags, method, time, date; then CRC and sizes.
+        try out.appendSlice(a, &[_]u8{ 20, 3, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+        try out.appendSlice(a, &zeros);
+        try appendInt(a, &out, u16, @intCast(n.len));
+        // Extra and comment lengths, disk, attributes.
+        try out.appendSlice(a, &zeros);
+        try appendInt(a, &out, u32, off);
+        try out.appendSlice(a, n);
+    }
+    const cd_size: u32 = @as(u32, @intCast(out.items.len)) - cd_start;
+    try out.appendSlice(a, "PK\x05\x06\x00\x00\x00\x00");
+    try appendInt(a, &out, u16, @intCast(names.len));
+    try appendInt(a, &out, u16, @intCast(names.len));
+    try appendInt(a, &out, u32, cd_size);
+    try appendInt(a, &out, u32, cd_start);
+    try appendInt(a, &out, u16, 0);
+    return out.toOwnedSlice(a);
+}
+
+fn appendInt(a: std.mem.Allocator, out: *std.ArrayList(u8), comptime T: type, v: T) !void {
+    var b: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &b, v, .little);
+    try out.appendSlice(a, &b);
+}
+
+test "zipHoldsLibrary tells a full ZIP export from a pack" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cases = [_]struct { name: []const u8, entries: []const []const u8, want: bool }{
+        .{ .name = "full.zip", .entries = &.{ "Game/game.x86_64", "Game/game.pck", "Game/" ++ lib_file }, .want = true },
+        .{ .name = "top.zip", .entries = &.{lib_file}, .want = true },
+        .{ .name = "pack.zip", .entries = &.{ "project.binary", "main.tscn", ".godot/global_script_class_cache.cfg" }, .want = false },
+        .{ .name = "near.zip", .entries = &.{ "Game/" ++ lib_file ++ ".bak", "Game/old" ++ lib_file }, .want = false },
+        .{ .name = "empty.zip", .entries = &.{}, .want = false },
+    };
+    for (cases) |c| {
+        const bytes = try testZip(testing.allocator, c.entries);
+        defer testing.allocator.free(bytes);
+        try tmp.dir.writeFile(io, .{ .sub_path = c.name, .data = bytes });
+        const path = try tmp.dir.realPathFileAlloc(io, c.name, testing.allocator);
+        defer testing.allocator.free(path);
+        try testing.expectEqual(c.want, try zipHoldsLibrary(io, path));
+    }
+    // Not a zip, and no file: errors, never a panic.
+    try tmp.dir.writeFile(io, .{ .sub_path = "game.x86_64", .data = "\x7fELF not a zip" });
+    const elf = try tmp.dir.realPathFileAlloc(io, "game.x86_64", testing.allocator);
+    defer testing.allocator.free(elf);
+    try testing.expect(std.meta.isError(zipHoldsLibrary(io, elf)));
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const missing = try std.fs.path.join(testing.allocator, &.{ dir, "missing.zip" });
+    defer testing.allocator.free(missing);
+    try testing.expectError(error.FileNotFound, zipHoldsLibrary(io, missing));
 }

@@ -43,6 +43,10 @@ the bottom of the editor shows the result and every error.
   (ReleaseSafe), so Zig must be available as above. The `.zig` sources are
   not put into the exported game. The game runs on Linux with glibc 2.28 or
   newer.
+- Zig scripts are only exported with a full export (Export Project). A
+  PCK/ZIP or patch export does not contain them: the export log shows an
+  error, and a game that runs such a pack with the game library of an
+  earlier export runs that export's Zig code.
 - If the export fails (for example, a script does not compile), Godot can
   leave an incomplete game in the output folder. Do not ship it; fix the
   error and export again.

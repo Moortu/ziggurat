@@ -25,7 +25,9 @@
 //!
 //! Every function here is evaluated at compile time. Classification
 //! functions (`is...`) take any type and return false for types that are not
-//! classes; the others need a class and fail compilation otherwise.
+//! classes; the others need a class and fail compilation otherwise. A
+//! `base` or `Base` chain that loops back to a type already in it is not a
+//! class; a chain of more than `max_depth` classes is a compile error.
 
 /// True when `T` is an engine class: an `opaque` type that declares a type
 /// `Base` that is `void` or another engine class.
@@ -34,11 +36,7 @@ pub fn isOpaqueClass(comptime T: type) bool {
 }
 
 fn isOpaqueClassImpl(comptime T: type) bool {
-    @setEvalBranchQuota(quota);
-    if (@typeInfo(T) != .@"opaque") return false;
-    if (!@hasDecl(T, "Base")) return false;
-    if (@TypeOf(T.Base) != type) return false;
-    return T.Base == void or isOpaqueClass(T.Base);
+    return opaqueClassIn(T, &.{});
 }
 
 /// True when `T` is a user class: a `struct` whose field `base` is a
@@ -48,10 +46,7 @@ pub fn isStructClass(comptime T: type) bool {
 }
 
 fn isStructClassImpl(comptime T: type) bool {
-    @setEvalBranchQuota(quota);
-    if (@typeInfo(T) != .@"struct") return false;
-    if (!@hasField(T, "base")) return false;
-    return structParent(@FieldType(T, "base")) != null;
+    return structClassIn(T, &.{});
 }
 
 /// True when `T` is an engine class or a user class.
@@ -83,7 +78,10 @@ pub fn BaseOf(comptime T: type) type {
     comptime {
         @setEvalBranchQuota(quota);
         if (isOpaqueClass(T)) return T.Base;
-        if (isStructClass(T)) return structParent(@FieldType(T, "base")).?;
+        if (isStructClass(T)) return switch (@typeInfo(@FieldType(T, "base"))) {
+            .pointer => |p| p.child,
+            else => @FieldType(T, "base"),
+        };
         @compileError("expected a class type, found '" ++ @typeName(T) ++ "'");
     }
 }
@@ -207,9 +205,11 @@ pub fn upcast(comptime P: type, value: anytype) P {
     return @ptrCast(value);
 }
 
-/// The comptime branch quota of the class walks: an engine class chain is
-/// about ten classes deep, and every step is a few calls.
-const quota = 100_000;
+/// The comptime branch quota of the class walks. An engine class chain is
+/// about ten classes deep, and every step is a few calls; a chain of
+/// `max_depth` classes needs more than 100 000 (each step checks the classes
+/// walked so far). A quota is only a ceiling: short chains cost the same.
+const quota = 1_000_000;
 
 /// The type a single-item pointer `T` points to, or null for any other type.
 fn pointee(comptime T: type) ?type {
@@ -219,12 +219,54 @@ fn pointee(comptime T: type) ?type {
     };
 }
 
+/// The longest class chain the checks walk: a class and its ancestors. An
+/// engine class chain is about ten classes deep.
+const max_depth = 64;
+
+// The walks below carry `walked`, the classes already passed on the way up
+// from the type first asked about. A `base` field or a `Base` declaration
+// that leads back to one of them is a loop that never reaches the root
+// engine class, so the type is not a class (and its callers give their own
+// compile error). Without this the walk would recurse until the compiler
+// crashes. A chain longer than `max_depth` is a compile error.
+
+/// `walked` followed by `T`, or null when `T` is already in `walked`.
+fn enter(comptime T: type, comptime walked: []const type) ?[]const type {
+    for (walked) |W| if (W == T) return null;
+    if (walked.len >= max_depth)
+        @compileError("the class chain of '" ++ @typeName(walked[0]) ++ "' is more than " ++ std.fmt.comptimePrint("{d}", .{max_depth}) ++ " classes deep");
+    const list = walked[0..walked.len].* ++ [_]type{T};
+    return &list;
+}
+
+fn classIn(comptime T: type, comptime walked: []const type) bool {
+    return opaqueClassIn(T, walked) or structClassIn(T, walked);
+}
+
+fn opaqueClassIn(comptime T: type, comptime walked: []const type) bool {
+    @setEvalBranchQuota(quota);
+    if (@typeInfo(T) != .@"opaque") return false;
+    if (!@hasDecl(T, "Base")) return false;
+    if (@TypeOf(T.Base) != type) return false;
+    const next = enter(T, walked) orelse return false;
+    return T.Base == void or opaqueClassIn(T.Base, next);
+}
+
+fn structClassIn(comptime T: type, comptime walked: []const type) bool {
+    @setEvalBranchQuota(quota);
+    if (@typeInfo(T) != .@"struct") return false;
+    if (!@hasField(T, "base")) return false;
+    const next = enter(T, walked) orelse return false;
+    return structParentIn(@FieldType(T, "base"), next) != null;
+}
+
 /// The parent class named by a `base` field of type `F`, or null when `F`
-/// does not make a user class.
-fn structParent(comptime F: type) ?type {
+/// does not make a user class. `walked` holds the struct with the field and
+/// the classes below it.
+fn structParentIn(comptime F: type, comptime walked: []const type) ?type {
     return switch (@typeInfo(F)) {
-        .pointer => |p| if (p.size == .one and !p.attrs.@"const" and isClass(p.child)) p.child else null,
-        .@"struct" => if (isStructClass(F)) F else null,
+        .pointer => |p| if (p.size == .one and !p.attrs.@"const" and classIn(p.child, walked)) p.child else null,
+        .@"struct" => if (structClassIn(F, walked)) F else null,
         else => null,
     };
 }
@@ -274,6 +316,25 @@ const IntField = struct { base: u32 };
 const NoBaseField = struct { x: u32 };
 const NotAClassBase = struct { base: NoBaseField };
 const Tuple = struct { u32, u32 };
+// `base` chains that never reach an engine class: they loop.
+const SelfBase = struct { base: *SelfBase };
+const LoopA = struct { base: *LoopB };
+const LoopB = struct { base: *LoopA };
+const LoopIntoSelf = struct { base: *SelfBase };
+const SelfOpaque = opaque {
+    pub const Base = SelfOpaque;
+};
+const OpaqueLoopA = opaque {
+    pub const Base = OpaqueLoopB;
+};
+const OpaqueLoopB = opaque {
+    pub const Base = OpaqueLoopA;
+};
+/// A user class chain `n` structs long on top of `Mid`.
+fn Chain(comptime n: usize) type {
+    if (n == 0) return UserA;
+    return struct { base: Chain(n - 1) };
+}
 
 const testing = std.testing;
 
@@ -473,6 +534,35 @@ test upcast {
     const cc: *const UserC = &c;
     try testing.expect(upcast(*const UserA, cc) == &c.base.base);
     try testing.expect(upcast(*const Mid, cc) == mid);
+}
+
+test "a base chain that loops is not a class" {
+    // A loop never reaches an engine class, so these are not classes, and
+    // the callers give their own compile error ("not an engine class").
+    inline for (.{ SelfBase, LoopA, LoopB, LoopIntoSelf, SelfOpaque, OpaqueLoopA, OpaqueLoopB }) |T| {
+        try testing.expect(!comptime isClass(T));
+        try testing.expect(!comptime isClassPtr(*T));
+        try testing.expect(!comptime isA(Root, T));
+        try testing.expect(!comptime isA(T, T));
+        try testing.expect(!comptime isAny(.{ Root, T }, T));
+    }
+    try testing.expect(!comptime isStructClass(SelfBase));
+    try testing.expect(!comptime isStructClass(LoopA));
+    try testing.expect(!comptime isOpaqueClass(SelfOpaque));
+    try testing.expect(!comptime isOpaqueClass(OpaqueLoopB));
+    try testing.expect(!comptime isStructClassPtr(*LoopB));
+    try testing.expect(!comptime isOpaqueClassPtr(*OpaqueLoopA));
+}
+
+test "a long base chain below the depth limit is a class" {
+    // `max_depth - 3` structs, then UserA, Mid and Root: exactly
+    // `max_depth` classes. One more struct is a compile error (PATCHES.md,
+    // patch 4).
+    const Long = Chain(max_depth - 3);
+    try testing.expect(comptime isClass(Long));
+    try testing.expectEqual(@as(usize, max_depth - 1), comptime depthOf(Long));
+    try testing.expect(comptime isA(Root, Long));
+    try testing.expect(comptime isA(UserA, Long));
 }
 
 test "the bool and count checks can be called outside a comptime scope" {

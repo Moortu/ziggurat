@@ -12,7 +12,9 @@
 //! earlier export can never ship (when the delete fails it empties the
 //! file and removes its permissions, so Godot cannot copy it and the
 //! export fails; when that fails too, the error says what the export
-//! ships), then:
+//! ships). A full export also deletes the game library in its output
+//! folder, so a failed export does not leave the previous one's library
+//! next to the new game files. Then:
 //!   - with Zig scripts (the build service's scan, which leaves out
 //!     `addons/`), it runs the export build (`export_build.run`, blocking,
 //!     with progress lines). The build uses the Zig and SDK editor builds
@@ -24,12 +26,24 @@
 //!   - without Zig scripts, it copies the add-on's empty game library
 //!     (`empty_lib_file`, next to the editor library: the export host
 //!     linked with no scripts), so such a project exports without Zig.
+//!     When the scan reported problems (a `.zig` file it cannot read), it
+//!     sends them as errors and copies nothing: such a file may be a
+//!     script.
 //! Any failure goes to the export platform's message list as an error
-//! (`add_message`, which also prints it) that ends with `incomplete_note`. An error message alone does not
-//! stop Godot's export, but the library stays missing, and Godot's
-//! GDExtension export then fails to copy it ("Failed to copy shared
-//! object"), so the export fails (a headless export exits with status 1).
+//! (`add_message`, which also prints it) that ends with
+//! `incomplete_note`. An error message alone does not stop Godot's
+//! export, but the library stays missing, and Godot's GDExtension export
+//! then fails to copy it ("Failed to copy shared object"), so the export
+//! fails (a headless export exits with status 1).
 //! Other presets get the error message `platform_message`.
+//!
+//! A pack export (PCK or ZIP, also as a patch) never contains shared
+//! libraries, so it never contains the Zig scripts, and Godot gives an
+//! export plugin no way to stop it. For a project with Zig scripts the
+//! plugin still builds (so errors show) and then sends the error
+//! `pack_message`. A path ending in `zip` is either a pack or a full Linux
+//! export that Godot zips, so `_export_end` decides from the written zip
+//! (`export_build.zipHoldsLibrary`).
 //!
 //! The `.gdextension` names the game library for the `template_debug` and
 //! `template_release` features, so Godot's own GDExtension export plugin
@@ -71,6 +85,9 @@ pub const empty_lib_file = "libziggurat_game_empty.so";
 /// The end of every error after which the export fails: Godot has
 /// already written the game executable and its pack.
 pub const incomplete_note = "This export fails: the files in the export's output folder are incomplete.";
+/// The start of the error for a pack export of a project with Zig scripts.
+pub const pack_message = "Ziggurat exports Zig scripts only with a full export: this PCK/ZIP export does not contain them.";
+const pack_text = pack_message ++ " They are compiled into the game library " ++ export_build.lib_file ++ ", and only a full export (Export Project, --export-release or --export-debug) copies it next to the game executable. A game that runs this pack with the game library of an earlier export runs that export's Zig code, and scripts added since do not load. Godot finishes a pack export despite this error. Export the project instead.";
 /// How long an export waits for an editor build of the same project.
 const lock_timeout_ms = 120_000;
 /// Compile errors listed as messages; the rest are counted.
@@ -80,6 +97,8 @@ const gpa = std.heap.c_allocator;
 
 pub const ZigExportPlugin = struct {
     base: *EditorExportPlugin,
+    /// A `zip` export of a project with Zig scripts, for `_export_end`.
+    zip_check: ?ZipCheck = null,
 
     pub fn create(allocator: *Allocator) !*ZigExportPlugin {
         const self = try allocator.create(ZigExportPlugin);
@@ -91,6 +110,7 @@ pub const ZigExportPlugin = struct {
     /// Called by gdzig's free callback when Godot frees the object (the
     /// last reference dropped, see `detach`).
     pub fn destroy(self: *ZigExportPlugin, allocator: *Allocator) void {
+        if (self.zip_check) |c| c.deinit();
         self.base.destroy();
         allocator.destroy(self);
     }
@@ -106,8 +126,15 @@ pub const ZigExportPlugin = struct {
         return true;
     }
 
-    pub fn _exportBegin(self: *ZigExportPlugin, features: PackedStringArray, _: bool, _: String, _: u32) void {
-        exportBegin(self, &features);
+    pub fn _exportBegin(self: *ZigExportPlugin, features: PackedStringArray, _: bool, path: String, _: u32) void {
+        exportBegin(self, &features, &path);
+    }
+
+    pub fn _exportEnd(self: *ZigExportPlugin) void {
+        const c = self.zip_check orelse return;
+        self.zip_check = null;
+        defer c.deinit();
+        checkZip(self, c);
     }
 
     /// Leaves every `.zig` file out of the export.
@@ -144,27 +171,90 @@ fn hasFeature(features: *const PackedStringArray, comptime name: []const u8) boo
     return false;
 }
 
-fn exportBegin(self: *ZigExportPlugin, features: *const PackedStringArray) void {
+/// A `zip` export to check when it ends: the zip's path (absolute or
+/// relative to the working folder) and its modification time before the
+/// export, null when it did not exist.
+const ZipCheck = struct {
+    path: []u8,
+    before: ?std.Io.Timestamp,
+
+    fn deinit(c: ZipCheck) void {
+        gpa.free(c.path);
+    }
+};
+
+fn exportBegin(self: *ZigExportPlugin, features: *const PackedStringArray, path: *const String) void {
+    if (self.zip_check) |c| c.deinit();
+    self.zip_check = null;
     // A `Ref` return: the reference is the caller's.
     const plat = self.base.getExportPlatform();
     defer if (plat) |x| editor_build.releaseRef(x);
-    const r: Reporter = .{ .platform = plat };
     if (!hasFeature(features, "linux") or !hasFeature(features, "x86_64")) {
-        r.err("{s}", .{platform_message});
+        (Reporter{ .platform = plat }).err("{s}", .{platform_message});
         return;
     }
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    buildGameLibrary(arena_state.allocator(), r) catch r.fail("Ziggurat cannot build the game library for the export: out of memory.", .{});
+    const a = arena_state.allocator();
+    const out_path = outputPath(a, path) catch {
+        (Reporter{ .platform = plat }).fail("Ziggurat cannot build the game library for the export: out of memory.", .{});
+        return;
+    };
+    const kind = export_build.outputKind(out_path);
+    // A pack export does not fail on these errors, so they do not say so.
+    const r: Reporter = .{ .platform = plat, .note = if (kind == .pack) "" else incomplete_note };
+    const has_scripts = buildGameLibrary(a, r, kind, out_path) catch blk: {
+        r.fail("Ziggurat cannot build the game library for the export: out of memory.", .{});
+        break :blk false;
+    };
+    if (!has_scripts) return;
+    switch (kind) {
+        .full => {},
+        .pack => r.err("{s}", .{pack_text}),
+        .zip => {
+            const io = host_io.get();
+            const before: ?std.Io.Timestamp = if (std.Io.Dir.cwd().statFile(io, out_path, .{})) |st| st.mtime else |_| null;
+            const owned = gpa.dupe(u8, out_path) catch return r.err("{s}", .{pack_text});
+            self.zip_check = .{ .path = owned, .before = before };
+        },
+    }
 }
 
-fn buildGameLibrary(a: Allocator, r: Reporter) Allocator.Error!void {
+/// The export's output path as a file system path: `res://` and `user://`
+/// paths globalized, other relative paths joined to the working folder
+/// (Godot's working folder is the project folder).
+fn outputPath(a: Allocator, path: *const String) Allocator.Error![]const u8 {
+    var abs = ProjectSettings.globalizePath(path.*);
+    defer abs.deinit();
+    return props.utf8Alloc(a, &abs);
+}
+
+/// At the end of a `zip` export of a project with Zig scripts: a zip
+/// without the game library is a pack.
+fn checkZip(self: *ZigExportPlugin, c: ZipCheck) void {
+    const plat = self.base.getExportPlatform();
+    defer if (plat) |x| editor_build.releaseRef(x);
+    const r: Reporter = .{ .platform = plat };
+    const io = host_io.get();
+    const st = std.Io.Dir.cwd().statFile(io, c.path, .{}) catch return; // nothing written: the export failed
+    if (c.before) |b| if (st.mtime.nanoseconds == b.nanoseconds) return; // an earlier export's file
+    const full = export_build.zipHoldsLibrary(io, c.path) catch |err|
+        return r.err("Ziggurat cannot read the ZIP export {s} ({t}), so it cannot tell whether the zip holds the game library. " ++ pack_message ++ " Only a full export holds the Zig scripts.", .{ c.path, err });
+    if (!full) r.err("{s}", .{pack_text});
+}
+
+/// Builds or copies the game library for a Linux x86_64 export to
+/// `out_path`. True when the project has Zig scripts.
+fn buildGameLibrary(a: Allocator, r: Reporter, kind: export_build.OutputKind, out_path: []const u8) Allocator.Error!bool {
     const io = host_io.get();
     const cwd = std.Io.Dir.cwd();
     var msg: std.ArrayList(u8) = .empty;
     const project = editor_build.projectRoot(a, &msg) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.Unusable => return r.fail("Ziggurat cannot build the game library for the export: {s}", .{msg.items}),
+        error.Unusable => {
+            r.fail("Ziggurat cannot build the game library for the export: {s}", .{msg.items});
+            return false;
+        },
     };
     const out: platform.path.OsPath = .fromTrusted(try std.fs.path.join(a, &.{ project, lib_rel }));
 
@@ -172,30 +262,62 @@ fn buildGameLibrary(a: Allocator, r: Reporter) Allocator.Error!void {
     // export wrote it.
     cwd.deleteFile(io, out.bytes) catch |err| switch (err) {
         error.FileNotFound => {},
-        else => return oldLibraryStays(r, out.bytes, err),
+        else => {
+            oldLibraryStays(r, out.bytes, err);
+            return false;
+        },
     };
+    // Nor leave one next to the new game files when this export fails.
+    if (kind == .full and out_path.len != 0) {
+        const dir = std.fs.path.dirname(out_path) orelse ".";
+        const base = if (std.fs.path.isAbsolute(dir)) dir else try std.fs.path.join(a, &.{ project, dir });
+        const old = try std.fs.path.join(a, &.{ base, export_build.lib_file });
+        cwd.deleteFile(io, old) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => r.send(.export_message_error, "Ziggurat cannot delete {s}, the game library of an earlier export in the export's output folder ({t}). If this export fails, that old library stays next to the new game files: delete it.", .{ old, err }),
+        };
+    }
 
     const sc = zbuild.scan.scan(a, io, .fromTrusted(project), zbuild.scan.default_script_dirs) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return r.fail("Ziggurat cannot build the game library for the export: scanning the project folder {s} failed ({t}).", .{ project, err }),
+        else => {
+            r.fail("Ziggurat cannot build the game library for the export: scanning the project folder {s} failed ({t}).", .{ project, err });
+            return false;
+        },
     };
-    const bin = addonBinDir(a) orelse
-        return r.fail("Ziggurat cannot build the game library for the export: the path of its own library is unknown.", .{});
+    const bin = addonBinDir(a) orelse {
+        r.fail("Ziggurat cannot build the game library for the export: the path of its own library is unknown.", .{});
+        return sc.scripts.len != 0;
+    };
 
     if (sc.scripts.len == 0) {
+        if (sc.problems.len != 0) {
+            // A file the scan could not read may be a script: the empty
+            // library would leave it out without a word.
+            for (sc.problems) |pr| r.diagnostic(.export_message_error, .{ .rel = if (pr.rel.len == 0) null else pr.rel, .line = 0, .column = 0, .message = pr.message, .notes = &.{} });
+            r.fail("Ziggurat cannot export the project's Zig files: the scan found the problems above, so it does not use the game library without scripts.", .{});
+            return false;
+        }
         const empty = try std.fs.path.join(a, &.{ bin, empty_lib_file });
-        cwd.copyFile(empty, cwd, out.bytes, io, .{ .make_path = true, .replace = true }) catch |err|
-            return r.fail("Ziggurat cannot copy the game library for a project without Zig scripts from {s} to {s} ({t}); reinstall the add-on.", .{ empty, out.bytes, err });
+        cwd.copyFile(empty, cwd, out.bytes, io, .{ .make_path = true, .replace = true }) catch |err| {
+            r.fail("Ziggurat cannot copy the game library for a project without Zig scripts from {s} to {s} ({t}); reinstall the add-on.", .{ empty, out.bytes, err });
+            return false;
+        };
         log("Ziggurat: the project has no Zig scripts; the export uses the add-on's game library without scripts.", .{});
-        return;
+        return false;
     }
 
     const archive: platform.path.OsPath = .fromTrusted(try std.fs.path.join(a, &.{ bin, archive_file }));
-    cwd.access(io, archive.bytes, .{}) catch |err|
-        return r.fail("Ziggurat cannot build the game library for the export: the export host archive {s} is missing ({t}); reinstall the add-on.", .{ archive.bytes, err });
+    cwd.access(io, archive.bytes, .{}) catch |err| {
+        r.fail("Ziggurat cannot build the game library for the export: the export host archive {s} is missing ({t}); reinstall the add-on.", .{ archive.bytes, err });
+        return true;
+    };
     const in = editor_build.exportInputs(a, project, &msg) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.Unusable => return r.fail("Ziggurat cannot build the game library for the export: {s}", .{msg.items}),
+        error.Unusable => {
+            r.fail("Ziggurat cannot build the game library for the export: {s}", .{msg.items});
+            return true;
+        },
     };
 
     log("Ziggurat: building the game library for the export ({d} Zig scripts, Zig {s} at {s})...", .{ sc.scripts.len, in.zig.version, in.zig.exe.bytes });
@@ -211,7 +333,10 @@ fn buildGameLibrary(a: Allocator, r: Reporter) Allocator.Error!void {
         .lock_timeout_ms = lock_timeout_ms,
     }, &diag) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return r.fail("The Zig build for the export failed: {s}", .{platform.elf.diagText(&diag)}),
+        else => {
+            r.fail("The Zig build for the export failed: {s}", .{platform.elf.diagText(&diag)});
+            return true;
+        },
     };
     defer res.deinit(gpa);
     const ms = t0.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
@@ -220,7 +345,7 @@ fn buildGameLibrary(a: Allocator, r: Reporter) Allocator.Error!void {
         // Only the scan's problems remain: they did not fail the build.
         for (res.diagnostics) |d| r.diagnostic(.export_message_warning, d);
         log("Ziggurat: export library built in {d} ms: {s}", .{ ms, out.bytes });
-        return;
+        return true;
     }
     for (res.diagnostics[0..@min(res.diagnostics.len, max_listed)]) |d| r.diagnostic(.export_message_error, d);
     if (res.diagnostics.len > max_listed) r.err("{d} more errors are not listed.", .{res.diagnostics.len - max_listed});
@@ -229,6 +354,7 @@ fn buildGameLibrary(a: Allocator, r: Reporter) Allocator.Error!void {
     } else {
         r.fail("The Zig build for the export failed with the errors above. The game library was not written.", .{});
     }
+    return true;
 }
 
 /// An old game library that could not be deleted must not ship. It is
@@ -273,15 +399,21 @@ fn addonBinDir(a: Allocator) ?[]const u8 {
 /// without a platform they are printed as errors.
 const Reporter = struct {
     platform: ?*EditorExportPlatform,
+    /// The end of `fail` messages: `incomplete_note`, or empty for a pack
+    /// export, which does not fail.
+    note: []const u8 = incomplete_note,
 
     fn err(r: Reporter, comptime fmt: []const u8, args: anytype) void {
         r.send(.export_message_error, fmt, args);
     }
 
     /// An error after which the export fails (or ships no working game
-    /// library); the message ends with `incomplete_note`.
+    /// library); the message ends with `note`.
     fn fail(r: Reporter, comptime fmt: []const u8, args: anytype) void {
-        r.send(.export_message_error, fmt ++ " " ++ incomplete_note, args);
+        const text = std.fmt.allocPrint(gpa, fmt, args) catch return r.sendText(.export_message_error, "Ziggurat cannot report an export problem: out of memory.");
+        defer gpa.free(text);
+        if (r.note.len == 0) return r.sendText(.export_message_error, text);
+        r.send(.export_message_error, "{s} {s}", .{ text, r.note });
     }
 
     fn send(r: Reporter, kind: MessageType, comptime fmt: []const u8, args: anytype) void {

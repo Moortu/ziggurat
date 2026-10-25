@@ -3446,6 +3446,109 @@ test "export: non-Linux preset gives the error message" {
     });
 }
 
+/// The start of the error for a pack export of a project with Zig scripts.
+const export_pack_message = "Ziggurat exports Zig scripts only with a full export: this PCK/ZIP export does not contain them.";
+
+/// Exports the Linux preset as a pack only (`--export-pack`, `.pck` or
+/// `.zip` by `rel`'s extension).
+fn exportPack(p: *Project, rel: []const u8, texts: Project.Texts) !void {
+    var t = texts;
+    t.deadline = export_deadline_s;
+    const a = p.arena_state.allocator();
+    return p.run(&.{ "export-pack", "Linux", try std.fs.path.join(a, &.{ p.path, rel }) }, t);
+}
+
+test "export: pack export of Zig scripts gives the error" {
+    try requireTemplates();
+    var p: Project = undefined;
+    try initExport(&p, null);
+    defer p.deinit();
+    // A good build: the pack is written (Godot does not let a plugin stop
+    // it) and the error says the scripts are not in it.
+    try exportPack(&p, "out/game.pck", .{ .once = &.{ export_building, export_pack_message } });
+    try testing.expect(try projectFileExists(&p, "out/game.pck"));
+    try testing.expect(!try projectFileExists(&p, "out/libziggurat_game.so"));
+    // A broken build, as a `.zip` pack: the build errors (with the note
+    // of a failing export: a `zip` path may be a full export until the
+    // zip is written), then the same error at the end; still status 0.
+    try writeProjectFile(&p, "broken.zig", broken_script);
+    try exportPack(&p, "out/game.zip", .{
+        .once = &.{ export_building, export_pack_message },
+        .expect = &.{ "Ziggurat: res://broken.zig:5:5: ", "Ziggurat: The Zig build for the export failed" },
+    });
+    // A broken build as a `.pck` pack: no "This export fails" note.
+    try exportPack(&p, "out/game2.pck", .{
+        .once = &.{ export_building, export_pack_message },
+        .expect = &.{"Ziggurat: The Zig build for the export failed"},
+        .reject = &.{export_incomplete},
+    });
+    try testing.expect(try projectFileExists(&p, "out/game.zip"));
+}
+
+test "export: full ZIP export holds the game library" {
+    try requireTemplates();
+    var p: Project = undefined;
+    try initExport(&p, null);
+    defer p.deinit();
+    // The Linux platform zips a full export whose path ends in `zip`.
+    const a = p.arena_state.allocator();
+    try p.run(&.{ "export", "Linux", try std.fs.path.join(a, &.{ p.path, "out/game.zip" }) }, .{
+        .once = &.{export_building},
+        .reject = &.{ "ERROR:", export_pack_message },
+        .deadline = export_deadline_s,
+    });
+    try testing.expect(try zbuild.export_build.zipHoldsLibrary(io, try std.fs.path.join(a, &.{ p.path, "out/game.zip" })));
+}
+
+test "export: pack export without Zig scripts is unaffected" {
+    try requireTemplates();
+    var p: Project = undefined;
+    try initExport(&p, "/nonexistent/ziggurat-test/zig");
+    defer p.deinit();
+    try removeExportScripts(&p);
+    try exportPack(&p, "out/game.pck", .{ .reject = &.{ "ERROR:", export_building, export_pack_message } });
+    try testing.expect(try projectFileExists(&p, "out/game.pck"));
+}
+
+test "export: a failed export removes the old library from the output folder" {
+    try requireTemplates();
+    var p: Project = undefined;
+    try initExport(&p, null);
+    defer p.deinit();
+    // An earlier export's library next to the game, then a broken build.
+    try writeProjectFile(&p, "out/libziggurat_game.so", "an old game library");
+    try writeProjectFile(&p, "broken.zig", broken_script);
+    try exportGame(&p, .{ .once = &.{export_building}, .expect = &.{export_incomplete}, .exit_code = "1" });
+    try testing.expect(!try projectFileExists(&p, "out/libziggurat_game.so"));
+}
+
+test "export: an unreadable Zig file fails an export without scripts" {
+    try requireTemplates();
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var p: Project = undefined;
+    try initExport(&p, "/nonexistent/ziggurat-test/zig");
+    defer p.deinit();
+    try removeExportScripts(&p);
+    // The only Zig file cannot be read, so the scan cannot tell whether it
+    // is a script.
+    try writeProjectFile(&p, "secret.zig", "pub const extends = @import(\"ziggurat\").godot.Node;\n");
+    const a = p.arena_state.allocator();
+    const secret = try std.fs.path.join(a, &.{ p.path, "secret.zig" });
+    try setMode(secret, 0);
+    defer setMode(secret, 0o644) catch {};
+    // A user who may read anyway (root) cannot run this test.
+    if (Io.Dir.cwd().openFile(io, secret, .{})) |f| {
+        f.close(io);
+        return error.SkipZigTest;
+    } else |_| {}
+    try exportGame(&p, .{
+        .expect = &.{ "Ziggurat: res://secret.zig: Could not read", "the scan found the problems above", export_incomplete },
+        .exit_code = "1",
+    });
+    try testing.expect(!try projectFileExists(&p, game_lib_rel));
+    try testing.expect(!try projectFileExists(&p, "out/libziggurat_game.so"));
+}
+
 test "export: project without Zig scripts exports" {
     try requireTemplates();
     var p: Project = undefined;

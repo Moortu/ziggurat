@@ -202,6 +202,7 @@ pub fn build(b: *std.Build) void {
         for ([_]struct { []const u8, std.Build.LazyPath }{
             .{ "LICENSE", b.path("LICENSE") },
             .{ "THIRD_PARTY_LICENSES.md", b.path("THIRD_PARTY_LICENSES.md") },
+            .{ "gdzig-PATCHES.md", b.path("vendor/gdzig/PATCHES.md") },
             .{ "README.md", b.path("addons/ziggurat/README.md") },
             .{ "ziggurat.gdextension", gdextension_file },
             .{ "bin/libziggurat_host.so", release_host.getEmittedBin() },

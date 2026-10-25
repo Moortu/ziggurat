@@ -13,7 +13,9 @@ Download Zig 0.17.0).
 
 - Source: https://github.com/gdzig/gdzig, commit
   `c8e0768c9eb768827163f0ac893a5038bda799cb`, with the Ziggurat patches
-  listed in the repository's `vendor/gdzig/PATCHES.md`. Patch 4 replaces
+  listed in `gdzig-PATCHES.md` next to this file (a copy of the
+  repository's `vendor/gdzig/PATCHES.md`; its paths are relative to that
+  folder). Patch 4 replaces
   gdzig's upstream class checks with Ziggurat's own code
   (`sdk/gdzig/class_kind.zig`), under this licence.
 - Where: `sdk/gdzig/`, `sdk/common/`, `sdk/build_options/`, and compiled into

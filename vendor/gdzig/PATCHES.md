@@ -288,6 +288,39 @@ takes the address of an embedded parent, and reads a `base` pointer; it
 refuses at compile time a target that is not an ancestor, an optional
 value, and a const value with a non-const target.
 
+The class walks carry the list of classes already passed. A `base` field
+or a `Base` declaration that leads back to one of them (`struct { base:
+*@This() }`, two structs whose `base` fields point at each other, or an
+`opaque` whose `Base` is itself) never reaches `Object`, so the type is
+not a class: the `is...` checks return false and the callers give their
+own error (for example `z.Obj`: "is not an engine class type"). Without
+this the walk recursed until the compiler crashed. A chain of more than
+64 classes (`max_depth`) is a compile error; an engine class chain is
+about ten deep. The comptime branch quota of the walks is 1 000 000,
+because a 64-class chain needs more than 100 000.
+
+Compile-error cases. A failing check cannot run as a unit test, so these
+were checked by hand. To repeat them, copy `src/class_kind.zig` and
+`src/compat/singleton.zig` into an empty folder (keeping `compat/`), add a
+file with `Root`, `Mid` and `Leaf` engine classes as in the unit test
+fixtures, `User = struct { base: *Mid }` and `Chain(n)` (`n` structs, each
+embedding the next, on top of `User`), and run `zig test` on a file with
+one case each. The expected first error line (Zig 0.17.0; the type names
+carry the file's name, here `common`):
+
+| Case | Error |
+|---|---|
+| `comptime assertIsA(Leaf, Mid)` | `expected 'common.Mid' to be a class that inherits 'common.Leaf'` |
+| `comptime assertIsAny(.{Leaf}, Mid)` | `expected 'common.Mid' to be a class that inherits one of .{ common.Leaf }` |
+| `upcast(*u32, mid)` (`mid: *Mid`) | `upcast expects a class pointer type as the target type, found '*u32'` |
+| `upcast(*Root, opt)` (`opt: ?*Mid`) | `upcast expects a class pointer as the value, found '?*common.Mid'` |
+| `upcast(*Root, cmid)` (`cmid: *const Mid`) | `upcast cannot drop const: '*const common.Mid' to '*common.Root'` |
+| `upcast(*Leaf, mid)` (down, not up) | `expected 'common.Mid' to be a class that inherits 'common.Leaf'` |
+| `BaseOf(u32)` | `expected a class type, found 'u32'` |
+| `comptime isClass(Chain(62))` (65 classes) | `the class chain of 'common.Chain(62)' is more than 64 classes deep` |
+
+`comptime isClass(Chain(61))` (64 classes) compiles and is true.
+
 Tests: the unit tests in `src/class_kind.zig` (plus the singleton test)
 run in Ziggurat's `zig build test-unit` and `zig build test`, which also
 compile the host, SDK and test classes against the new file. The shipped
