@@ -146,8 +146,9 @@ pub fn build(b: *std.Build) void {
         .use_llvm = true,
         .strip = true,
     });
-    // Zig names the archive's member after its cache folder, which differs
-    // between checkouts; the shipped archive gets a fixed name.
+    // Zig names the archive's member after its path in the build cache,
+    // which holds the cache folder (absolute with an absolute --cache-dir)
+    // and differs per checkout; the shipped archive names it by base name.
     const shipped_archive = blk: {
         const tool = b.addExecutable(.{
             .name = "ar_normalize",
@@ -1277,6 +1278,8 @@ fn addTestSet(
             package_options.addOptionPath("package_zip", zips[0]);
             package_options.addOptionPath("package_zip_again", zips[1]);
             package_options.addOptionPath("staged_sdk_manifest", staged.?.path(b, "sdk-manifest.json"));
+            package_options.addOption([]const u8, "zig_exe", zig_exe);
+            package_options.addOption([]const u8, "sdk_version", sdk_version);
             package_options.addOption([]const u8, "build_machine_repo", b.root.joinString(b.allocator, "") catch @panic("OOM"));
             package_options.addOptionPathUntracked("build_machine_local_cache", .{ .relative = .{ .base = .local_cache } });
             package_options.addOptionPathUntracked("build_machine_global_cache", .{ .relative = .{ .base = .global_cache } });

@@ -29,6 +29,11 @@ const top_files = [_][]const u8{
     "ziggurat.gdextension",
 };
 
+/// Folders that hold build machine paths on Linux: no package entry may
+/// name them. (`/usr/` is left out: Zig's standard library holds the
+/// default `PATH`.)
+const generic_paths = [_][]const u8{ "/home/", "/tmp/", "/nix/store/" };
+
 /// Names the Asset Store guidelines ask to leave out (any path component).
 const unwanted = [_][]const u8{ ".gitignore", ".gitattributes", ".github", "Thumbs.db", ".DS_Store", "__MACOSX", "zig", "zig.exe" };
 
@@ -150,11 +155,12 @@ test "integration: package contents" {
     const entries = try readZip(a, try readFile(a, options.package_zip));
 
     // The build machine's paths, absolute (the cache options may be relative).
-    var machine_paths: [3][]const u8 = undefined;
-    for (&machine_paths, [_][]const u8{ options.build_machine_repo, options.build_machine_global_cache, options.build_machine_local_cache }) |*out, p| {
+    var machine_paths: [3 + generic_paths.len][]const u8 = undefined;
+    for (machine_paths[0..3], [_][]const u8{ options.build_machine_repo, options.build_machine_global_cache, options.build_machine_local_cache }) |*out, p| {
         out.* = try std.Io.Dir.cwd().realPathFileAlloc(io, p, a);
         try testing.expect(std.fs.path.isAbsolute(out.*));
     }
+    machine_paths[3..].* = generic_paths;
 
     // Sorted, unique, all under the add-on folder, regular files only,
     // with fixed time stamps and no executable bit.
@@ -306,4 +312,43 @@ test "integration: every gdextension library present" {
         }
     }
     try testing.expect(keys >= 1);
+}
+
+test "integration: package from two cache folders outside the checkout" {
+    try platform.testing_support.requireIntegration();
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // Outside the checkout, with cache folders of different lengths, as a
+    // release build or a clean CI run would have them.
+    const base = try std.fmt.allocPrint(a, "/tmp/ziggurat-package-test-{x}", .{testing.random_seed});
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, base);
+    defer cwd.deleteTree(io, base) catch {};
+    const runs = [_][]const u8{ "one", "second-cache-folder" };
+    var zips: [runs.len][]const u8 = undefined;
+    for (runs, &zips) |name, *zip| {
+        const prefix = try std.fs.path.join(a, &.{ base, name, "out" });
+        const cache = try std.fs.path.join(a, &.{ base, name, "cache" });
+        const result = try std.process.run(a, io, .{
+            .argv = &.{ options.zig_exe, "build", "package", "-p", prefix, "--cache-dir", cache },
+            .cwd = .{ .path = options.build_machine_repo },
+        });
+        if (!result.term.success()) {
+            std.debug.print("zig build package --cache-dir {s} failed:\n{s}\n", .{ cache, result.stderr });
+            return error.PackageBuildFailed;
+        }
+        zip.* = try readFile(a, try std.fs.path.join(a, &.{ prefix, "ziggurat-" ++ options.sdk_version ++ ".zip" }));
+    }
+    try testing.expect(std.mem.eql(u8, zips[0], zips[1]));
+    const needles = [_][]const u8{ base, options.build_machine_repo } ++ generic_paths;
+    for (try readZip(a, zips[0])) |e| {
+        for (needles) |needle| {
+            if (std.mem.indexOf(u8, e.name, needle) != null or std.mem.indexOf(u8, e.data, needle) != null) {
+                std.debug.print("{s} holds the build machine path {s}\n", .{ e.name, needle });
+                return error.BuildMachinePath;
+            }
+        }
+    }
 }
