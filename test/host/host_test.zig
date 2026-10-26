@@ -3417,7 +3417,7 @@ test "export: exported game runs scripts" {
 }
 
 /// The export plugin's log line for a debug export.
-const export_debug_line = "Ziggurat: debug export keeps debug information; this library is not reproducible.";
+const export_debug_line = "Ziggurat: debug export keeps debug information, with this computer's file paths, and is not reproducible. Turn off Export With Debug for a release.";
 
 /// Whether the exported game library `out/libziggurat_game.so` has a
 /// `.debug_info` section.
@@ -3762,7 +3762,7 @@ test "export: an unreadable Zig file fails an export without scripts" {
         return error.SkipZigTest;
     } else |_| {}
     try exportGame(&p, .{
-        .expect = &.{ "Ziggurat: res://secret.zig: Could not read", "the scan found the problems above", export_incomplete },
+        .expect = &.{ "Ziggurat: res://secret.zig: Could not read", "the scan found the problems above", "add a `.gdignore` file", export_incomplete },
         .exit_code = "1",
     });
     try testing.expect(!try projectFileExists(&p, game_lib_rel));

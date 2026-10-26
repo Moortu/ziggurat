@@ -2,7 +2,7 @@
 //! by counting fakes. This file is not part of the SDK module (nothing in
 //! the SDK imports it), so it does not ship.
 //!
-//! `zig build test-unit` builds it with ThreadSanitizer on x86_64 Linux:
+//! `zig build test-unit` builds it with ThreadSanitizer on x86_64 and aarch64 Linux:
 //! a cache that publishes its value without release and acquire ordering
 //! is reported as a data race and fails the test.
 const std = @import("std");

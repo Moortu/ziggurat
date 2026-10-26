@@ -1020,7 +1020,9 @@ pub const BuildService = struct {
     /// server dropped, so no thread uses a server after it is freed. The
     /// join cannot deadlock: the warm thread never waits for the build
     /// thread (this thread holds neither `mu` nor `session_mu` while it
-    /// joins), and a killed warm-up update ends at once. Build thread only.
+    /// joins), and a killed warm-up update ends at once on POSIX. On Windows
+    /// `Session.interrupt` does nothing yet, so the join can wait up to
+    /// `update_timeout_ms`. Build thread only.
     fn stopWarm(self: *BuildService) void {
         const io = self.io;
         {

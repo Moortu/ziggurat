@@ -58,7 +58,17 @@ fn StaticNameOf(comptime n: usize, comptime bytes: [n]u8) type {
             // Another thread is storing the same name; `ptr()` returns the
             // stored one, so wait for that store (a few instructions).
             // `made` is not freed.
-            while (@atomicLoad(State, &state, .acquire) != .ready) std.atomic.spinLoopHint();
+            // After a bounded number of spins, yield, so a loser on a
+            // single core does not starve the winner.
+            var spins: u32 = 0;
+            while (@atomicLoad(State, &state, .acquire) != .ready) {
+                if (spins < 64) {
+                    spins += 1;
+                    std.atomic.spinLoopHint();
+                } else {
+                    std.Thread.yield() catch {};
+                }
+            }
         }
 
         /// True once `ptr()` has built the name.

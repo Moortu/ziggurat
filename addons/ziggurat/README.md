@@ -66,8 +66,9 @@ debug information.
   module path.
 - `--export-debug` (or Export With Debug) builds the game library with its
   debug information. The export log says "Ziggurat: debug export keeps
-  debug information; this library is not reproducible." A release export
-  has no debug information.
+  debug information, with this computer's file paths, and is not
+  reproducible. Turn off Export With Debug for a release." A release
+  export has no debug information.
 - The editor setting `ziggurat/build/backend` chooses the compiler backend
   for normal builds: `auto` (the default), `llvm`, `self_hosted` or
   `self_hosted_incremental`. `debugger_builds` wins over it.
@@ -81,6 +82,11 @@ debug information.
   (ReleaseSafe), so Zig must be available as above. The `.zig` sources are
   not put into the exported game. The game runs on Linux with glibc 2.28 or
   newer.
+- Godot's export dialog has "Export With Debug" on by default. A debug
+  export keeps debug information in the game library. That information
+  holds absolute paths from your computer (your project, SDK and cache
+  folders, so your user name too), and the library is not reproducible.
+  Turn "Export With Debug" off for a game you ship.
 - Zig scripts are only exported with a full export (Export Project). A
   PCK/ZIP or patch export does not contain them: the export log shows an
   error, and a game that runs such a pack with the game library of an

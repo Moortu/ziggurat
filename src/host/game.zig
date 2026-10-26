@@ -265,7 +265,7 @@ fn keepingText(buf: *[48]u8) []const u8 {
 
 /// `announced` is the generation the editor's message named when it is
 /// newer than the current one, else 0. A refusal is then a fault, not the
-/// expected state before staging, and is logged even for a quiet request.
+/// expected state before staging, and is logged.
 fn reloadFromManifest(announced: u32) void {
     const manifest = @import("manifest.zig");
     const zbuild = @import("ziggurat_build");

@@ -328,7 +328,7 @@ test "integration: every gdextension library present" {
     try testing.expect(editor_keys >= 1);
 }
 
-test "integration: package from two cache folders outside the checkout" {
+test "integration: package from two cache folders gives identical bytes" {
     try platform.testing_support.requireIntegration();
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);

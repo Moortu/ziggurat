@@ -80,7 +80,7 @@ pub const plugin_name = "Ziggurat";
 /// The error message for a preset that is not Linux x86_64.
 pub const platform_message = "Ziggurat exports Linux x86_64 only in this version";
 /// The log line of a debug export with Zig scripts.
-pub const debug_export_line = "Ziggurat: debug export keeps debug information; this library is not reproducible.";
+pub const debug_export_line = "Ziggurat: debug export keeps debug information, with this computer's file paths, and is not reproducible. Turn off Export With Debug for a release.";
 /// Where the export writes the game library; the `.gdextension`'s template
 /// keys name this path.
 pub const lib_rel = ".godot/ziggurat/export/linux.x86_64/" ++ export_build.lib_file;
@@ -299,7 +299,7 @@ fn buildGameLibrary(a: Allocator, r: Reporter, kind: export_build.OutputKind, ou
     // differ only by case fail too, so one rule holds.
     if (sc.problems.len != 0) {
         for (sc.problems) |pr| r.diagnostic(.export_message_error, .{ .rel = if (pr.rel.len == 0) null else pr.rel, .line = 0, .column = 0, .message = pr.message, .notes = &.{} });
-        r.fail("Ziggurat cannot export the project's Zig files: the scan found the problems above, so it does not build the game library.", .{});
+        r.fail("Ziggurat cannot export the project's Zig files: the scan found the problems above, so it does not build the game library. For a file or folder it could not read, fix its permissions, or add a `.gdignore` file to a folder that holds no scripts.", .{});
         return false;
     }
     const bin = addonBinDir(a) orelse {

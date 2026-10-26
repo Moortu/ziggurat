@@ -44,9 +44,9 @@ pub const Staged = struct {
 /// Generation sizes are allocated bytes (`allocatedBytes`), not apparent
 /// sizes: a staged library keeps the holes of the compiler's sparse output.
 pub const Caps = struct {
-    /// The most generations a sweep keeps. Pinned generations count
-    /// toward it (they are never deleted), so with many pinned builds
-    /// fewer unpinned ones stay.
+    /// The count above which a sweep deletes the oldest unpinned generations.
+    /// Pinned generations count toward it (they are never deleted), so with
+    /// many pinned builds fewer unpinned ones stay.
     max_count: u32 = 8,
     /// The most allocated bytes of unpinned generations a sweep keeps
     /// (pinned ones do not count).

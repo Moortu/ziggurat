@@ -133,7 +133,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options, diag: *[256]u8) !Res
     errdefer out.deinit();
     // A file the scan could not read may be a script, and the library would
     // leave it out without a word.
-    if (sc.problems.len != 0) return out.fail("The scan found the problems above, so it does not build the game library.", .{});
+    if (sc.problems.len != 0) return out.fail("The scan found the problems above, so it does not build the game library. For a file or folder it could not read, fix its permissions, or add a `.gdignore` file to a folder that holds no scripts.", .{});
 
     // `env` is read only for its `os`: the cache folder is given.
     const ps = platform.path.PathService.init(.{ .project = opts.project_root }, .{ .os = builtin.os.tag, .home = null });

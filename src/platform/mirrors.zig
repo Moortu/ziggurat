@@ -54,8 +54,9 @@ pub fn parse(a: std.mem.Allocator, text: []const u8) Error![][]const u8 {
 }
 
 /// `https://<host>[:port][/path]`: host labels of letters, digits and `-`
-/// (not first or last) joined by single dots; a port from 1 to 65535; path segments of letters, digits and `-._~`,
-/// never `.` or `..`; a trailing `/` is allowed.
+/// (not first or last) joined by single dots; a port from 1 to 65535; path
+/// segments of letters, digits and `-._~`, never `.` or `..`; a trailing `/`
+/// is allowed.
 fn validBase(line: []const u8) bool {
     const scheme = "https://";
     if (line.len > max_line or !std.mem.startsWith(u8, line, scheme)) return false;

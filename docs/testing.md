@@ -7,7 +7,7 @@ take `-Dgodot-path=<absolute path>`.
 |---|---|---|
 | `zig fmt --check src test sdk tools build.zig` | formatting | Zig |
 | `zig build test` | unit tests, integration tests, `test-godot`, `test-host` and `test-package`; pass `-Dexport-templates=<folder>` to run the export tests too (below) | Zig, Godot |
-| `zig build test-unit` | unit tests only (no compiler child, no Godot) | Zig |
+| `zig build test-unit` | unit tests only (no compiler child, no Godot). On Linux x86_64 and aarch64 it also builds `sdk/names_test.zig` (the SDK's lazy caches) with ThreadSanitizer and runs it with `TSAN_OPTIONS=halt_on_error=1`, which the build sets: a reported data race fails the step. | Zig |
 | `zig build test-godot` | the SDK tests inside a headless Godot | Godot |
 | `zig build test-host` | the host tests in a headless Godot, including the editor plugin (Zig panel, Build on Play, reload message, highlighter, indentation, external edits), the Zig download and the export (`-Dhost-test-filter=<text>` runs only matching tests, for example `download` or `export:`). The export tests export a project with `--export-release` and run the exported game; the test `install from the zip` unzips the release package (`zig build package`) into a fresh project whose path holds a space, builds, plays, exports and runs it. They need Godot 4.7.2's export templates, `-Dexport-templates=<folder with linux_release.x86_64>`, and skip without it (one notice line after the run). | Godot (export templates for the export tests) |
 | `zig build test-gui` | the GUI editor test under Xvfb: a script saved in the script editor reaches the running game through the editor's `ziggurat:reload` message (`test/host/gui/README.md`, also the manual desktop runs). Not part of `test`. | Godot, `xvfb-run` |

@@ -484,13 +484,14 @@ pub fn debuggerBuilds() bool {
 var backend_reader: zbuild.backend.SettingReader = .{};
 
 /// The override of the editor setting `ziggurat/build/backend` (null for
-/// `auto`, when unset or not a String, and while the editor does not
-/// exist). An unknown value prints `backend.unknown_setting_warning` once
+/// `auto`, when unset and while the editor does not exist). An unknown
+/// value, or one that is not a String, prints `backend.unknown_setting_warning` once
 /// per session. Main thread.
 fn backendOverride() ?zbuild.workspace.BuildMode {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const text = editorSettingText(arena_state.allocator(), setting_backend) catch return null;
+    // A value that is not a String is as unknown as an unknown string.
+    const text = if (editorSettingNotString(setting_backend)) "(not a String)" else editorSettingText(arena_state.allocator(), setting_backend) catch return null;
     const r = backend_reader.read(text);
     if (r.warning) |w| {
         var buf: [256]u8 = undefined;
@@ -498,6 +499,21 @@ fn backendOverride() ?zbuild.workspace.BuildMode {
         godot.raw.printWarning(msg.ptr, "Zig build", "src/host/editor_build.zig", @src().line, 1);
     }
     return r.override;
+}
+
+/// True when the editor setting `name` is set to a value that is not a
+/// String. Main thread.
+fn editorSettingNotString(comptime name: []const u8) bool {
+    const es = editorSettings() orelse return false;
+    defer releaseRef(es);
+    var n = String.fromLatin1(name);
+    defer n.deinit();
+    if (!es.hasSetting(n)) return false;
+    const v = es.getSetting(n);
+    defer v.deinit();
+    var s = v.as(String) orelse return true;
+    s.deinit();
+    return false;
 }
 
 /// Hands the editor settings `ziggurat/build/backend` and
