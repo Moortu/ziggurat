@@ -196,15 +196,13 @@ pub const ZigEditorPlugin = struct {
                 self.indent_dirty = true;
                 editor_build.requestIfChanged(.watcher);
             },
-            notification_editor_settings_changed => {
-                self.indent_dirty = true;
-                self.readSettings();
-            },
+            notification_editor_settings_changed => self.onSettingsChanged(),
             else => {},
         }
     }
 
-    /// Bound as `on_settings_changed` (EditorSettings `settings_changed`).
+    /// Bound as `on_settings_changed` (EditorSettings `settings_changed`),
+    /// and called for NOTIFICATION_EDITOR_SETTINGS_CHANGED.
     pub fn onSettingsChanged(self: *ZigEditorPlugin) void {
         self.indent_dirty = true;
         self.readSettings();
@@ -366,7 +364,7 @@ pub const ZigEditorPlugin = struct {
     /// ScriptEditor `editor_script_changed` to the bound methods.
     fn connectSignals(self: *ZigEditorPlugin, on: bool) void {
         const obj = Object.upcast(self.base);
-        if (editorSettings()) |es| {
+        if (editor_build.editorSettings()) |es| {
             defer editor_build.releaseRef(es);
             connectOne(Object.upcast(es), .fromComptimeLatin1("settings_changed"), obj, "on_settings_changed", on);
         }
@@ -547,12 +545,6 @@ fn connectOne(source: *Object, signal: StringName, target: *Object, comptime met
     } else if (!on and connected) {
         source.disconnectRaw(signal, c);
     }
-}
-
-/// The editor's settings with a reference for the caller (release it with
-/// `editor_build.releaseRef`), or null.
-fn editorSettings() ?*godot.class.EditorSettings {
-    return EditorInterface.getEditorSettings();
 }
 
 fn nowMs() i64 {

@@ -53,11 +53,9 @@ var pin: ?platform.generation_store.FileLock = null;
 /// held per loaded generation until the game exits. Main thread.
 var reload_pins: std.ArrayList(platform.generation_store.FileLock) = .empty;
 
-/// What `requestReload` (any thread) asked for, taken by `frame`: 0 nothing,
-/// `quiet` a check that says nothing when no newer generation is named,
-/// `loud` an explicit request that logs "nothing to do".
-var reload_wanted: std.atomic.Value(u8) = .init(0);
-pub const Request = enum(u8) { quiet = 1, loud = 2 };
+/// Set by `requestReload` (any thread), taken by `frame`: a check that
+/// says nothing when no newer generation is named.
+var reload_wanted: std.atomic.Value(bool) = .init(false);
 /// The highest generation number a request named (0: none), taken with
 /// `reload_wanted` by `frame`.
 var reload_min_gen: std.atomic.Value(u32) = .init(0);
@@ -116,7 +114,7 @@ pub fn stop() void {
     if (comptime host_options.export_build) return;
     unregisterCapture();
     releasePins();
-    reload_wanted.store(0, .release);
+    reload_wanted.store(false, .release);
     reload_min_gen.store(0, .release);
 }
 
@@ -128,22 +126,22 @@ fn releasePins() void {
 }
 
 /// Something asked this game to reload its scripts: Godot's
-/// `_reload_scripts` and `_reload_all_scripts` (`.quiet`, `min_gen` 0: they
-/// come on a save, before the editor staged the build, and from other
-/// extensions) or the editor's `ziggurat:reload` message (`.quiet`, the
-/// generation it just wrote into the manifest). Any thread; it only sets
+/// `_reload_scripts` and `_reload_all_scripts` (`min_gen` 0: they come on a
+/// save, before the editor staged the build, and from other extensions) or
+/// the editor's `ziggurat:reload` message (the generation it just wrote
+/// into the manifest). Any thread; it only sets
 /// flags, `frame` does the work. An export build has no reload path.
-pub fn requestReload(kind: Request, min_gen: u32) void {
+pub fn requestReload(min_gen: u32) void {
     if (comptime host_options.export_build) return;
     _ = reload_min_gen.fetchMax(min_gen, .acq_rel);
-    _ = reload_wanted.fetchMax(@backingInt(kind), .acq_rel);
+    reload_wanted.store(true, .release);
 }
 
 /// The editor wrote generation `n` into the manifest (`ziggurat:reload`).
 /// A number not newer than the current generation does nothing: a game
 /// started by Play already loaded the generation the message names.
 pub fn onReloadMessage(n: u32) void {
-    requestReload(.quiet, n);
+    requestReload(n);
 }
 
 /// The generation a `ziggurat:<message>` capture call names: `reload` with
@@ -248,18 +246,16 @@ pub fn captureRegistered() bool {
 /// uses (`manifest.readTrusted`, `recheck`).
 pub fn frame() void {
     if (comptime host_options.export_build) return;
-    const want = reload_wanted.swap(0, .acq_rel);
-    if (want == 0) return;
+    if (!reload_wanted.swap(false, .acq_rel)) return;
     const min_gen = reload_min_gen.swap(0, .acq_rel);
-    const loud = want == @backingInt(Request.loud);
     // The message names a generation this game runs already (or an older
     // one): nothing to read.
-    if (!loud and min_gen != 0) {
+    if (min_gen != 0) {
         if (runtime.current()) |c| if (min_gen <= c.n) return;
     }
     // Here `min_gen` is 0 (Godot's reload) or newer than the current
     // generation (the editor announced a build this game does not run).
-    reloadFromManifest(loud, min_gen);
+    reloadFromManifest(min_gen);
 }
 
 fn keepingText(buf: *[48]u8) []const u8 {
@@ -270,7 +266,7 @@ fn keepingText(buf: *[48]u8) []const u8 {
 /// `announced` is the generation the editor's message named when it is
 /// newer than the current one, else 0. A refusal is then a fault, not the
 /// expected state before staging, and is logged even for a quiet request.
-fn reloadFromManifest(loud: bool, announced: u32) void {
+fn reloadFromManifest(announced: u32) void {
     const manifest = @import("manifest.zig");
     const zbuild = @import("ziggurat_build");
     const stem = zbuild.service.lib_stem;
@@ -295,9 +291,7 @@ fn reloadFromManifest(loud: bool, announced: u32) void {
                 // Godot's reload comes on a save, before the editor staged
                 // the build; the editor's message follows the staging.
                 .missing, .library_missing => if (announced != 0)
-                    logError("Ziggurat cannot load build {d}, which the editor announced, because {s}; {s}.", .{ announced, r.because(), keepingText(&keep_buf) })
-                else if (loud)
-                    log("ziggurat: reload: the build may not be staged yet; {s}", .{keepingText(&keep_buf)}),
+                    logError("Ziggurat cannot load build {d}, which the editor announced, because {s}; {s}.", .{ announced, r.because(), keepingText(&keep_buf) }),
                 else => logError("Ziggurat ignores the generation manifest for this reload because {s}; {s}.", .{ r.because(), keepingText(&keep_buf) }),
             }
             return;
@@ -307,9 +301,7 @@ fn reloadFromManifest(loud: bool, announced: u32) void {
     if (cur) |c| {
         if (trusted.n <= c.n) {
             if (announced != 0)
-                logError("Ziggurat cannot load build {d}, which the editor announced, because the manifest names build {d}; {s}.", .{ announced, trusted.n, keepingText(&keep_buf) })
-            else if (loud)
-                log("ziggurat: reload: nothing to do (gen {d})", .{c.n});
+                logError("Ziggurat cannot load build {d}, which the editor announced, because the manifest names build {d}; {s}.", .{ announced, trusted.n, keepingText(&keep_buf) });
             return;
         }
     }

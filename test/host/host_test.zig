@@ -1637,6 +1637,29 @@ test "focus-in builds an external edit; interval check" {
     });
 }
 
+test "zig path: unusable path is logged once by the change check" {
+    try requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("editor_panel");
+    defer p.deinit();
+    try addBuildSettings(&p);
+    try isolateUserFolders(&p);
+    try p.addAutoloadCheck("zig_path_check.gd");
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS zig_path_unusable_not_checked",
+            "ZTEST PASS zig_path_usable_checked",
+            "ZTEST DONE",
+            "build service stopped (0 threads left)",
+        },
+        // Three checks with the relative path: one line.
+        .once = &.{"Ziggurat: the Zig path is not usable, so changed files are not checked: the project setting ziggurat/zig_path (relative/zig) is not usable, because it is not an absolute path."},
+        .reject = &.{"ZTEST FAIL"},
+        .deadline = build_deadline_s,
+    });
+}
+
 test "no plugin in a game" {
     try requireIntegration();
     var p: Project = undefined;

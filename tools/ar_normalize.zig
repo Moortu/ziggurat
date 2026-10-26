@@ -30,7 +30,11 @@ pub fn main(init: std.process.Init) !void {
     const cwd = Io.Dir.cwd();
     const bytes = cwd.readFileAlloc(io, args[1], arena, .limited(1 << 30)) catch |err|
         fail("cannot read {s} ({t})", .{ args[1], err });
-    const out = normalize(arena, bytes) catch |err| fail("{s}: {t}", .{ args[1], err });
+    var problem: Problem = .{};
+    const out = normalizeProblem(arena, bytes, &problem) catch |err| {
+        var buf: [256]u8 = undefined;
+        fail("{s}: {s}", .{ args[1], problem.text(&buf, err) });
+    };
     try cwd.writeFile(io, .{ .sub_path = args[2], .data = out });
 }
 
@@ -39,7 +43,28 @@ fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(1);
 }
 
-pub const Error = error{ NotAnArchive, BadMember, BadName, BadSymbolTable, OutOfMemory };
+pub const Error = error{ NotAnArchive, BadMember, BadName, BadSymbolTable, DuplicateName, SecondNameTable, OutOfMemory };
+
+/// What `normalizeProblem` found wrong, for the message.
+pub const Problem = struct {
+    /// For `error.DuplicateName`: the base name two members share (points
+    /// into the input).
+    name: []const u8 = "",
+
+    /// One sentence for `err` (in `buf` when it names the member).
+    pub fn text(p: Problem, buf: []u8, err: Error) []const u8 {
+        return switch (err) {
+            error.DuplicateName => std.fmt.bufPrint(buf, "two members have the same base name {s}, so their normalized names would be the same", .{p.name}) catch
+                "two members have the same base name, so their normalized names would be the same",
+            error.SecondNameTable => "the archive has a second long-name table (//); only one is allowed",
+            error.NotAnArchive => "not an ar archive",
+            error.BadMember => "a member header or size is malformed",
+            error.BadName => "a member name is malformed",
+            error.BadSymbolTable => "the symbol table is malformed",
+            error.OutOfMemory => "out of memory",
+        };
+    }
+};
 
 const Member = struct {
     /// Offset of the header in the input.
@@ -51,10 +76,19 @@ const Member = struct {
 /// The archive `bytes` with base names as member names (see the file
 /// comment). Allocates the result with `a`.
 pub fn normalize(a: std.mem.Allocator, bytes: []const u8) Error![]u8 {
+    var problem: Problem = .{};
+    return normalizeProblem(a, bytes, &problem);
+}
+
+/// As `normalize`; on `error.DuplicateName` (two members with the same
+/// base name) `problem` names it. A second long-name table (`//`) is
+/// `error.SecondNameTable`.
+pub fn normalizeProblem(a: std.mem.Allocator, bytes: []const u8, problem: *Problem) Error![]u8 {
     if (!std.mem.startsWith(u8, bytes, magic)) return error.NotAnArchive;
     var symtab: ?Member = null;
     var sym64 = false;
     var long_names: []const u8 = "";
+    var seen_long_names = false;
     var members: std.ArrayList(Member) = .empty;
     defer members.deinit(a);
     var p: usize = magic.len;
@@ -72,6 +106,8 @@ pub fn normalize(a: std.mem.Allocator, bytes: []const u8) Error![]u8 {
             symtab = m;
             sym64 = name.len > 1;
         } else if (std.mem.eql(u8, name, "//")) {
+            if (seen_long_names) return error.SecondNameTable;
+            seen_long_names = true;
             long_names = m.data;
         } else {
             try members.append(a, m);
@@ -84,10 +120,16 @@ pub fn normalize(a: std.mem.Allocator, bytes: []const u8) Error![]u8 {
     defer table.deinit(a);
     const name_at = try a.alloc(usize, members.items.len);
     defer a.free(name_at);
+    var bases: std.StringHashMapUnmanaged(void) = .empty;
+    defer bases.deinit(a);
     for (members.items, name_at) |m, *at| {
         const full = try memberName(m.header, long_names);
         const base = full[if (std.mem.lastIndexOfScalar(u8, full, '/')) |i| i + 1 else 0..];
         if (base.len == 0) return error.BadName;
+        if ((try bases.getOrPut(a, base)).found_existing) {
+            problem.name = base;
+            return error.DuplicateName;
+        }
         at.* = table.items.len;
         try table.appendSlice(a, base);
         try table.appendSlice(a, "/\n");
@@ -275,6 +317,46 @@ test "two cache folders give the same archive" {
     defer a.free(n2);
     try std.testing.expectEqualSlices(u8, n1, n2);
     try std.testing.expectEqualStrings("obj", symbolTarget(n1, 0));
+}
+
+test "ar_normalize: duplicate base name fails" {
+    const a = std.testing.allocator;
+    const in = try testArchive(a, &.{
+        "/cache/o/00000000000000000000000000000000/same.o",
+        "/cache/o/11111111111111111111111111111111/same.o",
+    }, &.{ "one", "two" }, &.{ .{ "a", 0 }, .{ "b", 1 } });
+    defer a.free(in);
+    var problem: Problem = .{};
+    try std.testing.expectError(error.DuplicateName, normalizeProblem(a, in, &problem));
+    try std.testing.expectEqualStrings("same.o", problem.name);
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "two members have the same base name same.o, so their normalized names would be the same",
+        problem.text(&buf, error.DuplicateName),
+    );
+}
+
+test "ar_normalize: second name table fails" {
+    const a = std.testing.allocator;
+    const one = try testArchive(a, &.{"x.o"}, &.{"obj"}, &.{.{ "entry", 0 }});
+    defer a.free(one);
+    // A second `//` member after the first archive's members.
+    const extra = "y.o/\n";
+    var h: [header_len]u8 = @splat(' ');
+    h[0] = '/';
+    h[1] = '/';
+    _ = try std.fmt.bufPrint(h[48..58], "{d}", .{extra.len});
+    h[58] = '`';
+    h[59] = '\n';
+    const in = try std.mem.concat(a, u8, &.{ one, &h, extra, "\n" });
+    defer a.free(in);
+    var problem: Problem = .{};
+    try std.testing.expectError(error.SecondNameTable, normalizeProblem(a, in, &problem));
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "the archive has a second long-name table (//); only one is allowed",
+        problem.text(&buf, error.SecondNameTable),
+    );
 }
 
 test "not an archive, and a symbol that points nowhere" {

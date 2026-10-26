@@ -51,7 +51,7 @@ pub const lib_file = "lib" ++ lib_name ++ ".so";
 /// The add-on's export host archive, in `addons/ziggurat/bin/`.
 pub const host_archive_file = "libziggurat_host_export.a";
 /// Godot's entry point, the one symbol the library exports.
-pub const entry_symbol = "ziggurat_host_init";
+pub const entry_symbol = workspace.entry_symbol;
 const version_script = "{ global: " ++ entry_symbol ++ "; local: *; };\n";
 const version_script_name = "export.map";
 /// Largest library `run` reads back for its check.

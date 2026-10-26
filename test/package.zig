@@ -294,6 +294,7 @@ test "integration: every gdextension library present" {
     const readme = find(entries, root ++ "README.md").?.data;
     var section: []const u8 = "";
     var keys: usize = 0;
+    var editor_keys: usize = 0;
     var it = std.mem.splitScalar(u8, ext, '\n');
     while (it.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
@@ -307,6 +308,8 @@ test "integration: every gdextension library present" {
         const key = std.mem.trim(u8, line[0..eq], " \t");
         const value = std.mem.trim(u8, std.mem.trim(u8, line[eq + 1 ..], " \t"), "\"");
         keys += 1;
+        // The editor library: the editor cannot load the add-on without it.
+        if (std.mem.indexOf(u8, key, ".editor.") != null) editor_keys += 1;
         if (std.mem.startsWith(u8, value, "res://.godot/")) {
             // A template key: the export plugin fills it at export, and the
             // README says so.
@@ -322,6 +325,7 @@ test "integration: every gdextension library present" {
         }
     }
     try testing.expect(keys >= 1);
+    try testing.expect(editor_keys >= 1);
 }
 
 test "integration: package from two cache folders outside the checkout" {
@@ -330,12 +334,11 @@ test "integration: package from two cache folders outside the checkout" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    // Outside the checkout, with cache folders of different lengths, as a
-    // release build or a clean CI run would have them.
-    const base = try std.fmt.allocPrint(a, "/tmp/ziggurat-package-test-{x}", .{testing.random_seed});
-    const cwd = std.Io.Dir.cwd();
-    try cwd.createDirPath(io, base);
-    defer cwd.deleteTree(io, base) catch {};
+    // Fresh cache folders of different lengths in the test's own
+    // temporary folder, as a release build or a clean CI run would have them.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", a);
     const runs = [_][]const u8{ "one", "second-cache-folder" };
     var zips: [runs.len][]const u8 = undefined;
     for (runs, &zips) |name, *zip| {

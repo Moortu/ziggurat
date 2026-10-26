@@ -43,7 +43,15 @@ pub const Staged = struct {
 
 /// Generation sizes are allocated bytes (`allocatedBytes`), not apparent
 /// sizes: a staged library keeps the holes of the compiler's sparse output.
-pub const Caps = struct { max_count: u32 = 8, max_bytes: u64 = 1 << 30 };
+pub const Caps = struct {
+    /// The most generations a sweep keeps. Pinned generations count
+    /// toward it (they are never deleted), so with many pinned builds
+    /// fewer unpinned ones stay.
+    max_count: u32 = 8,
+    /// The most allocated bytes of unpinned generations a sweep keeps
+    /// (pinned ones do not count).
+    max_bytes: u64 = 1 << 30,
+};
 
 /// The bytes `file` occupies on disk. On Linux that is the allocated block
 /// count (`statx` blocks, 512 bytes each), so the holes of a sparse file do

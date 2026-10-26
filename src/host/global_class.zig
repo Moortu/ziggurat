@@ -24,7 +24,9 @@ pub const Info = struct {
     name: []const u8,
     /// The last identifier of the `extends` expression (`Node2D` for
     /// `z.godot.Node2D` or `g.Node2D`), or empty when there is none or it is
-    /// not a dotted name.
+    /// not a dotted name. A plain identifier that a top-level `const`
+    /// declares (`const N = g.Node2D;`) is the last identifier of that
+    /// declaration's value.
     base_type: []const u8,
     /// `pub const tool = true;`.
     is_tool: bool,
@@ -37,7 +39,7 @@ pub const max_file_bytes = 4 << 20;
 /// `pub const class_name` whose value is a plain identifier string.
 pub fn scan(text: [:0]const u8) ?Info {
     var name: ?[]const u8 = null;
-    var base_type: []const u8 = "";
+    var base: Dotted = .{};
     var is_tool = false;
     var seen_extends = false;
     var seen_tool = false;
@@ -58,7 +60,7 @@ pub fn scan(text: [:0]const u8) ?Info {
                 if (std.mem.eql(u8, decl.name, "class_name")) {
                     if (name == null) name = stringIdentifier(&ahead, text);
                 } else if (std.mem.eql(u8, decl.name, "extends")) {
-                    if (!seen_extends) base_type = dottedLast(&ahead, text);
+                    if (!seen_extends) base = dottedName(&ahead, text);
                     seen_extends = true;
                 } else if (std.mem.eql(u8, decl.name, "tool")) {
                     if (!seen_tool) is_tool = isTrue(&ahead, text);
@@ -68,7 +70,41 @@ pub fn scan(text: [:0]const u8) ?Info {
             else => {},
         }
     }
-    return .{ .name = name orelse return null, .base_type = base_type, .is_tool = is_tool };
+    const class_name = name orelse return null;
+    // `extends = N` with `const N = g.Node2D;` at top level: the alias's
+    // value names the class. Aliases of aliases are followed a few steps.
+    var hops: usize = 0;
+    while (!base.dotted and base.last.len != 0 and hops < max_alias_hops) : (hops += 1) {
+        base = aliasValue(text, base.last) orelse break;
+    }
+    return .{ .name = class_name, .base_type = base.last, .is_tool = is_tool };
+}
+
+/// Most alias steps `scan` follows from `extends` (an alias cycle stops
+/// there).
+const max_alias_hops = 8;
+
+/// The value of the top-level `const <alias> = a.b.C;` (with or without
+/// `pub`) as a dotted name, or null when there is no such declaration.
+fn aliasValue(text: [:0]const u8, alias: []const u8) ?Dotted {
+    var t: std.zig.Tokenizer = .init(text);
+    var depth: usize = 0;
+    while (true) {
+        const tok = t.next();
+        switch (tok.tag) {
+            .eof => return null,
+            .l_brace => depth +|= 1,
+            .r_brace => depth -|= 1,
+            .keyword_const => if (depth == 0) {
+                var ahead = t;
+                const id = ahead.next();
+                if (id.tag != .identifier or !std.mem.eql(u8, text[id.loc.start..id.loc.end], alias)) continue;
+                if (ahead.next().tag != .equal) continue;
+                return dottedName(&ahead, text);
+            },
+            else => {},
+        }
+    }
 }
 
 /// Most signal names `signalNames` returns.
@@ -135,17 +171,21 @@ fn stringIdentifier(t: *std.zig.Tokenizer, text: []const u8) ?[]const u8 {
     return inner;
 }
 
-/// `a.b.C ;`: `C`, or empty for anything else.
-fn dottedLast(t: *std.zig.Tokenizer, text: []const u8) []const u8 {
-    var last: []const u8 = "";
+/// A dotted name's last identifier, and whether it had a dot.
+const Dotted = struct { last: []const u8 = "", dotted: bool = false };
+
+/// `a.b.C ;`: `C` (dotted), `C ;`: `C` (not dotted), or empty for
+/// anything else.
+fn dottedName(t: *std.zig.Tokenizer, text: []const u8) Dotted {
+    var out: Dotted = .{};
     while (true) {
         const id = t.next();
-        if (id.tag != .identifier) return "";
-        last = text[id.loc.start..id.loc.end];
+        if (id.tag != .identifier) return .{};
+        out.last = text[id.loc.start..id.loc.end];
         switch (t.next().tag) {
-            .period => continue,
-            .semicolon => return last,
-            else => return "",
+            .period => out.dotted = true,
+            .semicolon => return out,
+            else => return .{},
         }
     }
 }
@@ -254,6 +294,50 @@ test "an extends that is not a dotted name gives an empty base type" {
     try testing.expectEqualStrings("", info.base_type);
     try testing.expect(!info.is_tool);
     try testing.expectEqualStrings("Node", scan("pub const class_name = \"A\";\npub const extends = Node;\n").?.base_type);
+}
+
+test "global class: alias base reports the engine class" {
+    const info = scan(
+        \\const z = @import("ziggurat");
+        \\const g = z.godot;
+        \\const N = g.Node2D;
+        \\pub const class_name = "Aliased";
+        \\pub const extends = N;
+        \\
+    ).?;
+    try testing.expectEqualStrings("Node2D", info.base_type);
+    // A public alias, and an alias of an alias.
+    try testing.expectEqualStrings("Sprite2D", scan(
+        \\pub const S = z.godot.Sprite2D;
+        \\const T = S;
+        \\pub const class_name = "A";
+        \\pub const extends = T;
+        \\
+    ).?.base_type);
+    // An alias declared after `extends`.
+    try testing.expectEqualStrings("Node3D", scan(
+        \\pub const class_name = "A";
+        \\pub const extends = N;
+        \\const N = g.Node3D;
+        \\
+    ).?.base_type);
+    // A local `const` inside a function or struct is not an alias.
+    try testing.expectEqualStrings("N", scan(
+        \\pub const class_name = "A";
+        \\pub const extends = N;
+        \\fn f() void { const N = g.Node3D; _ = N; }
+        \\const Inner = struct { const N = g.Node3D; };
+        \\
+    ).?.base_type);
+    // An alias of something that is not a dotted name, and alias cycles.
+    try testing.expectEqualStrings("", scan(
+        \\const B = @import("base.zig");
+        \\pub const class_name = "A";
+        \\pub const extends = B;
+        \\
+    ).?.base_type);
+    _ = scan("const A = B;\nconst B = A;\npub const class_name = \"A\";\npub const extends = A;\n").?;
+    _ = scan("const A = A;\npub const class_name = \"A\";\npub const extends = A;\n").?;
 }
 
 test "garbage text is scanned without failing" {

@@ -561,6 +561,65 @@ test "integration: deinit stops a running build" {
     try testing.expectEqual(@as(u32, 0), counter.calls.load(.acquire));
 }
 
+test "integration: a helper three references deep is mapped to the script line" {
+    try platform.testing_support.requireIntegration();
+    if (is_windows) return error.SkipZigTest;
+    var fx: Fx = undefined;
+    try fx.init("proj");
+    defer fx.deinit();
+    const a = fx.arena();
+    // An SDK outside the project: the stub SDK and a withheld helper that
+    // only code three calls deep in the SDK names, so the reference trace
+    // reaches the script only at its fourth frame.
+    const stub = try std.Io.Dir.cwd().readFileAlloc(io, build_options.stub_sdk_path, a, .limited(1 << 20));
+    try fx.tmp.dir.createDirPath(io, "sdk");
+    try fx.tmp.dir.writeFile(io, .{ .sub_path = "sdk/ziggurat.zig", .data = try std.mem.concat(a, u8, &.{
+        stub,
+        \\
+        \\pub const deep = struct {
+        \\    pub const Bad = struct {
+        \\        pub const helper = @compileError("ziggurat: helper is not available in scripts");
+        \\    };
+        \\    pub fn one(comptime T: type) void {
+        \\        two(T);
+        \\    }
+        \\    fn two(comptime T: type) void {
+        \\        three(T);
+        \\    }
+        \\    fn three(comptime T: type) void {
+        \\        _ = T.helper;
+        \\    }
+        \\};
+        \\
+    }) });
+    const sdk_root = try std.fs.path.join(a, &.{ fx.base, "sdk", "ziggurat.zig" });
+    fx.sdk = try a.dupe(zbuild.workspace.ModuleDep, &.{.{ .name = "ziggurat", .root = .fromTrusted(sdk_root), .deps = &.{} }});
+    try fx.write("a.zig",
+        \\const z = @import("ziggurat");
+        \\pub const extends = "Node";
+        \\export fn e2e_value() i32 {
+        \\    z.deep.one(z.deep.Bad);
+        \\    return 1;
+        \\}
+        \\
+    );
+
+    const svc = try BuildService.init(testing.allocator, io, fx.config(build_options.zig_exe));
+    defer svc.deinit();
+    const o = try build(svc, .open);
+    try testing.expect(!o.ok);
+    for (o.diagnostics) |d| {
+        if (std.mem.indexOf(u8, d.message, "helper is not available") == null) continue;
+        errdefer std.debug.print("diagnostic: {?s}:{d}:{d}: {s}\n", .{ d.rel, d.line, d.column, d.message });
+        try testing.expectEqualStrings("a.zig", d.rel orelse return error.HelperNotInScript);
+        try testing.expectEqual(@as(u32, 4), d.line);
+        break;
+    } else {
+        for (o.diagnostics) |d| std.debug.print("  {?s}:{d}: {s}\n", .{ d.rel, d.line, d.message });
+        return error.HelperNotReported;
+    }
+}
+
 test "integration: deinit while warming" {
     try platform.testing_support.requireIntegration();
     if (is_windows) return error.SkipZigTest;

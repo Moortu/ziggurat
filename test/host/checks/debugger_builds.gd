@@ -67,9 +67,22 @@ func game_has(line: String) -> bool:
 
 
 # The arguments of the newest compiler start.
+func argv_lines() -> PackedStringArray:
+	var text := FileAccess.get_file_as_string(argv_log).strip_edges()
+	return PackedStringArray() if text.is_empty() else text.split("\n")
+
+
 func last_argv() -> PackedStringArray:
-	var lines := FileAccess.get_file_as_string(argv_log).strip_edges().split("\n")
+	var lines := argv_lines()
 	return lines[lines.size() - 1].split(" ")
+
+
+# The first compiler start after the first `count` lines: the build that
+# came next. A warm server may start right after that build, before the
+# check reads the file, so the last line is not always the build's.
+func argv_after(count: int) -> PackedStringArray:
+	var lines := argv_lines()
+	return lines[count].split(" ") if lines.size() > count else PackedStringArray()
 
 
 # Rewrites the score line of res://hero.zig to add `bonus`, requests a save
@@ -139,8 +152,9 @@ func run() -> void:
 	ok = await wait_for(func(): return line != null and not line.visible, 10000)
 	report("debugger_panel_line_hidden", ok, "visible %s" % [line.visible if line != null else "missing"])
 	before = st.n
+	var starts := argv_lines().size()
 	st = await edit_and_build(200)
-	argv = last_argv()
+	argv = argv_after(starts)
 	report("debugger_off_full", st.ok and st.n > before and st.path == "full" and argv.has("-fno-llvm") and not argv.has("-fincremental"),
 		"status %s argv %s" % [st, argv])
 	ok = await wait_for(func(): return probe.editor_build_warm() == "ready", BUILD_WAIT_MS)

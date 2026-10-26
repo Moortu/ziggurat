@@ -54,7 +54,7 @@ pub fn parse(a: std.mem.Allocator, text: []const u8) Error![][]const u8 {
 }
 
 /// `https://<host>[:port][/path]`: host labels of letters, digits and `-`
-/// joined by single dots; path segments of letters, digits and `-._~`,
+/// (not first or last) joined by single dots; a port from 1 to 65535; path segments of letters, digits and `-._~`,
 /// never `.` or `..`; a trailing `/` is allowed.
 fn validBase(line: []const u8) bool {
     const scheme = "https://";
@@ -65,7 +65,7 @@ fn validBase(line: []const u8) bool {
     if (host.len == 0) return false;
     var labels = std.mem.splitScalar(u8, host, '.');
     while (labels.next()) |label| {
-        if (label.len == 0) return false;
+        if (label.len == 0 or label[0] == '-' or label[label.len - 1] == '-') return false;
         for (label) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
     }
     var tail = rest[host_end..];
@@ -74,6 +74,8 @@ fn validBase(line: []const u8) bool {
         const port = tail[1..port_end];
         if (port.len == 0 or port.len > 5) return false;
         for (port) |c| if (!std.ascii.isDigit(c)) return false;
+        const n = std.fmt.parseInt(u32, port, 10) catch return false;
+        if (n < 1 or n > 65535) return false;
         tail = tail[port_end..];
     }
     if (tail.len == 0) return true;
@@ -226,6 +228,41 @@ test "strict parse" {
     defer many.deinit(a);
     for (0..max_mirrors + 1) |_| try many.appendSlice(a, "https://a.example\n");
     try testing.expectError(error.Malformed, parse(a, many.items));
+}
+
+test "mirrors: port and label checks" {
+    const a = testing.allocator;
+    const good = [_][]const u8{
+        "https://a.example:1\n",
+        "https://a.example:65535/zig\n",
+        "https://a-b.example\n",
+        "https://a.b-c-d.example:443\n",
+    };
+    for (good) |text| {
+        const l = parse(a, text) catch |err| {
+            std.debug.print("refused: {f}\n", .{std.ascii.hexEscape(text, .lower)});
+            return err;
+        };
+        freeList(a, l);
+    }
+    const bad = [_][]const u8{
+        "https://a.example:0\n",
+        "https://a.example:00000\n",
+        "https://a.example:65536\n",
+        "https://a.example:99999/zig\n",
+        "https://-a.example\n",
+        "https://a-.example\n",
+        "https://a.example-\n",
+        "https://a.-example:443\n",
+        "https://-\n",
+    };
+    for (bad) |text| {
+        if (parse(a, text)) |l| {
+            freeList(a, l);
+            std.debug.print("accepted: {f}\n", .{std.ascii.hexEscape(text, .lower)});
+            return error.TestUnexpectedResult;
+        } else |err| try testing.expectEqual(error.Malformed, err);
+    }
 }
 
 test "urls order" {

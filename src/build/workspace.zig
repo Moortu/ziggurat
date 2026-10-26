@@ -39,6 +39,10 @@ pub const PrepareOptions = struct {
     build_id: ?[]const u8 = null,
 };
 
+/// Godot's entry point in the export host archive: the one symbol an
+/// exported game's library exports (`export_build` checks it).
+pub const entry_symbol = "ziggurat_host_init";
+
 /// What `Workspace.exportArgv` adds for an exported game's library: one
 /// shared library of the scripts and the export host archive.
 pub const ExportLink = struct {
@@ -80,6 +84,9 @@ pub const Workspace = struct {
         self.* = undefined;
     }
 
+    /// The editor build's reference-trace depth (`argv`).
+    pub const reference_trace_flag = "-freference-trace=16";
+
     /// The compiler command line; run it with `build_dir` as the working folder.
     /// Free with `freeArgv`, or use an arena.
     pub fn argv(self: Workspace, a: std.mem.Allocator, zig: ZigInstall, mode: BuildMode) ![]const []const u8 {
@@ -91,6 +98,12 @@ pub const Workspace = struct {
         try push(a, &out, "-lc", .{});
         if (mode.use_llvm) try push(a, &out, "-fllvm", .{}) else try push(a, &out, "-fno-llvm", .{});
         if (mode.incremental) try push(a, &out, "-fincremental", .{});
+        // Up to 16 frames of reference trace (the compiler keeps 2 by
+        // default): the diagnostics map an error outside the project to
+        // its first frame in a project file, such as the script line that
+        // names a withheld helper deep inside other code (spec risk 24).
+        // Measured at 300 scripts: no change in the median body edit.
+        try push(a, &out, reference_trace_flag, .{});
         try self.pushOutput(a, &out, "zmod");
         // `-O` is a per-module option: each `-M` gets its own, so no module
         // depends on how the compiler fills in a missing one.
@@ -120,7 +133,7 @@ pub const Workspace = struct {
         // Nothing in the scripts refers to Godot's entry point, so the
         // archive member that defines it is pulled in by name.
         try push(a, &out, "--force_undefined", .{});
-        try push(a, &out, "ziggurat_host_init", .{});
+        try push(a, &out, entry_symbol, .{});
         try push(a, &out, "{s}", .{link.host_archive.bytes});
         // `-target`, `-O` and `-fstrip` are per-module options.
         try self.pushModules(a, &out, &.{ "-target", link.target, optFlag(.ReleaseSafe), if (link.strip) "-fstrip" else "-fno-strip" });
@@ -619,16 +632,16 @@ test "argv golden" {
     };
     const inc = try ws.argv(arena, dummyZig(), .{ .incremental = true, .use_llvm = false, .optimize = .Debug });
     const want_inc: []const []const u8 = &.{
-        "/opt/zig/zig", "build-lib",               "-dynamic",                     "-lc",     "-fno-llvm", "-fincremental", "--name",                          "zmod",
-        "--cache-dir",  "/c/projects/p/zig-cache", "--listen=-",                   "-ODebug", "--dep",     "ziggurat",      "-Mroot=/proj/.ziggurat_root.zig", "-ODebug",
-        "--dep",        "gdzig",                   "-Mziggurat=/sdk/ziggurat.zig",
+        "/opt/zig/zig", "build-lib",                    "-dynamic",   "-lc",     "-fno-llvm", "-fincremental", "-freference-trace=16",            "--name",  "zmod",
+        "--cache-dir",  "/c/projects/p/zig-cache",      "--listen=-", "-ODebug", "--dep",     "ziggurat",      "-Mroot=/proj/.ziggurat_root.zig", "-ODebug", "--dep",
+        "gdzig",        "-Mziggurat=/sdk/ziggurat.zig",
     };
     try expectArgv(want_inc, inc);
     const full = try ws.argv(arena, dummyZig(), .{ .incremental = false, .use_llvm = true, .optimize = .ReleaseFast });
     const want_full: []const []const u8 = &.{
-        "/opt/zig/zig",            "build-lib",                    "-dynamic",      "-lc",   "-fllvm",   "--name",                          "zmod",          "--cache-dir",
-        "/c/projects/p/zig-cache", "--listen=-",                   "-OReleaseFast", "--dep", "ziggurat", "-Mroot=/proj/.ziggurat_root.zig", "-OReleaseFast", "--dep",
-        "gdzig",                   "-Mziggurat=/sdk/ziggurat.zig",
+        "/opt/zig/zig",                 "build-lib",  "-dynamic",      "-lc",   "-fllvm",   "-freference-trace=16",            "--name",        "zmod",  "--cache-dir",
+        "/c/projects/p/zig-cache",      "--listen=-", "-OReleaseFast", "--dep", "ziggurat", "-Mroot=/proj/.ziggurat_root.zig", "-OReleaseFast", "--dep", "gdzig",
+        "-Mziggurat=/sdk/ziggurat.zig",
     };
     try expectArgv(want_full, full);
 }
@@ -654,10 +667,9 @@ test "argv repeats optimize" {
     };
     const got = try ws.argv(arena, dummyZig(), .{ .incremental = false, .use_llvm = false, .optimize = .Debug });
     const want: []const []const u8 = &.{
-        "/opt/zig/zig",            "build-lib",                    "-dynamic",    "-lc",                          "-fno-llvm", "--name",                          "zmod",    "--cache-dir",
-        "/c/projects/p/zig-cache", "--listen=-",                   "-ODebug",     "--dep",                        "ziggurat",  "-Mroot=/proj/.ziggurat_root.zig", "-ODebug", "--dep",
-        "gdzig",                   "--dep",                        "sdk_options", "-Mziggurat=/sdk/ziggurat.zig", "-ODebug",   "--dep",                           "gdzig",   "-Mgdzig=/g/gdzig.zig",
-        "-ODebug",                 "-Msdk_options=/o/options.zig",
+        "/opt/zig/zig",            "build-lib",   "-dynamic",                     "-lc",     "-fno-llvm", "-freference-trace=16",            "--name",               "zmod",    "--cache-dir",
+        "/c/projects/p/zig-cache", "--listen=-",  "-ODebug",                      "--dep",   "ziggurat",  "-Mroot=/proj/.ziggurat_root.zig", "-ODebug",              "--dep",   "gdzig",
+        "--dep",                   "sdk_options", "-Mziggurat=/sdk/ziggurat.zig", "-ODebug", "--dep",     "gdzig",                           "-Mgdzig=/g/gdzig.zig", "-ODebug", "-Msdk_options=/o/options.zig",
     };
     try expectArgv(want, got);
     // Exactly one -O per module, each before that module's -M.

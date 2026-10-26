@@ -208,6 +208,9 @@ const State = struct {
     had_tool: bool = false,
     /// Set once the loss of the last tool script was logged.
     tool_loss_logged: bool = false,
+    /// Set once a change check logged an unusable Zig path; cleared when
+    /// a check finds the path usable again (`requestIfChanged`).
+    unusable_logged: bool = false,
 };
 
 var state: ?State = null;
@@ -296,17 +299,26 @@ pub fn requestBuild(t: Trigger) void {
 
 /// As `requestBuild`, but the service builds only when a script or helper
 /// file changed since the last build's scan (`BuildService.requestIfChanged`);
-/// otherwise there is no outcome. An unusable Zig path setting builds
-/// nothing and reports nothing here (the open build and every requested
-/// build report it; a check at every focus-in would repeat it). Main
-/// thread.
+/// otherwise there is no outcome. An unusable Zig path setting checks
+/// nothing and gives no outcome here (the open build and every requested
+/// build report it); it logs one warning until the path is usable again,
+/// so a check at every focus-in does not repeat it. Main thread.
 pub fn requestIfChanged(t: Trigger) void {
     const st = if (state) |*s| s else return;
     passPolicy(st);
     var buf: [max_path_bytes + 256]u8 = undefined;
     switch (passZigPaths(st, &buf)) {
-        .ok => st.svc.requestIfChanged(t),
-        .unusable, .out_of_memory => {},
+        .ok => {
+            st.unusable_logged = false;
+            st.svc.requestIfChanged(t);
+        },
+        .unusable => |text| {
+            if (st.unusable_logged) return;
+            st.unusable_logged = true;
+            const reason = if (std.mem.startsWith(u8, text, unusable_prefix)) text[unusable_prefix.len..] else text;
+            logWarning("Ziggurat: the Zig path is not usable, so changed files are not checked: {s}", .{reason});
+        },
+        .out_of_memory => {},
     }
 }
 
@@ -382,15 +394,38 @@ pub fn buildOnPlay() bool {
     return v.as(bool) orelse true;
 }
 
-/// The project setting `ziggurat/build/play_wait_seconds`, at least 0
-/// (60 when unset or not an int).
+/// The project setting `ziggurat/build/play_wait_seconds` (see
+/// `waitSecondsFrom`).
 pub fn playWaitSeconds() u32 {
     var n = String.fromLatin1(setting_play_wait);
     defer n.deinit();
     const v = ProjectSettings.getSetting(n, .{ .default_value = Variant.init(i64, default_play_wait_seconds) });
     defer v.deinit();
-    const s = v.as(i64) orelse return default_play_wait_seconds;
-    return std.math.cast(u32, @max(s, 0)) orelse std.math.maxInt(u32);
+    if (v.as(i64)) |i| return waitSecondsFrom(.{ .int = i });
+    if (v.as(f64)) |f| return waitSecondsFrom(.{ .float = f });
+    return waitSecondsFrom(.other);
+}
+
+/// A `play_wait_seconds` value as Godot stored it: an int, a float (a
+/// project file edited by hand, or a value typed with a fraction), or
+/// anything else.
+const WaitValue = union(enum) { int: i64, float: f64, other };
+
+/// The seconds Play waits: an int as is, a float rounded to the nearest
+/// second; a negative number, a float that is not finite, and any other
+/// type read as the default (60). Above the largest u32 it is that.
+fn waitSecondsFrom(v: WaitValue) u32 {
+    const default = default_play_wait_seconds;
+    switch (v) {
+        .int => |i| return if (i < 0) default else std.math.cast(u32, i) orelse std.math.maxInt(u32),
+        .float => |f| {
+            if (!std.math.isFinite(f) or f < 0) return default;
+            const r = @round(f);
+            if (r >= @as(f64, @floatFromInt(std.math.maxInt(u32)))) return std.math.maxInt(u32);
+            return @intFromFloat(r);
+        },
+        .other => return default,
+    }
 }
 
 /// The generation a game started now would load: the last build the
@@ -538,7 +573,7 @@ pub fn editorSetting(comptime name: []const u8) ?Variant {
 /// The editor's settings, or null while the editor does not exist yet.
 /// Godot returns them with a reference for the caller (a `Ref` return):
 /// release it with `releaseRef`.
-fn editorSettings() ?*godot.class.EditorSettings {
+pub fn editorSettings() ?*godot.class.EditorSettings {
     if (!Engine.hasSingleton(.fromComptimeLatin1("EditorInterface"))) return null;
     return EditorInterface.getEditorSettings();
 }
@@ -576,8 +611,11 @@ fn passZigPaths(st: *State, buf: []u8) PathCheck {
     return .ok;
 }
 
+/// How every `unusable` sentence starts; the rest is the reason.
+const unusable_prefix = "Ziggurat does not build Zig scripts: ";
+
 fn unusable(buf: []u8, comptime kind: []const u8, value: []const u8) PathCheck {
-    const fmt = "Ziggurat does not build Zig scripts: the " ++ kind ++ " setting " ++ setting_zig_path ++ " ({s}) is not usable, because it is not an absolute path.";
+    const fmt = unusable_prefix ++ "the " ++ kind ++ " setting " ++ setting_zig_path ++ " ({s}) is not usable, because it is not an absolute path.";
     return .{ .unusable = std.fmt.bufPrint(buf, fmt, .{value}) catch
         std.fmt.bufPrint(buf, fmt, .{"too long"}) catch unreachable };
 }
@@ -1788,12 +1826,41 @@ fn logError(comptime fmt: []const u8, args: anytype) void {
     godot.raw.printError(msg.ptr, "Zig build", "src/host/editor_build.zig", @src().line, 1);
 }
 
+fn logWarning(comptime fmt: []const u8, args: anytype) void {
+    var buf: [max_path_bytes + 1024]u8 = undefined;
+    const msg = std.fmt.bufPrintSentinel(&buf, fmt, args, 0) catch return;
+    godot.raw.printWarning(msg.ptr, "Zig build", "src/host/editor_build.zig", @src().line, 1);
+}
+
 fn log(comptime fmt: []const u8, args: anytype) void {
     var buf: [max_path_bytes + 1024]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
     var s: String = String.fromUtf8(msg) catch String.fromLatin1(msg);
     defer s.deinit();
     godot.general.print(.init(String, s), .{});
+}
+
+test "play_wait_seconds: float and string values" {
+    const t = std.testing;
+    const d = default_play_wait_seconds;
+    try t.expectEqual(@as(u32, 0), waitSecondsFrom(.{ .int = 0 }));
+    try t.expectEqual(@as(u32, 30), waitSecondsFrom(.{ .int = 30 }));
+    try t.expectEqual(@as(u32, 5000), waitSecondsFrom(.{ .int = 5000 }));
+    try t.expectEqual(std.math.maxInt(u32), waitSecondsFrom(.{ .int = std.math.maxInt(i64) }));
+    try t.expectEqual(d, waitSecondsFrom(.{ .int = -1 }));
+    // A float is rounded.
+    try t.expectEqual(@as(u32, 3), waitSecondsFrom(.{ .float = 2.5 }));
+    try t.expectEqual(@as(u32, 2), waitSecondsFrom(.{ .float = 2.4 }));
+    try t.expectEqual(@as(u32, 0), waitSecondsFrom(.{ .float = 0.2 }));
+    try t.expectEqual(@as(u32, 90), waitSecondsFrom(.{ .float = 90.0 }));
+    try t.expectEqual(std.math.maxInt(u32), waitSecondsFrom(.{ .float = 1e30 }));
+    // A negative number, a float that is no number, and a string read as
+    // the default.
+    try t.expectEqual(d, waitSecondsFrom(.{ .float = -0.4 }));
+    try t.expectEqual(d, waitSecondsFrom(.{ .float = -5.0 }));
+    try t.expectEqual(d, waitSecondsFrom(.{ .float = std.math.nan(f64) }));
+    try t.expectEqual(d, waitSecondsFrom(.{ .float = -std.math.inf(f64) }));
+    try t.expectEqual(d, waitSecondsFrom(.other));
 }
 
 test "size text" {
