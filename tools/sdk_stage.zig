@@ -300,6 +300,8 @@ fn dropLine(line: []const u8, strip: Strip) bool {
 }
 
 const testing = std.testing;
+// The tests check that a path exists with `statFile`, not `access`: under
+// Wine, `access` relative to an open folder never finds anything.
 
 fn tmpPath(buf: []u8, tmp: *const testing.TmpDir, rest: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, rest }) catch unreachable;
@@ -324,7 +326,7 @@ test "a cache folder left half-filled by an interrupted run is replaced" {
     const got = try tmp.dir.readFileAlloc(testing.io, "o/h1/sdk/sdk-manifest.json", testing.allocator, .limited(100));
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("new", got);
-    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "o/h1/sdk/gdzig", .{}));
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "o/h1/sdk/gdzig", .{}));
     // Only the swapped-in folder is left next to the others.
     var n: usize = 0;
     var d = try tmp.dir.openDir(testing.io, "o/h1", .{ .iterate = true });
@@ -344,7 +346,7 @@ test "a cache folder that is missing is made" {
     var staging = try begin(testing.allocator, testing.io, out_path, .cache_folder, &held);
     defer staging.deinit(testing.allocator);
     try staging.finish(testing.io);
-    try tmp.dir.access(testing.io, "o/h1/sdk", .{});
+    _ = try tmp.dir.statFile(testing.io, "o/h1/sdk", .{});
 }
 
 test "temporary folders of earlier interrupted runs do not matter and are removed" {
@@ -359,9 +361,9 @@ test "temporary folders of earlier interrupted runs do not matter and are remove
     var staging = try begin(testing.allocator, testing.io, out_path, .cache_folder, &held);
     defer staging.deinit(testing.allocator);
     try staging.finish(testing.io);
-    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "o/h1/sdk.tmp-0123456789abcdef", .{}));
-    try tmp.dir.access(testing.io, "o/h1/other", .{});
-    try tmp.dir.access(testing.io, "o/h1/sdk", .{});
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "o/h1/sdk.tmp-0123456789abcdef", .{}));
+    _ = try tmp.dir.statFile(testing.io, "o/h1/other", .{});
+    _ = try tmp.dir.statFile(testing.io, "o/h1/sdk", .{});
 }
 
 test "a user folder that is not empty is refused and left alone" {
@@ -391,7 +393,7 @@ test "a user folder that is missing or empty is filled in place" {
         defer staging.deinit(testing.allocator);
         try testing.expectEqualStrings(out_path, staging.stage_path);
         try staging.finish(testing.io);
-        try tmp.dir.access(testing.io, rel, .{});
+        _ = try tmp.dir.statFile(testing.io, rel, .{});
     }
 }
 
@@ -405,10 +407,10 @@ test "only exact stage folder names are removed" {
     var staging = try begin(testing.allocator, testing.io, out_path, .cache_folder, &held);
     defer staging.deinit(testing.allocator);
     try staging.finish(testing.io);
-    try tmp.dir.access(testing.io, "o/sdk.tmp-backup", .{});
-    try tmp.dir.access(testing.io, "o/sdk.tmp-0123456789abcdef0", .{});
-    try tmp.dir.access(testing.io, "o/sdk.tmp-0123456789abcdeg", .{});
-    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "o/sdk.tmp-0123456789abcdef", .{}));
+    _ = try tmp.dir.statFile(testing.io, "o/sdk.tmp-backup", .{});
+    _ = try tmp.dir.statFile(testing.io, "o/sdk.tmp-0123456789abcdef0", .{});
+    _ = try tmp.dir.statFile(testing.io, "o/sdk.tmp-0123456789abcdeg", .{});
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "o/sdk.tmp-0123456789abcdef", .{}));
 }
 
 test "a cache output path that could hit something else is refused" {

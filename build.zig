@@ -28,6 +28,11 @@ pub fn build(b: *std.Build) void {
     const sdk_out = b.option([]const u8, "sdk-out", "Absolute path of the empty or missing folder the sdk-stage step writes the shipped SDK into");
     const host_test_filter = b.option([]const u8, "host-test-filter", "Run only the host tests whose name contains this text");
     const export_templates = b.option([]const u8, "export-templates", "Folder with Godot 4.7.2's export templates (linux_release.x86_64); the host export tests skip without it");
+    // Windows test inputs, never downloaded by a test. Giving any of them
+    // also adds the Wine steps to `test`.
+    const windows_godot = b.option([]const u8, "windows-godot", "Folder with Godot_v4.7.2-stable_win64_console.exe and Godot_v4.7.2-stable_win64.exe; the Windows editor tests skip without it");
+    const windows_zig = b.option([]const u8, "windows-zig", "Folder of the unpacked zig-x86_64-windows-0.17.0; the Windows build tests skip without it");
+    const windows_zig_zip = b.option([]const u8, "windows-zig-zip", "The original zig-x86_64-windows-0.17.0.zip (its .minisig next to it); the Windows install test skips without it");
 
     const test_step = b.step("test", "Run unit and integration tests");
     const unit_step = b.step("test-unit", "Run unit tests only (spawns no compiler)");
@@ -41,6 +46,7 @@ pub fn build(b: *std.Build) void {
     const gui_test_step = b.step("test-gui", "Run the GUI editor test under Xvfb (needs Godot and xvfb-run); not part of test");
     const stress_step = b.step("test-stress", "Run the reload stress test with 300 edits in a headless editor (needs Godot); not part of test");
     const package_test_step = b.step("test-package", "Run the release package tests (part of test)");
+    const windows_step = b.step("test-windows", "Run the unit tests for x86_64-windows-gnu under Wine (needs wine on PATH)");
     const package_step = b.step("package", "Write the release package <prefix>/ziggurat-" ++ sdk_version ++ ".zip (the release download and the Asset Store upload)");
 
     const sdk = addSdk(b, target, optimize, godot_path);
@@ -272,15 +278,31 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(host_test_step);
 
     // Native: integration on for `test`, off for `test-unit`.
-    addTestSet(b, test_step, target, optimize, zig_exe, true, true, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) }, sdk_options, sdk, sdk.import_table.get("gdzig").?, export_host_archive, staged_sdk, .{ .zips = packages, .step = package_test_step });
-    addTestSet(b, unit_step, target, optimize, zig_exe, false, true, null, null, sdk_options, sdk, sdk.import_table.get("gdzig").?, null, null, null);
+    addTestSet(b, test_step, target, optimize, zig_exe, true, .native, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) }, sdk_options, sdk, sdk.import_table.get("gdzig").?, export_host_archive, staged_sdk, .{ .zips = packages, .step = package_test_step });
+    // Windows: the unit test set under Wine. One Wine prefix per build cache.
+    {
+        const windows = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = "x86_64-windows-gnu" }) catch
+            @panic("bad Windows target triple"));
+        const wine_run = b.addExecutable(.{
+            .name = "wine_run",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/wine_run.zig"),
+                .target = b.graph.host,
+                .optimize = .Debug,
+            }),
+        });
+        const runner: Runner = .{ .wine = .{ .tool = wine_run, .state = std.Build.LazyPath.cache_root.path(b, "ziggurat-wine") } };
+        addTestSet(b, windows_step, windows, optimize, zig_exe, false, runner, null, null, sdk_options, sdk, sdkGdzig(b, windows, optimize, godot_path), null, null, null);
+        if (windows_godot != null or windows_zig != null or windows_zig_zip != null) test_step.dependOn(windows_step);
+    }
+    addTestSet(b, unit_step, target, optimize, zig_exe, false, .native, null, null, sdk_options, sdk, sdk.import_table.get("gdzig").?, null, null, null);
 
     // Cross: compile only.
     for (cross_targets) |triple| {
         const query = std.Target.Query.parse(.{ .arch_os_abi = triple }) catch
             @panic("bad cross target triple");
         const resolved = b.resolveTargetQuery(query);
-        addTestSet(b, cross_step, resolved, optimize, zig_exe, false, false, null, null, sdk_options, sdk, sdkGdzig(b, resolved, optimize, godot_path), null, null, null);
+        addTestSet(b, cross_step, resolved, optimize, zig_exe, false, .compile, null, null, sdk_options, sdk, sdkGdzig(b, resolved, optimize, godot_path), null, null, null);
 
         // The host library, the export archive and the empty game library,
         // built as an export build builds them.
@@ -1081,6 +1103,33 @@ const PackageTests = struct {
     step: *std.Build.Step,
 };
 
+/// How `addTestSet` treats its test binaries.
+const Runner = union(enum) {
+    /// Compile them only.
+    compile,
+    /// Run them on this machine.
+    native,
+    /// Run them under Wine through tools/wine_run.zig, with the Wine prefix
+    /// under `state`.
+    wine: struct { tool: *std.Build.Step.Compile, state: std.Build.LazyPath },
+};
+
+/// A run step for the test binary `t`, or null when `runner` only compiles.
+fn runTest(b: *std.Build, runner: Runner, t: *std.Build.Step.Compile) ?*std.Build.Step.Run {
+    switch (runner) {
+        .compile => return null,
+        .native => return b.addRunArtifact(t),
+        .wine => |w| {
+            const run = std.Build.Step.Run.create(b, b.fmt("wine test {s}", .{t.root_module.root_source_file.?.src_path.sub_path}));
+            run.addArtifactArg(w.tool);
+            run.addDirectoryArg2(w.state, .{ .make_absolute = true });
+            run.addArtifactArg2(t, .{ .make_absolute = true });
+            run.enableTestRunnerMode();
+            return run;
+        },
+    }
+}
+
 fn addTestSet(
     b: *std.Build,
     step: *std.Build.Step,
@@ -1088,7 +1137,7 @@ fn addTestSet(
     optimize: std.builtin.OptimizeMode,
     zig_exe: []const u8,
     run_integration: bool,
-    run: bool,
+    runner: Runner,
     /// The SDK manifest for integration tests; null where none run.
     sdk_manifest: ?std.Build.LazyPath,
     /// The SDK built in Debug and in ReleaseSafe, for the panic probes; null where none runs.
@@ -1219,10 +1268,18 @@ fn addTestSet(
     });
     const options_mod = options.createModule();
     platform.addImport("build_options", options_mod);
+    // The tests Wine cannot run (test/wine_gaps.zig).
+    const wine_gaps = b.createModule(.{
+        .root_source_file = b.path("test/wine_gaps.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    platform.addImport("wine_gaps", wine_gaps);
 
     // The SDK e2e tests compile the SDK (through the fixtures) and the build
     // service together, so both must use one `ziggurat_abi` module.
-    const abi = if (run) fixture_sdk.import_table.get("ziggurat_abi").? else addAbi(b, target, optimize);
+    const native = runner == .native;
+    const abi = if (native) fixture_sdk.import_table.get("ziggurat_abi").? else addAbi(b, target, optimize);
 
     const build_mod = b.createModule(.{
         .root_source_file = b.path("src/build/root.zig"),
@@ -1233,6 +1290,7 @@ fn addTestSet(
     build_mod.addImport("build_options", options_mod);
     build_mod.addImport("ziggurat_platform", platform);
     build_mod.addImport("ziggurat_abi", abi);
+    build_mod.addImport("wine_gaps", wine_gaps);
 
     // The SDK's name conversion imports only std, so it tests without gdzig.
     const snake = b.createModule(.{
@@ -1310,7 +1368,7 @@ fn addTestSet(
     // replaced by fakes. Where it runs on Linux it is built with
     // ThreadSanitizer, and `halt_on_error` makes a reported data race fail
     // the test (without it the test runner still exits 0).
-    const tsan = run and target.result.os.tag == .linux and
+    const tsan = native and target.result.os.tag == .linux and
         (target.result.cpu.arch == .x86_64 or target.result.cpu.arch == .aarch64);
     const names_test = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("sdk/names_test.zig"),
@@ -1319,8 +1377,7 @@ fn addTestSet(
         .sanitize_thread = tsan,
         .imports = &.{.{ .name = "gdzig", .module = sdk_gdzig }},
     }) });
-    if (run) {
-        const names_run = b.addRunArtifact(names_test);
+    if (runTest(b, runner, names_test)) |names_run| {
         names_run.setEnvironmentVariable("TSAN_OPTIONS", "halt_on_error=1");
         step.dependOn(&names_run.step);
     } else {
@@ -1329,15 +1386,15 @@ fn addTestSet(
 
     for ([_]*std.Build.Module{ platform, build_mod, abi, snake, fmtlog, host_version, output_scan, host_std[0], host_std[1], host_std[2], host_std[3], host_std[4], host_manifest, class_kind, ar_normalize, sdk_stage_tool }) |mod| {
         const t = b.addTest(.{ .root_module = mod });
-        if (run) {
-            step.dependOn(&b.addRunArtifact(t).step);
+        if (runTest(b, runner, t)) |r| {
+            step.dependOn(&r.step);
         } else {
             step.dependOn(&t.step);
         }
     }
 
     // End-to-end tests (native only; all integration-gated, so `test-unit` skips them).
-    if (run) {
+    if (native) {
         const e2e = b.createModule(.{
             .root_source_file = b.path("test/e2e.zig"),
             .target = target,

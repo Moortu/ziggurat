@@ -537,6 +537,7 @@ fn genExists(a: Allocator, f: *Fixture, n: u32) !bool {
 }
 
 test "stage numbers" {
+    if (@import("wine_gaps").skip("generation_store.test.stage numbers")) return error.SkipZigTest;
     const a = std.testing.allocator;
     var f = try Fixture.init(a);
     defer f.deinit(a);
@@ -553,6 +554,7 @@ test "stage numbers" {
 }
 
 test "remove deletes and never reuses the number" {
+    if (@import("wine_gaps").skip("generation_store.test.remove deletes and never reuses the number")) return error.SkipZigTest;
     const a = std.testing.allocator;
     var f = try Fixture.init(a);
     defer f.deinit(a);
@@ -578,6 +580,7 @@ test "remove deletes and never reuses the number" {
 }
 
 test "stage copies, never moves" {
+    if (@import("wine_gaps").skip("generation_store.test.stage copies, never moves")) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = std.testing.io;
     var f = try Fixture.init(a);
@@ -682,6 +685,7 @@ test "sweep counts allocated bytes" {
 }
 
 test "pin blocks sweep" {
+    if (@import("wine_gaps").skip("generation_store.test.pin blocks sweep")) return error.SkipZigTest;
     const a = std.testing.allocator;
     var f = try Fixture.init(a);
     defer f.deinit(a);
@@ -704,6 +708,7 @@ test "pin blocks sweep" {
 }
 
 test "a game's pin keeps its generation from an editor's sweep" {
+    if (@import("wine_gaps").skip("generation_store.test.a game's pin keeps its generation from an editor's sweep")) return error.SkipZigTest;
     const a = std.testing.allocator;
     var f = try Fixture.init(a);
     defer f.deinit(a);
@@ -778,6 +783,7 @@ test "a lock that cannot be checked does not end the sweep" {
 }
 
 test "sweep keeps newest" {
+    if (@import("wine_gaps").skip("generation_store.test.sweep keeps newest")) return error.SkipZigTest;
     const a = std.testing.allocator;
     var f = try Fixture.init(a);
     defer f.deinit(a);
@@ -794,6 +800,7 @@ test "sweep keeps newest" {
 }
 
 test "store_lock_blocks_second_writer" {
+    if (@import("wine_gaps").skip("generation_store.test.store_lock_blocks_second_writer")) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = std.testing.io;
     var f = try Fixture.init(a);
@@ -838,6 +845,7 @@ test "stageDiag leaves a sentence for a non-ELF output" {
 }
 
 test "stage with a missing extra leaves no folder" {
+    if (@import("wine_gaps").skip("generation_store.test.stage with a missing extra leaves no folder")) return error.SkipZigTest;
     const a = std.testing.allocator;
     var f = try Fixture.init(a);
     defer f.deinit(a);
@@ -854,6 +862,7 @@ test "stage with a missing extra leaves no folder" {
 }
 
 test "pin of a missing generation" {
+    if (@import("wine_gaps").skip("generation_store.test.pin of a missing generation")) return error.SkipZigTest;
     const a = std.testing.allocator;
     var f = try Fixture.init(a);
     defer f.deinit(a);
@@ -867,6 +876,7 @@ test "pin of a missing generation" {
 }
 
 test "sweep by bytes keeps a pinned oldest" {
+    if (@import("wine_gaps").skip("generation_store.test.sweep by bytes keeps a pinned oldest")) return error.SkipZigTest;
     const a = std.testing.allocator;
     var f = try Fixture.init(a);
     defer f.deinit(a);
@@ -887,6 +897,7 @@ test "sweep by bytes keeps a pinned oldest" {
 }
 
 test "staged build survives a sweep before load" {
+    if (@import("wine_gaps").skip("generation_store.test.staged build survives a sweep before load")) return error.SkipZigTest;
     const a = std.testing.allocator;
     var f = try Fixture.init(a);
     defer f.deinit(a);
@@ -957,6 +968,7 @@ test "pinned bytes do not evict" {
 }
 
 test "folders with non-canonical names are ignored" {
+    if (@import("wine_gaps").skip("generation_store.test.folders with non-canonical names are ignored")) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = std.testing.io;
     var f = try Fixture.init(a);

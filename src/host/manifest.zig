@@ -590,6 +590,8 @@ test "readTrusted loads the generation the manifest names" {
     try testing.expectEqual(@as(u32, 3), t.n);
     const want = try std.fs.path.join(a, &.{ s.root, rel });
     defer a.free(want);
+    // `rel` is written with `/`; the loaded path uses the system separator.
+    std.mem.replaceScalar(u8, want[s.root.len..], '/', std.fs.path.sep);
     try testing.expectEqualStrings(want, t.lib);
     try testing.expect(try recheck(a, testing.io, s.store, &t, lib_os, "zmod") == null);
 }

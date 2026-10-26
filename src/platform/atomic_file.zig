@@ -82,5 +82,5 @@ test "writeInFolder replaces a file and refuses a missing folder" {
     defer a.free(got);
     try std.testing.expectEqualStrings("second", got);
     try std.testing.expectError(error.FileNotFound, writeInFolder(io, .fromTrusted(missing), "x"));
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "nope", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "nope", .{}));
 }

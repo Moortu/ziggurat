@@ -1713,6 +1713,8 @@ fn appendProblems(a: std.mem.Allocator, o: *Outcome, problems: []const scan_mod.
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;
+// The tests check that a path exists with `statFile`, not `access`: under
+// Wine, `access` relative to an open folder never finds anything.
 
 test "appendProblems keeps compile errors first" {
     const a = testing.allocator;
@@ -1932,7 +1934,7 @@ test "a project without scripts builds without Zig" {
     try testing.expectEqual(@as(usize, 0), empty.diagnostics.len);
     try testing.expect(empty.message == null);
     // Nothing was generated or staged in the project.
-    try testing.expectError(error.FileNotFound, tmp.dir.access(io, @import("rootgen.zig").root_file_name, .{}));
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, @import("rootgen.zig").root_file_name, .{}));
 
     // With a script, the build needs Zig again.
     try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "pub const extends = \"Node\";\n" });

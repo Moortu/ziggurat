@@ -220,7 +220,11 @@ const Scanner = struct {
             return;
         };
         defer dir.close(self.io);
-        if (dir.access(self.io, ".gdignore", .{})) |_| return else |_| {}
+        // `statFile`, not `access`: under Wine 11.19, `access` relative to
+        // an open folder never finds anything (Zig's Windows `access` is
+        // NtQueryAttributesFile with the folder as root), so `.gdignore`
+        // would be missed.
+        if (dir.statFile(self.io, ".gdignore", .{})) |_| return else |_| {}
 
         var it = dir.iterate();
         while (true) {
@@ -548,7 +552,16 @@ test "scan reports a problem once for overlapping dirs" {
 fn age(tmp: std.testing.TmpDir, sub: []const u8) !void {
     const now = std.Io.Clock.real.now(testing.io);
     const old: std.Io.Timestamp = .{ .nanoseconds = now.nanoseconds - 10 * std.time.ns_per_s };
-    try tmp.dir.setTimestamps(testing.io, sub, .{ .modify_timestamp = .{ .new = old } });
+    try setMtime(tmp, sub, old);
+}
+
+/// Sets the modification time of the file `sub`. Through an open file,
+/// because Zig 0.17's `Dir.setTimestamps` panics on Windows ("TODO implement
+/// dirSetTimestamps windows") while `File.setTimestamps` works there.
+fn setMtime(tmp: std.testing.TmpDir, sub: []const u8, mtime: std.Io.Timestamp) !void {
+    const f = try tmp.dir.openFile(testing.io, sub, .{ .mode = .write_only });
+    defer f.close(testing.io);
+    try f.setTimestamps(testing.io, .{ .modify_timestamp = .{ .new = mtime } });
 }
 
 test "build id changes" {
@@ -649,7 +662,7 @@ test "scan cache never trusts an entry stored inside the guard window" {
     const now = std.Io.Clock.real.now(testing.io);
     const mtime: std.Io.Timestamp = .{ .nanoseconds = now.nanoseconds - 1500 * std.time.ns_per_ms };
     try put(tmp, "s.zig", "pub const extends = \"Node\";\n");
-    try tmp.dir.setTimestamps(testing.io, "s.zig", .{ .modify_timestamp = .{ .new = mtime } });
+    try setMtime(tmp, "s.zig", mtime);
     const project = try tmpProject(tmp, a);
 
     var cache: Cache = .init(testing.allocator);
@@ -661,7 +674,7 @@ test "scan cache never trusts an entry stored inside the guard window" {
     // A same-size edit in the same mtime tick (the mtime is restored), then a
     // scan after the guard has expired: the file must be parsed again.
     try put(tmp, "s.zig", "pub const extendz = \"Node\";\n");
-    try tmp.dir.setTimestamps(testing.io, "s.zig", .{ .modify_timestamp = .{ .new = mtime } });
+    try setMtime(tmp, "s.zig", mtime);
     try testing.io.sleep(.fromMilliseconds(700), .awake);
     const r2 = try scanCached(a, testing.io, project, default_script_dirs, &cache);
     try testing.expectEqual(@as(u32, 1), r2.parsed);

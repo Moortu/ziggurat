@@ -624,6 +624,8 @@ fn moveIntoPlace(io: Io, gpa: std.mem.Allocator, tc: Dir, tc_abs: []const u8, sr
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;
+// The tests check that a path exists with `statFile`, not `access`: under
+// Wine, `access` relative to an open folder never finds anything.
 const build_options = @import("build_options");
 const good_name = "zig-x86_64-linux-0.17.0.tar.xz";
 const good_zip_name = "zig-x86_64-linux-0.17.0.zip";
@@ -781,7 +783,7 @@ test "toolchains folder is created" {
     defer testing.allocator.free(nested);
     opts.toolchains_dir = nested;
     try testing.expectEqual(Result.installed, try install(testing.io, testing.allocator, opts));
-    try f.tmp.dir.access(testing.io, "new/toolchains/" ++ target_name ++ "/" ++ exe_name, .{});
+    _ = try f.tmp.dir.statFile(testing.io, "new/toolchains/" ++ target_name ++ "/" ++ exe_name, .{});
 }
 
 test "size or sha mismatch leaves nothing" {
@@ -1212,7 +1214,7 @@ test "zip: hostile names leave nothing" {
         try testing.expectError(error.BadArchive, install(testing.io, a, f.options(good_zip_name)));
         try f.expectListing("");
         // Nothing next to the toolchains folder either.
-        try testing.expectError(error.FileNotFound, f.tmp.dir.access(testing.io, "evil", .{}));
+        try testing.expectError(error.FileNotFound, f.tmp.dir.statFile(testing.io, "evil", .{}));
     }
 }
 
@@ -1310,7 +1312,7 @@ test "tar: hostile entries leave nothing" {
                 return error.TestUnexpectedResult;
             }
             try f.expectListing("");
-            try testing.expectError(error.FileNotFound, f.tmp.dir.access(testing.io, "evil", .{}));
+            try testing.expectError(error.FileNotFound, f.tmp.dir.statFile(testing.io, "evil", .{}));
             continue;
         };
         std.debug.print("case {d} installed\n", .{i});
@@ -1411,15 +1413,15 @@ test "leftovers of a crashed run are swept after an hour" {
     const now = Io.Clock.real.now(io).nanoseconds;
     // Young leftovers may belong to a run in another editor: kept.
     try testing.expectEqual(@as(u32, 0), sweepLeftovers(io, tc, now, leftover_age_ns));
-    try d.access(io, "toolchains/" ++ download_prefix ++ "00112233", .{});
+    _ = try d.statFile(io, "toolchains/" ++ download_prefix ++ "00112233", .{});
     // Two hours later they go; the installed Zig and other files stay.
     try testing.expectEqual(@as(u32, 3), sweepLeftovers(io, tc, now + 2 * leftover_age_ns, leftover_age_ns));
-    try testing.expectError(error.FileNotFound, d.access(io, "toolchains/" ++ download_prefix ++ "00112233", .{}));
-    try testing.expectError(error.FileNotFound, d.access(io, "toolchains/" ++ temp_prefix ++ "aabb", .{}));
-    try testing.expectError(error.FileNotFound, d.access(io, "toolchains/" ++ old_prefix ++ "ccdd", .{}));
-    try d.access(io, "toolchains/" ++ target_name ++ "/zig", .{});
-    try d.access(io, "toolchains/.install.lock", .{});
-    try d.access(io, "toolchains/notes.txt", .{});
+    try testing.expectError(error.FileNotFound, d.statFile(io, "toolchains/" ++ download_prefix ++ "00112233", .{}));
+    try testing.expectError(error.FileNotFound, d.statFile(io, "toolchains/" ++ temp_prefix ++ "aabb", .{}));
+    try testing.expectError(error.FileNotFound, d.statFile(io, "toolchains/" ++ old_prefix ++ "ccdd", .{}));
+    _ = try d.statFile(io, "toolchains/" ++ target_name ++ "/zig", .{});
+    _ = try d.statFile(io, "toolchains/.install.lock", .{});
+    _ = try d.statFile(io, "toolchains/notes.txt", .{});
     // A missing folder is no error.
     try testing.expectEqual(@as(u32, 0), sweepLeftovers(io, "/nonexistent/ziggurat-toolchains", now, leftover_age_ns));
 }

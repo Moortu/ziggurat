@@ -54,6 +54,7 @@ fn tmpPath(a: std.mem.Allocator, tmp: std.testing.TmpDir, name: []const u8) !pat
 }
 
 test "shared locks coexist, exclusive conflicts" {
+    if (@import("wine_gaps").skip("lock.test.shared locks coexist, exclusive conflicts")) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
