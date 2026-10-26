@@ -54,6 +54,7 @@
 //! `.zig` file: no source reaches the pack; the game's loader answers the
 //! script paths from the linked table.
 const std = @import("std");
+const builtin = @import("builtin");
 const godot = @import("gdzig");
 const host_options = @import("host_options");
 const platform = @import("ziggurat_platform");
@@ -392,7 +393,11 @@ fn oldLibraryStays(r: Reporter, path: []const u8, err: anyerror) void {
         f.close(io);
         break :blk null;
     } else |e| e;
-    const locked: ?anyerror = if (cwd.setFilePermissions(io, path, .fromMode(0), .{})) |_| null else |e| e;
+    // Windows has no permission bits here; its behaviour comes with the
+    // Windows export work.
+    const locked: ?anyerror = if (builtin.os.tag == .windows)
+        error.Unsupported
+    else if (cwd.setFilePermissions(io, path, .fromMode(0), .{})) |_| null else |e| e;
     const head = "Ziggurat cannot delete the game library of an earlier export {s} ({t})";
     if (locked == null) {
         if (emptied == null)

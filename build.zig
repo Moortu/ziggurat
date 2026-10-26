@@ -3,7 +3,7 @@ const gdzig_build = @import("gdzig");
 const pins = @import("src/platform/pins.zig");
 const empty_root = @import("src/build/empty_root.zig");
 
-const cross_targets = [_][]const u8{ "x86_64-windows-gnu", "aarch64-macos", "aarch64-linux-gnu" };
+const cross_targets = [_][]const u8{ "x86_64-windows-gnu", "aarch64-macos", "x86_64-macos", "aarch64-linux-gnu" };
 
 /// The SDK version written into `sdk_options` and the SDK manifest.
 const sdk_version = "0.1.0";
@@ -281,6 +281,28 @@ pub fn build(b: *std.Build) void {
             @panic("bad cross target triple");
         const resolved = b.resolveTargetQuery(query);
         addTestSet(b, cross_step, resolved, optimize, zig_exe, false, false, null, null, sdk_options, sdk, sdkGdzig(b, resolved, optimize, godot_path), null, null, null);
+
+        // The host library, the export archive and the empty game library,
+        // built as an export build builds them.
+        const cross_sdk = addSdk(b, resolved, .ReleaseSafe, godot_path);
+        const cross_options = cross_sdk.import_table.get("sdk_options").?;
+        cross_step.dependOn(&addHost(b, resolved, optimize, godot_path, zig_exe, cross_options, .{}).step);
+        const cross_archive = addHost(b, resolved, .ReleaseSafe, godot_path, zig_exe, cross_options, .{
+            .export_build = true,
+            .linkage = .static,
+            .use_llvm = true,
+            .strip = true,
+        });
+        cross_step.dependOn(&cross_archive.step);
+        // 7c: the macOS empty game library does not link yet
+        // (undefined symbol: ziggurat_host_init).
+        if (resolved.result.os.tag != .macos) {
+            cross_step.dependOn(&linkedLibrary(b, emptyRootObject(b, resolved, cross_sdk), cross_archive, .{
+                .name = "ziggurat_game_empty",
+                .use_llvm = true,
+                .strip = true,
+            }).step);
+        }
     }
 }
 
