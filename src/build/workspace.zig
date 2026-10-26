@@ -484,7 +484,6 @@ fn rootMtime(io: std.Io, ws: Workspace, a: std.mem.Allocator) !std.Io.Timestamp 
 }
 
 test "prepare writes root once" {
-    if (@import("wine_gaps").skip("workspace.test.prepare writes root once")) return error.SkipZigTest;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -514,7 +513,6 @@ test "prepare writes root once" {
 }
 
 test "prepare lock timeout" {
-    if (@import("wine_gaps").skip("workspace.test.prepare lock timeout")) return error.SkipZigTest;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -750,7 +748,6 @@ test "export argv golden" {
 }
 
 test "prepare writes the given build id" {
-    if (@import("wine_gaps").skip("workspace.test.prepare writes the given build id")) return error.SkipZigTest;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -838,7 +835,6 @@ test "mirror rejects paths that leave the project" {
 }
 
 test "failed prepare releases the lock" {
-    if (@import("wine_gaps").skip("workspace.test.failed prepare releases the lock")) return error.SkipZigTest;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

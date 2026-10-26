@@ -1,4 +1,5 @@
-//! Dynamic library loader (L1). The only code in Ziggurat that calls `dlopen`.
+//! Dynamic library loader (L1). The only code in Ziggurat that calls `dlopen`
+//! (Linux, macOS) or `LoadLibraryExW` (Windows).
 const builtin = @import("builtin");
 const impl = switch (builtin.os.tag) {
     .windows => @import("loader_windows.zig"),

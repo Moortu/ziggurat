@@ -1164,6 +1164,19 @@ fn addTestSet(
     options.addOption([]const u8, "zig_exe", zig_exe);
     options.addOption(bool, "run_integration", run_integration);
     options.addOptionPath("stub_sdk_path", b.path("test/stub_sdk/ziggurat.zig"));
+    // A small x86_64 Windows DLL for the PE reader and the Windows loader
+    // tests. It is built here, not in the test: under Wine a Windows test
+    // cannot start the Linux `zig`.
+    const pe_fixture = b.addLibrary(.{
+        .name = "answer",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/fixtures/pe/answer_dll.zig"),
+            .target = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = "x86_64-windows-gnu" }) catch unreachable),
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    options.addOptionPath("answer_dll", pe_fixture.getEmittedBin());
     // Toolchain install fixtures (test/fixtures/toolchain/make.sh).
     for ([_][2][]const u8{
         .{ "toolchain_good_tar", "zig-x86_64-linux-0.17.0.tar.xz" },

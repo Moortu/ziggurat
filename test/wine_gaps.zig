@@ -16,33 +16,10 @@ pub const Gap = struct {
     cause: []const u8,
 };
 
-/// std's `File.tryLock`/`lock` on Windows is `NtLockFile` with an I/O
-/// status block; Wine answers NOT_IMPLEMENTED (NTSTATUS 0xc0000002,
-/// std/Io/Threaded.zig `fileTryLock`), so every test that takes a file lock
-/// fails under Wine. Real Windows supports the call. Until the Windows locks
-/// move to `LockFileEx`.
-const lock_cause = "NtLockFile returns NOT_IMPLEMENTED under Wine (std File.tryLock/lock)";
-
 /// Each name is as the test runner prints it: `<file>.test.<test name>`.
-pub const gaps = [_]Gap{
-    .{ .name = "generation_store.test.a game's pin keeps its generation from an editor's sweep", .cause = lock_cause },
-    .{ .name = "generation_store.test.folders with non-canonical names are ignored", .cause = lock_cause },
-    .{ .name = "generation_store.test.pin blocks sweep", .cause = lock_cause },
-    .{ .name = "generation_store.test.pin of a missing generation", .cause = lock_cause },
-    .{ .name = "generation_store.test.remove deletes and never reuses the number", .cause = lock_cause },
-    .{ .name = "generation_store.test.stage copies, never moves", .cause = lock_cause },
-    .{ .name = "generation_store.test.stage numbers", .cause = lock_cause },
-    .{ .name = "generation_store.test.stage with a missing extra leaves no folder", .cause = lock_cause },
-    .{ .name = "generation_store.test.staged build survives a sweep before load", .cause = lock_cause },
-    .{ .name = "generation_store.test.store_lock_blocks_second_writer", .cause = lock_cause },
-    .{ .name = "generation_store.test.sweep by bytes keeps a pinned oldest", .cause = lock_cause },
-    .{ .name = "generation_store.test.sweep keeps newest", .cause = lock_cause },
-    .{ .name = "lock.test.shared locks coexist, exclusive conflicts", .cause = lock_cause },
-    .{ .name = "workspace.test.failed prepare releases the lock", .cause = lock_cause },
-    .{ .name = "workspace.test.prepare lock timeout", .cause = lock_cause },
-    .{ .name = "workspace.test.prepare writes root once", .cause = lock_cause },
-    .{ .name = "workspace.test.prepare writes the given build id", .cause = lock_cause },
-};
+/// Empty since the Windows locks moved to `LockFileEx` (which Wine runs);
+/// the 17 lock tests that were listed here now run under Wine.
+pub const gaps = [_]Gap{};
 
 /// True when the test `name` is a listed gap and this binary runs under
 /// Wine. A name that is not listed is a compile error.
