@@ -20,25 +20,39 @@ pub inline fn fromLatin1(str: [:0]const u8, is_static: bool) StringName {
 /// Creates a StringName from a comptime Latin-1 encoded C string.
 ///
 /// The string is treated as static and the result is cached per unique string.
+///
+/// Safe to call from several threads at once. Ziggurat patch 5
+/// (vendor/gdzig/PATCHES.md): the cache is published with release and read
+/// with acquire ordering. Threads that race to fill it each build a name;
+/// one stores it and the others return their own copy. A copy is never
+/// freed: freeing a static StringName twice deadlocks Godot, and the extra
+/// reference only keeps an interned name alive.
 pub fn fromComptimeLatin1(comptime str: [:0]const u8) StringName {
     const S = struct {
         const key = str;
         var value: StringName = undefined;
-        var init: bool = false;
+        var state: CacheState = .empty;
     };
 
-    if (S.init) return S.value;
+    if (@atomicLoad(CacheState, &S.state, .acquire) == .ready) return S.value;
 
+    var made: StringName = undefined;
     if (raw.stringNameNewWithLatin1Chars) |func| {
-        func(@ptrCast(&S.value), @ptrCast(str.ptr), 1);
-        S.init = true;
+        func(@ptrCast(&made), @ptrCast(str.ptr), 1);
     } else {
-        S.value = viaString(str);
-        S.init = true;
+        made = viaString(str);
     }
 
-    return S.value;
+    // Only the thread that moves the state from `empty` writes `value`.
+    if (@cmpxchgStrong(CacheState, &S.state, .empty, .filling, .monotonic, .monotonic) == null) {
+        S.value = made;
+        @atomicStore(CacheState, &S.state, .ready, .release);
+    }
+    return made;
 }
+
+/// The fill state of the `fromComptimeLatin1` cache (Ziggurat patch 5).
+const CacheState = enum(u8) { empty, filling, ready };
 
 /// Creates a StringName from a UTF-8 encoded string.
 ///

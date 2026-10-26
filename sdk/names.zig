@@ -1,9 +1,26 @@
 //! Names and method binds that live for the whole process.
 //!
-//! Both caches are plain variables written without atomics. Each must be
-//! filled on the main thread before any other thread uses it: `moduleInit`
-//! does that for every one the SDK itself uses (see `warm.zig`).
+//! Both caches are safe to use from several threads at once (spec risk 17).
+//! A cache is published with release ordering and read with acquire
+//! ordering, so a thread that sees it filled also sees its value, on weakly
+//! ordered CPUs (arm64) too. Threads that race to fill one cache each ask
+//! Godot; one thread stores its result and the others never free theirs (a
+//! static StringName freed twice deadlocks Godot; the extra reference keeps
+//! an interned name alive). `moduleInit` still fills every cache the SDK
+//! itself uses on the main thread (see `warm.zig`).
+const std = @import("std");
 const godot = @import("gdzig");
+
+/// The fill state of one cache. Only the thread that moves it from `empty`
+/// to `filling` writes the value; `ready` is stored with release ordering
+/// after the value.
+const State = enum(u8) { empty, filling, ready };
+
+/// True when this thread may store its value: it moved `state` from
+/// `empty` to `filling`, and must then store `ready` with release ordering.
+fn claim(state: *State) bool {
+    return @cmpxchgStrong(State, state, .empty, .filling, .monotonic, .monotonic) == null;
+}
 
 /// A StringName built once from a comptime string and never freed. The type
 /// has no `deinit`: freeing a name that `fromComptimeLatin1` cached would
@@ -24,19 +41,29 @@ fn StaticNameOf(comptime n: usize, comptime bytes: [n]u8) type {
             break :blk k;
         };
         var value: godot.builtin.StringName = undefined;
-        var ready: bool = false;
+        var state: State = .empty;
 
         pub fn ptr() *const anyopaque {
-            if (!ready) {
-                value = godot.builtin.StringName.fromComptimeLatin1(&key);
-                ready = true;
-            }
+            if (@atomicLoad(State, &state, .acquire) != .ready) fill();
             return @ptrCast(&value);
+        }
+
+        fn fill() void {
+            const made = godot.builtin.StringName.fromComptimeLatin1(&key);
+            if (claim(&state)) {
+                value = made;
+                @atomicStore(State, &state, .ready, .release);
+                return;
+            }
+            // Another thread is storing the same name; `ptr()` returns the
+            // stored one, so wait for that store (a few instructions).
+            // `made` is not freed.
+            while (@atomicLoad(State, &state, .acquire) != .ready) std.atomic.spinLoopHint();
         }
 
         /// True once `ptr()` has built the name.
         pub fn isReady() bool {
-            return ready;
+            return @atomicLoad(State, &state, .acquire) == .ready;
         }
     };
 }
@@ -48,23 +75,27 @@ fn StaticNameOf(comptime n: usize, comptime bytes: [n]u8) type {
 pub fn MethodBind(comptime class: []const u8, comptime method: []const u8, comptime hash: i64) type {
     return struct {
         var bind: godot.c.GDExtensionMethodBindPtr = null;
-        var looked_up: bool = false;
+        var state: State = .empty;
 
         pub fn get() godot.c.GDExtensionMethodBindPtr {
-            if (!looked_up) {
-                bind = godot.raw.classdbGetMethodBind(
-                    @ptrCast(StaticName(class).ptr()),
-                    @ptrCast(StaticName(method).ptr()),
-                    hash,
-                );
-                looked_up = true;
+            if (@atomicLoad(State, &state, .acquire) == .ready) return bind;
+            const found = godot.raw.classdbGetMethodBind(
+                @ptrCast(StaticName(class).ptr()),
+                @ptrCast(StaticName(method).ptr()),
+                hash,
+            );
+            if (claim(&state)) {
+                bind = found;
+                @atomicStore(State, &state, .ready, .release);
             }
-            return bind;
+            // The lookup is pure: a thread that lost the claim found the
+            // same bind.
+            return found;
         }
 
         /// True once `get()` has asked Godot.
         pub fn isReady() bool {
-            return looked_up;
+            return @atomicLoad(State, &state, .acquire) == .ready;
         }
     };
 }

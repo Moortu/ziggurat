@@ -767,11 +767,12 @@ inline fn getVariantFromTypeConstructor(comptime tag: Variant.Tag) Child(c.GDExt
         var function: c.GDExtensionVariantFromTypeConstructorFunc = null;
     }.function;
 
-    if (function.* == null) {
-        function.* = raw.getVariantFromTypeConstructor(@intFromEnum(tag));
+    // Ziggurat patch 5 (vendor/gdzig/PATCHES.md): acquire and release.
+    if (@atomicLoad(@TypeOf(function.*), function, .acquire) == null) {
+        @atomicStore(@TypeOf(function.*), function, raw.getVariantFromTypeConstructor(@intFromEnum(tag)), .release);
     }
 
-    return function.*.?;
+    return @atomicLoad(@TypeOf(function.*), function, .acquire).?;
 }
 
 inline fn getVariantToTypeConstructor(comptime tag: Variant.Tag) Child(c.GDExtensionTypeFromVariantConstructorFunc) {
@@ -780,11 +781,12 @@ inline fn getVariantToTypeConstructor(comptime tag: Variant.Tag) Child(c.GDExten
         var function: c.GDExtensionTypeFromVariantConstructorFunc = null;
     }.function;
 
-    if (function.* == null) {
-        function.* = raw.getVariantToTypeConstructor(@intFromEnum(tag));
+    // Ziggurat patch 5 (vendor/gdzig/PATCHES.md): acquire and release.
+    if (@atomicLoad(@TypeOf(function.*), function, .acquire) == null) {
+        @atomicStore(@TypeOf(function.*), function, raw.getVariantToTypeConstructor(@intFromEnum(tag)), .release);
     }
 
-    return function.*.?;
+    return @atomicLoad(@TypeOf(function.*), function, .acquire).?;
 }
 
 test "forType" {

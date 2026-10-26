@@ -3,7 +3,7 @@ const gdzig_build = @import("gdzig");
 const pins = @import("src/platform/pins.zig");
 const empty_root = @import("src/build/empty_root.zig");
 
-const cross_targets = [_][]const u8{ "x86_64-windows-gnu", "aarch64-macos" };
+const cross_targets = [_][]const u8{ "x86_64-windows-gnu", "aarch64-macos", "aarch64-linux-gnu" };
 
 /// The SDK version written into `sdk_options` and the SDK manifest.
 const sdk_version = "0.1.0";
@@ -31,7 +31,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit and integration tests");
     const unit_step = b.step("test-unit", "Run unit tests only (spawns no compiler)");
-    const cross_step = b.step("cross", "Compile test binaries for Windows and macOS (not run)");
+    const cross_step = b.step("cross", "Compile test binaries for Windows, macOS and Linux arm64 (not run)");
     const manifest_step = b.step("sdk-manifest", "Write the SDK module manifest to -Dmanifest-out=<absolute path>");
     const stage_step = b.step("sdk-stage", "Write the shipped SDK (sources and a manifest with relative roots) into -Dsdk-out=<absolute path>");
     const godot_step = b.step("test-godot", "Run the SDK tests inside a headless Godot (needs Godot)");
@@ -272,26 +272,27 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(host_test_step);
 
     // Native: integration on for `test`, off for `test-unit`.
-    addTestSet(b, test_step, target, optimize, zig_exe, true, true, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) }, sdk_options, sdk, export_host_archive, staged_sdk, .{ .zips = packages, .step = package_test_step });
-    addTestSet(b, unit_step, target, optimize, zig_exe, false, true, null, null, sdk_options, sdk, null, null, null);
+    addTestSet(b, test_step, target, optimize, zig_exe, true, true, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) }, sdk_options, sdk, sdk.import_table.get("gdzig").?, export_host_archive, staged_sdk, .{ .zips = packages, .step = package_test_step });
+    addTestSet(b, unit_step, target, optimize, zig_exe, false, true, null, null, sdk_options, sdk, sdk.import_table.get("gdzig").?, null, null, null);
 
     // Cross: compile only.
     for (cross_targets) |triple| {
         const query = std.Target.Query.parse(.{ .arch_os_abi = triple }) catch
             @panic("bad cross target triple");
         const resolved = b.resolveTargetQuery(query);
-        addTestSet(b, cross_step, resolved, optimize, zig_exe, false, false, null, null, sdk_options, sdk, null, null, null);
+        addTestSet(b, cross_step, resolved, optimize, zig_exe, false, false, null, null, sdk_options, sdk, sdkGdzig(b, resolved, optimize, godot_path), null, null, null);
     }
 }
 
-/// The SDK module `ziggurat` and everything it imports.
-fn addSdk(
+/// The SDK's gdzig dependency. One set of arguments gives one dependency
+/// instance, so every caller shares the SDK's bindings.
+fn sdkGdzigDependency(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     godot_path: []const u8,
-) *std.Build.Module {
-    const gdzig = b.dependency("gdzig", .{
+) *std.Build.Dependency {
+    return b.dependency("gdzig", .{
         .target = target,
         .optimize = optimize,
         .@"godot-path" = godot_path,
@@ -304,6 +305,26 @@ fn addSdk(
         // helpers.
         .object_helpers = false,
     });
+}
+
+/// The SDK's `gdzig` module for `target`.
+fn sdkGdzig(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    godot_path: []const u8,
+) *std.Build.Module {
+    return sdkGdzigDependency(b, target, optimize, godot_path).module("gdzig");
+}
+
+/// The SDK module `ziggurat` and everything it imports.
+fn addSdk(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    godot_path: []const u8,
+) *std.Build.Module {
+    const gdzig = sdkGdzigDependency(b, target, optimize, godot_path);
 
     const options_tool = b.addExecutable(.{
         .name = "sdk_options",
@@ -1056,6 +1077,8 @@ fn addTestSet(
     /// The SDK the fixture scripts are compiled against in the SDK e2e tests
     /// (they read `@sizeOf` of the fixture types).
     fixture_sdk: *std.Build.Module,
+    /// The SDK's `gdzig` module for `target` (the lazy cache test).
+    sdk_gdzig: *std.Build.Module,
     /// The export host archive the export build tests link (native sets
     /// that run integration tests only).
     export_host_archive: ?*std.Build.Step.Compile,
@@ -1260,6 +1283,27 @@ fn addTestSet(
         .link_libc = true,
         .imports = &.{.{ .name = "ziggurat_platform", .module = platform }},
     });
+
+    // The SDK's lazy caches (sdk/names_test.zig), with the engine calls
+    // replaced by fakes. Where it runs on Linux it is built with
+    // ThreadSanitizer, and `halt_on_error` makes a reported data race fail
+    // the test (without it the test runner still exits 0).
+    const tsan = run and target.result.os.tag == .linux and
+        (target.result.cpu.arch == .x86_64 or target.result.cpu.arch == .aarch64);
+    const names_test = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("sdk/names_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = tsan,
+        .imports = &.{.{ .name = "gdzig", .module = sdk_gdzig }},
+    }) });
+    if (run) {
+        const names_run = b.addRunArtifact(names_test);
+        names_run.setEnvironmentVariable("TSAN_OPTIONS", "halt_on_error=1");
+        step.dependOn(&names_run.step);
+    } else {
+        step.dependOn(&names_test.step);
+    }
 
     for ([_]*std.Build.Module{ platform, build_mod, abi, snake, fmtlog, host_version, output_scan, host_std[0], host_std[1], host_std[2], host_std[3], host_std[4], host_manifest, class_kind, ar_normalize, sdk_stage_tool }) |mod| {
         const t = b.addTest(.{ .root_module = mod });

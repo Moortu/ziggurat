@@ -2,9 +2,12 @@
 //!
 //! Every cache the SDK fills on first use (`StaticName` names, method binds,
 //! gdzig's cached names and builtin functions behind the SDK's own calls) is
-//! a plain variable written without atomics. Godot 4 may run script code on
-//! other threads (thread groups), so `moduleInit` fills these caches on the
-//! main thread, before any script code runs:
+//! safe to fill from any thread: it is published with release ordering and
+//! read with acquire ordering (`names.zig`; gdzig patch 5). Godot 4 may run
+//! script code on other threads (thread groups), and threads that race to
+//! fill one cache each keep one extra reference to a static name, so
+//! `moduleInit` still fills these caches on the main thread, before any
+//! script code runs:
 //!
 //! - `sdk()`: the `is_class` and `emit_signal` method binds and the names
 //!   they need, gdzig's `RefCounted` name (used by `ClassDB.instantiate`),
@@ -18,10 +21,10 @@
 //!   (the names of the class checks those values go through) and every
 //!   signal name (used by `emit`).
 //!
-//! Still lazy, so their first use must be on the main thread: class checks
-//! on types that appear in no descriptor (private fields, local handles),
-//! names given to `Callable.init`, and the method binds gdzig caches inside
-//! other engine class methods scripts call.
+//! Still lazy, filled on first use on whichever thread comes first: class
+//! checks on types that appear in no descriptor (private fields, local
+//! handles), names given to `Callable.init`, and the method binds gdzig
+//! caches inside other engine class methods scripts call.
 const std = @import("std");
 const abi = @import("ziggurat_abi");
 const godot = @import("gdzig");

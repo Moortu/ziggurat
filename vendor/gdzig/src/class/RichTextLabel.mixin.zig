@@ -22,10 +22,11 @@ pub fn addImage(self: *Self, p_image: *gdzig.class.Texture2d, opt: AddImageOptio
         @ptrCast(&alignment),      @ptrCast(&opt.region),    @ptrCast(&actual_key),     @ptrCast(&opt.pad),
         @ptrCast(&actual_tooltip), @ptrCast(&width_percent), @ptrCast(&height_percent), @ptrCast(&actual_alt_text),
     };
-    if (addImage_legacy_ptr == null) {
-        addImage_legacy_ptr = raw.classdbGetMethodBind(@ptrCast(&StringName.fromComptimeLatin1("RichTextLabel")), @ptrCast(&StringName.fromComptimeLatin1("add_image")), rich_text_image_compat.godot_4_6.rich_text_label_add_image);
+    // Ziggurat patch 5 (vendor/gdzig/PATCHES.md): acquire and release.
+    if (@atomicLoad(@TypeOf(addImage_legacy_ptr), &addImage_legacy_ptr, .acquire) == null) {
+        @atomicStore(@TypeOf(addImage_legacy_ptr), &addImage_legacy_ptr, raw.classdbGetMethodBind(@ptrCast(&StringName.fromComptimeLatin1("RichTextLabel")), @ptrCast(&StringName.fromComptimeLatin1("add_image")), rich_text_image_compat.godot_4_6.rich_text_label_add_image), .release);
     }
-    raw.objectMethodBindPtrcall(addImage_legacy_ptr, @ptrCast(self), @ptrCast(&args), null);
+    raw.objectMethodBindPtrcall(@atomicLoad(@TypeOf(addImage_legacy_ptr), &addImage_legacy_ptr, .acquire), @ptrCast(self), @ptrCast(&args), null);
 }
 var addImage_legacy_ptr: c.GDExtensionMethodBindPtr = null;
 
@@ -46,10 +47,11 @@ pub fn updateImage(self: *Self, p_key: Variant, p_mask: Self.ImageUpdateMask, p_
         @ptrCast(&height),  @ptrCast(&opt.color),      @ptrCast(&alignment),     @ptrCast(&opt.region),
         @ptrCast(&opt.pad), @ptrCast(&actual_tooltip), @ptrCast(&width_percent), @ptrCast(&height_percent),
     };
-    if (updateImage_legacy_ptr == null) {
-        updateImage_legacy_ptr = raw.classdbGetMethodBind(@ptrCast(&StringName.fromComptimeLatin1("RichTextLabel")), @ptrCast(&StringName.fromComptimeLatin1("update_image")), rich_text_image_compat.godot_4_6.rich_text_label_update_image);
+    // Ziggurat patch 5 (vendor/gdzig/PATCHES.md): acquire and release.
+    if (@atomicLoad(@TypeOf(updateImage_legacy_ptr), &updateImage_legacy_ptr, .acquire) == null) {
+        @atomicStore(@TypeOf(updateImage_legacy_ptr), &updateImage_legacy_ptr, raw.classdbGetMethodBind(@ptrCast(&StringName.fromComptimeLatin1("RichTextLabel")), @ptrCast(&StringName.fromComptimeLatin1("update_image")), rich_text_image_compat.godot_4_6.rich_text_label_update_image), .release);
     }
-    raw.objectMethodBindPtrcall(updateImage_legacy_ptr, @ptrCast(self), @ptrCast(&args), null);
+    raw.objectMethodBindPtrcall(@atomicLoad(@TypeOf(updateImage_legacy_ptr), &updateImage_legacy_ptr, .acquire), @ptrCast(self), @ptrCast(&args), null);
 }
 var updateImage_legacy_ptr: c.GDExtensionMethodBindPtr = null;
 

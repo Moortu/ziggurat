@@ -20,10 +20,10 @@ const Object = godot.class.Object;
 const RefCounted = godot.class.RefCounted;
 
 // Thread note: the `StaticName` behind the class check and the `is_class`
-// method bind are plain variables written without atomics. `moduleInit`
+// method bind are safe to fill from any thread (`names.zig`). `moduleInit`
 // fills the bind and the names of every class check a script's descriptor
 // shows (see `warm.zig`); a class used only in private fields or local
-// handles is named lazily, on first use, which must be on the main thread.
+// handles is named lazily, on first use.
 
 /// Hash of `Object.is_class` in extension_api.json (Godot 4.7.2).
 const is_class_hash: i64 = 2619796661;

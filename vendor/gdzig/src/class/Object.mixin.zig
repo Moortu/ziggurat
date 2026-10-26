@@ -18,10 +18,11 @@ fn isClassForSingleton(p_class: StringName) bool {
     if (comptime Singleton == Self) {
         // Use the API's exact name, not a lossy conversion from the Zig type
         // name (for example, Os must resolve the engine singleton named OS).
-        if (Singleton.instance == null) {
-            Singleton.instance = @ptrCast(raw.globalGetSingleton(@ptrCast(&StringName.fromComptimeLatin1(self_name))).?);
+        // Ziggurat patch 5 (vendor/gdzig/PATCHES.md): acquire and release.
+        if (@atomicLoad(@TypeOf(Singleton.instance), &Singleton.instance, .acquire) == null) {
+            @atomicStore(@TypeOf(Singleton.instance), &Singleton.instance, @ptrCast(raw.globalGetSingleton(@ptrCast(&StringName.fromComptimeLatin1(self_name))).?), .release);
         }
-        return isClassWithRuntimeAbi(@ptrCast(Singleton.instance.?), p_class);
+        return isClassWithRuntimeAbi(@ptrCast(@atomicLoad(@TypeOf(Singleton.instance), &Singleton.instance, .acquire).?), p_class);
     } else {
         // The owning class initializes its storage with its own exact API name.
         return Singleton.isClass(p_class);
@@ -35,14 +36,15 @@ fn isClassWithRuntimeAbi(self: *const Self, p_class: StringName) bool {
     if (gdzig.version.gte(.@"4.7")) {
         return if (comptime object_is_class_singleton.owner(Self) != null) isClassRaw(p_class) else self.isClassRaw(p_class);
     }
-    if (isClass_legacy_ptr == null) {
-        isClass_legacy_ptr = raw.classdbGetMethodBind(@ptrCast(&StringName.fromComptimeLatin1("Object")), @ptrCast(&StringName.fromComptimeLatin1("is_class")), object_is_class_compat.godot_4_6.object_is_class);
+    // Ziggurat patch 5 (vendor/gdzig/PATCHES.md): acquire and release.
+    if (@atomicLoad(@TypeOf(isClass_legacy_ptr), &isClass_legacy_ptr, .acquire) == null) {
+        @atomicStore(@TypeOf(isClass_legacy_ptr), &isClass_legacy_ptr, raw.classdbGetMethodBind(@ptrCast(&StringName.fromComptimeLatin1("Object")), @ptrCast(&StringName.fromComptimeLatin1("is_class")), object_is_class_compat.godot_4_6.object_is_class), .release);
     }
     var result: bool = false;
     var legacy_name: gdzig.builtin.String = .fromStringName(p_class);
     defer legacy_name.deinit();
     const args = [_]c.GDExtensionConstTypePtr{@ptrCast(&legacy_name)};
-    raw.objectMethodBindPtrcall(isClass_legacy_ptr, @ptrCast(@constCast(self)), @ptrCast(&args), @ptrCast(&result));
+    raw.objectMethodBindPtrcall(@atomicLoad(@TypeOf(isClass_legacy_ptr), &isClass_legacy_ptr, .acquire), @ptrCast(@constCast(self)), @ptrCast(&args), @ptrCast(&result));
     return result;
 }
 var isClass_legacy_ptr: c.GDExtensionMethodBindPtr = null;

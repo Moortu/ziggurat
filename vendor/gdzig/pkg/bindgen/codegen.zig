@@ -200,10 +200,10 @@ fn writeBuiltinConstructor(w: *CodeWriter, builtin_name: []const u8, constructor
         }
     } else {
         try w.printLine(
-            \\if ({0s}_ptr == null) {{
-            \\    {0s}_ptr = raw.variantGetPtrConstructor(@intFromEnum(Variant.Tag.forType({2s})), {1d});
+            \\if (@atomicLoad(@TypeOf({0s}_ptr), &{0s}_ptr, .acquire) == null) {{
+            \\    @atomicStore(@TypeOf({0s}_ptr), &{0s}_ptr, raw.variantGetPtrConstructor(@intFromEnum(Variant.Tag.forType({2s})), {1d}), .release);
             \\}}
-            \\{0s}_ptr.?(@ptrCast(&result), @ptrCast(&args));
+            \\@atomicLoad(@TypeOf({0s}_ptr), &{0s}_ptr, .acquire).?(@ptrCast(&result), @ptrCast(&args));
         , .{
             constructor.name,
             constructor.index.?,
@@ -221,10 +221,10 @@ fn writeBuiltinConstructor(w: *CodeWriter, builtin_name: []const u8, constructor
 fn writeBuiltinDestructor(w: *CodeWriter, builtin: *const Context.Builtin) !void {
     try w.printLine(
         \\pub fn deinit(self: *{0s}) void {{
-        \\    if (deinit_ptr == null) {{
-        \\        deinit_ptr = raw.variantGetPtrDestructor(@intFromEnum(Variant.Tag.forType({0s}))).?;
+        \\    if (@atomicLoad(@TypeOf(deinit_ptr), &deinit_ptr, .acquire) == null) {{
+        \\        @atomicStore(@TypeOf(deinit_ptr), &deinit_ptr, raw.variantGetPtrDestructor(@intFromEnum(Variant.Tag.forType({0s}))).?, .release);
         \\    }}
-        \\    deinit_ptr.?(@ptrCast(self));
+        \\    @atomicLoad(@TypeOf(deinit_ptr), &deinit_ptr, .acquire).?(@ptrCast(self));
         \\}}
         \\var deinit_ptr: c.GDExtensionPtrDestructor = null;
         \\
@@ -238,10 +238,10 @@ fn writeBuiltinMethod(w: *CodeWriter, builtin_name: []const u8, method: *const C
 
     if (method.hash_compatibility.items.len == 0) {
         try w.printLine(
-            \\if ({0s}_ptr == null) {{
-            \\    {0s}_ptr = raw.variantGetPtrBuiltinMethod(@intFromEnum(Variant.Tag.forType({3s})), @ptrCast(&StringName.fromComptimeLatin1("{1s}")), {2d}).?;
+            \\if (@atomicLoad(@TypeOf({0s}_ptr), &{0s}_ptr, .acquire) == null) {{
+            \\    @atomicStore(@TypeOf({0s}_ptr), &{0s}_ptr, raw.variantGetPtrBuiltinMethod(@intFromEnum(Variant.Tag.forType({3s})), @ptrCast(&StringName.fromComptimeLatin1("{1s}")), {2d}).?, .release);
             \\}}
-            \\{0s}_ptr.?({4s}, @ptrCast(&args), {5s}, args.len);
+            \\@atomicLoad(@TypeOf({0s}_ptr), &{0s}_ptr, .acquire).?({4s}, @ptrCast(&args), {5s}, args.len);
         , .{
             method.name,
             method.name_api,
@@ -258,8 +258,8 @@ fn writeBuiltinMethod(w: *CodeWriter, builtin_name: []const u8, method: *const C
         });
     } else {
         try w.printLine(
-            \\if ({0s}_ptr == null) {{
-            \\    {0s}_ptr = raw.variantGetPtrBuiltinMethod(@intFromEnum(Variant.Tag.forType({2s})), @ptrCast(&StringName.fromComptimeLatin1("{1s}")), {3d});
+            \\if (@atomicLoad(@TypeOf({0s}_ptr), &{0s}_ptr, .acquire) == null) {{
+            \\    @atomicStore(@TypeOf({0s}_ptr), &{0s}_ptr, raw.variantGetPtrBuiltinMethod(@intFromEnum(Variant.Tag.forType({2s})), @ptrCast(&StringName.fromComptimeLatin1("{1s}")), {3d}), .release);
         , .{
             method.name,
             method.name_api,
@@ -275,8 +275,8 @@ fn writeBuiltinMethod(w: *CodeWriter, builtin_name: []const u8, method: *const C
         try w.writeLine(" }) |compat_hash| {");
         w.indent += 1;
         try w.printLine(
-            \\if ({0s}_ptr == null) {{
-            \\    {0s}_ptr = raw.variantGetPtrBuiltinMethod(@intFromEnum(Variant.Tag.forType({2s})), @ptrCast(&StringName.fromComptimeLatin1("{1s}")), compat_hash);
+            \\if (@atomicLoad(@TypeOf({0s}_ptr), &{0s}_ptr, .acquire) == null) {{
+            \\    @atomicStore(@TypeOf({0s}_ptr), &{0s}_ptr, raw.variantGetPtrBuiltinMethod(@intFromEnum(Variant.Tag.forType({2s})), @ptrCast(&StringName.fromComptimeLatin1("{1s}")), compat_hash), .release);
             \\}}
         , .{
             method.name,
@@ -286,11 +286,11 @@ fn writeBuiltinMethod(w: *CodeWriter, builtin_name: []const u8, method: *const C
         w.indent -= 1;
         try w.writeLine("}");
         // Preserve the unresolved-bind failure semantics of the non-compat path.
-        try w.printLine("_ = {0s}_ptr.?;", .{method.name});
+        try w.printLine("_ = @atomicLoad(@TypeOf({0s}_ptr), &{0s}_ptr, .acquire).?;", .{method.name});
         w.indent -= 1;
         try w.writeLine("}");
         try w.printLine(
-            \\{0s}_ptr.?({1s}, @ptrCast(&args), {2s}, args.len);
+            \\@atomicLoad(@TypeOf({0s}_ptr), &{0s}_ptr, .acquire).?({1s}, @ptrCast(&args), {2s}, args.len);
         , .{
             method.name,
             switch (method.self) {
@@ -314,8 +314,8 @@ fn writeBuiltinOperator(w: *CodeWriter, builtin_name: []const u8, operator: *con
 
     // Lookup the method
     try w.print(
-        \\if ({0s}_ptr == null) {{
-        \\    {0s}_ptr = raw.variantGetPtrOperatorEvaluator(@intFromEnum(Variant.Operator.{1s}), @intFromEnum(Variant.Tag.forType({2s})),
+        \\if (@atomicLoad(@TypeOf({0s}_ptr), &{0s}_ptr, .acquire) == null) {{
+        \\    @atomicStore(@TypeOf({0s}_ptr), &{0s}_ptr, raw.variantGetPtrOperatorEvaluator(@intFromEnum(Variant.Operator.{1s}), @intFromEnum(Variant.Tag.forType({2s})),
     , .{ operator.name, operator.operator_name.?, builtin_name });
     w.indent += 1;
     if (operator.parameters.getPtr("rhs")) |rhs| {
@@ -327,12 +327,12 @@ fn writeBuiltinOperator(w: *CodeWriter, builtin_name: []const u8, operator: *con
     }
     w.indent -= 1;
     try w.writeLine(
-        \\);
+        \\), .release);
         \\}
     );
 
     // Call the method
-    try w.print("{0s}_ptr.?(", .{operator.name});
+    try w.print("@atomicLoad(@TypeOf({0s}_ptr), &{0s}_ptr, .acquire).?(", .{operator.name});
     w.indent += 1;
     try w.writeAll("@ptrCast(self), ");
     if (operator.parameters.getPtr("rhs")) |_| {
@@ -592,15 +592,15 @@ fn writeClassFunction(w: *CodeWriter, class: *const Context.Class, function: *co
 
     if (class.is_singleton) {
         try w.writeLine(
-            \\if (instance == null) {
-            \\    instance = @ptrCast(raw.globalGetSingleton(@ptrCast(&StringName.fromComptimeLatin1(self_name))).?);
+            \\if (@atomicLoad(@TypeOf(instance), &instance, .acquire) == null) {
+            \\    @atomicStore(@TypeOf(instance), &instance, @ptrCast(raw.globalGetSingleton(@ptrCast(&StringName.fromComptimeLatin1(self_name))).?), .release);
             \\}
         );
     }
 
     try writeClassMethodBind(w, function, "");
 
-    try w.print("raw.objectMethodBindPtrcall({0s}_ptr, ", .{function.name});
+    try w.print("raw.objectMethodBindPtrcall(@atomicLoad(@TypeOf({0s}_ptr), &{0s}_ptr, .acquire), ", .{function.name});
     try writeClassFunctionObjectPtr(w, class, function, ctx);
     try w.printLine(", @ptrCast(&args), {s});", .{
         if (function.return_type != .void)
@@ -619,9 +619,9 @@ fn writeClassFunction(w: *CodeWriter, class: *const Context.Class, function: *co
 /// Keep primary first, then API-order compatibility hashes. A null result is
 /// deliberately passed to the caller as before, rather than changing failures.
 fn writeClassMethodBind(w: *CodeWriter, function: *const Context.Function, suffix: []const u8) !void {
-    try w.printLine("if ({s}{s}_ptr == null) {{", .{ function.name, suffix });
+    try w.printLine("if (@atomicLoad(@TypeOf({0s}{1s}_ptr), &{0s}{1s}_ptr, .acquire) == null) {{", .{ function.name, suffix });
     w.indent += 1;
-    try w.printLine("{s}{s}_ptr = raw.classdbGetMethodBind(@ptrCast(&StringName.fromComptimeLatin1(\"{s}\")), @ptrCast(&StringName.fromComptimeLatin1(\"{s}\")), {d});", .{
+    try w.printLine("@atomicStore(@TypeOf({0s}{1s}_ptr), &{0s}{1s}_ptr, raw.classdbGetMethodBind(@ptrCast(&StringName.fromComptimeLatin1(\"{2s}\")), @ptrCast(&StringName.fromComptimeLatin1(\"{3s}\")), {4d}), .release);", .{
         function.name, suffix, function.base.?, function.name_api, function.hash.?,
     });
     if (function.hash_compatibility.items.len > 0) {
@@ -632,9 +632,9 @@ fn writeClassMethodBind(w: *CodeWriter, function: *const Context.Function, suffi
         }
         try w.writeLine(" }) |compat_hash| {");
         w.indent += 1;
-        try w.printLine("if ({s}{s}_ptr == null) {{", .{ function.name, suffix });
+        try w.printLine("if (@atomicLoad(@TypeOf({0s}{1s}_ptr), &{0s}{1s}_ptr, .acquire) == null) {{", .{ function.name, suffix });
         w.indent += 1;
-        try w.printLine("{s}{s}_ptr = raw.classdbGetMethodBind(@ptrCast(&StringName.fromComptimeLatin1(\"{s}\")), @ptrCast(&StringName.fromComptimeLatin1(\"{s}\")), compat_hash);", .{
+        try w.printLine("@atomicStore(@TypeOf({0s}{1s}_ptr), &{0s}{1s}_ptr, raw.classdbGetMethodBind(@ptrCast(&StringName.fromComptimeLatin1(\"{2s}\")), @ptrCast(&StringName.fromComptimeLatin1(\"{3s}\")), compat_hash), .release);", .{
             function.name, suffix, function.base.?, function.name_api,
         });
         w.indent -= 1;
@@ -657,11 +657,11 @@ test "class bind primary then compatibility order, including Alloc and no metada
         out.clearRetainingCapacity();
         try writeClassMethodBind(&w, &function, suffix);
         const text = out.written();
-        const primary = std.mem.indexOf(u8, text, ", 123);").?;
+        const primary = std.mem.indexOf(u8, text, ", 123), .release);").?;
         const fallback = std.mem.indexOf(u8, text, "inline for ([_]i64{ 456, 789 }").?;
         try std.testing.expect(primary < fallback);
         try std.testing.expectEqual(@as(usize, 0), w.indent);
-        const guard = try std.fmt.allocPrint(std.testing.allocator, "if (probe{s}_ptr == null)", .{suffix});
+        const guard = try std.fmt.allocPrint(std.testing.allocator, "if (@atomicLoad(@TypeOf(probe{0s}_ptr), &probe{0s}_ptr, .acquire) == null)", .{suffix});
         defer std.testing.allocator.free(guard);
         try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, guard));
     }
@@ -670,7 +670,7 @@ test "class bind primary then compatibility order, including Alloc and no metada
     try writeClassMethodBind(&w, &function, "");
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "inline for") == null);
     try std.testing.expectEqualStrings(
-        "if (probe_ptr == null) {\n    probe_ptr = raw.classdbGetMethodBind(@ptrCast(&StringName.fromComptimeLatin1(\"Object\")), @ptrCast(&StringName.fromComptimeLatin1(\"probe\")), 123);\n}\n",
+        "if (@atomicLoad(@TypeOf(probe_ptr), &probe_ptr, .acquire) == null) {\n    @atomicStore(@TypeOf(probe_ptr), &probe_ptr, raw.classdbGetMethodBind(@ptrCast(&StringName.fromComptimeLatin1(\"Object\")), @ptrCast(&StringName.fromComptimeLatin1(\"probe\")), 123), .release);\n}\n",
         out.written(),
     );
 }
@@ -896,30 +896,30 @@ fn writeFunctionAlloc(w: *CodeWriter, function: *const Context.Function, class: 
         try w.writeLine("var err: c.GDExtensionCallError = undefined;");
         // Class method
         if (cls.is_singleton) {
-            try w.writeLine("if (instance == null) {");
+            try w.writeLine("if (@atomicLoad(@TypeOf(instance), &instance, .acquire) == null) {");
             w.indent += 1;
-            try w.writeLine("instance = @ptrCast(raw.globalGetSingleton(@ptrCast(&StringName.fromComptimeLatin1(self_name))).?);");
+            try w.writeLine("@atomicStore(@TypeOf(instance), &instance, @ptrCast(raw.globalGetSingleton(@ptrCast(&StringName.fromComptimeLatin1(self_name))).?), .release);");
             w.indent -= 1;
             try w.writeLine("}");
         }
 
         try writeClassMethodBind(w, function, "Alloc");
 
-        try w.print("raw.objectMethodBindCall({0s}Alloc_ptr, ", .{function.name});
+        try w.print("raw.objectMethodBindCall(@atomicLoad(@TypeOf({0s}Alloc_ptr), &{0s}Alloc_ptr, .acquire), ", .{function.name});
         try writeClassFunctionObjectPtr(w, cls, function, ctx);
         try w.writeLine(", @ptrCast(@alignCast(&args[0])), @intCast(args.len), @ptrCast(&result), &err);");
     } else {
         // Utility function
-        try w.printLine("if ({0s}Alloc_ptr == null) {{", .{function.name});
+        try w.printLine("if (@atomicLoad(@TypeOf({0s}Alloc_ptr), &{0s}Alloc_ptr, .acquire) == null) {{", .{function.name});
         w.indent += 1;
-        try w.printLine("{0s}Alloc_ptr = raw.variantGetPtrUtilityFunction(@ptrCast(@constCast(&StringName.fromComptimeLatin1(\"{1s}\"))), {2d});", .{
+        try w.printLine("@atomicStore(@TypeOf({0s}Alloc_ptr), &{0s}Alloc_ptr, raw.variantGetPtrUtilityFunction(@ptrCast(@constCast(&StringName.fromComptimeLatin1(\"{1s}\"))), {2d}), .release);", .{
             function.name,
             function.name_api,
             function.hash.?,
         });
         w.indent -= 1;
         try w.writeLine("}");
-        try w.printLine("{0s}Alloc_ptr.?(@ptrCast(&result), @ptrCast(&args), @intCast(args.len));", .{function.name});
+        try w.printLine("@atomicLoad(@TypeOf({0s}Alloc_ptr), &{0s}Alloc_ptr, .acquire).?(@ptrCast(&result), @ptrCast(&args), @intCast(args.len));", .{function.name});
     }
 
     // Return
@@ -950,9 +950,9 @@ fn writeClassFunctionObjectPtr(w: *CodeWriter, class: *const Context.Class, func
         try w.writeAll("null");
     } else if (class.getNearestSingleton(ctx)) |singleton| {
         if (class.is_singleton) {
-            try w.writeAll("@ptrCast(instance)");
+            try w.writeAll("@ptrCast(@atomicLoad(@TypeOf(instance), &instance, .acquire))");
         } else {
-            try w.print("@ptrCast({s}.instance)", .{singleton.name});
+            try w.print("@ptrCast(@atomicLoad(@TypeOf({0s}.instance), &{0s}.instance, .acquire))", .{singleton.name});
         }
     } else if (function.self == .constant) {
         try w.writeAll("@ptrCast(@constCast(self))");
@@ -1932,10 +1932,10 @@ fn writeModuleFunction(w: *CodeWriter, function: *const Context.Function, ctx: *
     try writeFunctionHeader(w, function, null, ctx);
 
     try w.printLine(
-        \\if ({0s}_ptr == null) {{
-        \\    {0s}_ptr = raw.variantGetPtrUtilityFunction(@ptrCast(@constCast(&StringName.fromComptimeLatin1("{1s}"))), {2d});
+        \\if (@atomicLoad(@TypeOf({0s}_ptr), &{0s}_ptr, .acquire) == null) {{
+        \\    @atomicStore(@TypeOf({0s}_ptr), &{0s}_ptr, raw.variantGetPtrUtilityFunction(@ptrCast(@constCast(&StringName.fromComptimeLatin1("{1s}"))), {2d}), .release);
         \\}}
-        \\{0s}_ptr.?({3s}, @ptrCast(&args), @intCast(args.len));
+        \\@atomicLoad(@TypeOf({0s}_ptr), &{0s}_ptr, .acquire).?({3s}, @ptrCast(&args), @intCast(args.len));
     , .{
         function.name,
         function.name_api,

@@ -33,8 +33,9 @@
 //! have the signal (the host and the descriptor disagree). Any other failed
 //! emit is logged as a warning, never a panic; so is a missing method bind,
 //! which is then never called.
-//! The bind and the signal names are cached in plain `var`s without
-//! atomics; `moduleInit` fills them on the main thread (`warm.zig`).
+//! The bind and the signal names are cached with acquire and release
+//! ordering (`names.zig`); `moduleInit` fills them on the main thread
+//! (`warm.zig`).
 const std = @import("std");
 const abi = @import("ziggurat_abi");
 const godot = @import("gdzig");
