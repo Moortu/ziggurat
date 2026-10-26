@@ -149,3 +149,26 @@ test "malformed input never panics" {
         }
     }
 }
+
+test "a DLL whose export and import directory Size is 0 still lists its names" {
+    const a = std.testing.allocator;
+    const bytes = try readFixture(a);
+    defer a.free(bytes);
+    const copy = try a.dupe(u8, bytes);
+    defer a.free(copy);
+    // Data directories: export (0) and import (1); the Size follows each RVA.
+    const img = try pe.Image.parse(copy);
+    for ([_]usize{ 0, 1 }) |i| {
+        const size_off = img.data_dirs + i * 8 + 4;
+        try std.testing.expect(std.mem.readInt(u32, copy[size_off..][0..4], .little) != 0);
+        std.mem.writeInt(u32, copy[size_off..][0..4], 0, .little);
+    }
+
+    const ex = try pe.exports(a, copy);
+    defer pe.freeExports(a, ex);
+    try std.testing.expect(hasName(ex, "answer"));
+    try std.testing.expect(hasName(ex, "answer_pid"));
+    const im = try pe.imports(a, copy);
+    defer pe.freeImports(a, im);
+    try std.testing.expect(hasImport(im, "kernel32.dll", "GetCurrentProcessId"));
+}
