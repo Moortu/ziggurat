@@ -589,6 +589,62 @@ test "integration: deinit while warming" {
     try expectThreadGone(counter.tid.load(.acquire));
 }
 
+test "integration: debugger builds: toggling drops the warm server and brings it back" {
+    try platform.testing_support.requireIntegration();
+    if (is_windows) return error.SkipZigTest;
+    var fx: Fx = undefined;
+    try fx.init("proj");
+    defer fx.deinit();
+    try fx.write("a.zig", try scriptSource(fx.arena(), 1));
+    // The incremental server waits at its gate until the test opens it.
+    const zig = try fx.wrapper("gatezig", "0.17.0", false, true);
+    const svc = try BuildService.init(testing.allocator, io, fx.config(zig));
+    defer svc.deinit();
+
+    const o1 = try build(svc, .open);
+    try expectOk(o1);
+    try fx.waitAtGate("gatezig", "incremental");
+    try testing.expectEqual(service.WarmState.warming, svc.stats().warm);
+
+    // On while the server warms up: the next build drops it (not a death)
+    // and builds with LLVM; no server warms up again.
+    svc.setPolicy(null, true);
+    try fx.write("a.zig", try scriptSource(fx.arena(), 2));
+    const o2 = try build(svc, .save);
+    try expectOk(o2);
+    try testing.expectEqual(service.BuildPath.full, o2.path);
+    try testing.expectEqual(@as(i32, 2), try callValue(o2));
+    try testing.expectEqual(service.WarmState.disabled, svc.stats().warm);
+    try testing.expectEqual(@as(u32, 0), svc.stats().session_deaths);
+    try expectIncrementalLockFree(&fx);
+
+    // Off: the next build is a full self-hosted one and warms a server again.
+    try fx.openGate("gatezig", "incremental");
+    svc.setPolicy(null, false);
+    try fx.write("a.zig", try scriptSource(fx.arena(), 3));
+    const o3 = try build(svc, .save);
+    try expectOk(o3);
+    try testing.expectEqual(service.BuildPath.full, o3.path);
+    try testing.expectEqual(@as(i32, 3), try callValue(o3));
+    try svc.waitWarm(build_wait_ms);
+    try fx.write("a.zig", try scriptSource(fx.arena(), 4));
+    const o4 = try build(svc, .save);
+    try expectOk(o4);
+    try testing.expectEqual(service.BuildPath.incremental, o4.path);
+    try testing.expectEqual(@as(i32, 4), try callValue(o4));
+
+    // On again with a ready server: it is stopped at the next build.
+    svc.setPolicy(null, true);
+    try fx.write("a.zig", try scriptSource(fx.arena(), 5));
+    const o5 = try build(svc, .save);
+    try expectOk(o5);
+    try testing.expectEqual(service.BuildPath.full, o5.path);
+    try testing.expectEqual(@as(i32, 5), try callValue(o5));
+    try testing.expectEqual(service.WarmState.disabled, svc.stats().warm);
+    try testing.expectEqual(@as(u32, 0), svc.stats().session_deaths);
+    try expectIncrementalLockFree(&fx);
+}
+
 fn incrementalLockPath(fx: *Fx) ![]const u8 {
     const a = fx.arena();
     const cache_root = try fx.paths().dir(.cache, a);

@@ -697,6 +697,13 @@ pub const ZigguratTestProbe = struct {
         return d;
     }
 
+    /// The build service's warm state (`editor_build.warmState`) as text:
+    /// `cold`, `warming`, `ready` or `disabled`; `none` without a service.
+    pub fn editorBuildWarm(_: *ZigguratTestProbe) String {
+        const w = editor_build.warmState() orelse return .fromLatin1("none");
+        return .fromLatin1(@tagName(w));
+    }
+
     /// `editor_build.diagnosticsCopy` flattened: one Dictionary per
     /// diagnostic with `rel`, `line`, `column` and `message`.
     pub fn editorBuildDiagnostics(_: *ZigguratTestProbe) Array {
@@ -1175,7 +1182,7 @@ pub const method_names = [_][:0]const u8{
     "game_capture_registered",  "debugger_reload_last",        "debugger_reload_sends",     "debugger_sessions",
     "debugger_started",         "editor_build_checks",         "zig_download_configure",    "zig_download_state",
     "zig_download_cancel",      "zig_download_requests",       "editor_build_wait_idle",    "editor_build_set_store_caps",
-    "editor_build_hold_queue",  "editor_build_memory",         "editor_plugin_play_nested",
+    "editor_build_hold_queue",  "editor_build_memory",         "editor_plugin_play_nested", "editor_build_warm",
 };
 
 fn scriptDesc(script: i64) ?*const abi.ScriptDesc {

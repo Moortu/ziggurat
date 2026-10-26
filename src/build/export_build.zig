@@ -10,7 +10,8 @@
 //!     `platform.pins.export_target` (glibc `pins.export_glibc`, baseline
 //!     CPU), without debug information (`-fstrip`: debug information holds
 //!     absolute paths, so the same project in two folders gave different
-//!     bytes);
+//!     bytes); a debug export (`Options.strip` false) keeps it
+//!     (`-fno-strip`) and is not reproducible;
 //!   - the result is linked with the export host archive
 //!     (`zig build host-archive`, built ReleaseSafe for the same target)
 //!     into one shared library. `--force_undefined ziggurat_host_init`
@@ -77,6 +78,11 @@ pub const Options = struct {
     lock_timeout_ms: u32 = 30000,
     /// Longest compiler run before the compiler is killed.
     update_timeout_ms: u32 = 600000,
+    /// Build without debug information (`-fstrip`), so the bytes are the
+    /// same in every project folder. False for a debug export
+    /// (`-fno-strip`): the library keeps its debug information, which
+    /// holds absolute paths, so it is not reproducible.
+    strip: bool = true,
 };
 
 /// Owned; free with `deinit`.
@@ -155,6 +161,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options, diag: *[256]u8) !Res
         .host_archive = opts.host_archive,
         .version_script = map,
         .name = lib_name,
+        .strip = opts.strip,
     });
 
     var s = compiler.Session.start(a, io, argv, ws.build_dir) catch |err|

@@ -350,12 +350,16 @@ pub const ZigEditorPlugin = struct {
         return st;
     }
 
-    /// Reads the check interval again. A changed interval starts counting
-    /// now.
+    /// Reads the check interval again (a changed interval starts counting
+    /// now) and the build settings (`editor_build.readBuildSettings`; they
+    /// apply at the next build), and shows the debugger-builds line in the
+    /// panel.
     fn readSettings(self: *ZigEditorPlugin) void {
         const ms = @as(i64, editor_build.checkIntervalSeconds()) * 1000;
         if (ms != self.check_interval_ms) self.last_check_ms = nowMs();
         self.check_interval_ms = ms;
+        editor_build.readBuildSettings();
+        if (self.panel) |panel| panel.setDebugger(editor_build.debuggerBuilds());
     }
 
     /// Connects (or disconnects) EditorSettings `settings_changed` and

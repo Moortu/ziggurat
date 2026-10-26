@@ -8,6 +8,7 @@
 //!   runner <godot> <project dir> build <quit-after frames> <deadline s> [--exit-code <n>] [--expect <text>]...
 //!   runner <godot> <project dir> export <preset> <out> <deadline s> [--exit-code <n>] [--expect <text>]...
 //!   runner <godot> <project dir> export-pack <preset> <out> <deadline s> [--exit-code <n>] [--expect <text>]...
+//!   runner <godot> <project dir> export-debug <preset> <out> <deadline s> [--exit-code <n>] [--expect <text>]...
 //!   runner <godot> <project dir> run <exe> <deadline s> [--exit-code <n>] [--expect <text>]...
 //!
 //! Writes `<project>/.godot/extension_list.cfg` with every `.gdextension`
@@ -16,8 +17,9 @@
 //! `--editor --quit-after <frames>`, the same with `--build-solutions` for
 //! `build`, which calls the editor plugins' `_build` on the first frame and
 //! exits with status 1 when one returns false, or the scene path for a game
-//! run of that scene, or `--export-release <preset> <out>` for `export` and
-//! `--export-pack <preset> <out>` for `export-pack`) with stdin from
+//! run of that scene, or `--export-release <preset> <out>` for `export`,
+//! `--export-pack <preset> <out>` for `export-pack` and
+//! `--export-debug <preset> <out>` for `export-debug`) with stdin from
 //! /dev/null and one deadline for the whole run. `run` starts an exported
 //! game instead: `<exe> --headless --verbose`, with no project folder
 //! (`<project dir>` is not touched; a release template refuses `--path`
@@ -59,6 +61,7 @@ const usage =
     \\       runner <godot> <project dir> build <quit-after frames> <deadline s> [--exit-code <n> | --expect[-once] <text> | --reject <text> | --allow-report <line> | --echo <prefix>]...
     \\       runner <godot> <project dir> export <preset> <out> <deadline s> [--exit-code <n> | --expect[-once] <text> | --reject <text> | --allow-report <line> | --echo <prefix>]...
     \\       runner <godot> <project dir> export-pack <preset> <out> <deadline s> [--exit-code <n> | --expect[-once] <text> | --reject <text> | --allow-report <line> | --echo <prefix>]...
+    \\       runner <godot> <project dir> export-debug <preset> <out> <deadline s> [--exit-code <n> | --expect[-once] <text> | --reject <text> | --allow-report <line> | --echo <prefix>]...
     \\       runner <godot> <project dir> run <exe> <deadline s> [--exit-code <n> | --expect[-once] <text> | --reject <text> | --allow-report <line> | --echo <prefix>]...
     \\
 ;
@@ -76,7 +79,7 @@ pub fn main(init: std.process.Init) !u8 {
     const project = args[2];
     const mode = args[3];
     const mode_arg = args[4];
-    const is_export = std.mem.eql(u8, mode, "export") or std.mem.eql(u8, mode, "export-pack");
+    const is_export = std.mem.eql(u8, mode, "export") or std.mem.eql(u8, mode, "export-pack") or std.mem.eql(u8, mode, "export-debug");
     // The export modes take two arguments: the preset and the output path.
     const first_opt: usize = if (is_export) 7 else 6;
     if (args.len < first_opt) {
@@ -132,7 +135,8 @@ pub fn main(init: std.process.Init) !u8 {
     if (is_run) {
         // The exported game: nothing more.
     } else if (is_export) {
-        try argv.appendSlice(arena, &.{ if (std.mem.eql(u8, mode, "export")) "--export-release" else "--export-pack", mode_arg, args[5] });
+        const flag = if (std.mem.eql(u8, mode, "export")) "--export-release" else if (std.mem.eql(u8, mode, "export-debug")) "--export-debug" else "--export-pack";
+        try argv.appendSlice(arena, &.{ flag, mode_arg, args[5] });
     } else if (std.mem.eql(u8, mode, "script")) {
         try argv.appendSlice(arena, &.{ "--script", mode_arg });
     } else if (std.mem.eql(u8, mode, "editor") or std.mem.eql(u8, mode, "build")) {

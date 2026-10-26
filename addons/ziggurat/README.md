@@ -34,6 +34,44 @@ Ziggurat builds the project's Zig scripts when you save a script, when you
 press Play, and with Project > Tools > Build Zig Scripts. The Zig panel at
 the bottom of the editor shows the result and every error.
 
+## Debugging with lldb
+
+Normal editor builds are fast, but their debug information is not good
+enough for a debugger: the first build of a session has lines and a stack
+but no variables, and the later fast (incremental) builds have broken
+debug information.
+
+- Turn on the editor setting `ziggurat/build/debugger_builds` (Editor
+  Settings > Ziggurat > Build). While it is on, every build uses LLVM and
+  Debug mode without incremental compilation, so lldb can read it. Builds
+  are slower, and the Zig panel shows "Debugger builds: on (slower, no
+  incremental)". The change applies at the next build. A running game gets
+  each new build as usual. Turn it off to get fast builds back.
+- Many Linux distributions set `/proc/sys/kernel/yama/ptrace_scope` to 1.
+  Then lldb cannot attach to a game that the editor started, unless lldb
+  runs as root. Start the game under a debugger instead:
+  1. In Debug > Customize Run Instances, set Main Run Args to
+     `lldb-server gdbserver 127.0.0.1:1234 %command%`. Godot then starts
+     the game through `lldb-server`, which is the game's parent, so
+     `ptrace_scope` 1 allows it.
+  2. Press Play, then connect from a terminal:
+     `lldb -o "gdb-remote 1234"`.
+  This route is not tested yet.
+  Or run the game under lldb from a terminal, without the editor:
+  `lldb -- godot --path <project folder>`. The add-on's tests check this
+  way. The game then runs the last build and does not get new builds
+  from the editor.
+- Set breakpoints by file and line, for example `b player.zig:12`. That is
+  more reliable than function names, because Zig names functions by their
+  module path.
+- `--export-debug` (or Export With Debug) builds the game library with its
+  debug information. The export log says "Ziggurat: debug export keeps
+  debug information; this library is not reproducible." A release export
+  has no debug information.
+- The editor setting `ziggurat/build/backend` chooses the compiler backend
+  for normal builds: `auto` (the default), `llvm`, `self_hosted` or
+  `self_hosted_incremental`. `debugger_builds` wins over it.
+
 ## Export
 
 - Exports work for Linux x86_64 only in this version. An export for another

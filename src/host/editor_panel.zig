@@ -10,6 +10,9 @@
 //! - a memory line, `Loaded builds: <n> (<size>); descriptor snapshots:
 //!   <size>` (`editor_build.memoryText`, refreshed by `update`; hidden
 //!   while the text is empty, that is without a build service);
+//! - the line `debugger_line` while the editor setting
+//!   `ziggurat/build/debugger_builds` is on (`setDebugger`, refreshed by
+//!   `update` and when the editor settings change);
 //! - a download row (hidden until `showDownload` shows it): the Zig
 //!   download's line and a Cancel button while it transfers;
 //! - a `RichTextLabel` of the last build's diagnostics. Each diagnostic in
@@ -48,6 +51,9 @@ const EditorInterface = godot.class.EditorInterface;
 const ResourceLoader = godot.class.ResourceLoader;
 const Script = godot.class.Script;
 
+/// The panel's line while debugger builds are on.
+pub const debugger_line = "Debugger builds: on (slower, no incremental)";
+
 /// Longest diagnostic line handled (longer messages are cut).
 const max_line_bytes = 4096 + 1024;
 
@@ -56,6 +62,7 @@ pub const ZigPanel = struct {
     button: *Button,
     status: *Label,
     memory: *Label,
+    debugger: *Label,
     download_row: *HBoxContainer,
     download_text: *Label,
     download_cancel: *Button,
@@ -71,6 +78,7 @@ pub const ZigPanel = struct {
             .button = Button.init(),
             .status = Label.init(),
             .memory = Label.init(),
+            .debugger = Label.init(),
             .download_row = HBoxContainer.init(),
             .download_text = Label.init(),
             .download_cancel = Button.init(),
@@ -115,6 +123,11 @@ pub const ZigPanel = struct {
         self.memory.setName(.fromComptimeLatin1("Memory"));
         self.memory.setVisible(false);
         column.addChild(.upcast(self.memory), .{});
+
+        self.debugger.setName(.fromComptimeLatin1("Debugger"));
+        setText(Label, self.debugger, "setText", debugger_line);
+        self.debugger.setVisible(false);
+        column.addChild(.upcast(self.debugger), .{});
 
         self.download_row.setName(.fromComptimeLatin1("Download"));
         self.download_row.setVisible(false);
@@ -171,6 +184,7 @@ pub const ZigPanel = struct {
         setText(Label, self.status, "setText", line);
         var memory_buf: [256]u8 = undefined;
         self.setMemory(editor_build.memoryText(&memory_buf));
+        self.setDebugger(editor_build.debuggerBuilds());
 
         const rt = self.diagnostics;
         rt.clear();
@@ -209,6 +223,11 @@ pub const ZigPanel = struct {
     pub fn setMemory(self: *ZigPanel, text: []const u8) void {
         setText(Label, self.memory, "setText", text);
         self.memory.setVisible(text.len != 0);
+    }
+
+    /// The debugger-builds line: shown while `on`.
+    pub fn setDebugger(self: *ZigPanel, on: bool) void {
+        self.debugger.setVisible(on);
     }
 
     /// The download row (filled by the Zig download): hidden in state

@@ -2787,6 +2787,142 @@ test "e2e headless" {
     });
 }
 
+// ------------------------------------------------------------ debugger builds
+
+/// The project's Zig is a shell script around the real one that appends
+/// the arguments of every compiler start (not `zig version`) to a file in
+/// the test's folder; `res://argv_log.txt` names that file.
+fn addArgvLogWrapper(p: *Project) !void {
+    const a = p.arena_state.allocator();
+    const root = try p.tmp.dir.realPathFileAlloc(io, ".", a);
+    const log = try std.fs.path.join(a, &.{ root, "argv.log" });
+    const wrapper = try std.fs.path.join(a, &.{ root, "zig-argv.sh" });
+    const script = try std.fmt.allocPrint(a,
+        \\#!/bin/sh
+        \\if [ "$1" != version ]; then echo "$*" >> '{s}'; fi
+        \\exec '{s}' "$@"
+        \\
+    , .{ log, opts.zig_exe });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = wrapper, .data = script });
+    const chmod = try std.process.run(a, io, .{ .argv = &.{ "chmod", "755", wrapper } });
+    if (!chmod.term.success()) return error.ChmodFailed;
+    try writeIn(p.path, "argv_log.txt", log);
+    try addBuildSettingsWith(p, wrapper);
+}
+
+// The editor (headless) plays the e2e project's main scene; the game runs
+// headless too (`editor/run/main_run_args` set to `--headless` by the
+// check) and keeps running (ZTEST_GUI). The check turns the editor setting
+// ziggurat/build/debugger_builds on and off while the game runs and edits
+// res://hero.zig each time (test/host/checks/debugger_builds.gd).
+test "debugger builds: toggling during a session" {
+    try requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("e2e");
+    defer p.deinit();
+    const a = p.arena_state.allocator();
+    try addArgvLogWrapper(&p);
+    try isolateUserFolders(&p);
+    const root = try p.tmp.dir.realPathFileAlloc(io, ".", a);
+    try p.env.?.put("ZTEST_GUI", "1");
+    try p.env.?.put("ZTEST_GAME_LOG", try std.fs.path.join(a, &.{ root, "game.log" }));
+    try p.addAutoloadCheck("debugger_builds.gd");
+    try p.runEditorChecked("100000000", .{
+        .expect = &.{
+            "ZTEST PASS debugger_setting_registered",
+            "ZTEST PASS debugger_session_warm",
+            "ZTEST PASS debugger_game_running",
+            "ZTEST PASS debugger_panel_line",
+            "ZTEST PASS debugger_build_llvm",
+            "ZTEST PASS debugger_no_warm_server",
+            "ZTEST PASS debugger_game_new_code",
+            "ZTEST PASS debugger_panel_line_hidden",
+            "ZTEST PASS debugger_off_full",
+            "ZTEST PASS debugger_off_warm_again",
+            "ZTEST PASS debugger_off_game_new_code",
+            "ZTEST PASS debugger_off_incremental",
+            "ZTEST PASS debugger_off_game_incremental_code",
+            "build service stopped (0 threads left)",
+        },
+        .reject = &.{ refused_prefix, "Program crashed" },
+        .deadline = build_deadline_s,
+    });
+    // Opened again with the setting on (the first pass left it on): the
+    // build at open, which starts before the editor exists, is followed
+    // by one with debugger builds.
+    // The autoload res://check.gd is now the second check.
+    try p.addCheck("debugger_open.gd");
+    try p.runEditorChecked("100000000", .{
+        .expect = &.{
+            "ZTEST PASS debugger_open_setting_on",
+            "ZTEST PASS debugger_open_build_llvm",
+            "build service stopped (0 threads left)",
+        },
+        .reject = &.{"Program crashed"},
+        .deadline = build_deadline_s,
+    });
+}
+
+/// The absolute path of `lldb` on `PATH`, or null.
+fn findLldb(a: std.mem.Allocator) !?[]const u8 {
+    const which = try std.process.run(a, io, .{ .argv = &.{ "sh", "-c", "command -v lldb" } });
+    const path = std.mem.trim(u8, which.stdout, " \t\r\n");
+    if (!which.term.success() or path.len == 0) return null;
+    return path;
+}
+
+// The editor builds the e2e project in debugger mode; then the game runs
+// headless under lldb in batch mode (lldb starts Godot, so the default
+// `ptrace_scope` 1 allows it) with a breakpoint by file and line in
+// res://hero.zig's `_ready`: the game stops there and `frame variable`
+// shows the scene's value of `speed`. Skips when `lldb` is not on `PATH`.
+test "lldb stops in a script" {
+    try requireIntegration();
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a0 = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a0);
+    defer arena_state.deinit();
+    const lldb = try findLldb(arena_state.allocator()) orelse return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("e2e");
+    defer p.deinit();
+    const a = p.arena_state.allocator();
+    try addBuildSettings(&p);
+    try isolateUserFolders(&p);
+    try p.addAutoloadCheck("debugger_lldb.gd");
+    try p.runEditorChecked("100000000", .{
+        .expect = &.{ "ZTEST PASS lldb_debugger_build", "build service stopped (0 threads left)" },
+        .deadline = build_deadline_s,
+    });
+
+    // The line of `self.ready_calls += 1;` in hero.zig's `_ready`.
+    const hero = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ p.path, "hero.zig" }), a, .limited(1 << 20));
+    var line: usize = 0;
+    var it = std.mem.splitScalar(u8, hero, '\n');
+    var n: usize = 1;
+    while (it.next()) |l| : (n += 1) {
+        if (std.mem.indexOf(u8, l, "self.ready_calls += 1;") != null) line = n;
+    }
+    try testing.expect(line != 0);
+    const bp = try std.fmt.allocPrint(a, "b hero.zig:{d}", .{line});
+    const result = try std.process.run(a, io, .{
+        .argv = &.{ "timeout", "300", lldb, "--batch", "-o", bp, "-o", "run", "-o", "frame variable", "-o", "frame variable *self", "-o", "process kill", "--", opts.godot_exe, "--headless", "--path", p.path, "--quit-after", "5" },
+        .environ_map = p.env.?,
+    });
+    const out = try std.mem.concat(a, u8, &.{ result.stdout, result.stderr });
+    var problems: std.ArrayList([]const u8) = .empty;
+    if (!result.term.success()) try problems.append(a, "lldb did not exit with status 0");
+    for ([_][]const u8{ "stop reason = breakpoint", "hero._ready", "(hero *) self = 0x", "speed = 12.5" }) |text| {
+        if (std.mem.indexOf(u8, out, text) == null)
+            try problems.append(a, try std.fmt.allocPrint(a, "missing expected text: {s}", .{text}));
+    }
+    if (problems.items.len == 0) return;
+    std.debug.print("--- lldb output ---\n{s}\n---\n", .{out});
+    for (problems.items) |text| std.debug.print("lldb test: {s}\n", .{text});
+    return error.LldbRunFailed;
+}
+
 // ------------------------------------------------------------ GUI editor
 
 /// Seconds for the whole GUI run: the build at open, the game, the save
@@ -3225,6 +3361,37 @@ test "export: exported game runs scripts" {
     try exportGame(&p, .{ .once = &.{export_building}, .reject = &.{"ERROR:"} });
     try testing.expect(try projectFileExists(&p, "out/libziggurat_game.so"));
     try runExported(&p, .{ .once = &export_game_lines, .reject = &.{ "ERROR:", "WARNING:" } });
+}
+
+/// The export plugin's log line for a debug export.
+const export_debug_line = "Ziggurat: debug export keeps debug information; this library is not reproducible.";
+
+/// Whether the exported game library `out/libziggurat_game.so` has a
+/// `.debug_info` section.
+fn exportedLibHasDebugInfo(p: *Project) !bool {
+    const a = p.arena_state.allocator();
+    const lib = try std.fs.path.join(a, &.{ p.path, "out", "libziggurat_game.so" });
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, lib, a, .limited(1 << 30));
+    return platform.elf.hasSection(bytes, ".debug_info");
+}
+
+test "export: a debug export keeps debug information" {
+    try requireTemplates();
+    var p: Project = undefined;
+    try initExport(&p, null);
+    defer p.deinit();
+    const a = p.arena_state.allocator();
+    try p.run(&.{ "export-debug", "Linux", try std.fs.path.join(a, &.{ p.path, export_out }) }, .{
+        .once = &.{ export_building, export_debug_line },
+        .reject = &.{"ERROR:"},
+        .deadline = export_deadline_s,
+    });
+    try testing.expect(try exportedLibHasDebugInfo(&p));
+    // The debug game runs (the debug template).
+    try runExported(&p, .{ .once = &export_game_lines, .reject = &.{"ERROR:"} });
+    // A release export of the same project has none, and no such line.
+    try exportGame(&p, .{ .once = &.{export_building}, .reject = &.{ "ERROR:", export_debug_line } });
+    try testing.expect(!try exportedLibHasDebugInfo(&p));
 }
 
 test "export: no sources in the pack" {

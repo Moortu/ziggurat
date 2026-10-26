@@ -212,6 +212,20 @@ pub fn liveThreads() u32 {
     return live_threads.load(.acquire);
 }
 
+/// The backend policy in use (`Config.policy_override`,
+/// `Config.debugger_builds`, `BuildService.setPolicy`).
+const Policy = struct {
+    override: ?BuildMode,
+    debugger: bool,
+
+    fn eql(p: Policy, q: Policy) bool {
+        if (p.debugger != q.debugger) return false;
+        const x = p.override orelse return q.override == null;
+        const y = q.override orelse return false;
+        return x.incremental == y.incremental and x.use_llvm == y.use_llvm and x.optimize == y.optimize;
+    }
+};
+
 /// Configured Zig paths (`BuildService.setZigPaths`), owned.
 const ZigPaths = struct {
     project: ?[]const u8 = null,
@@ -246,8 +260,14 @@ pub const Config = struct {
     /// It exists so tests can check the backend policy; the compiler always
     /// builds for the host, and the staged file name and checks follow it.
     target: std.Target = builtin.target,
-    /// Replaces the backend policy table in every phase.
+    /// Replaces the backend policy table in the `session_start` and `warm`
+    /// phases (`backend.policy`). `BuildService.setPolicy` replaces it.
     policy_override: ?BuildMode = null,
+    /// Debugger builds: every build takes the debug-build policy (LLVM,
+    /// non-incremental, Debug, `backend.Phase.debug_build`) and no
+    /// incremental server runs. Wins over `policy_override`.
+    /// `BuildService.setPolicy` replaces it.
+    debugger_builds: bool = false,
     /// How long a build waits for another editor's `build.lock` (ruling P3).
     lock_timeout_ms: u32 = 30000,
     /// Longest single compiler update before the compiler is killed.
@@ -386,6 +406,16 @@ pub const BuildService = struct {
     /// The newest `setZigPaths` paths, until the build thread takes them.
     /// Guarded by `mu`.
     new_zig_paths: ?ZigPaths = null,
+    /// The newest `setPolicy` values, until the build thread takes them.
+    /// Guarded by `mu`.
+    new_policy: ?Policy = null,
+    /// The policy builds use (from `Config`, then `setPolicy`). Build
+    /// thread only.
+    policy_now: Policy,
+    /// Set while a policy change ends the incremental server: the warm
+    /// thread then neither starts a server nor counts a killed warm-up as
+    /// a death. Guarded by `mu`.
+    warm_abandon: bool = false,
     /// The table snapshot and file fingerprints of the last build whose
     /// table was checked and validated. Build thread only.
     prev: ?Prev = null,
@@ -421,6 +451,7 @@ pub const BuildService = struct {
             .cfg = cfg,
             .store = GenerationStore.init(a, io, cfg.store_root, cfg.target.os.tag, lib_stem, cfg.caps),
             .scan_cache = .init(a),
+            .policy_now = .{ .override = cfg.policy_override, .debugger = cfg.debugger_builds },
         };
         errdefer self.scan_cache.deinit();
         self.build_thread = try spawn(buildMain, .{self});
@@ -466,6 +497,20 @@ pub const BuildService = struct {
         defer self.mu.unlock(self.io);
         if (self.new_zig_paths) |old| old.deinit(self.a);
         self.new_zig_paths = paths;
+    }
+
+    /// Replaces `Config.policy_override` and `Config.debugger_builds`.
+    /// Safe from any thread; never waits for a build. The next build that
+    /// starts uses them; when they differ from the ones in use, that build
+    /// first stops the incremental server (a warm-up in progress too,
+    /// which is not counted as a server death), and a server warms up
+    /// again after the next successful full build when the new policy has
+    /// an incremental mode. For a host that reads its settings at each
+    /// request: call it before `request`.
+    pub fn setPolicy(self: *BuildService, override: ?BuildMode, debugger: bool) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        self.new_policy = .{ .override = override, .debugger = debugger };
     }
 
     /// True while a build runs or one is pending. Any thread.
@@ -719,6 +764,7 @@ pub const BuildService = struct {
         var arena_state = std.heap.ArenaAllocator.init(a);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
+        self.takePolicy();
 
         // The scan comes first: a project without Zig scripts has nothing
         // to build and needs no Zig (Play in a GDScript-only project).
@@ -928,6 +974,52 @@ pub const BuildService = struct {
         self.zig = null;
     }
 
+    /// The mode for `phase` under the policy in use: in debugger builds
+    /// every phase is the debug build. Build thread only.
+    fn modeFor(self: *const BuildService, phase: backend.Phase) BuildMode {
+        const p = self.policy_now;
+        if (p.debugger) return backend.policy(self.cfg.target, .debug_build, null);
+        return backend.policy(self.cfg.target, phase, p.override);
+    }
+
+    /// Takes the values of the newest `setPolicy`. When they differ from
+    /// the ones in use, the incremental server ends: a warm-up in
+    /// progress is killed and its thread joined, a ready server is
+    /// dropped (neither counts as a death), and a server that the old
+    /// policy disabled may warm up again. Build thread only.
+    fn takePolicy(self: *BuildService) void {
+        const io = self.io;
+        const new = blk: {
+            self.mu.lockUncancelable(io);
+            defer self.mu.unlock(io);
+            const n = self.new_policy orelse return;
+            self.new_policy = null;
+            if (n.eql(self.policy_now)) return;
+            // The warm thread sees this before it registers a server or
+            // after its warm-up update fails.
+            self.warm_abandon = true;
+            if (self.warm == .warming) if (self.warm_slot) |s| s.interrupt();
+            break :blk n;
+        };
+        self.policy_now = new;
+        if (self.warm_thread) |t| {
+            t.join();
+            self.warm_thread = null;
+        }
+        {
+            self.session_mu.lockUncancelable(io);
+            defer self.session_mu.unlock(io);
+            self.dropWarm(false);
+        }
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+        self.warm_abandon = false;
+        // `disabled` from a policy without an incremental mode; after two
+        // deaths it stays.
+        if (self.warm == .disabled and self.deaths < 2) self.warm = .cold;
+        self.cond.broadcast(io);
+    }
+
     /// `Workspace.prepare`, waiting for `build.lock` in short slices so that
     /// `deinit` does not have to wait for the whole lock timeout.
     fn prepareWorkspace(self: *BuildService, sc: scan_mod.ScanResult, o: *Outcome) !workspace.Workspace {
@@ -992,7 +1084,7 @@ pub const BuildService = struct {
     /// A fresh non-incremental compiler for one update; it exits afterwards.
     fn fullBuild(self: *BuildService, arena: std.mem.Allocator, ws: *const workspace.Workspace, zig: ZigInstall, build_id: []const u8, o: *Outcome) !void {
         const a = self.a;
-        const mode = backend.policy(self.cfg.target, .session_start, self.cfg.policy_override);
+        const mode = self.modeFor(.session_start);
         const argv = try ws.argv(arena, zig, mode);
         self.beginUpdate();
         defer self.endUpdate();
@@ -1043,11 +1135,11 @@ pub const BuildService = struct {
         const io = self.io;
         // Check before taking `session_mu`: the warm thread holds it for the
         // whole warm-up update, and a request must not wait for that.
-        if (self.warmState() != .ready) return false;
+        if (self.policy_now.debugger or self.warmState() != .ready) return false;
         self.session_mu.lockUncancelable(io);
         defer self.session_mu.unlock(io);
         // The server compiles what its command line named at warm-up time.
-        const mode = backend.policy(self.cfg.target, .warm, self.cfg.policy_override);
+        const mode = self.modeFor(.warm);
         const now_argv = try ws.argv(arena, zig, mode);
         if (self.warm_argv == null or !argvEql(self.warm_argv.?, now_argv)) {
             self.dropWarm(false);
@@ -1249,7 +1341,8 @@ pub const BuildService = struct {
     /// service on the full path.
     fn startWarm(self: *BuildService, ws: *const workspace.Workspace, zig: ZigInstall) void {
         const io = self.io;
-        const mode = backend.policy(self.cfg.target, .warm, self.cfg.policy_override);
+        // In debugger builds the mode has no incremental mode.
+        const mode = self.modeFor(.warm);
         {
             self.mu.lockUncancelable(io);
             defer self.mu.unlock(io);
@@ -1366,7 +1459,8 @@ pub const BuildService = struct {
         self.session_mu.lockUncancelable(io);
         defer self.session_mu.unlock(io);
         var r = s.update(self.cfg.update_timeout_ms) catch {
-            self.dropWarm(true);
+            // Killed by a policy change (`takePolicy`): not a death.
+            self.dropWarm(!self.warmAbandoned());
             return;
         };
         const clean = r.bundle.errorMessageCount() == 0;
@@ -1380,11 +1474,18 @@ pub const BuildService = struct {
         self.dropWarm(false);
     }
 
-    /// Puts the warm server and its lock in place unless the service is stopping.
+    fn warmAbandoned(self: *BuildService) bool {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        return self.warm_abandon;
+    }
+
+    /// Puts the warm server and its lock in place unless the service is
+    /// stopping or a policy change ends the server (`warm_abandon`).
     fn registerWarm(self: *BuildService, s: Session, lock: FileLock) bool {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
-        if (self.stopping) return false;
+        if (self.stopping or self.warm_abandon) return false;
         self.warm_slot = s;
         self.warm_lock = lock;
         return true;
@@ -1909,4 +2010,73 @@ test "stagingMessage names the staged file" {
     const m3 = try stagingMessage(a, "/c/x.so", "Staging /c/x.so failed: AccessDenied.");
     defer a.free(m3);
     try testing.expectEqualStrings("Staging /c/x.so failed: AccessDenied.", m3);
+}
+
+/// The lines of `<base>/argv.log`: one line per compiler start, the
+/// arguments the fake Zig of the debugger-builds test was given.
+fn argvLines(a: std.mem.Allocator, dir: std.Io.Dir) ![]const []const u8 {
+    const text = try dir.readFileAlloc(testing.io, "argv.log", a, .limited(1 << 20));
+    var lines: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.tokenizeScalar(u8, text, '\n');
+    while (it.next()) |l| try lines.append(a, l);
+    return lines.items;
+}
+
+fn hasArg(line: []const u8, arg: []const u8) bool {
+    var it = std.mem.tokenizeScalar(u8, line, ' ');
+    while (it.next()) |x| if (std.mem.eql(u8, x, arg)) return true;
+    return false;
+}
+
+test "debugger builds: argv has -fllvm and no -fincremental, no warm server starts" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    // Reports the pinned version; every compiler start writes its
+    // arguments to argv.log and fails at once (no compiler runs).
+    const fake = try std.fmt.allocPrint(arena, "#!/bin/sh\nif [ \"$1\" = version ]; then echo " ++ platform.pins.zig_version ++ "; exit 0; fi\necho \"$*\" >> '{s}/argv.log'\nexit 1\n", .{base});
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-zig", .data = fake, .flags = .{ .permissions = .executable_file } });
+    const zig = try std.fs.path.join(arena, &.{ base, "fake-zig" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "pub const extends = \"Node\";\n" });
+    var cfg = testConfig(base, &.{.{ .name = "ziggurat", .root = .fromTrusted(base), .deps = &.{} }});
+    cfg.locate.configured = .fromTrusted(zig);
+    // Debugger builds win over the backend override.
+    cfg.debugger_builds = true;
+    cfg.policy_override = .{ .incremental = true, .use_llvm = false, .optimize = .Debug };
+    const svc = try BuildService.init(a, io, cfg);
+    defer svc.deinit();
+
+    const first = try buildOnce(svc, a, .manual);
+    defer freeOutcome(a, first);
+    var lines = try argvLines(arena, tmp.dir);
+    try testing.expectEqual(@as(usize, 1), lines.len);
+    try testing.expect(hasArg(lines[0], "-fllvm"));
+    try testing.expect(!hasArg(lines[0], "-fincremental"));
+    try testing.expect(hasArg(lines[0], "-ODebug"));
+    try testing.expect(svc.stats().warm != .warming and svc.stats().warm != .ready);
+
+    // Off, with the override: applies at the next build.
+    svc.setPolicy(.{ .incremental = false, .use_llvm = false, .optimize = .Debug }, false);
+    const second = try buildOnce(svc, a, .manual);
+    defer freeOutcome(a, second);
+    lines = try argvLines(arena, tmp.dir);
+    try testing.expectEqual(@as(usize, 2), lines.len);
+    try testing.expect(hasArg(lines[1], "-fno-llvm"));
+    try testing.expect(!hasArg(lines[1], "-fincremental"));
+
+    // On again, with an incremental override: debugger builds still win.
+    svc.setPolicy(.{ .incremental = true, .use_llvm = false, .optimize = .Debug }, true);
+    const third = try buildOnce(svc, a, .save);
+    defer freeOutcome(a, third);
+    lines = try argvLines(arena, tmp.dir);
+    try testing.expectEqual(@as(usize, 3), lines.len);
+    try testing.expect(hasArg(lines[2], "-fllvm"));
+    try testing.expect(!hasArg(lines[2], "-fincremental"));
+    try testing.expect(svc.stats().warm != .warming and svc.stats().warm != .ready);
 }

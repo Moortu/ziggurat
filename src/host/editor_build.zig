@@ -17,9 +17,15 @@
 //!   scripts keep the descriptor cache.
 //! - The editor plugin registers the editor settings (per user;
 //!   `registerEditorSettings`): `ziggurat/zig_path` (the Zig path),
-//!   `ziggurat/editor/indent_with_spaces` (`.zig` tabs indent with spaces)
-//!   and `ziggurat/build/check_interval_seconds` (how often files changed
-//!   outside the editor are looked for; 0 = only at focus-in).
+//!   `ziggurat/editor/indent_with_spaces` (`.zig` tabs indent with spaces),
+//!   `ziggurat/build/check_interval_seconds` (how often files changed
+//!   outside the editor are looked for; 0 = only at focus-in),
+//!   `ziggurat/build/debugger_builds` (every build LLVM, non-incremental
+//!   and Debug, for lldb; no incremental server) and
+//!   `ziggurat/build/backend` (an override of the backend policy for the
+//!   session start and warm builds; `auto` keeps the table). Every build
+//!   request hands the last two to the service (`BuildService.setPolicy`),
+//!   so a change applies at the next build.
 //! - `requestIfChanged` (the plugin's `watcher` trigger: focus-in and the
 //!   interval) builds only when a script or helper file changed since the
 //!   last build (`BuildService.requestIfChanged`); without a change there
@@ -141,6 +147,19 @@ pub const setting_indent_with_spaces = "ziggurat/editor/indent_with_spaces";
 /// outside the editor; an int, 0 by default (only when the editor regains
 /// focus).
 pub const setting_check_interval = "ziggurat/build/check_interval_seconds";
+/// Editor setting (per user): debugger builds, a bool, false by default.
+/// While it is true every build is LLVM, non-incremental and Debug (the
+/// debug-build policy), so lldb can read it, and no incremental server
+/// runs (`BuildService.setPolicy`). Wins over `setting_backend`.
+pub const setting_debugger_builds = "ziggurat/build/debugger_builds";
+/// Editor setting (per user): the compiler backend, a String with the
+/// values of `zbuild.backend.Setting` (`auto` by default: the policy
+/// table). It overrides the policy for the session start and warm phases
+/// only. An unknown value is read as `auto`, with one warning per session.
+pub const setting_backend = "ziggurat/build/backend";
+comptime {
+    std.debug.assert(std.mem.indexOf(u8, zbuild.backend.unknown_setting_warning, " " ++ setting_backend ++ " ") != null);
+}
 
 /// Thread-safe, as the service requires.
 const gpa = std.heap.c_allocator;
@@ -149,12 +168,13 @@ const gpa = std.heap.c_allocator;
 const max_path_bytes = 4096;
 
 /// Godot's `Variant::BOOL`, `Variant::INT`, `Variant::STRING`,
-/// `PROPERTY_HINT_RANGE` and `PROPERTY_HINT_GLOBAL_FILE`
+/// `PROPERTY_HINT_RANGE`, `PROPERTY_HINT_ENUM` and `PROPERTY_HINT_GLOBAL_FILE`
 /// (core/variant/variant.h, core/object/property_info.h).
 const type_bool: i64 = 1;
 const type_int: i64 = 2;
 const type_string: i64 = 4;
 const hint_range: i64 = 1;
+const hint_enum: i64 = 2;
 const hint_global_file: i64 = 15;
 
 /// The running service and what its configuration borrows. Main thread.
@@ -265,6 +285,7 @@ pub const FileDiagnostics = struct {
 /// thread.
 pub fn requestBuild(t: Trigger) void {
     const st = if (state) |*s| s else return;
+    passPolicy(st);
     var buf: [max_path_bytes + 256]u8 = undefined;
     switch (passZigPaths(st, &buf)) {
         .ok => st.svc.request(t),
@@ -281,6 +302,7 @@ pub fn requestBuild(t: Trigger) void {
 /// thread.
 pub fn requestIfChanged(t: Trigger) void {
     const st = if (state) |*s| s else return;
+    passPolicy(st);
     var buf: [max_path_bytes + 256]u8 = undefined;
     switch (passZigPaths(st, &buf)) {
         .ok => st.svc.requestIfChanged(t),
@@ -392,11 +414,12 @@ pub fn startableGeneration() ?u32 {
 
 /// Registers the editor settings `ziggurat/zig_path` (the per-user Zig
 /// path, empty by default, with a file picker),
-/// `ziggurat/editor/indent_with_spaces` (true) and
+/// `ziggurat/editor/indent_with_spaces` (true),
 /// `ziggurat/build/check_interval_seconds` (0; 0 to 3600 in the inspector,
-/// more when typed). Main thread, once the editor exists (the editor
-/// plugin's `_enter_tree`). A value equal to the default is not written to
-/// the editor settings file.
+/// more when typed), `ziggurat/build/debugger_builds` (false) and
+/// `ziggurat/build/backend` (`auto`, a list of its values). Main thread,
+/// once the editor exists (the editor plugin's `_enter_tree`). A value
+/// equal to the default is not written to the editor settings file.
 pub fn registerEditorSettings() void {
     const es = editorSettings() orelse return;
     defer releaseRef(es);
@@ -405,6 +428,62 @@ pub fn registerEditorSettings() void {
     addEditorSetting(es, setting_zig_path, Variant.init(String, empty), type_string, hint_global_file, "");
     addEditorSetting(es, setting_indent_with_spaces, Variant.init(bool, true), type_bool, 0, "");
     addEditorSetting(es, setting_check_interval, Variant.init(i64, 0), type_int, hint_range, "0,3600,1,or_greater,suffix:s");
+    addEditorSetting(es, setting_debugger_builds, Variant.init(bool, false), type_bool, 0, "");
+    var auto = String.fromLatin1("auto");
+    defer auto.deinit();
+    addEditorSetting(es, setting_backend, Variant.init(String, auto), type_string, hint_enum, zbuild.backend.setting_values);
+}
+
+/// The editor setting `ziggurat/build/debugger_builds` (false when the
+/// editor does not exist yet, or the setting is unset or not a bool).
+/// Main thread.
+pub fn debuggerBuilds() bool {
+    const v = editorSetting(setting_debugger_builds) orelse return false;
+    defer v.deinit();
+    return v.as(bool) orelse false;
+}
+
+/// Reads `ziggurat/build/backend` for the whole editor session: an unknown
+/// value warns once.
+var backend_reader: zbuild.backend.SettingReader = .{};
+
+/// The override of the editor setting `ziggurat/build/backend` (null for
+/// `auto`, when unset or not a String, and while the editor does not
+/// exist). An unknown value prints `backend.unknown_setting_warning` once
+/// per session. Main thread.
+fn backendOverride() ?zbuild.workspace.BuildMode {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const text = editorSettingText(arena_state.allocator(), setting_backend) catch return null;
+    const r = backend_reader.read(text);
+    if (r.warning) |w| {
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrintSentinel(&buf, "{s}", .{w}, 0) catch return r.override;
+        godot.raw.printWarning(msg.ptr, "Zig build", "src/host/editor_build.zig", @src().line, 1);
+    }
+    return r.override;
+}
+
+/// Hands the editor settings `ziggurat/build/backend` and
+/// `ziggurat/build/debugger_builds` to the service
+/// (`BuildService.setPolicy`); they apply at the next build. Main thread.
+fn passPolicy(st: *State) void {
+    st.svc.setPolicy(backendOverride(), debuggerBuilds());
+}
+
+/// Reads the build settings again (`passPolicy`), for the editor plugin
+/// when the editor settings change: an unknown backend value warns then,
+/// not only at the next build. Main thread.
+pub fn readBuildSettings() void {
+    const st = if (state) |*s| s else return;
+    passPolicy(st);
+}
+
+/// The build service's warm state (the incremental server), or null
+/// without a service. Main thread.
+pub fn warmState() ?zbuild.service.WarmState {
+    const st = state orelse return null;
+    return st.svc.stats().warm;
 }
 
 /// Registers the editor setting `name` with default `value` (consumed)
@@ -624,6 +703,7 @@ pub fn stop() void {
     last_applied = null;
     good_n = null;
     open_pending = false;
+    open_early = false;
 }
 
 /// True while a requested build runs a compiler (for the host tests).
@@ -1040,6 +1120,9 @@ pub fn exportInputs(a: Allocator, project: []const u8, msg: *std.ArrayList(u8)) 
 
 /// Set while the build at open is not requested yet. Main thread.
 var open_pending = false;
+/// Set when the build at open was requested before the editor existed, so
+/// without the editor's build settings, until `editorReady`. Main thread.
+var open_early = false;
 
 /// True when the project setting `ziggurat/zig_path` is not empty.
 fn projectZigSet() bool {
@@ -1052,15 +1135,24 @@ fn projectZigSet() bool {
 fn requestOpen(_: ?*anyopaque) void {
     if (!open_pending) return;
     open_pending = false;
+    if (editorSettings()) |es| releaseRef(es) else open_early = true;
     requestBuild(.open);
 }
 
 /// The editor exists (the editor plugin entered the tree): registers the
-/// editor setting and requests the build at open if it still waits for
-/// the editor setting. Main thread.
+/// editor settings and requests the build at open if it still waits for
+/// the editor setting. When the build at open was requested before the
+/// editor existed (the project setting `ziggurat/zig_path` is set), it ran
+/// without the editor's build settings: when debugger builds are on or
+/// the backend setting is not `auto`, one more build at open follows with
+/// them. Main thread.
 pub fn editorReady() void {
     registerEditorSettings();
     requestOpen(null);
+    if (open_early) {
+        open_early = false;
+        if (debuggerBuilds() or backendOverride() != null) requestBuild(.open);
+    }
 }
 
 /// The per-user folders and `PATH` as the Zig locator and the path service

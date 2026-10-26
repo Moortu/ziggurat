@@ -50,6 +50,10 @@ pub const ExportLink = struct {
     version_script: OsPath,
     /// Library name: the compiler writes `lib<name>.so`.
     name: []const u8,
+    /// `-fstrip`: no debug information, so the bytes do not depend on the
+    /// project's folder. False gives `-fno-strip` (a debug export): the
+    /// library keeps its debug information, with absolute paths.
+    strip: bool = true,
 };
 
 pub const Workspace = struct {
@@ -97,8 +101,8 @@ pub const Workspace = struct {
     /// The compiler command line of an exported game's library (spec
     /// section 10): the generated root and the SDK compiled for
     /// `link.target`, non-incremental, LLVM, ReleaseSafe, without debug
-    /// information (it holds absolute paths, so the same project in two
-    /// folders would give different bytes), linked with the export host
+    /// information unless `link.strip` is false (it holds absolute paths, so
+    /// the same project in two folders would give different bytes), linked with the export host
     /// archive into one shared library that exports only
     /// `ziggurat_host_init`. Run it with `build_dir` as the working folder.
     /// Free with `freeArgv`, or use an arena.
@@ -119,7 +123,7 @@ pub const Workspace = struct {
         try push(a, &out, "ziggurat_host_init", .{});
         try push(a, &out, "{s}", .{link.host_archive.bytes});
         // `-target`, `-O` and `-fstrip` are per-module options.
-        try self.pushModules(a, &out, &.{ "-target", link.target, optFlag(.ReleaseSafe), "-fstrip" });
+        try self.pushModules(a, &out, &.{ "-target", link.target, optFlag(.ReleaseSafe), if (link.strip) "-fstrip" else "-fno-strip" });
         return out.toOwnedSlice(a);
     }
 
@@ -711,6 +715,24 @@ test "export argv golden" {
     try expectArgv(want, got);
     // Never incremental.
     for (got) |arg| try testing.expect(!std.mem.eql(u8, arg, "-fincremental"));
+
+    // A debug export: the same, with `-fno-strip` in place of `-fstrip`.
+    const debug = try ws.exportArgv(arena, dummyZig(), .{
+        .target = "x86_64-linux-gnu.2.28",
+        .host_archive = .fromTrusted("/a/libziggurat_host_export.a"),
+        .version_script = .fromTrusted("/c/projects/p/build/export.map"),
+        .name = "ziggurat_game",
+        .strip = false,
+    });
+    try testing.expectEqual(want.len, debug.len);
+    var no_strip: usize = 0;
+    for (want, debug) |w, d| {
+        if (std.mem.eql(u8, w, "-fstrip")) {
+            try testing.expectEqualStrings("-fno-strip", d);
+            no_strip += 1;
+        } else try testing.expectEqualStrings(w, d);
+    }
+    try testing.expectEqual(@as(usize, 3), no_strip);
 }
 
 test "prepare writes the given build id" {

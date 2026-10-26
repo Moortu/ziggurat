@@ -22,7 +22,10 @@
 //!     the editor library (`archive_file`), and the editor's per-user cache
 //!     folder, so it takes turns with editor builds on the project's
 //!     `build.lock`; it writes the library only when the build and the
-//!     library's checks pass.
+//!     library's checks pass. A release export builds it without debug
+//!     information (deterministic); a debug export (Godot's `is_debug`,
+//!     `--export-debug`) keeps it (`export_build.Options.strip` false)
+//!     and logs `debug_export_line`.
 //!   - without Zig scripts, it copies the add-on's empty game library
 //!     (`empty_lib_file`, next to the editor library: the export host
 //!     linked with no scripts), so such a project exports without Zig.
@@ -76,6 +79,8 @@ const export_build = zbuild.export_build;
 pub const plugin_name = "Ziggurat";
 /// The error message for a preset that is not Linux x86_64.
 pub const platform_message = "Ziggurat exports Linux x86_64 only in this version";
+/// The log line of a debug export with Zig scripts.
+pub const debug_export_line = "Ziggurat: debug export keeps debug information; this library is not reproducible.";
 /// Where the export writes the game library; the `.gdextension`'s template
 /// keys name this path.
 pub const lib_rel = ".godot/ziggurat/export/linux.x86_64/" ++ export_build.lib_file;
@@ -127,8 +132,8 @@ pub const ZigExportPlugin = struct {
         return true;
     }
 
-    pub fn _exportBegin(self: *ZigExportPlugin, features: PackedStringArray, _: bool, path: String, _: u32) void {
-        exportBegin(self, &features, &path);
+    pub fn _exportBegin(self: *ZigExportPlugin, features: PackedStringArray, is_debug: bool, path: String, _: u32) void {
+        exportBegin(self, &features, is_debug, &path);
     }
 
     pub fn _exportEnd(self: *ZigExportPlugin) void {
@@ -184,7 +189,7 @@ const ZipCheck = struct {
     }
 };
 
-fn exportBegin(self: *ZigExportPlugin, features: *const PackedStringArray, path: *const String) void {
+fn exportBegin(self: *ZigExportPlugin, features: *const PackedStringArray, is_debug: bool, path: *const String) void {
     if (self.zip_check) |c| c.deinit();
     self.zip_check = null;
     // A `Ref` return: the reference is the caller's.
@@ -204,7 +209,7 @@ fn exportBegin(self: *ZigExportPlugin, features: *const PackedStringArray, path:
     const kind = export_build.outputKind(out_path);
     // A pack export does not fail on these errors, so they do not say so.
     const r: Reporter = .{ .platform = plat, .note = if (kind == .pack) "" else incomplete_note };
-    const has_scripts = buildGameLibrary(a, r, kind, out_path) catch blk: {
+    const has_scripts = buildGameLibrary(a, r, kind, out_path, is_debug) catch blk: {
         r.fail("Ziggurat cannot build the game library for the export: out of memory.", .{});
         break :blk false;
     };
@@ -245,8 +250,10 @@ fn checkZip(self: *ZigExportPlugin, c: ZipCheck) void {
 }
 
 /// Builds or copies the game library for a Linux x86_64 export to
-/// `out_path`. True when the project has Zig scripts.
-fn buildGameLibrary(a: Allocator, r: Reporter, kind: export_build.OutputKind, out_path: []const u8) Allocator.Error!bool {
+/// `out_path`. True when the project has Zig scripts. A debug export
+/// (`is_debug`) builds the library with its debug information
+/// (`export_build.Options.strip` false) and logs `debug_export_line`.
+fn buildGameLibrary(a: Allocator, r: Reporter, kind: export_build.OutputKind, out_path: []const u8, is_debug: bool) Allocator.Error!bool {
     const io = host_io.get();
     const cwd = std.Io.Dir.cwd();
     var msg: std.ArrayList(u8) = .empty;
@@ -333,6 +340,7 @@ fn buildGameLibrary(a: Allocator, r: Reporter, kind: export_build.OutputKind, ou
     }
 
     log("Ziggurat: building the game library for the export ({d} Zig scripts, Zig {s} at {s})...", .{ sc.scripts.len, in.zig.version, in.zig.exe.bytes });
+    if (is_debug) log("{s}", .{debug_export_line});
     const t0 = std.Io.Clock.awake.now(io);
     var diag: [256]u8 = undefined;
     const res = export_build.run(gpa, io, .{
@@ -343,6 +351,7 @@ fn buildGameLibrary(a: Allocator, r: Reporter, kind: export_build.OutputKind, ou
         .out_path = out,
         .cache_dir = in.cache_dir,
         .lock_timeout_ms = lock_timeout_ms,
+        .strip = !is_debug,
     }, &diag) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {

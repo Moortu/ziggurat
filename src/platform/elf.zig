@@ -208,13 +208,14 @@ const Sections = struct {
         return .{ .bytes = bytes, .shoff = eh.shoff, .shnum = shnum };
     }
 
-    const Header = struct { sh_type: u32, offset: u64, size: u64, link: u32, info: u32, entsize: u64 };
+    const Header = struct { name: u32, sh_type: u32, offset: u64, size: u64, link: u32, info: u32, entsize: u64 };
 
     fn header(s: Sections, i: u64) Header {
         // In range: `init` checked the whole table.
         const off: usize = @intCast(s.shoff + i * shdr_size);
         const h = s.bytes[off..][0..shdr_size];
         return .{
+            .name = std.mem.readInt(u32, h[0..4], .little),
             .sh_type = std.mem.readInt(u32, h[4..8], .little),
             .offset = std.mem.readInt(u64, h[24..32], .little),
             .size = std.mem.readInt(u64, h[32..40], .little),
@@ -259,6 +260,25 @@ pub fn dynamicSymbols(a: std.mem.Allocator, bytes: []const u8) (ElfError || std.
         }
     }
     return out.toOwnedSlice(a);
+}
+
+/// Whether the 64-bit little-endian ELF image `bytes` has a section named
+/// `name` (looked up in the section name table, `e_shstrndx`). False when
+/// the image has no section name table.
+pub fn hasSection(bytes: []const u8, name: []const u8) ElfError!bool {
+    const secs = try Sections.init(bytes);
+    if (secs.shnum == 0) return false;
+    var shstrndx: u64 = std.mem.readInt(u16, bytes[62..64], .little);
+    // SHN_XINDEX: the real index is sh_link of section header 0.
+    if (shstrndx == 0xffff) shstrndx = secs.header(0).link;
+    if (shstrndx == 0) return false;
+    if (shstrndx >= secs.shnum) return error.Corrupt;
+    const names = try secs.data(secs.header(shstrndx));
+    var i: u64 = 0;
+    while (i < secs.shnum) : (i += 1) {
+        if (std.mem.eql(u8, try strAt(names, secs.header(i).name), name)) return true;
+    }
+    return false;
 }
 
 /// The symbol version names the image needs (`.gnu.version_r` auxiliary
@@ -591,4 +611,27 @@ test "integration: elf truncated" {
     try std.testing.expectError(error.Truncated, checkBytes(bytes[0 .. bytes.len / 2], &diag));
     try std.testing.expect(diagText(&diag).len > 0);
     try std.testing.expectError(error.Truncated, checkBytes(bytes[0..@intCast(shoff)], &diag));
+}
+
+test "elf hasSection reads section names" {
+    var b = SymImage.build();
+    // No section name table: no section has a name.
+    try std.testing.expect(!try hasSection(&b, "foo"));
+    // Section 1 (the strings) is the name table; sections 2 and 3 are named
+    // "foo" and "bar".
+    put(&b, 62, u16, 1);
+    put(&b, SymImage.field(2, 0), u32, 1);
+    put(&b, SymImage.field(3, 0), u32, 5);
+    try std.testing.expect(try hasSection(&b, "foo"));
+    try std.testing.expect(try hasSection(&b, "bar"));
+    try std.testing.expect(!try hasSection(&b, ".debug_info"));
+    try std.testing.expect(!try hasSection(&b, "fo"));
+    // A name offset past the table is corrupt; so is a table index past the
+    // section count.
+    put(&b, SymImage.field(3, 0), u32, 4096);
+    try std.testing.expectError(error.Corrupt, hasSection(&b, ".debug_info"));
+    put(&b, SymImage.field(3, 0), u32, 5);
+    put(&b, 62, u16, 9);
+    try std.testing.expectError(error.Corrupt, hasSection(&b, "foo"));
+    try std.testing.expectError(error.NotElf64, hasSection("nope", "foo"));
 }

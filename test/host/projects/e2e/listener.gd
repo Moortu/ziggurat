@@ -13,8 +13,9 @@ extends Node
 #   the same instance while its method runs);
 # - object metadata on a node with a Zig script still works.
 # Prints one ZTEST line per case. Headless, it then prints ZTEST DONE and
-# quits. With the environment variable ZTEST_GUI set (the GUI test), the game
-# keeps running so the editor can save a script while it runs.
+# quits. With the environment variable ZTEST_GUI set (the GUI test and the
+# host test "debugger builds: toggling during a session"), the game keeps
+# running so the editor can change a script while it runs.
 
 var hits := []
 var signal_hits := []
@@ -132,3 +133,12 @@ func _process(_delta: float) -> void:
 	if text != last_watch:
 		last_watch = text
 		print(text)
+		# Host test "debugger builds: toggling during a session": the
+		# editor's check reads the game's lines from this file.
+		var path := OS.get_environment("ZTEST_GAME_LOG")
+		if path != "":
+			var f := FileAccess.open(path, FileAccess.READ_WRITE if FileAccess.file_exists(path) else FileAccess.WRITE)
+			if f != null:
+				f.seek_end()
+				f.store_line(text)
+				f.close()
