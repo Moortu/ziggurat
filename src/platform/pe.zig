@@ -290,9 +290,15 @@ pub const Image = struct {
     }
 
     /// The NUL-terminated string at `rva`, without the NUL.
-    fn string(self: Image, rva: u32) Error![]const u8 {
+    /// The scan stops after `max_name_len + 1` bytes, so many entries
+    /// naming one long string cost time linear in the file size:
+    /// `error.TooLarge` when no NUL is found within that, `error.BadHeader`
+    /// when the raw data ends first.
+    fn string(self: Image, rva: u32) (Error || error{TooLarge})![]const u8 {
         const t = self.tail(rva) orelse return error.BadHeader;
-        const end = std.mem.indexOfScalar(u8, t, 0) orelse return error.BadHeader;
+        const window = t[0..@min(t.len, max_name_len + 1)];
+        const end = std.mem.indexOfScalar(u8, window, 0) orelse
+            return if (t.len > max_name_len) error.TooLarge else error.BadHeader;
         return t[0..end];
     }
 };
@@ -647,4 +653,30 @@ test "forged files: raw bytes past the virtual size are not read" {
     std.mem.writeInt(u32, b[0x58 + 240 + 8 ..][0..4], 0x40, .little);
     try std.testing.expectError(error.BadHeader, exports(a, b));
     try std.testing.expect((try Image.parse(b)).section(1) == null);
+}
+
+test "forged files: the NUL scan stops after max_name_len + 1 bytes" {
+    const a = std.testing.allocator;
+    const b = try forge(a, 0x10000);
+    defer a.free(b);
+    const img = try Image.parse(b);
+    // A name of exactly the cap, then its NUL: accepted.
+    @memset(b[at(0x1000)..][0..max_name_len], 'n');
+    try std.testing.expectEqual(@as(usize, max_name_len), (try img.string(0x1000)).len);
+    // One byte longer: TooLarge.
+    b[at(0x1000) + max_name_len] = 'n';
+    try std.testing.expectError(error.TooLarge, img.string(0x1000));
+    // 60 KiB with no NUL up to the end of the raw data: TooLarge, found
+    // after the cap, not after a scan to the end.
+    @memset(b[at(0x1000)..], 'n');
+    try std.testing.expectError(error.TooLarge, img.string(0x1000));
+    // A short string cut by the end of the raw data: BadHeader.
+    try std.testing.expectError(error.BadHeader, img.string(0x1000 + 0x10000 - 3));
+
+    // An import descriptor whose DLL name is longer than the cap: point
+    // its Name at the long function name.
+    const im = try forgeImports(a, 1, max_name_len + 10, 40);
+    defer a.free(im);
+    put32(im, 0x1000 + 12, 0x1200 + 2);
+    try std.testing.expectError(error.TooLarge, imports(a, im));
 }
