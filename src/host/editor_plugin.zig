@@ -54,7 +54,9 @@
 //! setting `ziggurat/build/check_interval_seconds` is above 0, at that
 //! interval, the plugin asks for a `watcher` build that the service runs
 //! only when a script or helper file changed since the last build
-//! (`editor_build.requestIfChanged`).
+//! (`editor_build.requestIfChanged`). With the setting at 0 it asks every
+//! 2 s while a game runs from the editor (`running_check_ms`; a debugger
+//! session is active), since the editor window then has no focus.
 //!
 //! Build on Play (`_build`: Godot calls it on the main thread when Play is
 //! pressed, after it saved the open scenes and scripts, and the run waits
@@ -98,6 +100,10 @@ const ScriptEditorBase = godot.class.ScriptEditorBase;
 const EditorInterface = godot.class.EditorInterface;
 const ZigPanel = editor_panel.ZigPanel;
 
+/// Milliseconds between the checks for changed files while a game runs and
+/// the interval setting is 0.
+pub const running_check_ms: i64 = 2000;
+
 pub const menu_build = "Build Zig Scripts";
 pub const menu_download = "Download Zig 0.17.0";
 
@@ -118,6 +124,8 @@ pub const ZigEditorPlugin = struct {
     check_interval_ms: i64 = 0,
     /// Awake-clock milliseconds of the last interval check.
     last_check_ms: i64 = 0,
+    /// Awake-clock milliseconds of the last check while a game runs.
+    last_run_check_ms: i64 = 0,
     /// `zig_download.changes` / `completions` / `failures` handled.
     seen_download: u32 = 0,
     seen_completions: u32 = 0,
@@ -228,6 +236,15 @@ pub const ZigEditorPlugin = struct {
             if (now - self.last_check_ms >= self.check_interval_ms) {
                 self.last_check_ms = now;
                 editor_build.requestIfChanged(.watcher);
+            }
+        } else {
+            // The interval is off: while a game runs, look every
+            // `running_check_ms`, because the editor window may have no
+            // focus (the game has it) and focus-in never comes.
+            const now = nowMs();
+            if (now - self.last_run_check_ms >= running_check_ms) {
+                self.last_run_check_ms = now;
+                if (debugger_plugin.sessionActive()) editor_build.requestIfChanged(.watcher);
             }
         }
         zig_download.tick();

@@ -19,7 +19,8 @@
 //!   `registerEditorSettings`): `ziggurat/zig_path` (the Zig path),
 //!   `ziggurat/editor/indent_with_spaces` (`.zig` tabs indent with spaces),
 //!   `ziggurat/build/check_interval_seconds` (how often files changed
-//!   outside the editor are looked for; 0 = only at focus-in),
+//!   outside the editor are looked for; 0 = only at focus-in, and every
+//!   2 s while a game runs from the editor),
 //!   `ziggurat/build/debugger_builds` (every build LLVM, non-incremental
 //!   and Debug, for lldb; no incremental server) and
 //!   `ziggurat/build/backend` (an override of the backend policy for the

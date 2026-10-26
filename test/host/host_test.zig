@@ -2887,6 +2887,36 @@ test "debugger builds: toggling during a session" {
     });
 }
 
+// The editor (headless, so no focus-in ever reaches it) plays the e2e
+// project's main scene with the check interval at 0; the check rewrites
+// res://hero.zig without requesting a build and the running game must
+// print the new score within 10 s (test/host/checks/change_check.gd).
+test "change check: external edit reaches a running game without focus" {
+    try requireIntegration();
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("e2e");
+    defer p.deinit();
+    const a = p.arena_state.allocator();
+    try addBuildSettings(&p);
+    try isolateUserFolders(&p);
+    const root = try p.tmp.dir.realPathFileAlloc(io, ".", a);
+    try p.env.?.put("ZTEST_GUI", "1");
+    try p.env.?.put("ZTEST_GAME_LOG", try std.fs.path.join(a, &.{ root, "game.log" }));
+    try p.addAutoloadCheck("change_check.gd");
+    try p.runEditorChecked("100000000", .{
+        .expect = &.{
+            "ZTEST PASS change_interval_zero",
+            "ZTEST PASS change_session_warm",
+            "ZTEST PASS change_game_running",
+            "ZTEST PASS change_game_new_code_without_focus",
+            "build service stopped (0 threads left)",
+        },
+        .reject = &.{ refused_prefix, "Program crashed" },
+        .deadline = build_deadline_s,
+    });
+}
+
 /// The absolute path of `lldb` on `PATH`, or null.
 fn findLldb(a: std.mem.Allocator) !?[]const u8 {
     const which = try std.process.run(a, io, .{ .argv = &.{ "sh", "-c", "command -v lldb" } });

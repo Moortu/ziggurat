@@ -139,6 +139,26 @@ pub fn sendReload(n: u32) void {
     sendNow(plugin, n);
 }
 
+/// True while a game the editor runs has an active debugger session. Asks
+/// Godot each time, so it is false as soon as the session ends and without
+/// the plugin. Main thread.
+pub fn sessionActive() bool {
+    if (comptime host_options.export_build) return false;
+    const plugin = current orelse return false;
+    var sessions = plugin.base.getSessions();
+    defer sessions.deinit();
+    const len: usize = @intCast(@max(sessions.size(), 0));
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        var v = sessions.get(@intCast(i));
+        defer v.deinit();
+        const o = v.as(*Object) orelse continue;
+        const s = EditorDebuggerSession.downcast(o) orelse continue;
+        if (s.isActive()) return true;
+    }
+    return false;
+}
+
 /// Sends generation `last` (none when null) on every active session of
 /// `plugin`.
 fn sendNow(plugin: *ZigDebuggerPlugin, last: ?u32) void {
