@@ -81,6 +81,9 @@ pub fn build(b: *std.Build) void {
     });
     const staged_sdk = blk: {
         const run = b.addRunArtifact(stage_tool);
+        // The output folder is in the build cache and an interrupted run
+        // may have left it half-filled: the tool replaces it.
+        run.addArg("--replace");
         const out = run.addOutputDirectoryArg("sdk");
         addStageModules(b, run, sdk);
         break :blk out;
@@ -1212,6 +1215,13 @@ fn addTestSet(
         .optimize = optimize,
     });
 
+    // The SDK stage tool's folder handling imports only std.
+    const sdk_stage_tool = b.createModule(.{
+        .root_source_file = b.path("tools/sdk_stage.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // gdzig's class checks (vendor/gdzig/PATCHES.md, patch 4) import only
     // std; their tests also cover gdzig's singleton-owner lookup.
     const class_kind = b.createModule(.{
@@ -1230,7 +1240,7 @@ fn addTestSet(
         .imports = &.{.{ .name = "ziggurat_platform", .module = platform }},
     });
 
-    for ([_]*std.Build.Module{ platform, build_mod, abi, snake, fmtlog, host_version, output_scan, host_std[0], host_std[1], host_std[2], host_std[3], host_std[4], host_manifest, class_kind, ar_normalize }) |mod| {
+    for ([_]*std.Build.Module{ platform, build_mod, abi, snake, fmtlog, host_version, output_scan, host_std[0], host_std[1], host_std[2], host_std[3], host_std[4], host_manifest, class_kind, ar_normalize, sdk_stage_tool }) |mod| {
         const t = b.addTest(.{ .root_module = mod });
         if (run) {
             step.dependOn(&b.addRunArtifact(t).step);

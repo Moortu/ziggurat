@@ -1,7 +1,7 @@
 //! Build tool: stages the shipped SDK (spec section 1), the folder that
 //! goes into a project as `addons/ziggurat/sdk/`.
 //!
-//! Usage: sdk_stage <out dir> <sdk_version> (<name> <root> <deps> <strip>)...
+//! Usage: sdk_stage [--replace] <out dir> <sdk_version> (<name> <root> <deps> <strip>)...
 //!
 //! `<deps>` is a comma-separated list of module names (empty for none).
 //! `<strip>` is `none`, `docs` (lines that hold only a `///` doc comment
@@ -36,19 +36,26 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const gpa = init.gpa;
     const io = init.io;
-    const args = try init.minimal.args.toSlice(arena);
+    const all_args = try init.minimal.args.toSlice(arena);
+    var args = all_args;
+    var mode: Mode = .user_folder;
+    if (all_args.len > 1 and std.mem.eql(u8, all_args[1], replace_flag)) {
+        mode = .cache_folder;
+        args = try std.mem.concat(arena, [:0]const u8, &.{ all_args[0..1], all_args[2..] });
+    }
     if (args.len < 3 or (args.len - 3) % 4 != 0) {
-        std.debug.print("usage: sdk_stage <out dir> <sdk_version> (<name> <root> <deps> <none|docs|comments>)...\n", .{});
+        std.debug.print("usage: sdk_stage [--replace] <out dir> <sdk_version> (<name> <root> <deps> <none|docs|comments>)...\n", .{});
         std.process.exit(2);
     }
     const cwd = Io.Dir.cwd();
-    try cwd.createDirPath(io, args[1]);
-    var out = try cwd.openDir(io, args[1], .{ .iterate = true });
+    var held: [Io.Dir.max_name_bytes]u8 = undefined;
+    var staging = begin(gpa, io, args[1], mode, &held) catch |err| switch (err) {
+        error.NotEmpty => fail("the output folder {s} is not empty (it holds {s})", .{ args[1], std.mem.sliceTo(&held, 0) }),
+        else => fail("cannot prepare the output folder {s} ({t})", .{ args[1], err }),
+    };
+    defer staging.deinit(gpa);
+    var out = try cwd.openDir(io, staging.stage_path, .{ .iterate = true });
     defer out.close(io);
-    {
-        var it = out.iterate();
-        if (try it.next(io)) |entry| fail("the output folder {s} is not empty (it holds {s})", .{ args[1], entry.name });
-    }
 
     var modules: std.ArrayList(Module) = .empty;
     var i: usize = 3;
@@ -78,6 +85,95 @@ pub fn main(init: std.process.Init) !void {
     };
     const json = try std.json.Stringify.valueAlloc(arena, manifest, .{ .whitespace = .indent_2 });
     try out.writeFile(io, .{ .sub_path = "sdk-manifest.json", .data = json });
+    out.close(io);
+    out = undefined;
+    try staging.finish(io);
+}
+
+/// The first argument that makes the tool replace its output folder.
+const replace_flag = "--replace";
+
+const Mode = enum {
+    /// A folder the user named: it must be missing or empty and is filled
+    /// in place.
+    user_folder,
+    /// The output folder of a cached build step: the build system made it,
+    /// it may hold what an interrupted run left, and nobody else uses it.
+    /// The tool stages into a fresh sibling and swaps it in at the end.
+    cache_folder,
+};
+
+/// Where a run writes: `stage_path` is `final_path` itself (user folder)
+/// or a fresh sibling folder that `finish` swaps in (cache folder).
+const Staging = struct {
+    final_path: []const u8,
+    stage_path: []const u8,
+    swap: bool,
+
+    fn deinit(self: *Staging, gpa: std.mem.Allocator) void {
+        if (self.swap) gpa.free(self.stage_path);
+    }
+
+    /// Swaps a finished stage folder in: the old output folder (whatever
+    /// an interrupted run left in it) goes first, then the stage folder is
+    /// renamed. An interruption between the two leaves no output folder,
+    /// which the next run makes again.
+    fn finish(self: *Staging, io: Io) !void {
+        if (!self.swap) return;
+        const cwd = Io.Dir.cwd();
+        try cwd.deleteTree(io, self.final_path);
+        try cwd.rename(self.stage_path, cwd, self.final_path, io);
+    }
+};
+
+/// Infix of the stage folder's name: `<out>.tmp-<16 hex digits>`.
+const tmp_infix = ".tmp-";
+
+/// Prepares the output folder. `held` receives the name of the first entry
+/// of a user folder that is not empty (zero-terminated).
+fn begin(gpa: std.mem.Allocator, io: Io, out_path: []const u8, mode: Mode, held: *[Io.Dir.max_name_bytes]u8) !Staging {
+    const cwd = Io.Dir.cwd();
+    switch (mode) {
+        .user_folder => {
+            try cwd.createDirPath(io, out_path);
+            var out = try cwd.openDir(io, out_path, .{ .iterate = true });
+            defer out.close(io);
+            var it = out.iterate();
+            if (try it.next(io)) |entry| {
+                @memset(held, 0);
+                @memcpy(held[0..entry.name.len], entry.name);
+                return error.NotEmpty;
+            }
+            return .{ .final_path = out_path, .stage_path = out_path, .swap = false };
+        },
+        .cache_folder => {
+            const final = std.mem.trimEnd(u8, out_path, "/");
+            const parent_path = std.fs.path.dirname(final) orelse ".";
+            const base = std.fs.path.basename(final);
+            try cwd.createDirPath(io, parent_path);
+            var parent = try cwd.openDir(io, parent_path, .{ .iterate = true });
+            defer parent.close(io);
+            // Stage folders of earlier runs that were interrupted.
+            const prefix = try std.fmt.allocPrint(gpa, "{s}{s}", .{ base, tmp_infix });
+            defer gpa.free(prefix);
+            var stale: std.ArrayList([]u8) = .empty;
+            defer {
+                for (stale.items) |n| gpa.free(n);
+                stale.deinit(gpa);
+            }
+            var it = parent.iterate();
+            while (try it.next(io)) |entry| {
+                if (std.mem.startsWith(u8, entry.name, prefix)) try stale.append(gpa, try gpa.dupe(u8, entry.name));
+            }
+            for (stale.items) |n| try parent.deleteTree(io, n);
+            var random: [8]u8 = undefined;
+            io.random(&random);
+            const stage = try std.fmt.allocPrint(gpa, "{s}{s}{x}", .{ final, tmp_infix, random });
+            errdefer gpa.free(stage);
+            try cwd.createDirPath(io, stage);
+            return .{ .final_path = final, .stage_path = stage, .swap = true };
+        },
+    }
 }
 
 fn fail(comptime fmt: []const u8, args: anytype) noreturn {
@@ -187,4 +283,100 @@ fn dropLine(line: []const u8, strip: Strip) bool {
         .docs => std.mem.startsWith(u8, t, "///") and !std.mem.startsWith(u8, t, "////"),
         .comments => std.mem.startsWith(u8, t, "//"),
     };
+}
+
+const testing = std.testing;
+
+fn tmpPath(buf: []u8, tmp: *const testing.TmpDir, rest: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, rest }) catch unreachable;
+}
+
+test "a cache folder left half-filled by an interrupted run is replaced" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "o/h1/sdk/gdzig");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "o/h1/sdk/gdzig/half.zig", .data = "old" });
+    var pb: [256]u8 = undefined;
+    const out_path = tmpPath(&pb, &tmp, "o/h1/sdk");
+    var held: [Io.Dir.max_name_bytes]u8 = undefined;
+
+    var staging = try begin(testing.allocator, testing.io, out_path, .cache_folder, &held);
+    defer staging.deinit(testing.allocator);
+    const file = try std.fmt.allocPrint(testing.allocator, "{s}/sdk-manifest.json", .{staging.stage_path});
+    defer testing.allocator.free(file);
+    try Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = file, .data = "new" });
+    try staging.finish(testing.io);
+
+    const got = try tmp.dir.readFileAlloc(testing.io, "o/h1/sdk/sdk-manifest.json", testing.allocator, .limited(100));
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("new", got);
+    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "o/h1/sdk/gdzig", .{}));
+    // Only the swapped-in folder is left next to the others.
+    var n: usize = 0;
+    var d = try tmp.dir.openDir(testing.io, "o/h1", .{ .iterate = true });
+    defer d.close(testing.io);
+    var it = d.iterate();
+    while (try it.next(testing.io)) |_| n += 1;
+    try testing.expectEqual(@as(usize, 1), n);
+}
+
+test "a cache folder that is missing is made" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "o/h1");
+    var pb: [256]u8 = undefined;
+    const out_path = tmpPath(&pb, &tmp, "o/h1/sdk");
+    var held: [Io.Dir.max_name_bytes]u8 = undefined;
+    var staging = try begin(testing.allocator, testing.io, out_path, .cache_folder, &held);
+    defer staging.deinit(testing.allocator);
+    try staging.finish(testing.io);
+    try tmp.dir.access(testing.io, "o/h1/sdk", .{});
+}
+
+test "temporary folders of earlier interrupted runs do not matter and are removed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "o/h1/sdk.tmp-0123456789abcdef/gdzig");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "o/h1/sdk.tmp-0123456789abcdef/gdzig/x.zig", .data = "x" });
+    try tmp.dir.createDirPath(testing.io, "o/h1/other");
+    var pb: [256]u8 = undefined;
+    const out_path = tmpPath(&pb, &tmp, "o/h1/sdk");
+    var held: [Io.Dir.max_name_bytes]u8 = undefined;
+    var staging = try begin(testing.allocator, testing.io, out_path, .cache_folder, &held);
+    defer staging.deinit(testing.allocator);
+    try staging.finish(testing.io);
+    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "o/h1/sdk.tmp-0123456789abcdef", .{}));
+    try tmp.dir.access(testing.io, "o/h1/other", .{});
+    try tmp.dir.access(testing.io, "o/h1/sdk", .{});
+}
+
+test "a user folder that is not empty is refused and left alone" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "mine");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "mine/precious.txt", .data = "keep" });
+    var pb: [256]u8 = undefined;
+    const out_path = tmpPath(&pb, &tmp, "mine");
+    var held: [Io.Dir.max_name_bytes]u8 = undefined;
+    try testing.expectError(error.NotEmpty, begin(testing.allocator, testing.io, out_path, .user_folder, &held));
+    try testing.expectEqualStrings("precious.txt", std.mem.sliceTo(&held, 0));
+    const got = try tmp.dir.readFileAlloc(testing.io, "mine/precious.txt", testing.allocator, .limited(100));
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("keep", got);
+}
+
+test "a user folder that is missing or empty is filled in place" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "empty");
+    var pb: [256]u8 = undefined;
+    var held: [Io.Dir.max_name_bytes]u8 = undefined;
+    for ([_][]const u8{ "empty", "missing/deeper" }) |rel| {
+        const out_path = tmpPath(&pb, &tmp, rel);
+        var staging = try begin(testing.allocator, testing.io, out_path, .user_folder, &held);
+        defer staging.deinit(testing.allocator);
+        try testing.expectEqualStrings(out_path, staging.stage_path);
+        try staging.finish(testing.io);
+        try tmp.dir.access(testing.io, rel, .{});
+    }
 }
