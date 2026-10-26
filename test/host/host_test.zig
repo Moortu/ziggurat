@@ -3593,6 +3593,38 @@ test "export: a case collision fails the export" {
     try testing.expect(!try projectFileExists(&p, "out/libziggurat_game.so"));
 }
 
+test "export: a foreign SDK version fails the export" {
+    try requireTemplates();
+    var p: Project = undefined;
+    try initExport(&p, null);
+    defer p.deinit();
+    const a = p.arena_state.allocator();
+    // A copy of the build's manifest (its module roots are absolute) that
+    // claims another SDK version, kept next to the project.
+    const manifest = try Io.Dir.cwd().realPathFileAlloc(io, opts.sdk_manifest_path, a);
+    const text = try Io.Dir.cwd().readFileAlloc(io, manifest, a, .limited(1 << 20));
+    const old_field = try std.fmt.allocPrint(a, "\"sdk_version\": \"{s}\"", .{sdk_options.sdk_version});
+    if (std.mem.indexOf(u8, text, old_field) == null) return error.NoSdkVersionField;
+    const foreign = try std.mem.replaceOwned(u8, a, text, old_field, "\"sdk_version\": \"9.9.9\"");
+    try writeProjectFile(&p, "foreign-sdk-manifest.json", foreign);
+    const copy = try std.fs.path.join(a, &.{ p.path, "foreign-sdk-manifest.json" });
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+    defer dir.close(io);
+    const cfg = try dir.readFileAlloc(io, "project.godot", a, .limited(64 * 1024));
+    const swapped = try std.mem.replaceOwned(u8, a, cfg, manifest, copy);
+    if (std.mem.eql(u8, swapped, cfg)) return error.SettingNotFound;
+    try dir.writeFile(io, .{ .sub_path = "project.godot", .data = swapped });
+
+    const sentence = try std.fmt.allocPrint(a, "Ziggurat cannot export: the SDK at {s} is version 9.9.9, but this add-on's export library (addons/ziggurat/bin/libziggurat_host_export.a) needs SDK version {s}. Clear the project setting ziggurat/dev/sdk_manifest, or install the add-on that matches the SDK.", .{ copy, sdk_options.sdk_version });
+    try exportGame(&p, .{
+        .expect = &.{ sentence, export_incomplete },
+        .reject = &.{export_building},
+        .exit_code = "1",
+    });
+    try testing.expect(!try projectFileExists(&p, game_lib_rel));
+    try testing.expect(!try projectFileExists(&p, "out/libziggurat_game.so"));
+}
+
 test "export: project without Zig scripts exports" {
     try requireTemplates();
     var p: Project = undefined;

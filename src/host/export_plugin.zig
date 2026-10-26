@@ -59,6 +59,7 @@ const editor_build = @import("editor_build.zig");
 const entry = @import("entry.zig");
 const host_io = @import("host_io.zig");
 const props = @import("props.zig");
+const sdk_options = @import("sdk_options");
 
 const Allocator = std.mem.Allocator;
 const String = godot.builtin.String;
@@ -80,7 +81,7 @@ pub const platform_message = "Ziggurat exports Linux x86_64 only in this version
 pub const lib_rel = ".godot/ziggurat/export/linux.x86_64/" ++ export_build.lib_file;
 pub const lib_res_path = "res://" ++ lib_rel;
 /// The add-on's export inputs, next to the editor library.
-pub const archive_file = "libziggurat_host_export.a";
+pub const archive_file = export_build.host_archive_file;
 pub const empty_lib_file = "libziggurat_game_empty.so";
 /// The end of every error after which the export fails: Godot has
 /// already written the game executable and its pack.
@@ -321,6 +322,15 @@ fn buildGameLibrary(a: Allocator, r: Reporter, kind: export_build.OutputKind, ou
             return true;
         },
     };
+
+    // A developer SDK of another version would build a library that the
+    // game refuses at load. The archive is the add-on's own, so its version
+    // is the running host's.
+    if (!std.mem.eql(u8, in.sdk_version, sdk_options.sdk_version)) {
+        const text = try export_build.sdkMismatchMessage(a, in.manifest_path, in.sdk_version, sdk_options.sdk_version, in.from_setting);
+        r.fail("{s}", .{text});
+        return true;
+    }
 
     log("Ziggurat: building the game library for the export ({d} Zig scripts, Zig {s} at {s})...", .{ sc.scripts.len, in.zig.version, in.zig.exe.bytes });
     const t0 = std.Io.Clock.awake.now(io);

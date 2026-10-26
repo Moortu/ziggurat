@@ -162,6 +162,10 @@ const State = struct {
     /// Holds every string and slice the service's `Config` borrows.
     arena: std.heap.ArenaAllocator,
     sdk: zbuild.sdk_manifest.Manifest,
+    /// The path `sdk` was loaded from, and whether the project setting
+    /// `ziggurat/dev/sdk_manifest` chose it. Held by `arena`.
+    sdk_path: []const u8,
+    sdk_from_setting: bool,
     /// The generation store's folder (`<project>/.godot/ziggurat`).
     store_root: []const u8,
     svc: *BuildService,
@@ -798,13 +802,14 @@ fn startService() Allocator.Error!void {
 
     var msg: std.ArrayList(u8) = .empty;
     defer msg.deinit(gpa);
-    var sdk = sdkManifest(gpa, a, &msg) catch |err| switch (err) {
+    const loaded = sdkManifest(gpa, a, &msg) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Unusable => {
             log("Ziggurat does not build Zig scripts: {s}", .{msg.items});
             return;
         },
     };
+    var sdk = loaded.manifest;
     var sdk_kept = false;
     defer if (!sdk_kept) sdk.deinit(gpa);
 
@@ -861,6 +866,8 @@ fn startService() Allocator.Error!void {
     state = .{
         .arena = arena_state,
         .sdk = sdk,
+        .sdk_path = loaded.path,
+        .sdk_from_setting = loaded.from_setting,
         .store_root = store_root,
         .svc = svc,
         .store = .init(gpa, io, .fromTrusted(store_root), @import("builtin").os.tag, zbuild.service.lib_stem, .{}),
@@ -881,10 +888,11 @@ fn startService() Allocator.Error!void {
 /// Loads the SDK manifest builds use: the one the project setting
 /// `ziggurat/dev/sdk_manifest` names (absolute), else the shipped SDK's
 /// (`shipped_sdk_manifest`, globalized) when that file exists. The
-/// manifest is allocated with `ga`, scratch text with `a`. On
+/// manifest is allocated with `ga`, scratch text (and the returned path)
+/// with `a`. On
 /// `error.Unusable` `msg` (allocated with `ga`) holds one sentence that
 /// starts in lower case and names what is missing or wrong. Main thread.
-fn sdkManifest(ga: Allocator, a: Allocator, msg: *std.ArrayList(u8)) error{ OutOfMemory, Unusable }!zbuild.sdk_manifest.Manifest {
+fn sdkManifest(ga: Allocator, a: Allocator, msg: *std.ArrayList(u8)) error{ OutOfMemory, Unusable }!LoadedSdk {
     const io = host_io.get();
     msg.clearRetainingCapacity();
     const set = try settingText(a, setting_sdk_manifest);
@@ -913,7 +921,7 @@ fn sdkManifest(ga: Allocator, a: Allocator, msg: *std.ArrayList(u8)) error{ OutO
     };
     var why: std.ArrayList(u8) = .empty;
     defer why.deinit(ga);
-    return zbuild.sdk_manifest.load(ga, io, .fromTrusted(path), &why) catch |err| switch (err) {
+    const loaded = zbuild.sdk_manifest.load(ga, io, .fromTrusted(path), &why) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             const what = if (set.len != 0) "the project setting " ++ setting_sdk_manifest else "the shipped SDK";
@@ -921,7 +929,17 @@ fn sdkManifest(ga: Allocator, a: Allocator, msg: *std.ArrayList(u8)) error{ OutO
             return error.Unusable;
         },
     };
+    return .{ .manifest = loaded, .path = path, .from_setting = set.len != 0 };
 }
+
+/// What `sdkManifest` chose and loaded.
+const LoadedSdk = struct {
+    manifest: zbuild.sdk_manifest.Manifest,
+    /// The manifest's path.
+    path: []const u8,
+    /// The project setting `ziggurat/dev/sdk_manifest` chose it.
+    from_setting: bool,
+};
 
 /// The project folder as a realpath (`res://` globalized, without a
 /// trailing separator), allocated with `a`. Editor builds and export
@@ -955,6 +973,12 @@ pub const ExportInputs = struct {
     /// project setting `ziggurat/dev/sdk_manifest` names, else the shipped
     /// SDK's (`sdkManifest`).
     sdk: []const zbuild.workspace.ModuleDep,
+    /// The `sdk_version` of the manifest `sdk` came from, and that
+    /// manifest's path. Owned like `sdk`.
+    sdk_version: []const u8,
+    manifest_path: []const u8,
+    /// The project setting `ziggurat/dev/sdk_manifest` chose the manifest.
+    from_setting: bool,
     /// The per-user cache folder (`PathService.dir(.cache)`), as editor
     /// builds use it, so both take turns on the project's `build.lock`.
     cache_dir: OsPath,
@@ -968,9 +992,11 @@ pub const ExportInputs = struct {
 pub fn exportInputs(a: Allocator, project: []const u8, msg: *std.ArrayList(u8)) error{ OutOfMemory, Unusable }!ExportInputs {
     const io = host_io.get();
     msg.clearRetainingCapacity();
-    const sdk: []const zbuild.workspace.ModuleDep = if (state) |*st| st.sdk.modules else blk: {
-        const m = try sdkManifest(a, a, msg);
-        break :blk m.modules;
+    const chosen: struct { modules: []const zbuild.workspace.ModuleDep, version: []const u8, path: []const u8, from_setting: bool } = if (state) |*st|
+        .{ .modules = st.sdk.modules, .version = st.sdk.sdk_version, .path = st.sdk_path, .from_setting = st.sdk_from_setting }
+    else blk: {
+        const l = try sdkManifest(a, a, msg);
+        break :blk .{ .modules = l.manifest.modules, .version = l.manifest.sdk_version, .path = l.path, .from_setting = l.from_setting };
     };
 
     const env = try hostEnv(a);
@@ -1009,7 +1035,7 @@ pub fn exportInputs(a: Allocator, project: []const u8, msg: *std.ArrayList(u8)) 
             return error.Unusable;
         },
     };
-    return .{ .zig = zig, .sdk = sdk, .cache_dir = cache_dir };
+    return .{ .zig = zig, .sdk = chosen.modules, .sdk_version = chosen.version, .manifest_path = chosen.path, .from_setting = chosen.from_setting, .cache_dir = cache_dir };
 }
 
 /// Set while the build at open is not requested yet. Main thread.

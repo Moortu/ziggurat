@@ -47,6 +47,8 @@ pub const build_id = "export";
 /// The library's name; the file is `lib_file`.
 pub const lib_name = "ziggurat_game";
 pub const lib_file = "lib" ++ lib_name ++ ".so";
+/// The add-on's export host archive, in `addons/ziggurat/bin/`.
+pub const host_archive_file = "libziggurat_host_export.a";
 /// Godot's entry point, the one symbol the library exports.
 pub const entry_symbol = "ziggurat_host_init";
 const version_script = "{ global: " ++ entry_symbol ++ "; local: *; };\n";
@@ -357,6 +359,18 @@ pub fn zipHoldsLibrary(io: std.Io, path: []const u8) !bool {
     return false;
 }
 
+/// The error for an export whose SDK (the manifest at `manifest_path`, of
+/// version `sdk_version`) is not the version `host_version` that the add-on's
+/// export archive was built for. `from_setting` is true when the project
+/// setting `ziggurat/dev/sdk_manifest` chose the manifest. Allocated with `a`.
+pub fn sdkMismatchMessage(a: std.mem.Allocator, manifest_path: []const u8, sdk_version: []const u8, host_version: []const u8, from_setting: bool) std.mem.Allocator.Error![]u8 {
+    const advice = if (from_setting)
+        "Clear the project setting ziggurat/dev/sdk_manifest, or install the add-on that matches the SDK."
+    else
+        "Reinstall the add-on.";
+    return std.fmt.allocPrint(a, "Ziggurat cannot export: the SDK at {s} is version {s}, but this add-on's export library (addons/ziggurat/bin/" ++ host_archive_file ++ ") needs SDK version {s}. {s}", .{ manifest_path, sdk_version, host_version, advice });
+}
+
 const testing = std.testing;
 
 test "exportProblem accepts only the entry point and no dlopen" {
@@ -549,4 +563,14 @@ test "export_build.run on a project with a case collision fails before the compi
     try testing.expect(res.message != null);
     try testing.expectEqual(@as(usize, 1), res.diagnostics.len);
     try testing.expect(std.mem.indexOf(u8, res.diagnostics[0].message, "differ only by case") != null);
+}
+
+test "sdkMismatchMessage names the manifest, both versions and the advice" {
+    const a = testing.allocator;
+    const set = try sdkMismatchMessage(a, "/dev/sdk/sdk-manifest.json", "9.9.9", "0.1.0", true);
+    defer a.free(set);
+    try testing.expectEqualStrings("Ziggurat cannot export: the SDK at /dev/sdk/sdk-manifest.json is version 9.9.9, but this add-on's export library (addons/ziggurat/bin/libziggurat_host_export.a) needs SDK version 0.1.0. Clear the project setting ziggurat/dev/sdk_manifest, or install the add-on that matches the SDK.", set);
+    const shipped = try sdkMismatchMessage(a, "/p/addons/ziggurat/sdk/sdk-manifest.json", "0.2.0", "0.1.0", false);
+    defer a.free(shipped);
+    try testing.expectEqualStrings("Ziggurat cannot export: the SDK at /p/addons/ziggurat/sdk/sdk-manifest.json is version 0.2.0, but this add-on's export library (addons/ziggurat/bin/libziggurat_host_export.a) needs SDK version 0.1.0. Reinstall the add-on.", shipped);
 }
