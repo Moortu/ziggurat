@@ -620,6 +620,89 @@ test "integration: a helper three references deep is mapped to the script line" 
     }
 }
 
+/// Waits (bounded) until `flag` is set.
+fn waitFlag(flag: *std.atomic.Value(bool)) !void {
+    const t0 = std.Io.Clock.awake.now(io);
+    while (!flag.load(.acquire)) {
+        if (t0.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() > build_wait_ms) return error.Timeout;
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+}
+
+test "integration: a full request joins the warm thread before it drops the server" {
+    try platform.testing_support.requireIntegration();
+    if (is_windows) return error.SkipZigTest;
+    var fx: Fx = undefined;
+    try fx.init("proj");
+    defer fx.deinit();
+    try fx.write("a.zig", try scriptSource(fx.arena(), 1));
+
+    var hold: service.WarmHold = .{};
+    var cfg = fx.config(build_options.zig_exe);
+    cfg.test_warm_hold = &hold;
+    const svc = try BuildService.init(testing.allocator, io, cfg);
+    defer svc.deinit();
+    const o1 = try build(svc, .open);
+    try expectOk(o1);
+
+    // The warm thread registered its server and is held just before it
+    // uses it; a full request comes. Dropping the server now would free it
+    // under the warm thread.
+    try waitFlag(&hold.held);
+    svc.requestFull(.save);
+    try svc.waitIdle(build_wait_ms);
+    const o2 = svc.last() orelse return error.NoOutcome;
+    try expectOk(o2);
+    try testing.expectEqual(service.BuildPath.full, o2.path);
+    try testing.expect(!hold.dropped.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), svc.stats().session_deaths);
+
+    // A server warms up again after the full build (the hold is used
+    // once), and the next save is incremental.
+    try svc.waitWarm(build_wait_ms);
+    try fx.write("a.zig", try scriptSource(fx.arena(), 2));
+    const o3 = try build(svc, .save);
+    try expectOk(o3);
+    try testing.expectEqual(service.BuildPath.incremental, o3.path);
+    try testing.expectEqual(@as(i32, 2), try callValue(o3));
+}
+
+test "integration: a full request does not wait for the warm-up update" {
+    try platform.testing_support.requireIntegration();
+    if (is_windows) return error.SkipZigTest;
+    var fx: Fx = undefined;
+    try fx.init("proj");
+    defer fx.deinit();
+    try fx.write("a.zig", try scriptSource(fx.arena(), 1));
+    // The incremental server waits at its gate (up to 120 s) until the
+    // test opens it.
+    const zig = try fx.wrapper("gatezig", "0.17.0", false, true);
+    const svc = try BuildService.init(testing.allocator, io, fx.config(zig));
+    defer svc.deinit();
+    const o1 = try build(svc, .open);
+    try expectOk(o1);
+    try fx.waitAtGate("gatezig", "incremental");
+    try testing.expectEqual(service.WarmState.warming, svc.stats().warm);
+
+    // The warm-up is stopped (not a death) instead of waited for.
+    try fx.write("a.zig", try scriptSource(fx.arena(), 2));
+    svc.requestFull(.save);
+    try svc.waitIdle(60_000);
+    const o2 = svc.last() orelse return error.NoOutcome;
+    try expectOk(o2);
+    try testing.expectEqual(service.BuildPath.full, o2.path);
+    try testing.expectEqual(@as(i32, 2), try callValue(o2));
+    try testing.expectEqual(@as(u32, 0), svc.stats().session_deaths);
+
+    // With the gate open a server warms up again.
+    try fx.openGate("gatezig", "incremental");
+    try svc.waitWarm(build_wait_ms);
+    try fx.write("a.zig", try scriptSource(fx.arena(), 3));
+    const o3 = try build(svc, .save);
+    try expectOk(o3);
+    try testing.expectEqual(service.BuildPath.incremental, o3.path);
+}
+
 test "integration: deinit while warming" {
     try platform.testing_support.requireIntegration();
     if (is_windows) return error.SkipZigTest;

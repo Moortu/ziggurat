@@ -14,7 +14,8 @@
 //!   build. After the second death, incremental builds stay off for the rest
 //!   of the service's life.
 //! - `requestFull` asks for a build on the full path: the warm server is
-//!   dropped first (not a death) and warms again after that full build.
+//!   stopped first (a warm-up in progress too; not a death) and warms again
+//!   after that full build.
 //! - `requestIfChanged` asks for a build only when a `.zig` file changed (for
 //!   an editor that has no file watcher: it checks when it regains focus).
 //!   The build thread scans the project and compares the scan's id
@@ -306,6 +307,20 @@ pub const Config = struct {
     /// TEST ONLY, and read only in test builds. The full build that follows
     /// a layout drift fails.
     test_fail_full_after_drift: bool = false,
+    /// TEST ONLY, and read only in test builds. See `WarmHold`.
+    test_warm_hold: ?*WarmHold = null,
+};
+
+/// TEST ONLY (`Config.test_warm_hold`). The first warm thread stops after
+/// it registered its server and before it uses it, and goes on once the
+/// build thread starts ending that server, or after 300 s. If the server
+/// was dropped meanwhile, the warm thread would have used a freed server:
+/// it sets `dropped` and returns instead.
+pub const WarmHold = struct {
+    /// Set when the warm thread is held.
+    held: std.atomic.Value(bool) = .init(false),
+    /// Set when the warm thread found its server dropped while it was held.
+    dropped: std.atomic.Value(bool) = .init(false),
 };
 
 const Timer = struct {
@@ -521,7 +536,8 @@ pub const BuildService = struct {
     }
 
     /// As `request`, and that build takes the full path: the incremental
-    /// server is dropped first and warms again after the full build. For a
+    /// server is stopped first (a warm-up in progress is killed, not
+    /// waited for) and warms again after the full build. For a
     /// caller that found the newest incremental build stale in a way the
     /// service cannot see (the editor host compares the module's defaults
     /// with its table). Requests made before the build starts join it.
@@ -786,12 +802,8 @@ pub const BuildService = struct {
         var ws = try self.prepareWorkspace(sc, o);
         defer ws.deinit(a);
 
-        if (full) {
-            // `requestFull`: the incremental server's state is not trusted.
-            self.session_mu.lockUncancelable(self.io);
-            defer self.session_mu.unlock(self.io);
-            self.dropWarm(false);
-        }
+        // `requestFull`: the incremental server's state is not trusted.
+        if (full) self.stopWarm();
         if (!full and try self.incrementalBuild(arena, &ws, zig, &sc.build_id, o, &stale.found)) {
             // A script whose layout changed although its source (and every
             // helper) did not: the incremental compiler kept stale layout
@@ -801,11 +813,7 @@ pub const BuildService = struct {
                 defer a.free(note);
                 self.discardGeneration(o);
                 o.path = .full;
-                {
-                    self.session_mu.lockUncancelable(self.io);
-                    defer self.session_mu.unlock(self.io);
-                    self.dropWarm(false);
-                }
+                self.stopWarm();
                 const res: anyerror!void = if (builtin.is_test and self.cfg.test_fail_full_after_drift) blk: {
                     o.message = try a.dupe(u8, "The full build failed (test fault).");
                     break :blk error.TestFault;
@@ -995,13 +1003,34 @@ pub const BuildService = struct {
             const n = self.new_policy orelse return;
             self.new_policy = null;
             if (n.eql(self.policy_now)) return;
+            break :blk n;
+        };
+        self.policy_now = new;
+        self.stopWarm();
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+        // `disabled` from a policy without an incremental mode; after two
+        // deaths it stays.
+        if (self.warm == .disabled and self.deaths < 2) self.warm = .cold;
+        self.cond.broadcast(io);
+    }
+
+    /// Ends the incremental server without counting a death: a warm-up in
+    /// progress is killed, the warm thread is joined, and only then is the
+    /// server dropped, so no thread uses a server after it is freed. The
+    /// join cannot deadlock: the warm thread never waits for the build
+    /// thread (this thread holds neither `mu` nor `session_mu` while it
+    /// joins), and a killed warm-up update ends at once. Build thread only.
+    fn stopWarm(self: *BuildService) void {
+        const io = self.io;
+        {
+            self.mu.lockUncancelable(io);
+            defer self.mu.unlock(io);
             // The warm thread sees this before it registers a server or
             // after its warm-up update fails.
             self.warm_abandon = true;
             if (self.warm == .warming) if (self.warm_slot) |s| s.interrupt();
-            break :blk n;
-        };
-        self.policy_now = new;
+        }
         if (self.warm_thread) |t| {
             t.join();
             self.warm_thread = null;
@@ -1014,9 +1043,6 @@ pub const BuildService = struct {
         self.mu.lockUncancelable(io);
         defer self.mu.unlock(io);
         self.warm_abandon = false;
-        // `disabled` from a policy without an incremental mode; after two
-        // deaths it stays.
-        if (self.warm == .disabled and self.deaths < 2) self.warm = .cold;
         self.cond.broadcast(io);
     }
 
@@ -1308,8 +1334,11 @@ pub const BuildService = struct {
     /// The new state is published only after the server is reaped and the
     /// lock released, so another editor that sees `cold` can take the lock.
     /// Called with `session_mu` held, or by the warm thread before the
-    /// server is ready. Until the state changes, `incrementalBuild` sees the
-    /// empty slot and takes the full path.
+    /// server is ready. The build thread calls it directly only for a
+    /// `ready` server (the warm thread is done with it); otherwise through
+    /// `stopWarm`, which joins the warm thread first. Until the state
+    /// changes, `incrementalBuild` sees the empty slot and takes the full
+    /// path.
     fn dropWarm(self: *BuildService, death: bool) void {
         const io = self.io;
         var s: ?Session = null;
@@ -1456,6 +1485,10 @@ pub const BuildService = struct {
             self.setWarm(.cold);
             return;
         }
+        if (builtin.is_test) if (self.cfg.test_warm_hold) |h| {
+            // The server, its lock and the state are the dropper's now.
+            if (!self.holdWarm(h)) return;
+        };
         self.session_mu.lockUncancelable(io);
         defer self.session_mu.unlock(io);
         var r = s.update(self.cfg.update_timeout_ms) catch {
@@ -1472,6 +1505,25 @@ pub const BuildService = struct {
         // The sources have errors right now: drop this server without counting
         // a death; the next successful full build warms a new one.
         self.dropWarm(false);
+    }
+
+    /// `WarmHold`: false when the server was dropped while held.
+    fn holdWarm(self: *BuildService, h: *WarmHold) bool {
+        if (h.held.swap(true, .acq_rel)) return true;
+        const timer = Timer.start(self.io);
+        while (timer.ms() < 300_000) {
+            {
+                self.mu.lockUncancelable(self.io);
+                defer self.mu.unlock(self.io);
+                if (self.warm_slot == null) {
+                    h.dropped.store(true, .release);
+                    return false;
+                }
+                if (self.warm_abandon or self.stopping) return true;
+            }
+            self.io.sleep(.fromMilliseconds(2), .awake) catch {};
+        }
+        return true;
     }
 
     fn warmAbandoned(self: *BuildService) bool {
