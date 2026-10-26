@@ -285,19 +285,21 @@ fn buildGameLibrary(a: Allocator, r: Reporter, kind: export_build.OutputKind, ou
             return false;
         },
     };
+    // Every scan problem fails the export. A file the scan could not read
+    // may be a script: the library would leave it out without a word, and a
+    // scene that uses it would fail to load it in the game. Two scripts that
+    // differ only by case fail too, so one rule holds.
+    if (sc.problems.len != 0) {
+        for (sc.problems) |pr| r.diagnostic(.export_message_error, .{ .rel = if (pr.rel.len == 0) null else pr.rel, .line = 0, .column = 0, .message = pr.message, .notes = &.{} });
+        r.fail("Ziggurat cannot export the project's Zig files: the scan found the problems above, so it does not build the game library.", .{});
+        return false;
+    }
     const bin = addonBinDir(a) orelse {
         r.fail("Ziggurat cannot build the game library for the export: the path of its own library is unknown.", .{});
         return sc.scripts.len != 0;
     };
 
     if (sc.scripts.len == 0) {
-        if (sc.problems.len != 0) {
-            // A file the scan could not read may be a script: the empty
-            // library would leave it out without a word.
-            for (sc.problems) |pr| r.diagnostic(.export_message_error, .{ .rel = if (pr.rel.len == 0) null else pr.rel, .line = 0, .column = 0, .message = pr.message, .notes = &.{} });
-            r.fail("Ziggurat cannot export the project's Zig files: the scan found the problems above, so it does not use the game library without scripts.", .{});
-            return false;
-        }
         const empty = try std.fs.path.join(a, &.{ bin, empty_lib_file });
         cwd.copyFile(empty, cwd, out.bytes, io, .{ .make_path = true, .replace = true }) catch |err| {
             r.fail("Ziggurat cannot copy the game library for a project without Zig scripts from {s} to {s} ({t}); reinstall the add-on.", .{ empty, out.bytes, err });
@@ -342,7 +344,8 @@ fn buildGameLibrary(a: Allocator, r: Reporter, kind: export_build.OutputKind, ou
     const ms = t0.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
 
     if (res.ok) {
-        // Only the scan's problems remain: they did not fail the build.
+        // The scan had no problems (they fail the export above), so a built
+        // library has no diagnostics left.
         for (res.diagnostics) |d| r.diagnostic(.export_message_warning, d);
         log("Ziggurat: export library built in {d} ms: {s}", .{ ms, out.bytes });
         return true;

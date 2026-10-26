@@ -83,7 +83,8 @@ pub const Result = struct {
     /// `out_path` was not touched.
     ok: bool,
     /// Compile errors mapped to project files as in editor builds, then the
-    /// scan's problems (line 0; they do not by themselves fail the build).
+    /// scan's problems (line 0). Any scan problem fails the build before the
+    /// workspace and the compiler: then these are the problems only.
     diagnostics: []Diagnostic,
     /// One sentence when the build failed for a reason other than compile
     /// errors: another build holds `build.lock`, the compiler could not
@@ -122,6 +123,9 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options, diag: *[256]u8) !Res
     };
     var out: Builder = .{ .a = a, .problems = sc.problems };
     errdefer out.deinit();
+    // A file the scan could not read may be a script, and the library would
+    // leave it out without a word.
+    if (sc.problems.len != 0) return out.fail("The scan found the problems above, so it does not build the game library.", .{});
 
     // `env` is read only for its `os`: the cache folder is given.
     const ps = platform.path.PathService.init(.{ .project = opts.project_root }, .{ .os = builtin.os.tag, .home = null });
@@ -483,4 +487,66 @@ test "zipHoldsLibrary tells a full ZIP export from a pack" {
     const missing = try std.fs.path.join(testing.allocator, &.{ dir, "missing.zip" });
     defer testing.allocator.free(missing);
     try testing.expectError(error.FileNotFound, zipHoldsLibrary(io, missing));
+}
+
+/// Options for `run` calls that must stop at the scan: the Zig path does
+/// not exist, so starting a compiler would give a different error.
+fn scanStopOptions(root: []const u8, sdk: []const ModuleDep) Options {
+    return .{
+        .zig = .{ .exe = .fromTrusted("/nonexistent/ziggurat-test/zig"), .version = "0.0.0" },
+        .project_root = .fromTrusted(root),
+        .sdk = sdk,
+        .host_archive = .fromTrusted("/nonexistent/ziggurat-test/host.a"),
+        .out_path = .fromTrusted("/nonexistent/ziggurat-test/out/libziggurat_game.so"),
+        .cache_dir = .fromTrusted("/nonexistent/ziggurat-test/cache"),
+    };
+}
+
+test "export_build.run on a project with an unreadable script fails before the compiler" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const script = "pub const extends = @import(\"ziggurat\").godot.Node;\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "good.zig", .data = script });
+    try tmp.dir.writeFile(io, .{ .sub_path = "secret.zig", .data = script });
+    try tmp.dir.setFilePermissions(io, "secret.zig", .fromMode(0), .{});
+    defer tmp.dir.setFilePermissions(io, "secret.zig", .fromMode(0o644), .{}) catch {};
+    // A user who may read anyway (root) cannot run this test.
+    if (tmp.dir.openFile(io, "secret.zig", .{})) |f| {
+        f.close(io);
+        return error.SkipZigTest;
+    } else |_| {}
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    const sdk = [_]ModuleDep{.{ .name = "ziggurat", .root = .fromTrusted("/nonexistent/ziggurat-test/sdk.zig"), .deps = &.{} }};
+    var diag: [256]u8 = undefined;
+    const res = try run(testing.allocator, io, scanStopOptions(root, &sdk), &diag);
+    defer res.deinit(testing.allocator);
+    try testing.expect(!res.ok);
+    try testing.expect(res.message != null);
+    try testing.expect(std.mem.indexOf(u8, res.message.?, "scan found the problems") != null);
+    try testing.expectEqual(@as(usize, 1), res.diagnostics.len);
+    try testing.expectEqualStrings("secret.zig", res.diagnostics[0].rel.?);
+    try testing.expect(std.mem.indexOf(u8, res.diagnostics[0].message, "Could not read") != null);
+}
+
+test "export_build.run on a project with a case collision fails before the compiler" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const script = "pub const extends = @import(\"ziggurat\").godot.Node;\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = script });
+    try tmp.dir.writeFile(io, .{ .sub_path = "A.zig", .data = script });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    const sdk = [_]ModuleDep{.{ .name = "ziggurat", .root = .fromTrusted("/nonexistent/ziggurat-test/sdk.zig"), .deps = &.{} }};
+    var diag: [256]u8 = undefined;
+    const res = try run(testing.allocator, io, scanStopOptions(root, &sdk), &diag);
+    defer res.deinit(testing.allocator);
+    try testing.expect(!res.ok);
+    try testing.expect(res.message != null);
+    try testing.expectEqual(@as(usize, 1), res.diagnostics.len);
+    try testing.expect(std.mem.indexOf(u8, res.diagnostics[0].message, "differ only by case") != null);
 }

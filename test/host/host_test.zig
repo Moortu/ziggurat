@@ -3549,6 +3549,50 @@ test "export: an unreadable Zig file fails an export without scripts" {
     try testing.expect(!try projectFileExists(&p, "out/libziggurat_game.so"));
 }
 
+test "export: an unreadable Zig file fails an export with scripts" {
+    try requireTemplates();
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var p: Project = undefined;
+    try initExport(&p, null);
+    defer p.deinit();
+    // The fixture's two scripts stay; a third file cannot be read, so the
+    // scan cannot tell whether it is a script.
+    try writeProjectFile(&p, "secret.zig", "pub const extends = @import(\"ziggurat\").godot.Node;\n");
+    const a = p.arena_state.allocator();
+    const secret = try std.fs.path.join(a, &.{ p.path, "secret.zig" });
+    try setMode(secret, 0);
+    defer setMode(secret, 0o644) catch {};
+    // A user who may read anyway (root) cannot run this test.
+    if (Io.Dir.cwd().openFile(io, secret, .{})) |f| {
+        f.close(io);
+        return error.SkipZigTest;
+    } else |_| {}
+    try exportGame(&p, .{
+        .expect = &.{ "Ziggurat: res://secret.zig: Could not read", "the scan found the problems above", export_incomplete },
+        .reject = &.{export_building},
+        .exit_code = "1",
+    });
+    try testing.expect(!try projectFileExists(&p, game_lib_rel));
+    try testing.expect(!try projectFileExists(&p, "out/libziggurat_game.so"));
+}
+
+test "export: a case collision fails the export" {
+    try requireTemplates();
+    var p: Project = undefined;
+    try initExport(&p, null);
+    defer p.deinit();
+    const script = "pub const extends = @import(\"ziggurat\").godot.Node;\n";
+    try writeProjectFile(&p, "a.zig", script);
+    try writeProjectFile(&p, "A.zig", script);
+    try exportGame(&p, .{
+        .expect = &.{ "differ only by case", "the scan found the problems above", export_incomplete },
+        .reject = &.{export_building},
+        .exit_code = "1",
+    });
+    try testing.expect(!try projectFileExists(&p, game_lib_rel));
+    try testing.expect(!try projectFileExists(&p, "out/libziggurat_game.so"));
+}
+
 test "export: project without Zig scripts exports" {
     try requireTemplates();
     var p: Project = undefined;
