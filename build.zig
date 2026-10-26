@@ -101,6 +101,27 @@ pub fn build(b: *std.Build) void {
     } else {
         stage_step.dependOn(&b.addFail("sdk-stage needs -Dsdk-out=<absolute path>").step);
     }
+    // The tool's own main path in a Debug build (the unit tests do not
+    // reach `main`; Debug builds trap on mistakes ReleaseSafe hides, such
+    // as closing a folder twice): one tiny module staged with --replace.
+    {
+        const debug_tool = b.addExecutable(.{
+            .name = "sdk_stage_debug",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/sdk_stage.zig"),
+                .target = b.graph.host,
+                .optimize = .Debug,
+            }),
+        });
+        const run = b.addRunArtifact(debug_tool);
+        run.addArg("--replace");
+        _ = run.addOutputDirectoryArg("sdk");
+        run.addArgs(&.{ "0.0.0", "empty" });
+        run.addFileArg2(b.path("src/build/empty_root.zig"), .{ .make_absolute = true });
+        run.addArgs(&.{ "", "none" });
+        unit_step.dependOn(&run.step);
+        test_step.dependOn(&run.step);
+    }
     // The manifest for `test`: written into the cache.
     const test_manifest = blk: {
         const run = b.addRunArtifact(manifest_tool);

@@ -47,14 +47,20 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("usage: sdk_stage [--replace] <out dir> <sdk_version> (<name> <root> <deps> <none|docs|comments>)...\n", .{});
         std.process.exit(2);
     }
-    const cwd = Io.Dir.cwd();
     var held: [Io.Dir.max_name_bytes]u8 = undefined;
     var staging = begin(gpa, io, args[1], mode, &held) catch |err| switch (err) {
         error.NotEmpty => fail("the output folder {s} is not empty (it holds {s})", .{ args[1], std.mem.sliceTo(&held, 0) }),
         else => fail("cannot prepare the output folder {s} ({t})", .{ args[1], err }),
     };
     defer staging.deinit(gpa);
-    var out = try cwd.openDir(io, staging.stage_path, .{ .iterate = true });
+    try fillOutput(gpa, arena, io, args, staging.stage_path);
+    staging.finish(io) catch |err|
+        fail("cannot replace the output folder {s} with the finished one ({t})", .{ staging.final_path, err });
+}
+
+/// Writes the whole SDK into the existing folder `out_path`.
+fn fillOutput(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io, args: []const [:0]const u8, out_path: []const u8) !void {
+    var out = try Io.Dir.cwd().openDir(io, out_path, .{ .iterate = true });
     defer out.close(io);
 
     var modules: std.ArrayList(Module) = .empty;
@@ -85,9 +91,6 @@ pub fn main(init: std.process.Init) !void {
     };
     const json = try std.json.Stringify.valueAlloc(arena, manifest, .{ .whitespace = .indent_2 });
     try out.writeFile(io, .{ .sub_path = "sdk-manifest.json", .data = json });
-    out.close(io);
-    out = undefined;
-    try staging.finish(io);
 }
 
 /// The first argument that makes the tool replace its output folder.
@@ -129,6 +132,17 @@ const Staging = struct {
 /// Infix of the stage folder's name: `<out>.tmp-<16 hex digits>`.
 const tmp_infix = ".tmp-";
 
+/// Whether `name` is exactly `<base>.tmp-` and 16 lowercase hex digits.
+fn isStageName(name: []const u8, base: []const u8) bool {
+    if (!std.mem.startsWith(u8, name, base)) return false;
+    const rest = name[base.len..];
+    if (!std.mem.startsWith(u8, rest, tmp_infix)) return false;
+    const hex = rest[tmp_infix.len..];
+    if (hex.len != 16) return false;
+    for (hex) |c| if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return false;
+    return true;
+}
+
 /// Prepares the output folder. `held` receives the name of the first entry
 /// of a user folder that is not empty (zero-terminated).
 fn begin(gpa: std.mem.Allocator, io: Io, out_path: []const u8, mode: Mode, held: *[Io.Dir.max_name_bytes]u8) !Staging {
@@ -148,14 +162,14 @@ fn begin(gpa: std.mem.Allocator, io: Io, out_path: []const u8, mode: Mode, held:
         },
         .cache_folder => {
             const final = std.mem.trimEnd(u8, out_path, "/");
-            const parent_path = std.fs.path.dirname(final) orelse ".";
             const base = std.fs.path.basename(final);
+            const parent_path = std.fs.path.dirname(final) orelse return error.BadOutputPath;
+            if (final.len == 0 or parent_path.len == 0 or std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, ".."))
+                return error.BadOutputPath;
             try cwd.createDirPath(io, parent_path);
             var parent = try cwd.openDir(io, parent_path, .{ .iterate = true });
             defer parent.close(io);
             // Stage folders of earlier runs that were interrupted.
-            const prefix = try std.fmt.allocPrint(gpa, "{s}{s}", .{ base, tmp_infix });
-            defer gpa.free(prefix);
             var stale: std.ArrayList([]u8) = .empty;
             defer {
                 for (stale.items) |n| gpa.free(n);
@@ -163,7 +177,7 @@ fn begin(gpa: std.mem.Allocator, io: Io, out_path: []const u8, mode: Mode, held:
             }
             var it = parent.iterate();
             while (try it.next(io)) |entry| {
-                if (std.mem.startsWith(u8, entry.name, prefix)) try stale.append(gpa, try gpa.dupe(u8, entry.name));
+                if (isStageName(entry.name, base)) try stale.append(gpa, try gpa.dupe(u8, entry.name));
             }
             for (stale.items) |n| try parent.deleteTree(io, n);
             var random: [8]u8 = undefined;
@@ -379,4 +393,26 @@ test "a user folder that is missing or empty is filled in place" {
         try staging.finish(testing.io);
         try tmp.dir.access(testing.io, rel, .{});
     }
+}
+
+test "only exact stage folder names are removed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "o/sdk.tmp-backup", "o/sdk.tmp-0123456789abcdef0", "o/sdk.tmp-0123456789abcdeg", "o/sdk.tmp-0123456789abcdef" }) |n| try tmp.dir.createDirPath(testing.io, n);
+    var pb: [256]u8 = undefined;
+    const out_path = tmpPath(&pb, &tmp, "o/sdk");
+    var held: [Io.Dir.max_name_bytes]u8 = undefined;
+    var staging = try begin(testing.allocator, testing.io, out_path, .cache_folder, &held);
+    defer staging.deinit(testing.allocator);
+    try staging.finish(testing.io);
+    try tmp.dir.access(testing.io, "o/sdk.tmp-backup", .{});
+    try tmp.dir.access(testing.io, "o/sdk.tmp-0123456789abcdef0", .{});
+    try tmp.dir.access(testing.io, "o/sdk.tmp-0123456789abcdeg", .{});
+    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "o/sdk.tmp-0123456789abcdef", .{}));
+}
+
+test "a cache output path that could hit something else is refused" {
+    var held: [Io.Dir.max_name_bytes]u8 = undefined;
+    for ([_][]const u8{ "/", "", ".", "..", "sdk", "a/..", "a/." }) |p|
+        try testing.expectError(error.BadOutputPath, begin(testing.allocator, testing.io, p, .cache_folder, &held));
 }
