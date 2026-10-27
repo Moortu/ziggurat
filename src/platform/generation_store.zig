@@ -434,6 +434,9 @@ pub const GenerationStore = struct {
         const trash = try path.join(a, self.root, &.{trash_dir});
         defer a.free(trash.bytes);
         try Dir.cwd().createDirPath(io, trash.bytes);
+        // The store is inside the project folder, which may carry a `.trash`
+        // link: never rename a generation out of the store.
+        if (!isRealDir(io, trash)) return error.TrashNotADirectory;
         var rnd: [8]u8 = undefined;
         io.random(&rnd);
         var nb: [32]u8 = undefined;
@@ -452,20 +455,28 @@ pub const GenerationStore = struct {
         try Dir.cwd().deleteDir(io, dp.bytes);
     }
 
-    /// Deletes each entry of `<root>/.trash/` that can be deleted now, and
-    /// the folder itself once it is empty. What is still in use stays for a
-    /// later sweep; nothing is reported.
+    /// Deletes each entry of `<root>/.trash/` that `moveToTrash` made
+    /// (`isTrashName`) and that can be deleted now, and the folder itself
+    /// once it is empty. What is still in use stays for a later sweep;
+    /// nothing is reported. A `.trash` that is a link (or a junction) or
+    /// not a folder is left alone, and so is every entry with another name:
+    /// the sweep never deletes outside the store or what it did not put there.
     fn emptyTrash(self: *GenerationStore) void {
         const a = self.a;
         const io = self.io;
         const trash = path.join(a, self.root, &.{trash_dir}) catch return;
         defer a.free(trash.bytes);
-        var d = Dir.cwd().openDir(io, trash.bytes, .{ .iterate = true }) catch return;
+        if (!isRealDir(io, trash)) return;
+        var d = Dir.cwd().openDir(io, trash.bytes, .{ .iterate = true, .follow_symlinks = false }) catch return;
         var left = false;
         {
             defer d.close(io);
             var it = d.iterate();
             while (it.next(io) catch null) |entry| {
+                if (!isTrashName(entry.name)) {
+                    left = true;
+                    continue;
+                }
                 d.deleteTree(io, entry.name) catch {
                     left = true;
                 };
@@ -474,6 +485,30 @@ pub const GenerationStore = struct {
         if (!left) Dir.cwd().deleteDir(io, trash.bytes) catch {};
     }
 };
+
+/// True when `p` is a folder itself, not a link (or a Windows junction) to one.
+fn isRealDir(io: std.Io, p: OsPath) bool {
+    const st = Dir.cwd().statFile(io, p.bytes, .{ .follow_symlinks = false }) catch return false;
+    return st.kind == .directory;
+}
+
+/// True for a name `moveToTrash` writes: a canonical generation number,
+/// `-`, and 16 lowercase hex digits.
+fn isTrashName(name: []const u8) bool {
+    const dash = std.mem.indexOfScalar(u8, name, '-') orelse return false;
+    const num = name[0..dash];
+    const hex = name[dash + 1 ..];
+    if (num.len == 0 or hex.len != 16) return false;
+    const n = std.fmt.parseInt(u32, num, 10) catch return false;
+    var nb: [16]u8 = undefined;
+    const canon = std.fmt.bufPrint(&nb, "{d}", .{n}) catch return false;
+    if (!std.mem.eql(u8, canon, num)) return false;
+    for (hex) |c| switch (c) {
+        '0'...'9', 'a'...'f' => {},
+        else => return false,
+    };
+    return true;
+}
 
 fn baseName(p: []const u8) []const u8 {
     const i = if (builtin.os.tag == .windows)
@@ -1169,4 +1204,72 @@ test "store: PE check after staging refuses a truncated DLL" {
     defer st.gen.deinit(a);
     defer st.pin.release();
     try std.testing.expectEqual(@as(u32, 1), st.gen.n);
+}
+
+test "isTrashName accepts only what moveToTrash writes" {
+    try std.testing.expect(isTrashName("1-0123456789abcdef"));
+    try std.testing.expect(isTrashName("4294967295-ffffffffffffffff"));
+    for ([_][]const u8{
+        "keep.txt",                    "1-0123456789abcde",  "1-0123456789abcdef0", "01-0123456789abcdef",
+        "-0123456789abcdef",           "1-0123456789ABCDEF", "+1-0123456789abcdef", "1-0123456789abcdeg",
+        "4294967296-0123456789abcdef",
+    }) |bad| try std.testing.expect(!isTrashName(bad));
+}
+
+/// Two generations staged and released, gen 1 unpinned and over the count.
+fn twoGens(a: Allocator, f: *Fixture) !GenerationStore {
+    try f.writeLib("built.so", "hello");
+    const built = try f.p(a, &.{"built.so"});
+    defer a.free(built.bytes);
+    var s = f.store(a, .{ .max_count = 1 });
+    _ = try stageOne(a, &s, built);
+    _ = try stageOne(a, &s, built);
+    return s;
+}
+
+test "store: a .trash link to an outside folder is never emptied" {
+    if (os_tag == .windows) return error.SkipZigTest; // no symbolic links under Wine
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    var s = try twoGens(a, &f);
+    // An outside folder with a file that looks like a trash entry.
+    try f.tmp.dir.createDirPath(io, "outside/1-0123456789abcdef");
+    try f.tmp.dir.writeFile(io, .{ .sub_path = "outside/1-0123456789abcdef/precious", .data = "x" });
+    const outside = try f.p(a, &.{"outside"});
+    defer a.free(outside.bytes);
+    const link = try path.join(a, f.root, &.{trash_dir});
+    defer a.free(link.bytes);
+    try Dir.cwd().symLink(io, outside.bytes, link.bytes, .{ .is_directory = true });
+
+    const rep = try s.sweep();
+    try std.testing.expectEqual(@as(u32, 1), rep.deleted);
+    try std.testing.expectEqual(@as(u32, 0), rep.failed);
+    _ = try f.tmp.dir.statFile(io, "outside/1-0123456789abcdef/precious", .{});
+    // The link itself stays too: the store does not touch it.
+    const st = try Dir.cwd().statFile(io, link.bytes, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.sym_link, st.kind);
+}
+
+test "store: a foreign entry in .trash survives the sweep" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    var s = try twoGens(a, &f);
+    const trash = try path.join(a, f.root, &.{trash_dir});
+    defer a.free(trash.bytes);
+    try Dir.cwd().createDirPath(io, trash.bytes);
+    const keep = try path.join(a, trash, &.{"keep.txt"});
+    defer a.free(keep.bytes);
+    try Dir.cwd().writeFile(io, .{ .sub_path = keep.bytes, .data = "x" });
+    const ours = try path.join(a, trash, &.{"7-0123456789abcdef"});
+    defer a.free(ours.bytes);
+    try Dir.cwd().createDirPath(io, ours.bytes);
+
+    _ = try s.sweep();
+    _ = try Dir.cwd().statFile(io, keep.bytes, .{});
+    try std.testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, ours.bytes, .{}));
+    try std.testing.expectEqual(@as(u32, 1), try trashCount(a, &f));
 }

@@ -51,7 +51,7 @@ fn spawnTree(io: std.Io, opts: std.process.SpawnOptions) !struct { std.process.C
     var child = try std.process.spawn(io, o);
     errdefer {
         _ = win32.TerminateProcess(child.id.?, 1);
-        _ = child.wait(io) catch {};
+        reapWindows(io, &child);
     }
     if (win32.AssignProcessToJobObject(job, child.id.?) == 0) return error.JobObjectFailed;
     if (win32.ResumeThread(child.thread_handle) == std.math.maxInt(u32)) return error.JobObjectFailed;
@@ -85,13 +85,30 @@ fn killReap(io: std.Io, child: *std.process.Child, tree: *Tree) void {
                 _ = win32.TerminateProcess(h, 1);
             }
             _ = waitHandle(h, win32.INFINITE);
-            _ = child.wait(io) catch {};
+            reapWindows(io, child);
         }
         closeTree(tree);
         return;
     }
     killTree(child, tree.*);
     child.kill(io);
+}
+
+/// Windows: reaps an ended `child` with `wait`, which closes its process,
+/// thread and pipe handles. If `wait` fails (for example when cancelled),
+/// the handles are closed here instead, so none leaks.
+fn reapWindows(io: std.Io, child: *std.process.Child) void {
+    if (child.id == null) return;
+    _ = child.wait(io) catch {
+        if (child.id) |h| _ = win32.CloseHandle(h);
+        child.id = null;
+        _ = win32.CloseHandle(child.thread_handle);
+        child.thread_handle = undefined;
+        inline for (.{ "stdin", "stdout", "stderr" }) |name| {
+            if (@field(child, name)) |f| _ = win32.CloseHandle(f.handle);
+            @field(child, name) = null;
+        }
+    };
 }
 
 /// Closes the job handle (Windows), which also kills what is left of the
