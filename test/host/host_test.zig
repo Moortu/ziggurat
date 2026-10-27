@@ -3352,7 +3352,12 @@ fn requireTemplates() !void {
 /// folder, the presets pointing at `-Dexport-templates`, and the export
 /// tests' shared build cache.
 fn initExport(p: *Project, zig: ?[]const u8) !void {
-    try p.init("export");
+    return initExportWith(p, zig, opts.host_lib);
+}
+
+/// As `initExport`, with the editor library `host_lib`.
+fn initExportWith(p: *Project, zig: ?[]const u8, host_lib: []const u8) !void {
+    try p.initWith("export", host_lib);
     errdefer p.deinit();
     const a = p.arena_state.allocator();
     const cwd = Io.Dir.cwd();
@@ -3427,6 +3432,9 @@ test "export: exported game runs scripts" {
 
 /// The export plugin's log line for a debug export.
 const export_debug_line = "Ziggurat: debug export keeps debug information, with this computer's file paths, and is not reproducible. Turn off Export With Debug for a release.";
+
+/// The export plugin's log line for a Windows debug export.
+const export_debug_line_windows = "Ziggurat: debug export writes the game library's debug information to a separate .pdb file in the build cache, which the export does not ship; the library keeps only that file's name. Turn off Export With Debug for a release.";
 
 /// Whether the exported game library `out/libziggurat_game.so` has a
 /// `.debug_info` section.
@@ -3639,6 +3647,43 @@ test "export: an old library that cannot be deleted fails the export" {
     try testing.expect(!try projectFileExists(&p, "out/libziggurat_game.so"));
 }
 
+test "export: an old library that stays is removed from the export's output" {
+    try requireTemplates();
+    var p: Project = undefined;
+    // The probe host, which with ZIGGURAT_TEST_OLD_LIBRARY_STAYS=1 applies
+    // the Windows rule with a failing delete and rename: the old library
+    // stays readable, so Godot copies it next to the game (an error message
+    // does not stop an export). No Zig scripts and no Zig: nothing else
+    // writes a library.
+    try initExportWith(&p, "/nonexistent/ziggurat-test/zig", opts.probe_host_lib);
+    defer p.deinit();
+    try removeExportScripts(&p);
+    try writeProjectFile(&p, game_lib_rel, "an old game library");
+    try p.env.?.put("ZIGGURAT_TEST_OLD_LIBRARY_STAYS", "1");
+    const a = p.arena_state.allocator();
+    const lib_abs = try std.fs.path.join(a, &.{ p.path, game_lib_rel });
+    const sentence = try std.fmt.allocPrint(a, "Ziggurat cannot replace the old game library {s}: AccessDenied (renaming it aside failed: AccessDenied). Close programs that use it and export again.", .{lib_abs});
+    // A full export: the copy next to the game is deleted at the end.
+    try exportGame(&p, .{
+        .expect = &.{ sentence, export_incomplete, "Ziggurat deleted ", "out/libziggurat_game.so from the export's output folder" },
+        .reject = &.{export_building},
+    });
+    try testing.expect(try projectFileExists(&p, "out/game.x86_64"));
+    try testing.expect(!try projectFileExists(&p, "out/libziggurat_game.so"));
+    try testing.expect(try projectFileExists(&p, game_lib_rel));
+    // A full ZIP export: the zip holds the old library, so it is deleted.
+    try p.run(&.{ "export", "Linux", try std.fs.path.join(a, &.{ p.path, "out/game.zip" }) }, .{
+        .expect = &.{ sentence, "Ziggurat deleted the ZIP export " },
+        .reject = &.{export_building},
+        .deadline = export_deadline_s,
+    });
+    try testing.expect(!try projectFileExists(&p, "out/game.zip"));
+    // Without the probe's failure the next export replaces it as usual.
+    _ = p.env.?.swapRemove("ZIGGURAT_TEST_OLD_LIBRARY_STAYS");
+    try exportGame(&p, .{ .reject = &.{ "ERROR:", "Ziggurat deleted " } });
+    try testing.expect(try projectFileExists(&p, "out/libziggurat_game.so"));
+}
+
 /// Sets the permission bits of the folder `path`.
 fn setMode(path: []const u8, mode: std.posix.mode_t) !void {
     return Io.Dir.cwd().setFilePermissions(io, path, .fromMode(mode), .{});
@@ -3692,6 +3737,9 @@ fn expectWindowsGameLibrary(p: *Project) !void {
     const ex = try platform.pe.exports(a, bytes);
     try testing.expectEqual(@as(usize, 1), ex.len);
     try testing.expectEqualStrings("ziggurat_host_init", ex[0]);
+    // No build-machine path: a debug build's information is in a `.pdb`
+    // in the build cache, and a release build has none.
+    try testing.expect(std.mem.indexOf(u8, bytes, p.path) == null);
 }
 
 test "export: windows export from the linux editor" {
@@ -3705,9 +3753,10 @@ test "export: windows export from the linux editor" {
     defer p.deinit();
     const a = p.arena_state.allocator();
     const exe = try std.fs.path.join(a, &.{ p.path, "out/game.exe" });
-    // A debug export first: the same log line as on Linux.
+    // A debug export first: its debug information goes to a `.pdb` in the
+    // build cache, and the log line says so.
     try p.run(&.{ "export-debug", "Windows", exe }, .{
-        .once = &.{ export_building, export_debug_line },
+        .once = &.{ export_building, export_debug_line_windows },
         .reject = &.{ "ERROR:", "is not set", "is not usable" },
         .deadline = export_deadline_s,
     });
@@ -3716,7 +3765,7 @@ test "export: windows export from the linux editor" {
     // Then a release export, without that line.
     try p.run(&.{ "export", "Windows", exe }, .{
         .once = &.{export_building},
-        .reject = &.{ "ERROR:", export_debug_line, "is not set", "is not usable" },
+        .reject = &.{ "ERROR:", export_debug_line, export_debug_line_windows, "is not set", "is not usable" },
         .deadline = export_deadline_s,
     });
     for ([_][]const u8{ "out/game.exe", "out/game.pck", "out/ziggurat_game.dll" }) |f| try testing.expect(try projectFileExists(&p, f));

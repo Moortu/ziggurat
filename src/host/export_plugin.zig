@@ -33,7 +33,7 @@
 //!     library's checks pass. A release export builds it without debug
 //!     information (deterministic); a debug export (Godot's `is_debug`,
 //!     `--export-debug`) keeps it (`export_build.Options.strip` false)
-//!     and logs `debug_export_line`.
+//!     and logs `debugExportLine(key)`.
 //!   - without Zig scripts, it copies the add-on's empty game library
 //!     (`target_key.Files.game_empty` in `bin/<key>/`: the export host
 //!     linked with no scripts), so such a project exports without Zig.
@@ -90,8 +90,17 @@ pub const plugin_name = "Ziggurat";
 /// The error message for a preset whose features name no target Ziggurat
 /// exports to.
 pub const platform_message = "Ziggurat exports Linux x86_64 and Windows x86_64 in this version";
-/// The log line of a debug export with Zig scripts.
+/// The log line of a Linux debug export with Zig scripts.
 pub const debug_export_line = "Ziggurat: debug export keeps debug information, with this computer's file paths, and is not reproducible. Turn off Export With Debug for a release.";
+/// The log line of a Windows debug export with Zig scripts: the compiler
+/// writes the debug information to a separate `.pdb` file in the build
+/// cache, and the DLL keeps only that file's name.
+pub const debug_export_line_windows = "Ziggurat: debug export writes the game library's debug information to a separate .pdb file in the build cache, which the export does not ship; the library keeps only that file's name. Turn off Export With Debug for a release.";
+
+/// The log line of a debug export for target key `key`.
+pub fn debugExportLine(key: []const u8) []const u8 {
+    return if (export_build.formatOf(key) == .pe) debug_export_line_windows else debug_export_line;
+}
 /// The folder, relative to the project, that holds one folder per target
 /// key with the game library an export writes.
 pub const export_dir_rel = ".godot/ziggurat/export/";
@@ -124,6 +133,10 @@ pub const ZigExportPlugin = struct {
     base: *EditorExportPlugin,
     /// A `zip` export of a project with Zig scripts, for `_export_end`.
     zip_check: ?ZipCheck = null,
+    /// Set when the game library of an earlier export could not be
+    /// removed: what `_export_end` removes so it does not ship (allocated
+    /// with `gpa`), with the library's file name (static).
+    stale: ?Stale = null,
 
     pub fn create(allocator: *Allocator) !*ZigExportPlugin {
         const self = try allocator.create(ZigExportPlugin);
@@ -136,6 +149,7 @@ pub const ZigExportPlugin = struct {
     /// last reference dropped, see `detach`).
     pub fn destroy(self: *ZigExportPlugin, allocator: *Allocator) void {
         if (self.zip_check) |c| c.deinit();
+        if (self.stale) |st| st.output.deinit(gpa);
         self.base.destroy();
         allocator.destroy(self);
     }
@@ -155,7 +169,15 @@ pub const ZigExportPlugin = struct {
         exportBegin(self, &features, is_debug, &path);
     }
 
+    /// Godot calls it after it copied the shared libraries next to the
+    /// game (`EditorExportPlatformPC::export_project`) and after it wrote a
+    /// zip (the Linux and Windows platforms' `export_project`).
     pub fn _exportEnd(self: *ZigExportPlugin) void {
+        if (self.stale) |st| {
+            self.stale = null;
+            defer st.output.deinit(gpa);
+            removeStale(self, st);
+        }
         const c = self.zip_check orelse return;
         self.zip_check = null;
         defer c.deinit();
@@ -210,9 +232,17 @@ const ZipCheck = struct {
     }
 };
 
+/// An export whose old game library stayed (`ZigExportPlugin.stale`).
+const Stale = struct {
+    output: export_build.StaleOutput,
+    lib: []const u8,
+};
+
 fn exportBegin(self: *ZigExportPlugin, features: *const PackedStringArray, is_debug: bool, path: *const String) void {
     if (self.zip_check) |c| c.deinit();
     self.zip_check = null;
+    if (self.stale) |st| st.output.deinit(gpa);
+    self.stale = null;
     // A `Ref` return: the reference is the caller's.
     const plat = self.base.getExportPlatform();
     defer if (plat) |x| editor_build.releaseRef(x);
@@ -240,10 +270,12 @@ fn exportBegin(self: *ZigExportPlugin, features: *const PackedStringArray, is_de
     const kind = export_build.outputKind(out_path);
     // A pack export does not fail on these errors, so they do not say so.
     const r: Reporter = .{ .platform = plat, .note = if (kind == .pack) "" else incomplete_note };
-    const has_scripts = buildGameLibrary(a, r, key, kind, out_path, is_debug) catch blk: {
+    var stale: ?export_build.StaleOutput = null;
+    const has_scripts = buildGameLibrary(a, r, key, kind, out_path, is_debug, &stale) catch blk: {
         r.fail("Ziggurat cannot build the game library for the export: out of memory.", .{});
         break :blk false;
     };
+    if (stale) |so| self.stale = .{ .output = so, .lib = game_lib };
     if (!has_scripts) return;
     switch (kind) {
         .full => {},
@@ -266,6 +298,19 @@ fn outputPath(a: Allocator, path: *const String) Allocator.Error![]const u8 {
     return props.utf8Alloc(a, &abs);
 }
 
+/// At the end of an export whose old game library stayed: removes the copy
+/// Godot shipped (`export_build.removeStaleOutput`) and says what it did.
+fn removeStale(self: *ZigExportPlugin, st: Stale) void {
+    const plat = self.base.getExportPlatform();
+    defer if (plat) |x| editor_build.releaseRef(x);
+    const r: Reporter = .{ .platform = plat };
+    const text = export_build.removeStaleOutput(gpa, host_io.get(), st.output, st.lib, .{}) catch
+        return r.err("Ziggurat cannot check whether this export ships the old game library: out of memory. Delete {s} from the export's output folder.", .{st.lib});
+    const t = text orelse return;
+    defer gpa.free(t);
+    r.err("{s}", .{t});
+}
+
 /// At the end of a `zip` export of a project with Zig scripts: a zip
 /// without the game library is a pack.
 fn checkZip(self: *ZigExportPlugin, c: ZipCheck) void {
@@ -284,8 +329,10 @@ fn checkZip(self: *ZigExportPlugin, c: ZipCheck) void {
 /// (one `export_build.libFile` knows) to `out_path`. True when the project has
 /// Zig scripts. A debug export
 /// (`is_debug`) builds the library with its debug information
-/// (`export_build.Options.strip` false) and logs `debug_export_line`.
-fn buildGameLibrary(a: Allocator, r: Reporter, key: []const u8, kind: export_build.OutputKind, out_path: []const u8, is_debug: bool) Allocator.Error!bool {
+/// (`export_build.Options.strip` false) and logs `debugExportLine(key)`.
+/// When the game library of an earlier export cannot be removed, `stale`
+/// is set (allocated with `gpa`) to what the export's end must remove.
+fn buildGameLibrary(a: Allocator, r: Reporter, key: []const u8, kind: export_build.OutputKind, out_path: []const u8, is_debug: bool, stale: *?export_build.StaleOutput) Allocator.Error!bool {
     const io = host_io.get();
     const cwd = std.Io.Dir.cwd();
     var msg: std.ArrayList(u8) = .empty;
@@ -307,32 +354,32 @@ fn buildGameLibrary(a: Allocator, r: Reporter, key: []const u8, kind: export_bui
     // longer in use.
     if (std.fs.path.dirname(out.bytes)) |dir| export_build.sweepRenamedLibraries(io, dir, files.game_lib);
     // Never ship an old library: from here on it exists only when this
-    // export wrote it.
-    switch (builtin.os.tag) {
-        .windows => {
-            const old = try export_build.removeOldLibrary(a, io, out.bytes, .{});
-            switch (old) {
-                .gone => {},
-                .renamed => |aside| log("Ziggurat: the game library of an earlier export {s} is in use, so it was renamed to {s}; the next export deletes it.", .{ out.bytes, aside }),
-                .stays => |sentence| {
-                    r.fail("{s}", .{sentence});
-                    return false;
-                },
-            }
+    // export wrote it. When it stays, Godot still copies it (an error
+    // message does not stop an export), so the export's end removes the
+    // copy (`stale`).
+    const removed = if (comptime builtin.os.tag == .windows)
+        try windowsOldLibrary(a, r, out.bytes, .{})
+    else if (testOldLibraryStays(a))
+        try windowsOldLibrary(a, r, out.bytes, .{ .delete = failForTest, .rename = failRenameForTest })
+    else if (cwd.deleteFile(io, out.bytes)) |_| true else |err| switch (err) {
+        error.FileNotFound => true,
+        else => blk: {
+            oldLibraryStays(r, out.bytes, err);
+            break :blk false;
         },
-        else => cwd.deleteFile(io, out.bytes) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => {
-                oldLibraryStays(r, out.bytes, err);
-                return false;
-            },
-        },
+    };
+    if (!removed) {
+        var zip_before: ?std.Io.Timestamp = null;
+        if (kind == .zip) {
+            const zip_abs = if (std.fs.path.isAbsolute(out_path)) out_path else try std.fs.path.join(a, &.{ project, out_path });
+            if (cwd.statFile(io, zip_abs, .{})) |st| zip_before = st.mtime else |_| {}
+        }
+        stale.* = try export_build.staleOutput(gpa, kind, project, out_path, files.game_lib, zip_before);
+        return false;
     }
     // Nor leave one next to the new game files when this export fails.
     if (kind == .full and out_path.len != 0) {
-        const dir = std.fs.path.dirname(out_path) orelse ".";
-        const base = if (std.fs.path.isAbsolute(dir)) dir else try std.fs.path.join(a, &.{ project, dir });
-        const old = try std.fs.path.join(a, &.{ base, files.game_lib });
+        const old = try export_build.outputLibraryPath(a, project, out_path, files.game_lib);
         cwd.deleteFile(io, old) catch |err| switch (err) {
             error.FileNotFound => {},
             else => r.send(.export_message_error, "Ziggurat cannot delete {s}, the game library of an earlier export in the export's output folder ({t}). If this export fails, that old library stays next to the new game files: delete it.", .{ old, err }),
@@ -395,7 +442,7 @@ fn buildGameLibrary(a: Allocator, r: Reporter, key: []const u8, kind: export_bui
     }
 
     log("Ziggurat: building the game library for the export ({d} Zig scripts, Zig {s} at {s})...", .{ sc.scripts.len, in.zig.version, in.zig.exe.bytes });
-    if (is_debug) log("{s}", .{debug_export_line});
+    if (is_debug) log("{s}", .{debugExportLine(key)});
     const t0 = std.Io.Clock.awake.now(io);
     var diag: [256]u8 = undefined;
     const res = export_build.run(gpa, io, .{
@@ -433,6 +480,40 @@ fn buildGameLibrary(a: Allocator, r: Reporter, key: []const u8, kind: export_bui
         r.fail("The Zig build for the export failed with the errors above. The game library was not written.", .{});
     }
     return true;
+}
+
+/// The Windows rule (`export_build.removeOldLibrary`): true when nothing
+/// is left at `path`; false after the failure was reported.
+fn windowsOldLibrary(a: Allocator, r: Reporter, path: []const u8, ops: export_build.FileOps) Allocator.Error!bool {
+    switch (try export_build.removeOldLibrary(a, host_io.get(), path, ops)) {
+        .gone => return true,
+        .renamed => |aside| {
+            log("Ziggurat: the game library of an earlier export {s} is in use, so it was renamed to {s}; the next export deletes it.", .{ path, aside });
+            return true;
+        },
+        .stays => |sentence| {
+            r.fail("{s}", .{sentence});
+            return false;
+        },
+    }
+}
+
+/// Test probe hosts only: with the environment variable
+/// `ZIGGURAT_TEST_OLD_LIBRARY_STAYS=1`, a Linux editor uses the Windows
+/// old-library rule with a failing delete and rename, so the host tests
+/// reach the branch where the old library stays and Godot copies it.
+fn testOldLibraryStays(a: Allocator) bool {
+    if (comptime !host_options.test_probe) return false;
+    const v = editor_build.envVar(a, "ZIGGURAT_TEST_OLD_LIBRARY_STAYS") catch return false;
+    return if (v) |t| std.mem.eql(u8, t, "1") else false;
+}
+
+fn failForTest(_: std.Io, _: []const u8) anyerror!void {
+    return error.AccessDenied;
+}
+
+fn failRenameForTest(_: std.Io, _: []const u8, _: []const u8) anyerror!void {
+    return error.AccessDenied;
 }
 
 /// POSIX: an old game library that could not be deleted must not ship. It

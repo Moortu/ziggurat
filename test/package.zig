@@ -329,6 +329,26 @@ test "package: holds both targets" {
         try testing.expectEqual(@as(u16, 0x8664), rd(u16, data, rd(u32, data, 0x3c) + 4)); // AMD64
         try testing.expect(!try isPeExecutable(data));
     }
+    // The empty game libraries pass the export build's own checks: the DLL
+    // exports only `ziggurat_host_init` (no MinGW runtime exports, no
+    // script entry points) and imports no module loader.
+    for ([_]struct { []const u8, zbuild.export_build.Format }{
+        .{ "bin/x86_64-linux/libziggurat_game_empty.so", .elf },
+        .{ "bin/x86_64-windows/ziggurat_game_empty.dll", .pe },
+    }) |lib| {
+        const data = find(entries, try std.fmt.allocPrint(a, root ++ "{s}", .{lib[0]})).?.data;
+        var why: [256]u8 = undefined;
+        if (try zbuild.export_build.checkLibrary(a, lib[1], data, &why)) |sentence| {
+            std.debug.print("{s}: {s}\n", .{ lib[0], sentence });
+            return error.EmptyGameLibraryRefused;
+        }
+    }
+    {
+        const dll = find(entries, root ++ "bin/x86_64-windows/ziggurat_game_empty.dll").?.data;
+        const ex = try platform.pe.exports(a, dll);
+        try testing.expectEqual(@as(usize, 1), ex.len);
+        try testing.expectEqualStrings("ziggurat_host_init", ex[0]);
+    }
     // The export host archives: a GNU archive and a COFF archive (two
     // linker members `/`), each with base names only, so no cache path.
     for ([_]struct { []const u8, bool }{

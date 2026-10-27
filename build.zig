@@ -920,7 +920,7 @@ const LinkedOptions = struct {
 /// resolve to the module's, so nothing is loaded at run time. Godot's
 /// entry `ziggurat_host_init` is the only symbol the library exports: a
 /// version script says so on ELF, a module-definition file on Windows
-/// (`export_build.module_definition`; without it the COFF linker also
+/// (`empty_root.module_definition`; without it the COFF linker also
 /// exports the MinGW runtime's `_CRT_INIT`, `__mingw_module_is_dll` and
 /// `atexit`).
 fn linkedLibrary(
@@ -936,7 +936,7 @@ fn linkedLibrary(
         .linkage = .dynamic,
         .name = o.name,
         .use_llvm = o.use_llvm,
-        .win32_module_definition = if (is_windows) files.add("exports.def", "EXPORTS\n    ziggurat_host_init\n") else null,
+        .win32_module_definition = if (is_windows) files.add("exports.def", empty_root.module_definition) else null,
         .root_module = b.createModule(.{
             .target = mod.resolved_target,
             .optimize = mod.optimize,

@@ -66,8 +66,11 @@ pub const host_archive_file = "libziggurat_host_export.a";
 pub const entry_symbol = workspace.entry_symbol;
 const version_script = "{ global: " ++ entry_symbol ++ "; local: *; };\n";
 const version_script_name = "export.map";
-/// The Windows counterpart of `version_script`.
-pub const module_definition = "EXPORTS\n    " ++ entry_symbol ++ "\n";
+/// The Windows counterpart of `version_script` (`empty_root.module_definition`).
+pub const module_definition = @import("empty_root.zig").module_definition;
+comptime {
+    if (!std.mem.eql(u8, module_definition, "EXPORTS\n    " ++ entry_symbol ++ "\n")) @compileError("the module-definition file must export only " ++ entry_symbol);
+}
 const module_definition_name = "export.def";
 /// The target of a Windows export (MinGW ABI, as Godot's own templates).
 pub const windows_target = "x86_64-windows-gnu";
@@ -366,13 +369,15 @@ pub fn exportProblem(syms: []const DynSymbol, buf: *[256]u8) ?[]const u8 {
 
 /// Why the export and import names of a Windows game DLL are wrong, or
 /// null: it must export `entry_symbol` and nothing else (an export by
-/// ordinal only, `#<n>`, counts as another export), and must import no
-/// `LoadLibrary*` and no `GetProcAddress` from any DLL: the game loads no
-/// module at run time, so the editor's loader must not be linked in. Every
-/// other import is allowed, among them `GetFileInformationByHandle` (file
-/// identity) and ntdll's `LdrLoadDll` and `LdrGetProcedureAddress`, which
-/// Zig's std uses to load `iphlpapi.dll` and `dnsapi.dll` by fixed name for
-/// its network functions. The sentence is in `buf`.
+/// ordinal only, `#<n>`, counts as another export). It must not import the
+/// module loader, so the editor's loader cannot be linked in: no
+/// `LoadLibrary*`, `LoadPackagedLibrary`, `LoadModule` or `GetProcAddress`
+/// from any DLL, and nothing from kernel32 by ordinal (the check cannot
+/// tell what that is). Every other import is allowed, among them
+/// `GetFileInformationByHandle` (file identity) and ntdll's `LdrLoadDll`,
+/// `LdrGetProcedureAddress` and `LdrUnloadDll`, which Zig's std uses to
+/// load `iphlpapi.dll` and `dnsapi.dll` by fixed name for its network
+/// functions. The sentence is in `buf`.
 pub fn peProblem(exports: []const []const u8, imports: []const platform.pe.Import, buf: *[256]u8) ?[]const u8 {
     var has_entry = false;
     for (exports) |name| {
@@ -384,14 +389,26 @@ pub fn peProblem(exports: []const []const u8, imports: []const platform.pe.Impor
         return platform.elf.diagText(buf);
     }
     for (imports) |im| {
-        if (std.mem.startsWith(u8, im.name, "LoadLibrary") or std.mem.eql(u8, im.name, "GetProcAddress")) {
-            platform.elf.setDiag(buf, "The export library imports {s} from {s}; it must load nothing at run time.", .{ im.name, im.dll });
+        if (isLoaderImport(im.name)) {
+            platform.elf.setDiag(buf, "The export library imports the module loader function {s} from {s}; a game library must not link the module loader.", .{ im.name, im.dll });
+            return platform.elf.diagText(buf);
+        }
+        if (std.mem.startsWith(u8, im.name, "#") and std.ascii.eqlIgnoreCase(im.dll, "kernel32.dll")) {
+            platform.elf.setDiag(buf, "The export library imports function {s} of {s} by ordinal, so the check cannot tell whether it is the module loader.", .{ im.name, im.dll });
             return platform.elf.diagText(buf);
         }
     }
     if (has_entry) return null;
     platform.elf.setDiag(buf, "The export library does not export " ++ entry_symbol ++ ".", .{});
     return platform.elf.diagText(buf);
+}
+
+fn isLoaderImport(name: []const u8) bool {
+    if (std.mem.startsWith(u8, name, "LoadLibrary")) return true;
+    for ([_][]const u8{ "LoadPackagedLibrary", "LoadModule", "GetProcAddress" }) |n| {
+        if (std.mem.eql(u8, name, n)) return true;
+    }
+    return false;
 }
 
 /// The first `GLIBC_` version in `versions` newer than `max` (`2.28`), or
@@ -547,6 +564,86 @@ pub fn sweepRenamedLibraries(io: std.Io, dir: []const u8, base: []const u8) void
     while (it.next(io) catch null) |entry| {
         if (entry.kind != .file or !isRenamedLibrary(base, entry.name)) continue;
         d.deleteFile(io, entry.name) catch {};
+    }
+}
+
+/// The game library a full export writes next to its executable, for the
+/// output path `out_path` (absolute, or relative to the project folder
+/// `project`, as Godot resolves it) and the target's library file `lib`.
+/// Allocated with `a`.
+pub fn outputLibraryPath(a: std.mem.Allocator, project: []const u8, out_path: []const u8, lib: []const u8) std.mem.Allocator.Error![]u8 {
+    const dir = std.fs.path.dirname(out_path) orelse return std.fs.path.join(a, &.{ project, lib });
+    if (std.fs.path.isAbsolute(dir)) return std.fs.path.join(a, &.{ dir, lib });
+    return std.fs.path.join(a, &.{ project, dir, lib });
+}
+
+/// What an export must remove at its end (`_export_end`) when the game
+/// library of an earlier export could not be removed (`OldLibrary.stays`,
+/// or the POSIX rule's failure). Godot does not stop an export for an
+/// error message, and it copies whatever file the `.gdextension` names,
+/// so the old library may have shipped. Free with `deinit`.
+pub const StaleOutput = union(enum) {
+    /// A pack export (`.pck`): it holds no shared library.
+    none,
+    /// A full export: Godot copied the library to this path, next to the
+    /// game executable, before `_export_end`.
+    library: []u8,
+    /// A `zip` export: Godot wrote the zip before `_export_end`. It holds
+    /// the old library when it is a full export (`zipHoldsLibrary`).
+    /// `before` is the zip's modification time before the export (null:
+    /// there was none), so an earlier export's zip is left alone.
+    zip: struct { path: []u8, before: ?std.Io.Timestamp },
+
+    pub fn deinit(self: StaleOutput, a: std.mem.Allocator) void {
+        switch (self) {
+            .none => {},
+            .library => |p| a.free(p),
+            .zip => |z| a.free(z.path),
+        }
+    }
+};
+
+/// The `StaleOutput` of an export of `kind` to `out_path` (absolute, or
+/// relative to `project`) for the library file `lib`. Allocated with `a`.
+pub fn staleOutput(a: std.mem.Allocator, kind: OutputKind, project: []const u8, out_path: []const u8, lib: []const u8, zip_before: ?std.Io.Timestamp) std.mem.Allocator.Error!StaleOutput {
+    return switch (kind) {
+        .pack => .none,
+        .full => if (out_path.len == 0) .none else .{ .library = try outputLibraryPath(a, project, out_path, lib) },
+        .zip => .{ .zip = .{
+            .path = if (std.fs.path.isAbsolute(out_path)) try a.dupe(u8, out_path) else try std.fs.path.join(a, &.{ project, out_path }),
+            .before = zip_before,
+        } },
+    };
+}
+
+/// Removes what `stale` names, so the old game library is not shipped:
+/// the library next to the game, or a zip written by this export that
+/// holds it (or that cannot be read). Returns the error sentence to send,
+/// allocated with `a`: what was removed, or what could not be removed and
+/// so still ships the old library. Null when nothing was there.
+pub fn removeStaleOutput(a: std.mem.Allocator, io: std.Io, stale: StaleOutput, lib: []const u8, ops: FileOps) std.mem.Allocator.Error!?[]u8 {
+    switch (stale) {
+        .none => return null,
+        .library => |path| {
+            if (ops.delete(io, path)) |_| {
+                return try std.fmt.allocPrint(a, "Ziggurat deleted {s} from the export's output folder: it was the old game library of an earlier export, with that export's Zig scripts.", .{path});
+            } else |err| {
+                if (err == error.FileNotFound) return null;
+                return try std.fmt.allocPrint(a, "Ziggurat cannot delete {s} ({t}): this export ships the old game library of an earlier export, with that export's Zig scripts. Delete it.", .{ path, err });
+            }
+        },
+        .zip => |z| {
+            const st = std.Io.Dir.cwd().statFile(io, z.path, .{}) catch return null; // nothing written
+            if (z.before) |b| if (st.mtime.nanoseconds == b.nanoseconds) return null; // an earlier export's zip
+            const holds = zipHoldsLibrary(io, z.path, lib) catch true;
+            if (!holds) return null;
+            if (ops.delete(io, z.path)) |_| {
+                return try std.fmt.allocPrint(a, "Ziggurat deleted the ZIP export {s}: it held the old game library of an earlier export, with that export's Zig scripts.", .{z.path});
+            } else |err| {
+                if (err == error.FileNotFound) return null;
+                return try std.fmt.allocPrint(a, "Ziggurat cannot delete the ZIP export {s} ({t}): it holds the old game library of an earlier export, with that export's Zig scripts. Delete it.", .{ z.path, err });
+            }
+        },
     }
 }
 
@@ -799,12 +896,21 @@ test "export_build: windows output has no LoadLibrary import" {
         imp("ntdll.dll", "LdrGetProcedureAddress"),
     };
     try testing.expect(peProblem(&.{"ziggurat_host_init"}, &ok, &buf) == null);
-    for ([_][]const u8{ "LoadLibraryA", "LoadLibraryW", "LoadLibraryExA", "LoadLibraryExW", "GetProcAddress" }) |name| {
+    for ([_][]const u8{ "LoadLibraryA", "LoadLibraryW", "LoadLibraryExA", "LoadLibraryExW", "LoadPackagedLibrary", "LoadModule", "GetProcAddress" }) |name| {
         const bad = ok ++ [_]platform.pe.Import{imp("KERNEL32.dll", name)};
-        const want = try std.fmt.allocPrint(testing.allocator, "The export library imports {s} from KERNEL32.dll; it must load nothing at run time.", .{name});
+        const want = try std.fmt.allocPrint(testing.allocator, "The export library imports the module loader function {s} from KERNEL32.dll; a game library must not link the module loader.", .{name});
         defer testing.allocator.free(want);
         try testing.expectEqualStrings(want, peProblem(&.{"ziggurat_host_init"}, &bad, &buf).?);
     }
+    // From another DLL too (api sets forward to kernel32).
+    const fwd = ok ++ [_]platform.pe.Import{imp("api-ms-win-core-libraryloader-l1-2-0.dll", "LoadLibraryExW")};
+    try testing.expect(peProblem(&.{"ziggurat_host_init"}, &fwd, &buf) != null);
+    // kernel32 by ordinal cannot be told apart from the loader.
+    const ord = ok ++ [_]platform.pe.Import{imp("kernel32.dll", "#583")};
+    try testing.expectEqualStrings("The export library imports function #583 of kernel32.dll by ordinal, so the check cannot tell whether it is the module loader.", peProblem(&.{"ziggurat_host_init"}, &ord, &buf).?);
+    // Names that only start like a loader function are fine.
+    const near = ok ++ [_]platform.pe.Import{ imp("KERNEL32.dll", "LoadResource"), imp("KERNEL32.dll", "GetProcAddressForCaller2"), imp("USER32.dll", "#12") };
+    try testing.expect(peProblem(&.{"ziggurat_host_init"}, &near, &buf) == null);
 }
 
 test "export_build: target keys give the triple, format and library name" {
@@ -817,10 +923,6 @@ test "export_build: target keys give the triple, format and library name" {
     try testing.expectEqualStrings("libziggurat_game.so", libFile("x86_64-linux").?);
     try testing.expectEqualStrings("ziggurat_game.dll", libFile("x86_64-windows").?);
     try testing.expect(libFile("aarch64-macos") == null);
-}
-
-test "the module-definition file exports only the entry point" {
-    try testing.expectEqualStrings("EXPORTS\n    ziggurat_host_init\n", module_definition);
 }
 
 test "the empty game root of a Windows export is the hidden generated root" {
@@ -930,6 +1032,102 @@ test "export: the next export deletes the renamed libraries, and nothing else" {
     const missing = try std.fs.path.join(a, &.{ dir, "missing" });
     defer a.free(missing);
     sweepRenamedLibraries(io, missing, "ziggurat_game.dll");
+}
+
+test "export: what a failed old-library removal must remove at the end" {
+    // The expected paths are written with `/`.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    {
+        const s = try staleOutput(a, .full, "/p", "/abs/out dir/game.exe", "ziggurat_game.dll", null);
+        defer s.deinit(a);
+        try testing.expectEqualStrings("/abs/out dir/ziggurat_game.dll", s.library);
+    }
+    {
+        // Relative output paths are relative to the project folder.
+        const s = try staleOutput(a, .full, "/p", "out/game.x86_64", lib_file, null);
+        defer s.deinit(a);
+        try testing.expectEqualStrings("/p/out/" ++ lib_file, s.library);
+        const bare = try staleOutput(a, .full, "/p", "game.exe", "ziggurat_game.dll", null);
+        defer bare.deinit(a);
+        try testing.expectEqualStrings("/p/ziggurat_game.dll", bare.library);
+    }
+    {
+        const s = try staleOutput(a, .zip, "/p", "out/game.zip", "ziggurat_game.dll", null);
+        defer s.deinit(a);
+        try testing.expectEqualStrings("/p/out/game.zip", s.zip.path);
+    }
+    // A pack holds no shared library; an empty path names nothing.
+    try testing.expect(try staleOutput(a, .pack, "/p", "out/game.pck", lib_file, null) == .none);
+    try testing.expect(try staleOutput(a, .full, "/p", "", lib_file, null) == .none);
+}
+
+test "export: the stale library copied next to the game is removed" {
+    const io = testing.io;
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "ziggurat_game.dll", .data = "old library" });
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const exe = try std.fs.path.join(a, &.{ dir, "game.exe" });
+    defer a.free(exe);
+    const stale = try staleOutput(a, .full, "/unused", exe, "ziggurat_game.dll", null);
+    defer stale.deinit(a);
+
+    // The delete fails: the sentence says the old library ships.
+    const kept = (try removeStaleOutput(a, io, stale, "ziggurat_game.dll", .{ .delete = failDelete })).?;
+    defer a.free(kept);
+    const want_kept = try std.fmt.allocPrint(a, "Ziggurat cannot delete {s} (FileBusy): this export ships the old game library of an earlier export, with that export's Zig scripts. Delete it.", .{stale.library});
+    defer a.free(want_kept);
+    try testing.expectEqualStrings(want_kept, kept);
+    _ = try tmp.dir.statFile(io, "ziggurat_game.dll", .{});
+
+    const gone = (try removeStaleOutput(a, io, stale, "ziggurat_game.dll", .{})).?;
+    defer a.free(gone);
+    try testing.expect(std.mem.startsWith(u8, gone, "Ziggurat deleted "));
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "ziggurat_game.dll", .{}));
+    // Nothing there (Godot's copy failed): nothing to say.
+    try testing.expect(try removeStaleOutput(a, io, stale, "ziggurat_game.dll", .{}) == null);
+}
+
+test "export: a zip that holds the stale library is removed, a pack zip is kept" {
+    const io = testing.io;
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const full_bytes = try testZip(a, &.{ "Game/game.exe", "Game/ziggurat_game.dll" });
+    defer a.free(full_bytes);
+    const pack_bytes = try testZip(a, &.{"project.binary"});
+    defer a.free(pack_bytes);
+
+    const full = try std.fs.path.join(a, &.{ dir, "full.zip" });
+    defer a.free(full);
+    try tmp.dir.writeFile(io, .{ .sub_path = "full.zip", .data = full_bytes });
+    const s_full = try staleOutput(a, .zip, "/unused", full, "ziggurat_game.dll", null);
+    defer s_full.deinit(a);
+    const msg = (try removeStaleOutput(a, io, s_full, "ziggurat_game.dll", .{})).?;
+    defer a.free(msg);
+    try testing.expect(std.mem.startsWith(u8, msg, "Ziggurat deleted the ZIP export "));
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "full.zip", .{}));
+
+    const pack = try std.fs.path.join(a, &.{ dir, "pack.zip" });
+    defer a.free(pack);
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack.zip", .data = pack_bytes });
+    const s_pack = try staleOutput(a, .zip, "/unused", pack, "ziggurat_game.dll", null);
+    defer s_pack.deinit(a);
+    try testing.expect(try removeStaleOutput(a, io, s_pack, "ziggurat_game.dll", .{}) == null);
+    _ = try tmp.dir.statFile(io, "pack.zip", .{});
+
+    // A zip this export did not write (same time as before) is kept.
+    try tmp.dir.writeFile(io, .{ .sub_path = "full.zip", .data = full_bytes });
+    const st = try tmp.dir.statFile(io, "full.zip", .{});
+    const s_old = try staleOutput(a, .zip, "/unused", full, "ziggurat_game.dll", st.mtime);
+    defer s_old.deinit(a);
+    try testing.expect(try removeStaleOutput(a, io, s_old, "ziggurat_game.dll", .{}) == null);
+    _ = try tmp.dir.statFile(io, "full.zip", .{});
 }
 
 test "sdkMismatchMessage names the manifest, both versions and the advice" {

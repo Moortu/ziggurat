@@ -1256,7 +1256,9 @@ pub fn hostEnv(a: Allocator) Allocator.Error!platform.path.HostEnv {
     };
 }
 
-fn envVar(a: Allocator, comptime name: []const u8) Allocator.Error!?[]const u8 {
+/// The environment variable `name` through Godot, or null when it is
+/// empty or unset; allocated in `a`. Main thread.
+pub fn envVar(a: Allocator, comptime name: []const u8) Allocator.Error!?[]const u8 {
     var n = String.fromLatin1(name);
     defer n.deinit();
     var v = Os.getEnvironment(n);

@@ -72,10 +72,13 @@ debug information.
   more reliable than function names, because Zig names functions by their
   module path.
 - `--export-debug` (or Export With Debug) builds the game library with its
-  debug information. The export log says "Ziggurat: debug export keeps
-  debug information, with this computer's file paths, and is not
-  reproducible. Turn off Export With Debug for a release." A release
-  export has no debug information.
+  debug information. For Linux the export log says "Ziggurat: debug export
+  keeps debug information, with this computer's file paths, and is not
+  reproducible. Turn off Export With Debug for a release." For Windows the
+  compiler writes the debug information to a separate `.pdb` file in the
+  build cache, which the export does not ship; the DLL keeps only that
+  file's name, and the log says so. A release export has no debug
+  information.
 - The editor setting `ziggurat/build/backend` chooses the compiler backend
   for normal builds: `auto` (the default), `llvm`, `self_hosted` or
   `self_hosted_incremental`. `debugger_builds` wins over it.

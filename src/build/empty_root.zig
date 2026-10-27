@@ -57,3 +57,10 @@ pub const hidden_text =
     \\}
     \\
 ;
+
+/// The module-definition file of every Windows game library (an export
+/// build's and the empty one): it exports only Godot's entry point. Without
+/// it the COFF linker also exports the MinGW runtime's `_CRT_INIT`,
+/// `__mingw_module_is_dll` and `atexit`. Kept here, next to the root
+/// texts, so build.zig and `export_build` share it.
+pub const module_definition = "EXPORTS\n    ziggurat_host_init\n";
