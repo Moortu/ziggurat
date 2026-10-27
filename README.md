@@ -18,10 +18,19 @@ editor. You do not need a custom engine build.
 
 ## The name
 
-Godot takes its name from Beckett's play *Waiting for Godot*, and the C++
-scripting framework [Projekt J.E.N.O.V.A](https://github.com/Jenova-Framework/J.E.N.O.V.A)
-gave itself a dotted, all-capitals name. Ziggurat follows both: a name
-with a story, styled Z.I.G.G.U.R.A.T, that starts with **Zig**.
+The names around this project point at the gods:
+
+- **Godot** comes from Beckett's play *Waiting for Godot*, where everyone
+  waits for a Godot who never arrives; the name is often read as a play
+  on *God*.
+- **Jenova**, the name of the C++ scripting framework
+  [Projekt J.E.N.O.V.A](https://github.com/Jenova-Framework/J.E.N.O.V.A),
+  is often read as *Jehovah* plus *nova*.
+- A **ziggurat** is the stepped temple tower of ancient Mesopotamia, built
+  to bring people closer to their gods.
+
+So a Zig layer for Godot became a temple you build up towards Godot:
+**Zig**gurat, styled Z.I.G.G.U.R.A.T after J.E.N.O.V.A.
 
 | Platform | Editor | Exported games |
 |---|---|---|
