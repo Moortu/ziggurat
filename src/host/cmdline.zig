@@ -39,6 +39,11 @@ pub fn nonInteractiveIn(raw: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Upper bound for `argsFromCommandLine`'s output: Windows allows 32,767
+/// UTF-16 units in a command line, and one unit is at most 3 bytes of UTF-8
+/// (a NUL separator replaces each separating space).
+pub const max_windows_args_bytes = 32768 * 3;
+
 /// This process's arguments on Windows (`GetCommandLineW`), as
 /// `argsFromCommandLine` gives them, or null.
 pub fn windowsArgs(buf: []u8) ?[]const u8 {
@@ -104,4 +109,30 @@ test "cmdline: --import detection on Windows" {
     try std.testing.expect(argsFromCommandLine(line, &small) == null);
     // This process's own command line splits.
     try std.testing.expect(windowsArgs(&buf) != null);
+}
+
+test "cmdline: the longest Windows command line fits and still shows --import" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    // `godot.exe "<32,700 euro signs>" --import`: 3 bytes of UTF-8 per unit.
+    var line = try a.alloc(u16, 32768);
+    defer a.free(line);
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    var n: usize = 0;
+    for (L("godot.exe \"")) |c| {
+        line[n] = c;
+        n += 1;
+    }
+    const tail = L("\" --import");
+    while (n + tail.len < 32767) : (n += 1) line[n] = 0x20ac;
+    for (tail) |c| {
+        line[n] = c;
+        n += 1;
+    }
+    line[n] = 0;
+    const z: [*:0]const u16 = line[0..n :0];
+    const buf = try a.alloc(u8, max_windows_args_bytes);
+    defer a.free(buf);
+    const raw = argsFromCommandLine(z, buf) orelse return error.SplitFailed;
+    try std.testing.expectEqualStrings("--import", nonInteractiveIn(raw).?);
 }

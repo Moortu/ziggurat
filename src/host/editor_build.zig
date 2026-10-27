@@ -814,7 +814,9 @@ pub fn busy() bool {
 fn nonInteractiveArg() ?[]const u8 {
     const S = struct {
         var buf: [256]u8 = undefined;
-        var raw_buf: [64 * 1024]u8 = undefined;
+        /// The longest Windows command line is 32,767 UTF-16 units, at most
+        /// 3 bytes each as UTF-8 (`cmdline.max_windows_args_bytes`).
+        var raw_buf: [cmdline.max_windows_args_bytes]u8 = undefined;
     };
     const raw: ?[]const u8 = switch (@import("builtin").os.tag) {
         .linux => readCmdline(&S.raw_buf),

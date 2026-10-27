@@ -424,10 +424,10 @@ pub const GenerationStore = struct {
         return true;
     }
 
-    /// Renames the generation folder `dp` into `<root>/.trash/<n>-<16 hex>`.
-    /// When the folder itself cannot be renamed (Windows refuses to rename a
-    /// folder while a file in it is open), its files are renamed one by one
-    /// into such a folder and the emptied folder is deleted.
+    /// Moves the generation `dp` into `<root>/.trash/<n>-<16 hex>`. On Windows
+    /// its files are moved one by one with `MoveFileExW` into a new folder of
+    /// that name and the emptied folder is deleted; elsewhere the folder is
+    /// renamed.
     fn moveToTrash(self: *GenerationStore, dp: OsPath, n: u32) !void {
         const a = self.a;
         const io = self.io;
@@ -443,16 +443,33 @@ pub const GenerationStore = struct {
         const name = try std.fmt.bufPrint(&nb, "{d}-{s}", .{ n, &std.fmt.bytesToHex(rnd, .lower) });
         const dst = try path.join(a, trash, &.{name});
         defer a.free(dst.bytes);
-        if (Dir.cwd().rename(dp.bytes, Dir.cwd(), dst.bytes, io)) |_| return else |_| {}
-
-        try Dir.cwd().createDir(io, dst.bytes, .default_dir);
-        var d = try Dir.cwd().openDir(io, dp.bytes, .{ .iterate = true });
-        defer d.close(io);
-        var to = try Dir.cwd().openDir(io, dst.bytes, .{});
-        defer to.close(io);
-        var it = d.iterate();
-        while (try it.next(io)) |entry| try d.rename(entry.name, to, entry.name, io);
-        try Dir.cwd().deleteDir(io, dp.bytes);
+        if (builtin.os.tag == .windows) {
+            // The folder rename is skipped on Windows: std's rename asks for
+            // write access, which Windows refuses for a loaded DLL (and for
+            // a folder with a running image in it), and it retries a refusal
+            // for about 4 s while `store.lock` is held. `MoveFileExW`
+            // (`win32.moveFile`) asks for delete access only.
+            const win32 = @import("win32.zig");
+            try Dir.cwd().createDir(io, dst.bytes, .default_dir);
+            {
+                var d = try Dir.cwd().openDir(io, dp.bytes, .{ .iterate = true, .follow_symlinks = false });
+                defer d.close(io);
+                var it = d.iterate();
+                while (try it.next(io)) |entry| {
+                    // `deleteTree` removed everything it could; a generation
+                    // holds plain files only. Links are never followed.
+                    if (entry.kind != .file) return error.NotAFile;
+                    const from = try path.join(a, dp, &.{entry.name});
+                    defer a.free(from.bytes);
+                    const to = try path.join(a, dst, &.{entry.name});
+                    defer a.free(to.bytes);
+                    try win32.moveFile(a, from.bytes, to.bytes);
+                }
+            }
+            try Dir.cwd().deleteDir(io, dp.bytes);
+            return;
+        }
+        try Dir.cwd().rename(dp.bytes, Dir.cwd(), dst.bytes, io);
     }
 
     /// Deletes each entry of `<root>/.trash/` that `moveToTrash` made
@@ -1164,9 +1181,13 @@ test "store: a loaded DLL's generation is renamed into trash and deleted later" 
     first.pin.release();
     _ = try stageOne(a, &s, built);
 
-    // Windows cannot delete the loaded DLL: the folder goes to the trash,
-    // with no failure.
+    // Windows cannot delete the loaded DLL: it goes to the trash, with no
+    // failure and without std's rename retries (about 4 s each), which
+    // would keep `store.lock` for that long.
+    const t0 = std.Io.Clock.awake.now(std.testing.io);
     const rep = try s.sweep();
+    const ms = t0.durationTo(std.Io.Clock.awake.now(std.testing.io)).toMilliseconds();
+    try std.testing.expect(ms < 2000);
     try std.testing.expectEqual(@as(u32, 1), rep.deleted);
     try std.testing.expectEqual(@as(u32, 0), rep.failed);
     try std.testing.expect(!try genExists(a, &f, 1));
