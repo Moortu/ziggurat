@@ -3,10 +3,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const path = @import("path.zig");
 const elf = @import("elf.zig");
+const macho = @import("macho.zig");
 const safe_open = @import("safe_open.zig");
 const testing_support = @import("testing_support.zig");
 
-pub const LoadError = error{ LoadFailed, Unsupported } || elf.ElfError;
+pub const LoadError = error{ LoadFailed, Unsupported } || elf.ElfError || macho.Error;
 
 /// Handle of an open shared library.
 pub const Library = struct {
@@ -15,16 +16,19 @@ pub const Library = struct {
 
 const setDiag = elf.setDiag;
 
-/// Opens the shared library at `p` with `RTLD_NOW | RTLD_LOCAL`. On ELF targets
-/// the file is first checked with `elf.checkComplete`, so a truncated or
-/// corrupt file is refused before `dlopen` sees it. macOS skips the check
-/// (Mach-O checking is stage 7 work).
+/// Opens the shared library at `p` with `RTLD_NOW | RTLD_LOCAL`. The file
+/// is first checked, so a truncated or corrupt file is refused before
+/// `dlopen` sees it: with `elf.checkComplete` on ELF targets, and with
+/// `macho.checkComplete` on macOS (thin or fat, every slice).
 /// On failure `diag` holds one NUL-terminated sentence (read it with
 /// `elf.diagText`): `error.LoadFailed` carries the `dlerror` text, or the
-/// reason the file could not be read for the check.
+/// reason the file could not be read for the check; the check's errors
+/// carry its reason.
 pub fn open(a: std.mem.Allocator, io: std.Io, p: path.OsPath, diag: *[256]u8) LoadError!Library {
-    if (builtin.object_format == .elf) {
-        try checkFile(io, p, diag);
+    switch (builtin.object_format) {
+        .elf => try checkFile(io, p, diag),
+        .macho => try checkMachO(a, io, p, diag),
+        else => {},
     }
     const z = a.dupeSentinel(u8, p.bytes, 0) catch {
         setDiag(diag, "Out of memory while loading {s}.", .{p.bytes});
@@ -59,6 +63,37 @@ fn checkFile(io: std.Io, p: path.OsPath, diag: *[256]u8) LoadError!void {
             return error.LoadFailed;
         },
     };
+}
+
+/// Reads the whole file at `p` and checks it with `macho.checkCompleteDiag`.
+fn checkMachO(a: std.mem.Allocator, io: std.Io, p: path.OsPath, diag: *[256]u8) LoadError!void {
+    const file = safe_open.openRegular(io, p.bytes, .{}) catch |err| {
+        setDiag(diag, "Cannot open {s} to check it: {s}.", .{ p.bytes, switch (err) {
+            error.NotRegular => "it is not a regular file",
+            else => @errorName(err),
+        } });
+        return error.LoadFailed;
+    };
+    defer file.close(io);
+    const bytes = readAll(a, io, file) catch |err| {
+        setDiag(diag, "Cannot read {s} to check it: {s}.", .{ p.bytes, @errorName(err) });
+        return error.LoadFailed;
+    };
+    defer a.free(bytes);
+    var why: [256]u8 = undefined;
+    macho.checkCompleteDiag(bytes, &why) catch |err| {
+        setDiag(diag, "{s} (while loading {s})", .{ elf.diagText(&why), p.bytes });
+        return err;
+    };
+}
+
+fn readAll(a: std.mem.Allocator, io: std.Io, file: std.Io.File) ![]u8 {
+    const len = try file.length(io);
+    const bytes = try a.alloc(u8, std.math.cast(usize, len) orelse return error.FileTooBig);
+    errdefer a.free(bytes);
+    const n = try file.readPositionalAll(io, bytes, 0);
+    if (n != bytes.len) return error.FileChanged;
+    return bytes;
 }
 
 /// Looks up the symbol `name`. `T` must be a pointer to a function type.

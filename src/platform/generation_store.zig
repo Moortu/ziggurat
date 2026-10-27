@@ -14,6 +14,7 @@ const builtin = @import("builtin");
 const path = @import("path.zig");
 const elf = @import("elf.zig");
 const pe = @import("pe.zig");
+const macho = @import("macho.zig");
 const lock = @import("lock.zig");
 const testing_support = @import("testing_support.zig");
 const Allocator = std.mem.Allocator;
@@ -124,8 +125,9 @@ pub const GenerationStore = struct {
     /// Copies `built` (never moves it) to `gen/<n>/<libName>` where n is the
     /// highest existing generation plus one, and copies each of `extras` into
     /// the same folder under its own file name. The staged copy is checked
-    /// with `elf.checkComplete` on an ELF target and with
-    /// `pe.checkCompleteDiag` on Windows. On any error no `gen/<n>`
+    /// with `elf.checkComplete` on an ELF target, with
+    /// `pe.checkCompleteDiag` on Windows and with `macho.checkCompleteDiag`
+    /// on macOS. On any error no `gen/<n>`
     /// folder is left behind. The new generation comes back pinned
     /// (`Staged.pin`, taken before `store.lock` is released), so no sweep can
     /// delete it before its user loads it (spec risk 20). The caller frees
@@ -136,7 +138,7 @@ pub const GenerationStore = struct {
     }
 
     /// Like `stage`, and on any failure `diag` holds one NUL-terminated
-    /// sentence (read it with `elf.diagText`): the ELF or PE check's text, or a
+    /// sentence (read it with `elf.diagText`): the ELF, PE or Mach-O check's text, or a
     /// generic sentence naming the error and the built file.
     pub fn stageDiag(self: *GenerationStore, built: OsPath, extras: []const OsPath, diag: *[256]u8) !Staged {
         @memset(diag, 0);
@@ -189,6 +191,10 @@ pub const GenerationStore = struct {
             const bytes = try Dir.cwd().readFileAlloc(io, lib.bytes, a, .unlimited);
             defer a.free(bytes);
             try pe.checkCompleteDiag(bytes, diag);
+        } else if (self.os.isDarwin()) {
+            const bytes = try Dir.cwd().readFileAlloc(io, lib.bytes, a, .unlimited);
+            defer a.free(bytes);
+            try macho.checkCompleteDiag(bytes, diag);
         }
 
         for (extras) |extra| {
@@ -616,10 +622,24 @@ const Fixture = struct {
         return GenerationStore.init(a, std.testing.io, f.root, os_tag, "demo", caps);
     }
     /// A library the store's check accepts for this target, holding
-    /// `payload`: `writePe` on Windows, `writeElf` elsewhere.
+    /// `payload`: `writePe` on Windows, `writeMachO` on macOS, `writeElf`
+    /// elsewhere.
     fn writeLib(f: *Fixture, name: []const u8, payload: []const u8) !void {
         if (os_tag == .windows) return f.writePe(name, payload);
+        if (os_tag.isDarwin()) return f.writeMachO(name, payload);
         return f.writeElf(name, payload);
+    }
+    /// A minimal complete Mach-O image: a 64-bit header with no load
+    /// commands, followed by `payload` bytes.
+    fn writeMachO(f: *Fixture, name: []const u8, payload: []const u8) !void {
+        var b: [32]u8 = @splat(0);
+        std.mem.writeInt(u32, b[0..4], std.macho.MH_MAGIC_64, .little);
+        std.mem.writeInt(u32, b[4..8], std.macho.CPU_TYPE_ARM64, .little);
+        std.mem.writeInt(u32, b[12..16], std.macho.MH_DYLIB, .little);
+        var file = try f.tmp.dir.createFile(std.testing.io, name, .{});
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, &b, 0);
+        try file.writePositionalAll(std.testing.io, payload, 32);
     }
     /// A minimal complete PE32+ file: headers up to byte 0x200, then one
     /// section holding `payload`.
@@ -1225,6 +1245,32 @@ test "store: PE check after staging refuses a truncated DLL" {
     defer st.gen.deinit(a);
     defer st.pin.release();
     try std.testing.expectEqual(@as(u32, 1), st.gen.n);
+}
+
+test "store: Mach-O check after staging refuses a truncated dylib" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    const bytes = try Dir.cwd().readFileAlloc(io, @import("build_options").macho_arm64_dylib, a, .unlimited);
+    defer a.free(bytes);
+    try f.tmp.dir.writeFile(io, .{ .sub_path = "cut.dylib", .data = bytes[0 .. bytes.len - 1] });
+    try f.tmp.dir.writeFile(io, .{ .sub_path = "whole.dylib", .data = bytes });
+    const cut = try f.p(a, &.{"cut.dylib"});
+    defer a.free(cut.bytes);
+    var s = GenerationStore.init(a, io, f.root, .macos, "demo", .{});
+    var diag: [256]u8 = undefined;
+    try std.testing.expectError(error.Truncated, s.stageDiag(cut, &.{}, &diag));
+    try std.testing.expect(std.mem.indexOf(u8, elf.diagText(&diag), "truncated") != null);
+    try std.testing.expect(!try genExists(a, &f, 1));
+    // The whole dylib is staged.
+    const whole = try f.p(a, &.{"whole.dylib"});
+    defer a.free(whole.bytes);
+    var st = try s.stage(whole, &.{});
+    defer st.gen.deinit(a);
+    defer st.pin.release();
+    try std.testing.expectEqual(@as(u32, 1), st.gen.n);
+    try std.testing.expect(std.mem.endsWith(u8, st.gen.lib.bytes, "libdemo.1.dylib"));
 }
 
 test "isTrashName accepts only what moveToTrash writes" {

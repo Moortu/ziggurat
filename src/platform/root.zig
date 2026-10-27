@@ -7,6 +7,7 @@ pub const target_key = @import("target_key.zig");
 pub const path = @import("path.zig");
 pub const elf = @import("elf.zig");
 pub const pe = @import("pe.zig");
+pub const macho = @import("macho.zig");
 pub const loader = @import("loader.zig");
 pub const atomic_file = @import("atomic_file.zig");
 pub const lock = @import("lock.zig");
@@ -28,6 +29,8 @@ test {
     std.testing.refAllDecls(elf);
     std.testing.refAllDecls(pe);
     _ = @import("pe_test.zig");
+    std.testing.refAllDecls(macho);
+    _ = @import("macho_test.zig");
     std.testing.refAllDecls(loader);
     std.testing.refAllDecls(atomic_file);
     std.testing.refAllDecls(lock);

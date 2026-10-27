@@ -1408,6 +1408,24 @@ fn addTestSet(
         }),
     });
     options.addOptionPath("answer_dll", pe_fixture.getEmittedBin());
+    // Small thin macOS dylibs (arm64 and x86_64) for the Mach-O reader
+    // tests, built here for the same reason. The tests join the fat file.
+    for ([_][2][]const u8{
+        .{ "macho_arm64_dylib", "aarch64-macos.11.0" },
+        .{ "macho_x86_64_dylib", "x86_64-macos.11.0" },
+    }) |m| {
+        const dylib = b.addLibrary(.{
+            .name = "answer",
+            .linkage = .dynamic,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/fixtures/macho/answer_dylib.zig"),
+                .target = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = m[1] }) catch unreachable),
+                .optimize = .ReleaseSmall,
+                .link_libc = true,
+            }),
+        });
+        options.addOptionPath(m[0], dylib.getEmittedBin());
+    }
     // A fake compiler `.exe` for the Windows process tests (a job tree that
     // must die on a timeout, an update that never ends), for the same reason.
     const fake_compiler = b.addExecutable(.{
