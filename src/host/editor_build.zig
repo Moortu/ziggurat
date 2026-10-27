@@ -1069,7 +1069,9 @@ fn sdkManifest(ga: Allocator, a: Allocator, key: ?[]const u8, msg: *std.ArrayLis
                 try msg.print(ga, "the shipped SDK's manifest {s} has no absolute path ({s}){s}.", .{ res_path, shipped, unset });
                 return error.Unusable;
             }
-            std.Io.Dir.cwd().access(io, shipped, .{}) catch |err| {
+            // `statFile`, not `access`: under Wine 11.19 `access` never
+            // finds a file.
+            _ = std.Io.Dir.cwd().statFile(io, shipped, .{}) catch |err| {
                 switch (err) {
                     error.FileNotFound => try msg.print(ga, "there is no SDK at {s} (the add-on's sdk folder is missing){s}.", .{ res_path, unset }),
                     else => try msg.print(ga, "the shipped SDK's manifest {s} cannot be read ({t}){s}.", .{ shipped, err, unset }),

@@ -23,9 +23,6 @@ const FORMAT_MESSAGE_IGNORE_INSERTS: u32 = 0x0000_0200;
 const FORMAT_MESSAGE_FROM_SYSTEM: u32 = 0x0000_1000;
 const FORMAT_MESSAGE_MAX_WIDTH_MASK: u32 = 0x0000_00ff;
 
-/// Paths of this many UTF-16 units or more need the `\\?\` prefix.
-const max_path = 260;
-
 /// Opens the DLL at `p` with
 /// `LoadLibraryExW(path, null, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)`:
 /// the DLL's own folder and the system folders are searched for its
@@ -39,7 +36,7 @@ const max_path = 260;
 /// `error.Truncated`, `error.NotPe` or `error.BadHeader` the check's reason.
 pub fn open(a: std.mem.Allocator, io: std.Io, p: path.OsPath, diag: *[256]u8) LoadError!Library {
     try checkFile(a, io, p, diag);
-    const wide = fullPath(a, p.bytes) catch |err| {
+    const wide = win32.fullPath(a, p.bytes) catch |err| {
         setDiag(diag, "Cannot make a full path of {s}: {s}.", .{ p.bytes, @errorName(err) });
         return error.LoadFailed;
     };
@@ -81,38 +78,6 @@ fn readAll(a: std.mem.Allocator, io: std.Io, file: std.Io.File) ![]u8 {
     const n = try file.readPositionalAll(io, bytes, 0);
     if (n != bytes.len) return error.FileChanged;
     return bytes;
-}
-
-/// `p` as a fully qualified UTF-16 path for `LoadLibraryExW`, with the
-/// `\\?\` (or `\\?\UNC\`) prefix when it is 260 characters or longer.
-fn fullPath(a: std.mem.Allocator, p: []const u8) ![:0]u16 {
-    const in = try std.unicode.wtf8ToWtf16LeAllocZ(a, p);
-    defer a.free(in);
-    var buf: []u16 = try a.alloc(u16, max_path);
-    defer a.free(buf);
-    var n = win32.GetFullPathNameW(in.ptr, @intCast(buf.len), buf.ptr, null);
-    if (n == 0) return error.BadPath;
-    if (n >= buf.len) {
-        // `n` is the size needed, with the NUL.
-        const bigger = try a.alloc(u16, n);
-        a.free(buf);
-        buf = bigger;
-        n = win32.GetFullPathNameW(in.ptr, @intCast(buf.len), buf.ptr, null);
-        if (n == 0 or n >= buf.len) return error.BadPath;
-    }
-    const full = buf[0..n];
-    const L = std.unicode.utf8ToUtf16LeStringLiteral;
-    const prefix: []const u16, const rest: []const u16 = if (full.len < max_path or
-        std.mem.startsWith(u16, full, L("\\\\?\\")) or std.mem.startsWith(u16, full, L("\\\\.\\")))
-        .{ &.{}, full }
-    else if (std.mem.startsWith(u16, full, L("\\\\")))
-        .{ L("\\\\?\\UNC\\"), full[2..] }
-    else
-        .{ L("\\\\?\\"), full };
-    const out = try a.allocSentinel(u16, prefix.len + rest.len, 0);
-    @memcpy(out[0..prefix.len], prefix);
-    @memcpy(out[prefix.len..], rest);
-    return out;
 }
 
 /// The system's text for the Windows error `code`, without a final period

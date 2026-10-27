@@ -514,6 +514,13 @@ pub const FileOps = struct {
     }
 
     fn renameFile(io: std.Io, from: []const u8, to: []const u8) anyerror!void {
+        // std's rename opens the file for writing too, which Windows
+        // refuses while another process has the DLL loaded.
+        if (builtin.os.tag == .windows) {
+            var buf: [4 * std.fs.max_path_bytes]u8 = undefined;
+            var fba: std.heap.FixedBufferAllocator = .init(&buf);
+            return platform.win32.moveFile(fba.allocator(), from, to);
+        }
         const cwd = std.Io.Dir.cwd();
         return cwd.rename(from, cwd, to, io);
     }
@@ -884,6 +891,49 @@ test "export_build: windows output exports only ziggurat_host_init" {
     // Not a PE file, or a cut one: errors, never a panic.
     try testing.expectError(error.NotPe, checkLibrary(testing.allocator, .pe, "\x7fELF not a PE file at all, but long enough to have a DOS header field..........", &buf));
     try testing.expectError(error.Truncated, checkLibrary(testing.allocator, .pe, dll[0 .. dll.len / 2], &buf));
+}
+
+test "export_build: a loaded old library is renamed aside, and swept once unloaded" {
+    // Windows refuses to delete a DLL another program has loaded, but lets
+    // it be renamed, if the rename asks for no write access.
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const dll = try std.Io.Dir.cwd().readFileAlloc(testing.io, build_options.answer_dll, a, .unlimited);
+    defer a.free(dll);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "ziggurat_game.dll", .data = dll });
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", a);
+    defer a.free(dir);
+    const lib_path = try std.fs.path.join(a, &.{ dir, "ziggurat_game.dll" });
+    defer a.free(lib_path);
+    var diag: [256]u8 = undefined;
+    const lib = try platform.loader.open(a, testing.io, .fromTrusted(lib_path), &diag);
+    var loaded = true;
+    defer if (loaded) platform.loader.close(lib);
+    const result = try removeOldLibrary(a, testing.io, lib_path, .{});
+    switch (result) {
+        .renamed => |aside| {
+            defer a.free(aside);
+            try testing.expect(isRenamedLibrary("ziggurat_game.dll", std.fs.path.basename(aside)));
+            _ = try std.Io.Dir.cwd().statFile(testing.io, aside, .{});
+        },
+        .gone => return error.LoadedLibraryWasDeleted,
+        .stays => |sentence| {
+            defer a.free(sentence);
+            std.debug.print("{s}\n", .{sentence});
+            return error.LoadedLibraryStays;
+        },
+    }
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, lib_path, .{}));
+    platform.loader.close(lib);
+    loaded = false;
+    sweepRenamedLibraries(testing.io, dir, "ziggurat_game.dll");
+    var it = tmp.dir.iterate();
+    while (try it.next(testing.io)) |e| {
+        std.debug.print("left: {s}\n", .{e.name});
+        return error.RenamedLibraryLeft;
+    }
 }
 
 test "export_build: windows output has no LoadLibrary import" {

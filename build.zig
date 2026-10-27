@@ -64,6 +64,7 @@ pub fn build(b: *std.Build) void {
     const stress_step = b.step("test-stress", "Run the reload stress test with 300 edits in a headless editor (needs Godot); not part of test");
     const package_test_step = b.step("test-package", "Run the release package tests (part of test)");
     const windows_step = b.step("test-windows", "Run the unit tests for x86_64-windows-gnu under Wine (needs wine on PATH)");
+    const wine_e2e_step = b.step("test-wine-e2e", "Run the Windows editor, export and download end to end under Wine (needs wine on PATH; the -Dwindows-* options; part of test when one is given)");
     const package_step = b.step("package", "Write the release package <prefix>/ziggurat-" ++ sdk_version ++ ".zip (the release download and the Asset Store upload)");
 
     const sdk = addSdk(b, target, optimize, godot_path);
@@ -299,7 +300,26 @@ pub fn build(b: *std.Build) void {
         });
         const runner: Runner = .{ .wine = .{ .tool = wine_run, .state = std.Build.LazyPath.cache_root.path(b, "ziggurat-wine") } };
         addTestSet(b, windows_step, windows, optimize, zig_exe, false, runner, null, null, sdk_options, sdk, sdkGdzig(b, windows, optimize, godot_path), null, null, null);
-        if (windows_godot != null or windows_zig != null or windows_zig_zip != null) test_step.dependOn(windows_step);
+        addWineE2e(b, wine_e2e_step, .{
+            .windows = windows,
+            .windows_build = for (shipped) |t| {
+                if (std.mem.eql(u8, t.key, target_key.x86_64_windows)) break t;
+            } else @panic("no packaged x86_64-windows target"),
+            .wine_run = wine_run,
+            .wine_state = runner.wine.state,
+            .package_zip = packages[0],
+            .godot_path = godot_path,
+            .linux_godot = godot_found,
+            .zig_exe = zig_exe,
+            .export_templates = export_templates,
+            .windows_godot = windows_godot,
+            .windows_zig = windows_zig,
+            .windows_zig_zip = windows_zig_zip,
+        });
+        if (windows_godot != null or windows_zig != null or windows_zig_zip != null) {
+            test_step.dependOn(windows_step);
+            test_step.dependOn(wine_e2e_step);
+        }
     }
     addTestSet(b, unit_step, target, optimize, zig_exe, false, .native, null, null, sdk_options, sdk, sdk.import_table.get("gdzig").?, null, null, null);
 
@@ -341,6 +361,99 @@ pub fn build(b: *std.Build) void {
             }).step);
         }
     }
+}
+
+const WineE2eInputs = struct {
+    windows: std.Build.ResolvedTarget,
+    /// The packaged x86_64-windows target (its SDK options).
+    windows_build: TargetBuild,
+    wine_run: *std.Build.Step.Compile,
+    wine_state: std.Build.LazyPath,
+    package_zip: std.Build.LazyPath,
+    godot_path: []const u8,
+    /// The Linux editor, which exports the Windows game (null: that test
+    /// skips).
+    linux_godot: ?[]const u8,
+    zig_exe: []const u8,
+    export_templates: ?[]const u8,
+    windows_godot: ?[]const u8,
+    windows_zig: ?[]const u8,
+    windows_zig_zip: ?[]const u8,
+};
+
+/// `test-wine-e2e`: test/host/wine_e2e.zig, run on this machine, starts the
+/// Windows editor, an exported Windows game and the Windows Zig under Wine
+/// (tools/wine_run.zig, the Wine prefix of `test-windows`). Its inputs are
+/// the release package, the Windows host built with the test probe (for the
+/// download's test overrides) and test/host/wine_holder.zig, a Windows
+/// program that holds a file open or loaded.
+fn addWineE2e(b: *std.Build, step: *std.Build.Step, in: WineE2eInputs) void {
+    const runner = b.addExecutable(.{
+        .name = "host_runner",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/host/runner.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "godot_output_scan", .module = b.createModule(.{
+                .root_source_file = b.path("test/godot/output_scan.zig"),
+                .target = b.graph.host,
+                .optimize = .Debug,
+            }) }},
+        }),
+    });
+    // As the package builds the Windows editor library: ReleaseSafe, LLVM.
+    const probe_dll = addHost(b, in.windows, .ReleaseSafe, in.godot_path, in.zig_exe, in.windows_build.sdk.import_table.get("sdk_options").?, .{
+        .test_probe = true,
+        .use_llvm = true,
+        .strip = true,
+    });
+    const holder = b.addExecutable(.{
+        .name = "wine_holder",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/host/wine_holder.zig"),
+            .target = in.windows,
+            .optimize = .ReleaseSafe,
+        }),
+        .use_llvm = true,
+    });
+    const options = b.addOptions();
+    options.addOptionPath("runner_exe", runner.getEmittedBin());
+    options.addOptionPath("wine_run_exe", in.wine_run.getEmittedBin());
+    options.addOptionPathUntracked("wine_state", in.wine_state);
+    options.addOptionPath("package_zip", in.package_zip);
+    options.addOptionPath("probe_host_dll", probe_dll.getEmittedBin());
+    options.addOptionPath("holder_exe", holder.getEmittedBin());
+    options.addOption([]const u8, "godot_exe", in.linux_godot orelse "");
+    options.addOption([]const u8, "zig_exe", in.zig_exe);
+    options.addOption([]const u8, "export_templates", in.export_templates orelse "");
+    options.addOption([]const u8, "windows_godot", in.windows_godot orelse "");
+    options.addOption([]const u8, "windows_zig", in.windows_zig orelse "");
+    options.addOption([]const u8, "windows_zig_zip", in.windows_zig_zip orelse "");
+    options.addOption([]const u8, "projects_dir", b.root.joinString(b.allocator, "test/host/projects") catch @panic("OOM"));
+    options.addOption([]const u8, "checks_dir", b.root.joinString(b.allocator, "test/host/checks") catch @panic("OOM"));
+    // The Linux editor's export build cache: the export tests' one.
+    options.addOptionPathUntracked("export_test_cache", std.Build.LazyPath.cache_root.path(b, "ziggurat-export-tests"));
+    const t = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("test/host/wine_e2e.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .imports = &.{
+            .{ .name = "wine_e2e_options", .module = options.createModule() },
+            .{ .name = "wine_gaps", .module = b.createModule(.{
+                .root_source_file = b.path("test/wine_gaps.zig"),
+                .target = b.graph.host,
+                .optimize = .Debug,
+            }) },
+        },
+    }) });
+    const run = b.addRunArtifact(t);
+    // Read at run time: the fixtures and checks, and the Windows inputs.
+    addSourceInputs(b, run, &.{ "test/host/projects", "test/host/checks" });
+    for ([_]?[]const u8{ in.windows_zig_zip, if (in.windows_godot) |d| b.pathJoin(&.{ d, "Godot_v4.7.2-stable_win64_console.exe" }) else null, if (in.windows_zig) |d| b.pathJoin(&.{ d, "zig.exe" }) else null }) |f| {
+        if (f) |path| run.addFileInput(.{ .cwd_relative = path });
+    }
+    if (in.linux_godot) |g| run.addFileInput(.{ .cwd_relative = g });
+    step.dependOn(&run.step);
 }
 
 /// The editor library's file name for target `t`: the packaged name for a

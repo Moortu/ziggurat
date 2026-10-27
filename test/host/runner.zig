@@ -39,6 +39,13 @@
 //! case. `runner --print <dir> <name>` only prints that file to stderr.
 //! Exits 0 on success, 1 on failure and 2 on a usage error.
 //!
+//! Wine mode: with `--wine-run <wine_run> --wine-state <dir>` the program
+//! (`<godot>`, or `<exe>` for `run`) is a Windows program, started as
+//! `wine_run <dir> <program> ...` (tools/wine_run.zig: the Wine prefix
+//! `<dir>/prefix`, `WINEDEBUG=-all`). The project folder, the export
+//! output and `<exe>` are passed as `Z:\...` paths (Wine's drive for `/`),
+//! and a `run` also gets `--quit-after 5`.
+//!
 //! Orphan StringName reports fail only on ordinary (non-static) references
 //! beyond what Godot itself leaves: Godot 4.7.2's editor (headless or not,
 //! with no extension loaded) ends with `Orphan StringName: Node (static: 3,
@@ -63,6 +70,7 @@ const usage =
     \\       runner <godot> <project dir> export-pack <preset> <out> <deadline s> [--exit-code <n> | --expect[-once] <text> | --reject <text> | --allow-report <line> | --echo <prefix>]...
     \\       runner <godot> <project dir> export-debug <preset> <out> <deadline s> [--exit-code <n> | --expect[-once] <text> | --reject <text> | --allow-report <line> | --echo <prefix>]...
     \\       runner <godot> <project dir> run <exe> <deadline s> [--exit-code <n> | --expect[-once] <text> | --reject <text> | --allow-report <line> | --echo <prefix>]...
+    \\       Wine mode, with any of them: --wine-run <wine_run> --wine-state <dir>
     \\
 ;
 
@@ -97,8 +105,18 @@ pub fn main(init: std.process.Init) !u8 {
     var allowed: std.ArrayList([]const u8) = .empty;
     var echoes: std.ArrayList([]const u8) = .empty;
     var exit_code: u8 = 0;
+    var wine_run: ?[]const u8 = null;
+    var wine_state: ?[]const u8 = null;
     var i: usize = first_opt;
     while (i < args.len) : (i += 2) {
+        if (std.mem.eql(u8, args[i], "--wine-run") and i + 1 < args.len) {
+            wine_run = args[i + 1];
+            continue;
+        }
+        if (std.mem.eql(u8, args[i], "--wine-state") and i + 1 < args.len) {
+            wine_state = args[i + 1];
+            continue;
+        }
         if (std.mem.eql(u8, args[i], "--exit-code") and i + 1 < args.len) {
             exit_code = std.fmt.parseInt(u8, args[i + 1], 10) catch {
                 std.debug.print("runner: exit code '{s}' is not a number from 0 to 255\n{s}", .{ args[i + 1], usage });
@@ -125,18 +143,25 @@ pub fn main(init: std.process.Init) !u8 {
         try list.?.append(arena, args[i + 1]);
     }
 
+    if ((wine_run == null) != (wine_state == null)) {
+        std.debug.print("runner: --wine-run and --wine-state go together\n{s}", .{usage});
+        return 2;
+    }
+    const wine = wine_run != null;
     const is_run = std.mem.eql(u8, mode, "run");
     var argv: std.ArrayList([]const u8) = .empty;
+    if (wine) try argv.appendSlice(arena, &.{ wine_run.?, wine_state.? });
     if (is_run) {
-        try argv.appendSlice(arena, &.{ mode_arg, "--headless", "--verbose" });
+        try argv.appendSlice(arena, &.{ try hostPath(arena, wine, mode_arg), "--headless", "--verbose" });
     } else {
-        try argv.appendSlice(arena, &.{ godot, "--headless", "--verbose", "--path", project });
+        try argv.appendSlice(arena, &.{ godot, "--headless", "--verbose", "--path", try hostPath(arena, wine, project) });
     }
     if (is_run) {
-        // The exported game: nothing more.
+        // The exported game: nothing more (under Wine, a frame limit).
+        if (wine) try argv.appendSlice(arena, &.{ "--quit-after", "5" });
     } else if (is_export) {
         const flag = if (std.mem.eql(u8, mode, "export")) "--export-release" else if (std.mem.eql(u8, mode, "export-debug")) "--export-debug" else "--export-pack";
-        try argv.appendSlice(arena, &.{ flag, mode_arg, args[5] });
+        try argv.appendSlice(arena, &.{ flag, mode_arg, try hostPath(arena, wine, args[5]) });
     } else if (std.mem.eql(u8, mode, "script")) {
         try argv.appendSlice(arena, &.{ "--script", mode_arg });
     } else if (std.mem.eql(u8, mode, "editor") or std.mem.eql(u8, mode, "build")) {
@@ -210,6 +235,24 @@ pub fn main(init: std.process.Init) !u8 {
     for (problems.items) |p| std.debug.print("runner: {s}\n", .{p});
     for (allowed.items) |l| std.debug.print("runner: allowed report: {s}\n", .{l});
     return 1;
+}
+
+/// `path` as the started program sees it: unchanged, or under Wine
+/// (`wine`) an absolute path as `Z:\...`, Wine's drive for `/`.
+fn hostPath(arena: std.mem.Allocator, wine: bool, path: []const u8) ![]const u8 {
+    if (!wine or !std.fs.path.isAbsolutePosix(path)) return path;
+    const out = try std.mem.concat(arena, u8, &.{ "Z:", path });
+    std.mem.replaceScalar(u8, out, '/', '\\');
+    return out;
+}
+
+test "hostPath gives Wine's Z: path" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try std.testing.expectEqualStrings("Z:\\tmp\\my game\\out\\game.exe", try hostPath(a, true, "/tmp/my game/out/game.exe"));
+    try std.testing.expectEqualStrings("/tmp/x", try hostPath(a, false, "/tmp/x"));
+    try std.testing.expectEqualStrings("res://main.tscn", try hostPath(a, true, "res://main.tscn"));
 }
 
 /// `runner --print <dir> <name>`: writes the file to stderr (build.zig's

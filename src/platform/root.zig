@@ -19,6 +19,9 @@ pub const minisign = @import("minisign.zig");
 pub const mirrors = @import("mirrors.zig");
 pub const toolchain_install = @import("toolchain_install.zig");
 pub const testing_support = @import("testing_support.zig");
+/// The kernel32 calls the platform layer makes on Windows (only Windows
+/// code paths may reference them).
+pub const win32 = @import("win32.zig");
 
 test {
     std.testing.refAllDecls(path);

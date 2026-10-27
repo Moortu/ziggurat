@@ -46,8 +46,9 @@
 //! stays (the install deletes its temporary folder on every path).
 //!
 //! Test overrides (probe builds only, `configureForTest`): the mirror list
-//! URL, the ziglang.org stand-in, the key, the archive pin, and plain http
-//! for the local fixture server. Product builds use the pinned values.
+//! URL, the ziglang.org stand-in, the key and the archive pin (or neither,
+//! for the pinned ones), plain http for the local fixture server, and the
+//! toolchains folder. Product builds use the pinned values.
 const std = @import("std");
 const builtin = @import("builtin");
 const godot = @import("gdzig");
@@ -358,7 +359,7 @@ pub fn onCompleted(result: i64, code: i64, body: *const PackedByteArray) void {
 
 fn config() ?Config {
     if (comptime host_options.test_probe) {
-        if (test_config) |t| return .{
+        if (test_config) |t| if (!t.pinned) return .{
             .list_url = t.list_url,
             .official_base = t.official_base,
             .key = t.key,
@@ -375,16 +376,31 @@ fn config() ?Config {
         fail("the pinned Zig key does not parse", .{});
         return null;
     };
-    return .{ .list_url = mirrors.list_url, .official_base = null, .key = key, .archive = archive, .plain_http = false, .timings = default_timings };
+    var c: Config = .{ .list_url = mirrors.list_url, .official_base = null, .key = key, .archive = archive, .plain_http = false, .timings = default_timings };
+    if (comptime host_options.test_probe) {
+        // The pinned key and archive, from the test's mirrors.
+        if (test_config) |t| {
+            c.list_url = t.list_url;
+            c.official_base = t.official_base;
+            c.plain_http = t.plain_http;
+            c.timings = t.timings;
+        }
+    }
+    return c;
 }
 
 /// Finds and makes `<toolchains>` and `<user data>/ziggurat`.
 fn folders() !void {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
-    const env = try editor_build.hostEnv(arena_state.allocator());
-    const paths: platform.path.PathService = .init(.{ .project = .fromTrusted("/") }, env);
-    const tc = try paths.dir(.toolchain, gpa);
+    const tc: platform.path.OsPath = override: {
+        if (comptime host_options.test_probe) {
+            if (test_config) |t| if (t.toolchains_dir) |d| break :override .{ .bytes = try gpa.dupe(u8, d) };
+        }
+        const env = try editor_build.hostEnv(arena_state.allocator());
+        const paths: platform.path.PathService = .init(.{ .project = .fromTrusted("/") }, env);
+        break :override try paths.dir(.toolchain, gpa);
+    };
     tc_dir = @constCast(tc.bytes);
     data_dir = try gpa.dupe(u8, std.fs.path.dirname(tc.bytes) orelse return error.NoDataFolder);
     const io = host_io.get();
@@ -824,6 +840,12 @@ const TestConfig = struct {
     archive_sha256: [32]u8,
     plain_http: bool,
     timings: Timings,
+    /// The overrides name no key and no archive: the pinned ones apply
+    /// (`key` and the `archive_*` fields are unused).
+    pinned: bool = false,
+    /// The toolchains folder instead of the per-user one (its parent holds
+    /// the mirror list cache).
+    toolchains_dir: ?[]const u8 = null,
     /// Owns the strings above.
     text: []u8,
 };
@@ -839,7 +861,10 @@ fn rejectConfig(own: []u8) bool {
 /// TEST ONLY (probe builds): takes the overrides from `key=value` lines
 /// (`list_url`, `official_base`, `key`, `archive_name`, `archive_size`,
 /// `archive_sha256`, `plain_http`; optional `request_timeout_ms`,
-/// `stall_ms`, `archive_deadline_ms`). False when one is missing or bad.
+/// `stall_ms`, `archive_deadline_ms`, `toolchains_dir`). `key` and the
+/// three `archive_*` lines may all be left out together: the pinned key
+/// and archive of this platform apply then. False when one is missing or
+/// bad.
 pub fn configureForTest(text: []const u8) bool {
     comptime std.debug.assert(host_options.test_probe);
     const own = gpa.dupe(u8, text) catch return false;
@@ -877,9 +902,14 @@ pub fn configureForTest(text: []const u8) bool {
             t.timings.stall_ms = std.fmt.parseInt(u32, v, 10) catch return rejectConfig(own);
         } else if (std.mem.eql(u8, k, "archive_deadline_ms")) {
             t.timings.archive_deadline_ms = std.fmt.parseInt(u64, v, 10) catch return rejectConfig(own);
+        } else if (std.mem.eql(u8, k, "toolchains_dir")) {
+            if (v.len == 0) return rejectConfig(own);
+            t.toolchains_dir = v;
         }
     }
-    if (have != 63) return rejectConfig(own);
+    // The mirror list and the ziglang.org stand-in, with the key and the
+    // archive or without both.
+    if (have == 3) t.pinned = true else if (have != 63) return rejectConfig(own);
     if (test_config) |old| gpa.free(old.text);
     test_config = t;
     return true;

@@ -3903,11 +3903,28 @@ test "export: an unreadable Zig file fails an export with scripts" {
     try testing.expect(!try projectFileExists(&p, "out/libziggurat_game.so"));
 }
 
+/// True when the project's file system finds a file under another case
+/// of its name (as Windows' does).
+fn caseInsensitive(p: *Project) !bool {
+    var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+    defer dir.close(io);
+    try dir.writeFile(io, .{ .sub_path = "case-probe.txt", .data = "" });
+    defer dir.deleteFile(io, "case-probe.txt") catch {};
+    _ = dir.statFile(io, "CASE-PROBE.TXT", .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
 test "export: a case collision fails the export" {
     try requireTemplates();
     var p: Project = undefined;
     try initExport(&p, null);
     defer p.deinit();
+    // Ruling 4: where names that differ only by case are one file, the
+    // project cannot hold both.
+    if (try caseInsensitive(&p)) return error.SkipZigTest;
     const script = "pub const extends = @import(\"ziggurat\").godot.Node;\n";
     try writeProjectFile(&p, "a.zig", script);
     try writeProjectFile(&p, "A.zig", script);

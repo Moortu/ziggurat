@@ -40,6 +40,73 @@ pub extern "kernel32" fn GetProcAddress(module: HANDLE, name: [*:0]const u8) cal
 pub extern "kernel32" fn FreeLibrary(module: HANDLE) callconv(.winapi) BOOL;
 pub extern "kernel32" fn GetFullPathNameW(name: [*:0]const u16, len: u32, buf: ?[*]u16, file_part: ?*?[*:0]u16) callconv(.winapi) u32;
 
+/// Paths of this many UTF-16 units or more need the `\\?\` prefix.
+const max_path = 260;
+
+/// `p` as a fully qualified UTF-16 path (for `LoadLibraryExW` or
+/// `MoveFileExW`), with the
+/// `\\?\` (or `\\?\UNC\`) prefix when it is 260 characters or longer.
+pub fn fullPath(a: std.mem.Allocator, p: []const u8) ![:0]u16 {
+    const in = try std.unicode.wtf8ToWtf16LeAllocZ(a, p);
+    defer a.free(in);
+    var buf: []u16 = try a.alloc(u16, max_path);
+    defer a.free(buf);
+    var n = GetFullPathNameW(in.ptr, @intCast(buf.len), buf.ptr, null);
+    if (n == 0) return error.BadPath;
+    if (n >= buf.len) {
+        // `n` is the size needed, with the NUL.
+        const bigger = try a.alloc(u16, n);
+        a.free(buf);
+        buf = bigger;
+        n = GetFullPathNameW(in.ptr, @intCast(buf.len), buf.ptr, null);
+        if (n == 0 or n >= buf.len) return error.BadPath;
+    }
+    const full = buf[0..n];
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    const prefix: []const u16, const rest: []const u16 = if (full.len < max_path or
+        std.mem.startsWith(u16, full, L("\\\\?\\")) or std.mem.startsWith(u16, full, L("\\\\.\\")))
+        .{ &.{}, full }
+    else if (std.mem.startsWith(u16, full, L("\\\\")))
+        .{ L("\\\\?\\UNC\\"), full[2..] }
+    else
+        .{ L("\\\\?\\"), full };
+    const out = try a.allocSentinel(u16, prefix.len + rest.len, 0);
+    @memcpy(out[0..prefix.len], prefix);
+    @memcpy(out[prefix.len..], rest);
+    return out;
+}
+
+// ---------------------------------------------------------------- rename
+
+pub extern "kernel32" fn MoveFileExW(from: [*:0]const u16, to: [*:0]const u16, flags: u32) callconv(.winapi) BOOL;
+
+pub const MoveError = error{ FileNotFound, AccessDenied, FileBusy, PathAlreadyExists, BadPath, Unexpected } || std.mem.Allocator.Error;
+
+/// Renames the file `from` to `to` (both absolute, in one volume) with
+/// `MoveFileExW`, which opens the file with delete access only. So a DLL
+/// another process has loaded can be renamed, which std's rename (it asks
+/// for write access too) cannot. An existing `to` is an error.
+pub fn moveFile(a: std.mem.Allocator, from: []const u8, to: []const u8) MoveError!void {
+    const from_w = fullPath(a, from) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.BadPath,
+    };
+    defer a.free(from_w);
+    const to_w = fullPath(a, to) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.BadPath,
+    };
+    defer a.free(to_w);
+    if (MoveFileExW(from_w.ptr, to_w.ptr, 0) != 0) return;
+    return switch (GetLastError()) {
+        2, 3 => error.FileNotFound, // ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
+        5 => error.AccessDenied, // ERROR_ACCESS_DENIED
+        32 => error.FileBusy, // ERROR_SHARING_VIOLATION
+        80, 183 => error.PathAlreadyExists, // ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS
+        else => error.Unexpected,
+    };
+}
+
 // ---------------------------------------------------------------- file identity
 
 pub const FILETIME = extern struct { low: u32, high: u32 };

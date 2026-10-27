@@ -137,7 +137,8 @@ pub const Server = struct {
         const rel = safeRel(target) orelse return notFound(out);
         const file = try std.fs.path.join(a, &.{ s.root, rel });
         const dir = Io.Dir.cwd();
-        const limit: Io.Limit = .limited(16 << 20);
+        // The real Windows Zig zip (100 MB) is the largest file served.
+        const limit: Io.Limit = .limited(128 << 20);
 
         if (dir.readFileAlloc(s.io, try std.mem.concat(a, u8, &.{ file, ".location" }), a, limit)) |loc| {
             try out.print("HTTP/1.1 302 Found\r\nLocation: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{std.mem.trim(u8, loc, " \r\n")});
