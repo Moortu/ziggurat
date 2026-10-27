@@ -1,5 +1,22 @@
 # Ziggurat
 
+> **Status: proof of concept (0.1.0-poc).** Ziggurat is a reverse
+> engineering of [Projekt J.E.N.O.V.A](https://github.com/Jenova-Framework/J.E.N.O.V.A)'s
+> idea for Zig, coded with Claude Code (an AI coding assistant). It
+> rebuilds what Jenova does for C++ from Godot's own source; it contains
+> no Jenova code. It shows that Zig scripting in stock Godot can work.
+> It will probably not be developed further, so do not build anything
+> important on it. Linux x86_64 is the tested platform. Windows x86_64 is
+> tested under Wine only. macOS (universal, 11.0 or newer) is built and
+> checked on Linux but has never run on a Mac. Expect rough edges. You
+> are welcome to fork it.
+
+| Platform | Editor | Exported games |
+|---|---|---|
+| Linux x86_64 | tested | tested (glibc 2.28 or newer) |
+| Windows x86_64 | tested under Wine only; building Zig scripts in a Windows editor is untested | tested under Wine |
+| macOS 11.0+ (arm64 and x86_64) | experimental, never run on a Mac | experimental, never run on a Mac |
+
 Ziggurat lets a Godot 4.7 project use **Zig scripts** (`.zig` files) next to
 GDScript. A Zig script is a real Godot script: you attach it to a node, its
 fields show up in the Inspector, GDScript can call its methods and connect to
@@ -23,19 +40,6 @@ which brings full C++ scripting into the Godot editor. Ziggurat asks the
 same question for Zig: what if a compiled language felt like GDScript
 inside Godot? Ziggurat shares no code with Jenova; the idea, and even the
 name (see [The name](#the-name)), come from it.
-
-> **Status: proof of concept (0.1.0-poc).** This project shows that Zig
-> scripting in stock Godot can work. It will probably not be developed
-> further, so do not build anything important on it. Linux x86_64 is the
-> tested platform. Windows x86_64 is tested under Wine only. macOS
-> (universal, 11.0 or newer) is built and checked on Linux but has never
-> run on a Mac. Expect rough edges. You are welcome to fork it.
-
-| Platform | Editor | Exported games |
-|---|---|---|
-| Linux x86_64 | tested | tested (glibc 2.28 or newer) |
-| Windows x86_64 | tested under Wine only; building Zig scripts in a Windows editor is untested | tested under Wine |
-| macOS 11.0+ (arm64 and x86_64) | experimental, never run on a Mac | experimental, never run on a Mac |
 
 ## The name
 
