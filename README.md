@@ -20,9 +20,8 @@ editor. You do not need a custom engine build.
 
 The names around this project point at the gods:
 
-- **Godot** comes from Beckett's play *Waiting for Godot*, where everyone
-  waits for a Godot who never arrives; the name is often read as a play
-  on *God*.
+- **Godot** comes from Beckett's play *Waiting for Godot*. The name is
+  often read as *God* plus the French diminutive *-ot*: a little god.
 - **Jenova**, the name of the C++ scripting framework
   [Projekt J.E.N.O.V.A](https://github.com/Jenova-Framework/J.E.N.O.V.A),
   is often read as *Jehovah* plus *nova*.
