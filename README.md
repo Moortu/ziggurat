@@ -65,7 +65,7 @@ Z.I.G.G.U.R.A.T like J.E.N.O.V.A.
 
 | Dependency | What Ziggurat uses it for | Where it comes from |
 |---|---|---|
-| [gdzig](https://github.com/gdzig/gdzig) | the Zig bindings to Godot: engine classes, Variant, StringName, method calls, class registration | vendored in `vendor/gdzig/`, pinned to commit `c8e0768c9eb768827163f0ac893a5038bda799cb`, with five local patches listed in [`vendor/gdzig/PATCHES.md`](vendor/gdzig/PATCHES.md) |
+| [gdzig](https://github.com/gdzig/gdzig) | the Zig bindings to Godot: engine classes, Variant, StringName, method calls, class registration | the git submodule `vendor/gdzig/`: branch [`ziggurat`](https://github.com/Moortu/gdzig/tree/ziggurat) of the fork [Moortu/gdzig](https://github.com/Moortu/gdzig), which is upstream commit `c8e0768c9eb768827163f0ac893a5038bda799cb` plus five patches, listed in `PATCHES.md` there. The patches are meant for upstream; once they are merged, the submodule can point at gdzig itself. |
 | [casez](https://github.com/gdzig/casez) (a gdzig package) | converting names between cases (`snake_case`, `PascalCase`, ...) | fetched by the build, commit `6864e2e3…` |
 | [translate-c](https://codeberg.org/ziglang/translate-c) | translating Godot's C header `gdextension_interface.h` to Zig, plus its small helper code | fetched by the build, commit `02ff0c52…` |
 | [Godot Engine](https://github.com/godotengine/godot) 4.7.2 | the GDExtension API description (`extension_api.json`) that the class bindings are generated from | vendored with gdzig (`vendor/gdzig/vendor/`) |
@@ -225,8 +225,18 @@ keeps debug information with your computer's file paths.
 ## Build from source
 
 You need Zig 0.17.0 and Godot 4.7.2 (the build reads Godot's API through
-the vendored gdzig bindings and looks for `godot` on `PATH`, or takes
+gdzig and looks for `godot` on `PATH`, or takes
 `-Dgodot-path=<absolute path>`).
+
+gdzig is a git submodule, so clone with `--recursive`:
+
+```sh
+git clone --recursive https://github.com/Moortu/ziggurat.git
+# or, in an existing clone:
+git submodule update --init
+```
+
+Then:
 
 ```sh
 # The release package: zig-out/ziggurat-0.1.0.zip (every platform).
@@ -272,7 +282,7 @@ need Wine and the Windows inputs. Without them those tests skip.
 | `addons/ziggurat/` | the add-on files that ship as they are (README, `.gdextension`) |
 | `tools/` | build helpers (archive normalising, SDK staging, Mach-O joining, Wine runner) |
 | `test/` | integration, host (headless Godot), GUI, stress and package tests |
-| `vendor/gdzig/` | the vendored gdzig bindings, with local patches (`vendor/gdzig/PATCHES.md`) |
+| `vendor/gdzig/` | the gdzig bindings: a git submodule of the fork [Moortu/gdzig](https://github.com/Moortu/gdzig/tree/ziggurat), with the patches in its `PATCHES.md` |
 
 ## License
 
