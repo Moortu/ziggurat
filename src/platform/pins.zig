@@ -48,7 +48,8 @@ pub const Archive = struct {
 const Entry = struct {
     target: Target,
     archive: Archive,
-    /// False for targets that are listed but not offered yet (Stage 7).
+    /// False for targets that are listed but not offered yet (aarch64
+    /// Linux).
     active: bool,
 };
 
@@ -62,8 +63,8 @@ const archives = [_]Entry{
     entry(.x86_64, .linux, "zig-x86_64-linux-0.17.0.tar.xz", 57332648, "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026", true),
     entry(.aarch64, .linux, "zig-aarch64-linux-0.17.0.tar.xz", 52877280, "9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8", false),
     entry(.x86_64, .windows, "zig-x86_64-windows-0.17.0.zip", 100268137, "b5663f69581dcf391293fbf16c06cb80d81d806545ce618b4d0bab7f0eb8c428", true),
-    entry(.aarch64, .macos, "zig-aarch64-macos-0.17.0.tar.xz", 53985220, "b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a", false),
-    entry(.x86_64, .macos, "zig-x86_64-macos-0.17.0.tar.xz", 59317572, "4f9a1c5269aa17ebda5e6d3c2b89d6cbf36f7d2b22a0306e9ab98f25f95529c6", false),
+    entry(.aarch64, .macos, "zig-aarch64-macos-0.17.0.tar.xz", 53985220, "b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a", true),
+    entry(.x86_64, .macos, "zig-x86_64-macos-0.17.0.tar.xz", 59317572, "4f9a1c5269aa17ebda5e6d3c2b89d6cbf36f7d2b22a0306e9ab98f25f95529c6", true),
 };
 
 /// The pinned Zig release archive for `target`, or null when Ziggurat does
@@ -75,7 +76,7 @@ pub fn zig_archive(target: Target) ?Archive {
     return null;
 }
 
-test "pins: archives for x86_64-linux and x86_64-windows only" {
+test "pins: archives for x86_64-linux, x86_64-windows and both macOS arches" {
     const a = zig_archive(.{ .arch = .x86_64, .os = .linux }).?;
     try std.testing.expectEqualStrings("zig-x86_64-linux-0.17.0.tar.xz", a.name);
     try std.testing.expectEqual(@as(u64, 57332648), a.size);
@@ -87,8 +88,20 @@ test "pins: archives for x86_64-linux and x86_64-windows only" {
     try std.testing.expectEqual(@as(u64, 100268137), w.size);
     try std.testing.expectEqual(@as(u8, 0xb5), w.sha256[0]);
     try std.testing.expectEqual(@as(u8, 0x28), w.sha256[31]);
-    try std.testing.expect(zig_archive(.{ .arch = .aarch64, .os = .macos }) == null);
-    try std.testing.expect(zig_archive(.{ .arch = .x86_64, .os = .macos }) == null);
+    // Offered since Stage 7c: both files were checked once against these
+    // pins (size, SHA-256, signature) and unpack on Linux through the
+    // download's install path (host test "download: the real macOS
+    // tarball checks and unpacks"). No Mac has run them.
+    const m = zig_archive(.{ .arch = .aarch64, .os = .macos }).?;
+    try std.testing.expectEqualStrings("zig-aarch64-macos-0.17.0.tar.xz", m.name);
+    try std.testing.expectEqual(@as(u64, 53985220), m.size);
+    try std.testing.expectEqual(@as(u8, 0xb6), m.sha256[0]);
+    try std.testing.expectEqual(@as(u8, 0x6a), m.sha256[31]);
+    const mx = zig_archive(.{ .arch = .x86_64, .os = .macos }).?;
+    try std.testing.expectEqualStrings("zig-x86_64-macos-0.17.0.tar.xz", mx.name);
+    try std.testing.expectEqual(@as(u64, 59317572), mx.size);
+    try std.testing.expectEqual(@as(u8, 0x4f), mx.sha256[0]);
+    try std.testing.expectEqual(@as(u8, 0xc6), mx.sha256[31]);
     try std.testing.expect(zig_archive(.{ .arch = .aarch64, .os = .linux }) == null);
     try std.testing.expect(zig_archive(.{ .arch = .riscv64, .os = .linux }) == null);
     // Every listed name has the pinned version.

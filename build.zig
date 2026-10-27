@@ -11,7 +11,9 @@ const cross_targets = [_][]const u8{ "x86_64-windows-gnu", macos_triples[0], mac
 const macos_triples = pins.macos_targets;
 
 /// The macOS targets as built for export (`addTargetBuild`): each arch's
-/// export host archive, empty game library and SDK. Not packaged yet.
+/// export host archive, empty game library and SDK, all packaged. Their
+/// editor library is the universal one (`addMacosEditorLib`), not
+/// `TargetBuild.release_host`.
 const macos_export_targets = [_]PackagedTarget{
     .{ .key = target_key.aarch64_macos, .triple = macos_triples[0] },
     .{ .key = target_key.x86_64_macos, .triple = macos_triples[1] },
@@ -61,6 +63,9 @@ pub fn build(b: *std.Build) void {
     const windows_godot = b.option([]const u8, "windows-godot", "Folder with Godot_v4.7.2-stable_win64_console.exe and Godot_v4.7.2-stable_win64.exe; the Windows editor tests skip without it");
     const windows_zig = b.option([]const u8, "windows-zig", "Folder of the unpacked zig-x86_64-windows-0.17.0; the Windows build tests skip without it");
     const windows_zig_zip = b.option([]const u8, "windows-zig-zip", "The original zig-x86_64-windows-0.17.0.zip (its .minisig next to it); the Windows install test skips without it");
+    // Stage 7c test inputs, never downloaded by a test.
+    const macos_zig_tarball = b.option([]const u8, "macos-zig-tarball", "The original zig-aarch64-macos-0.17.0.tar.xz or zig-x86_64-macos-0.17.0.tar.xz (its .minisig next to it); the host test that checks and unpacks it through the download skips without it");
+    const baseline_zip = b.option([]const u8, "baseline-zip", "The Stage 7b release package (ziggurat-0.1.0.zip built at 7b); the package test that compares the Linux and Windows files with it skips without it");
 
     const test_step = b.step("test", "Run unit and integration tests");
     const unit_step = b.step("test-unit", "Run unit tests only (spawns no compiler)");
@@ -199,7 +204,7 @@ pub fn build(b: *std.Build) void {
     });
     var shipped: [packaged_targets.len]TargetBuild = undefined;
     for (&shipped, packaged_targets) |*out, t| out.* = addTargetBuild(b, t, godot_path, zig_exe, stage_tool, ar_tool);
-    // macOS (7c), not packaged yet: per arch the export host archive (a BSD
+    // macOS (7c), packaged: per arch the export host archive (a BSD
     // archive, through tools/ar_normalize.zig), the empty game library and
     // the SDK, and the universal empty game library joined from the two
     // (tools/macho_fat.zig, x86_64 then arm64).
@@ -277,9 +282,23 @@ pub fn build(b: *std.Build) void {
             run.addArg(b.fmt("addons/ziggurat/sdk/{s}", .{t.key}));
             run.addDirectoryArg(t.staged_sdk);
         }
-        // The `.gdextension`'s `macos.editor` key names it.
+        // macOS (7c): the universal editor library (the `.gdextension`'s
+        // `macos.editor` key names it); per arch the export host archive,
+        // the thin empty game library and the SDK; and the universal empty
+        // game library the export plugin copies for a project without Zig
+        // scripts (bin/universal-macos/).
         run.addArg("addons/ziggurat/bin/" ++ comptime target_key.files(target_key.aarch64_macos).?.editor_lib);
         run.addFileArg(macos_editor_lib.file);
+        for (macos_builds) |t| {
+            run.addArg(b.fmt("addons/ziggurat/bin/{s}/{s}", .{ t.key, t.files.host_archive }));
+            run.addFileArg(t.shipped_archive);
+            run.addArg(b.fmt("addons/ziggurat/bin/{s}/{s}", .{ t.key, t.files.game_empty }));
+            run.addFileArg(t.game_empty.getEmittedBin());
+            run.addArg(b.fmt("addons/ziggurat/sdk/{s}", .{t.key}));
+            run.addDirectoryArg(t.staged_sdk);
+        }
+        run.addArg("addons/ziggurat/bin/" ++ target_key.universal_macos ++ "/" ++ comptime target_key.files(target_key.aarch64_macos).?.game_empty);
+        run.addFileArg(macos_game_empty);
     }
     package_step.dependOn(&b.addInstallFile(packages[0], package_name).step);
     var package_staged: [packaged_targets.len]std.Build.LazyPath = undefined;
@@ -310,6 +329,7 @@ pub fn build(b: *std.Build) void {
             .sdk_options = sdk_options,
             // Built only for a run that can export (the macOS export tests).
             .macos_export = if (export_templates != null) .{ .builds = macos_builds, .game_empty = macos_game_empty } else null,
+            .macos_zig_tarball = macos_zig_tarball,
             .filter = host_test_filter,
             .gui_step = gui_test_step,
             .stress_step = stress_step,
@@ -318,7 +338,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(host_test_step);
 
     // Native: integration on for `test`, off for `test-unit`.
-    addTestSet(b, test_step, target, optimize, zig_exe, true, .native, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) }, sdk_options, sdk, sdk.import_table.get("gdzig").?, export_host_archive, staged_sdk, .{ .zips = packages, .staged = package_staged, .step = package_test_step }, .{ .builds = macos_builds, .game_empty = macos_game_empty });
+    addTestSet(b, test_step, target, optimize, zig_exe, true, .native, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) }, sdk_options, sdk, sdk.import_table.get("gdzig").?, export_host_archive, staged_sdk, .{ .zips = packages, .staged = package_staged, .macos_staged = .{ macos_builds[0].staged_sdk, macos_builds[1].staged_sdk }, .baseline_zip = baseline_zip, .step = package_test_step }, .{ .builds = macos_builds, .game_empty = macos_game_empty });
     // Windows: the unit test set under Wine. One Wine prefix per build cache.
     {
         const windows = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = "x86_64-windows-gnu" }) catch
@@ -877,6 +897,9 @@ const HostTestInputs = struct {
     /// and the universal empty game library) the macOS export tests put
     /// into the add-on; null when the export tests skip.
     macos_export: ?MacosExportInputs = null,
+    /// `-Dmacos-zig-tarball`: a macOS Zig release file the download test
+    /// checks and unpacks; the test skips when it is null.
+    macos_zig_tarball: ?[]const u8 = null,
     /// Runs only the host tests whose name contains this text.
     filter: ?[]const u8 = null,
     /// The step that runs the GUI test (`test-gui`): the host tests named
@@ -963,6 +986,7 @@ fn addHostTests(
         }
     }
     if (in.macos_export) |m| options.addOptionPath("macos_game_empty", m.game_empty) else options.addOption([]const u8, "macos_game_empty", "");
+    options.addOption([]const u8, "macos_zig_tarball", in.macos_zig_tarball orelse "");
     const options_mod = options.createModule();
 
     const platform = b.createModule(.{
@@ -1085,6 +1109,7 @@ fn hostTestRun(
     // compiled from source by a child compiler; Godot is an input too.
     addSourceInputs(b, run, &.{ "test/host", "test/fixtures", "sdk", "src/abi" });
     run.addFileInput(.{ .cwd_relative = in.godot_exe });
+    if (in.macos_zig_tarball) |f| run.addFileInput(.{ .cwd_relative = f });
     return run;
 }
 
@@ -1455,6 +1480,10 @@ const PackageTests = struct {
     zips: [2]std.Build.LazyPath,
     /// The staged SDK of each packaged target, in `packaged_targets` order.
     staged: [packaged_targets.len]std.Build.LazyPath,
+    /// The staged SDK of each macOS target, in `macos_export_targets` order.
+    macos_staged: [macos_export_targets.len]std.Build.LazyPath,
+    /// `-Dbaseline-zip`: the 7b package; the comparison test skips without it.
+    baseline_zip: ?[]const u8,
     /// `test-package`, which runs only these tests.
     step: *std.Build.Step,
 };
@@ -1874,10 +1903,13 @@ fn addTestSet(
             const package_options = b.addOptions();
             package_options.addOptionPath("package_zip", zips[0]);
             package_options.addOptionPath("package_zip_again", zips[1]);
-            for (packaged_targets, pkg.staged) |pt, dir| {
+            for (packaged_targets ++ macos_export_targets, pkg.staged ++ pkg.macos_staged) |pt, dir| {
                 const name = std.mem.replaceOwned(u8, b.allocator, pt.key, "-", "_") catch @panic("OOM");
                 package_options.addOptionPath(b.fmt("staged_sdk_{s}", .{name}), dir.path(b, "sdk-manifest.json"));
             }
+            if (pkg.baseline_zip) |z| {
+                package_options.addOptionPath("baseline_zip", .{ .cwd_relative = z });
+            } else package_options.addOption([]const u8, "baseline_zip", "");
             package_options.addOption([]const u8, "zig_exe", zig_exe);
             package_options.addOption([]const u8, "sdk_version", sdk_version);
             package_options.addOption([]const u8, "build_machine_repo", b.root.joinString(b.allocator, "") catch @panic("OOM"));

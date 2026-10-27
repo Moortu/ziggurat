@@ -2023,6 +2023,67 @@ test "download: all mirrors fail" {
     try expectNoTemp(d.toolchains);
 }
 
+test "download: the real macOS tarball checks and unpacks" {
+    try requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    // `-Dmacos-zig-tarball=<zig-<arch>-macos-0.17.0.tar.xz>`, with its
+    // .minisig next to it: the original release file, never downloaded by
+    // a test.
+    if (opts.macos_zig_tarball.len == 0) return error.SkipZigTest;
+    const name = std.fs.path.basename(opts.macos_zig_tarball);
+    const pin = for ([_]std.Target.Cpu.Arch{ .aarch64, .x86_64 }) |arch| {
+        // The macOS pins are offered (Stage 7c).
+        const pin = platform.pins.zig_archive(.{ .arch = arch, .os = .macos }) orelse return error.MacosPinNotOffered;
+        if (std.mem.eql(u8, pin.name, name)) break pin;
+    } else return error.NotAMacosRelease;
+    var p: Project = undefined;
+    try p.initProbe("highlighter");
+    defer p.deinit();
+    var d = try setupDownload(&p, "fails", &.{"macos"}, false);
+    defer d.deinit();
+    errdefer d.server.dump();
+    const a = p.arena_state.allocator();
+    // The mirror serves the real file and its real signature (links to
+    // the test inputs; nothing is copied).
+    try p.tmp.dir.createDirPath(io, "www/macos");
+    try p.tmp.dir.symLink(io, opts.macos_zig_tarball, try std.fmt.allocPrint(a, "www/macos/{s}", .{name}), .{});
+    try p.tmp.dir.symLink(io, try std.mem.concat(a, u8, &.{ opts.macos_zig_tarball, ".minisig" }), try std.fmt.allocPrint(a, "www/macos/{s}.minisig", .{name}), .{});
+    // The pinned key and the macOS pin, as a Mac's editor uses them.
+    {
+        var dir = try Io.Dir.cwd().openDir(io, p.path, .{});
+        defer dir.close(io);
+        try dir.writeFile(io, .{ .sub_path = "download_cfg.txt", .data = try std.fmt.allocPrint(a,
+            \\list_url={s}/community-mirrors.txt
+            \\official_base={s}/official
+            \\plain_http=1
+            \\key={s}
+            \\archive_name={s}
+            \\archive_size={d}
+            \\archive_sha256={s}
+            \\
+        , .{ d.base, d.base, platform.pins.zig_minisign_key, pin.name, pin.size, &std.fmt.bytesToHex(pin.sha256, .lower) }) });
+    }
+    // The size, SHA-256, signature, unpack and layout checks pass; only
+    // `zig version` fails, because a macOS zig cannot run on Linux. So the
+    // mirror's reason is the version check, and nothing is installed.
+    try p.runEditorChecked("10000000", .{
+        .expect = &.{
+            "ZTEST PASS download_configured",
+            "ZTEST PASS download_menu",
+            "ZTEST PASS download_failed",
+            "ZTEST PASS download_nothing_installed",
+            "ZTEST PASS download_no_temp",
+            "ZTEST DONE",
+            try std.fmt.allocPrint(a, "{s}{s}/macos: {s}", .{ dl_mirror_prefix, d.base, platform.toolchain_install.describe(error.VersionCheckFailed) }),
+        },
+        .reject = &.{"ZTEST FAIL"},
+    });
+    try testing.expectEqual(@as(usize, 1), d.server.countExact(try std.fmt.allocPrint(a, "/macos/{s}.minisig", .{name})));
+    try testing.expectEqual(@as(usize, 1), d.server.countExact(try std.fmt.allocPrint(a, "/macos/{s}", .{name})));
+    try testing.expect(!fileExists(try std.fs.path.join(a, &.{ d.toolchains, "zig-0.17.0" })));
+    try expectNoTemp(d.toolchains);
+}
+
 test "download: cancel" {
     try requireIntegration();
     if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;

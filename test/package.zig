@@ -19,16 +19,22 @@ const export_dir = "res://.godot/ziggurat/export/";
 const max_size = 1_000_000_000;
 
 /// Every file outside `sdk/`, relative to the add-on folder, in name
-/// order: the editor libraries in `bin/`, and per target key the export
-/// host archive and the empty game library in `bin/<key>/`.
+/// order: the editor libraries in `bin/`, per target key the export host
+/// archive and the empty game library in `bin/<key>/`, and the universal
+/// macOS empty game library in `bin/universal-macos/`.
 const top_files = [_][]const u8{
     "LICENSE",
     "README.md",
     "THIRD_PARTY_LICENSES.md",
+    "bin/aarch64-macos/libziggurat_game_empty.dylib",
+    "bin/aarch64-macos/libziggurat_host_export.a",
     "bin/libziggurat_host.dylib",
     "bin/libziggurat_host.so",
+    "bin/universal-macos/libziggurat_game_empty.dylib",
     "bin/x86_64-linux/libziggurat_game_empty.so",
     "bin/x86_64-linux/libziggurat_host_export.a",
+    "bin/x86_64-macos/libziggurat_game_empty.dylib",
+    "bin/x86_64-macos/libziggurat_host_export.a",
     "bin/x86_64-windows/ziggurat_game_empty.dll",
     "bin/x86_64-windows/ziggurat_host_export.lib",
     "bin/ziggurat_host.dll",
@@ -41,6 +47,38 @@ const top_files = [_][]const u8{
 const packaged = [_]struct { key: []const u8, staged_manifest: []const u8 }{
     .{ .key = "x86_64-linux", .staged_manifest = options.staged_sdk_x86_64_linux },
     .{ .key = "x86_64-windows", .staged_manifest = options.staged_sdk_x86_64_windows },
+    .{ .key = "aarch64-macos", .staged_manifest = options.staged_sdk_aarch64_macos },
+    .{ .key = "x86_64-macos", .staged_manifest = options.staged_sdk_x86_64_macos },
+};
+
+/// The macOS files of the package (Stage 7c), relative to the add-on
+/// folder: the universal editor library, and the folders of both macOS
+/// target keys and of the universal empty game library.
+const macos_file = "bin/libziggurat_host.dylib";
+const macos_folders = [_][]const u8{
+    "bin/aarch64-macos/",
+    "bin/x86_64-macos/",
+    "bin/universal-macos/",
+    "sdk/aarch64-macos/",
+    "sdk/x86_64-macos/",
+};
+
+fn isMacosPath(rel: []const u8) bool {
+    if (std.mem.eql(u8, rel, macos_file)) return true;
+    for (macos_folders) |f| if (std.mem.startsWith(u8, rel, f)) return true;
+    return false;
+}
+
+/// The files shared with the 7b package that 7c changes on purpose:
+///   - the Linux and Windows editor libraries, which now hold the Mach-O
+///     reader (the macOS file checks run in every editor);
+///   - `ziggurat.gdextension`, which gains the macOS keys;
+///   - `README.md`, which gains the macOS section.
+const changed_since_7b = [_][]const u8{
+    "README.md",
+    "bin/libziggurat_host.so",
+    "bin/ziggurat_host.dll",
+    "ziggurat.gdextension",
 };
 
 /// gdzig's change list (vendor/gdzig/PATCHES.md), which THIRD_PARTY_LICENSES.md
@@ -398,7 +436,7 @@ test "package: holds both targets" {
     }
 }
 
-test "package: deterministic" {
+test "package: deterministic with macOS" {
     try platform.testing_support.requireIntegration();
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
@@ -408,6 +446,18 @@ test "package: deterministic" {
     const first = try readFile(a, options.package_zip);
     const second = try readFile(a, options.package_zip_again);
     try testing.expect(std.mem.eql(u8, first, second));
+    // The zips hold the macOS files, so the comparison covers them (and
+    // "integration: package from two cache folders gives identical bytes"
+    // builds them in two fresh caches).
+    var macos: usize = 0;
+    for (try readZip(a, first)) |e| {
+        if (isMacosPath(e.name[root.len..])) macos += 1;
+    }
+    var want: usize = 2; // the two macOS SDK manifests, at least
+    for (top_files) |f| {
+        if (isMacosPath(f)) want += 1;
+    }
+    try testing.expect(macos >= want);
 }
 
 test "integration: package size" {
@@ -417,7 +467,7 @@ test "integration: package size" {
     try testing.expect(stat.size < max_size);
 }
 
-test "integration: every gdextension library present" {
+test "package: every gdextension library is present" {
     try platform.testing_support.requireIntegration();
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
@@ -428,6 +478,9 @@ test "integration: every gdextension library present" {
     var section: []const u8 = "";
     var keys: usize = 0;
     var editor_keys: usize = 0;
+    // Per platform: an editor key and both template keys.
+    const platforms = [_][]const u8{ "linux", "windows", "macos" };
+    var seen: [platforms.len]u8 = @splat(0);
     var it = std.mem.splitScalar(u8, ext, '\n');
     while (it.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
@@ -441,14 +494,33 @@ test "integration: every gdextension library present" {
         const key = std.mem.trim(u8, line[0..eq], " \t");
         const value = std.mem.trim(u8, std.mem.trim(u8, line[eq + 1 ..], " \t"), "\"");
         keys += 1;
+        // `<platform>.<build>[.<arch>]`: the macOS keys have no arch.
+        var parts = std.mem.splitScalar(u8, key, '.');
+        const plat = parts.next().?;
+        const build = parts.next() orelse return error.BadKey;
+        const plat_index = for (platforms, 0..) |name, i| {
+            if (std.mem.eql(u8, plat, name)) break i;
+        } else {
+            std.debug.print("unknown platform in {s}\n", .{key});
+            return error.BadKey;
+        };
+        if (std.mem.eql(u8, plat, "macos") and parts.next() != null) {
+            std.debug.print("{s}: the macOS libraries are universal, so the key has no arch\n", .{key});
+            return error.BadKey;
+        }
+        for ([_][]const u8{ "editor", "template_debug", "template_release" }, 0..) |name, bit| {
+            if (std.mem.eql(u8, build, name)) seen[plat_index] |= @as(u8, 1) << @intCast(bit);
+        }
         // The editor library: the editor cannot load the add-on without it.
-        if (std.mem.indexOf(u8, key, ".editor.") != null) editor_keys += 1;
+        if (std.mem.eql(u8, build, "editor")) editor_keys += 1;
         if (std.mem.startsWith(u8, value, "res://.godot/")) {
             // A template key: the export plugin fills it at export, and the
             // README says so.
             try testing.expect(std.mem.indexOf(u8, key, "template") != null);
             try testing.expect(std.mem.startsWith(u8, value, export_dir));
             try testing.expect(std.mem.indexOf(u8, readme, export_dir) != null);
+            // macOS exports write the universal library.
+            if (std.mem.eql(u8, plat, "macos")) try testing.expectEqualStrings(export_dir ++ "universal-macos/libziggurat_game.dylib", value);
             continue;
         }
         const rel = if (std.mem.startsWith(u8, value, "res://" ++ root)) value[("res://" ++ root).len..] else value;
@@ -458,7 +530,179 @@ test "integration: every gdextension library present" {
         }
     }
     try testing.expect(keys >= 1);
-    try testing.expect(editor_keys >= 1);
+    try testing.expectEqual(platforms.len, editor_keys);
+    for (platforms, seen) |name, bits| {
+        if (bits != 0b111) {
+            std.debug.print("the {s} keys are incomplete (editor, template_debug, template_release: {b:0>3})\n", .{ name, bits });
+            return error.MissingKey;
+        }
+    }
+    // What the export plugin reads for each platform it exports to: the
+    // export host archive and the SDK per target key, and the game library
+    // of a project without Zig scripts (per key on Linux and Windows,
+    // universal on macOS).
+    for (packaged) |t| {
+        const f = platform.target_key.files(t.key).?;
+        for ([_][]const u8{
+            try std.fmt.allocPrint(a, "bin/{s}/{s}", .{ t.key, f.host_archive }),
+            try std.fmt.allocPrint(a, "sdk/{s}/sdk-manifest.json", .{t.key}),
+        }) |rel| try expectEntry(a, entries, rel);
+        if (!std.mem.endsWith(u8, t.key, "-macos")) try expectEntry(a, entries, try std.fmt.allocPrint(a, "bin/{s}/{s}", .{ t.key, f.game_empty }));
+    }
+    try expectEntry(a, entries, "bin/" ++ platform.target_key.universal_macos ++ "/libziggurat_game_empty.dylib");
+}
+
+fn expectEntry(a: std.mem.Allocator, entries: []const Entry, rel: []const u8) !void {
+    if (find(entries, try std.fmt.allocPrint(a, root ++ "{s}", .{rel})) == null) {
+        std.debug.print("the package lacks {s}\n", .{rel});
+        return error.MissingFile;
+    }
+}
+
+/// The thin image of `cpu` in a universal file (`macho.slices`).
+fn sliceOf(a: std.mem.Allocator, bytes: []const u8, cpu: platform.macho.Cpu) ![]const u8 {
+    for (try platform.macho.slices(a, bytes)) |s| {
+        if (s.cpu == cpu) return bytes[@intCast(s.offset)..][0..@intCast(s.size)];
+    }
+    return error.NoSlice;
+}
+
+const macos_min: std.SemanticVersion = .{ .major = 11, .minor = 0, .patch = 0 };
+
+test "package: holds macOS files" {
+    try platform.testing_support.requireIntegration();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const entries = try readZip(a, try readFile(a, options.package_zip));
+    const macho = platform.macho;
+    for ([_][]const u8{
+        "bin/libziggurat_host.dylib",
+        "bin/aarch64-macos/libziggurat_host_export.a",
+        "bin/aarch64-macos/libziggurat_game_empty.dylib",
+        "bin/x86_64-macos/libziggurat_host_export.a",
+        "bin/x86_64-macos/libziggurat_game_empty.dylib",
+        "bin/universal-macos/libziggurat_game_empty.dylib",
+        "sdk/aarch64-macos/sdk-manifest.json",
+        "sdk/x86_64-macos/sdk-manifest.json",
+    }) |rel| try expectEntry(a, entries, rel);
+    const data = struct {
+        fn of(al: std.mem.Allocator, es: []const Entry, rel: []const u8) ![]const u8 {
+            return find(es, try std.fmt.allocPrint(al, root ++ "{s}", .{rel})).?.data;
+        }
+    }.of;
+
+    // The universal files: x86_64 then arm64, every slice minos 11.0.
+    // The editor library exports the entry point; the empty game library
+    // passes the export build's own check (exports, no `dlopen`).
+    var why: [256]u8 = undefined;
+    for ([_][]const u8{ "bin/libziggurat_host.dylib", "bin/universal-macos/libziggurat_game_empty.dylib" }) |rel| {
+        const bytes = try data(a, entries, rel);
+        try macho.checkComplete(bytes);
+        const sl = try macho.slices(a, bytes);
+        try testing.expectEqual(@as(usize, 2), sl.len);
+        try testing.expectEqual(macho.Cpu.x86_64, sl[0].cpu);
+        try testing.expectEqual(macho.Cpu.arm64, sl[1].cpu);
+        for (sl) |s| {
+            const slice = bytes[@intCast(s.offset)..][0..@intCast(s.size)];
+            try testing.expectEqual(@as(u32, std.macho.MH_DYLIB), rd(u32, slice, 12)); // a dylib, not a program
+            try testing.expectEqual(macos_min, macho.minOs(slice).?);
+            var found = false;
+            for (try macho.exports(a, slice)) |name| found = found or std.mem.eql(u8, name, "_ziggurat_host_init");
+            try testing.expect(found);
+        }
+    }
+    if (try zbuild.export_build.checkUniversal(a, try data(a, entries, "bin/universal-macos/libziggurat_game_empty.dylib"), &why)) |sentence| {
+        std.debug.print("bin/universal-macos/libziggurat_game_empty.dylib: {s}\n", .{sentence});
+        return error.EmptyGameLibraryRefused;
+    }
+
+    // Per arch: the thin empty game library of that CPU (the universal one
+    // holds it, byte for byte), and a BSD export host archive of that CPU's
+    // objects with base names only.
+    const universal_empty = try data(a, entries, "bin/universal-macos/libziggurat_game_empty.dylib");
+    for ([_]struct { []const u8, macho.Cpu }{ .{ "aarch64-macos", .arm64 }, .{ "x86_64-macos", .x86_64 } }) |t| {
+        const thin = try data(a, entries, try std.fmt.allocPrint(a, "bin/{s}/libziggurat_game_empty.dylib", .{t[0]}));
+        try macho.checkComplete(thin);
+        const sl = try macho.slices(a, thin);
+        try testing.expectEqual(@as(usize, 1), sl.len);
+        try testing.expectEqual(@as(u64, 0), sl[0].offset);
+        try testing.expectEqual(t[1], sl[0].cpu);
+        try testing.expectEqual(@as(u32, std.macho.MH_DYLIB), rd(u32, thin, 12));
+        try testing.expectEqual(macos_min, macho.minOs(thin).?);
+        if (try zbuild.export_build.checkLibrary(a, .macho, thin, &why)) |sentence| {
+            std.debug.print("bin/{s}/libziggurat_game_empty.dylib: {s}\n", .{ t[0], sentence });
+            return error.EmptyGameLibraryRefused;
+        }
+        try testing.expectEqualSlices(u8, thin, try sliceOf(a, universal_empty, t[1]));
+
+        const arc = try data(a, entries, try std.fmt.allocPrint(a, "bin/{s}/libziggurat_host_export.a", .{t[0]}));
+        try testing.expect(std.mem.startsWith(u8, arc, "!<arch>\n"));
+        try testing.expect(std.mem.indexOf(u8, arc, "zig-cache") == null);
+        const first = arc[8..][0..16];
+        try testing.expect(std.mem.startsWith(u8, first, "__.SYMDEF") or std.mem.startsWith(u8, first, "#1/"));
+        // Every 64-bit Mach-O object in the archive is of this CPU.
+        var objects: usize = 0;
+        var at: usize = 0;
+        const magic = std.mem.toBytes(std.macho.MH_MAGIC_64);
+        while (std.mem.indexOfPos(u8, arc, at, &magic)) |i| : (at = i + 1) {
+            if (i + 16 > arc.len or rd(u32, arc, i + 12) != std.macho.MH_OBJECT) continue;
+            try testing.expectEqual(@backingInt(t[1]), rd(u32, arc, i + 4));
+            objects += 1;
+        }
+        try testing.expect(objects >= 1);
+    }
+}
+
+test "package: linux and windows files unchanged from 7b" {
+    try platform.testing_support.requireIntegration();
+    // `-Dbaseline-zip=<the 7b package>`; without it there is nothing to
+    // compare with.
+    if (options.baseline_zip.len == 0) return error.SkipZigTest;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const old = try readZip(a, try readFile(a, options.baseline_zip));
+    const new = try readZip(a, try readFile(a, options.package_zip));
+    // Every 7b file is still there, and the same bytes, except the files
+    // 7c changes on purpose.
+    var changed: usize = 0;
+    var different: usize = 0;
+    for (old) |o| {
+        try testing.expect(std.mem.startsWith(u8, o.name, root));
+        const rel = o.name[root.len..];
+        // 7b had no macOS files.
+        try testing.expect(!isMacosPath(rel));
+        const n = find(new, o.name) orelse {
+            std.debug.print("the 7b file {s} is missing from the package\n", .{rel});
+            return error.MissingFile;
+        };
+        const allowed = for (changed_since_7b) |c| {
+            if (std.mem.eql(u8, c, rel)) break true;
+        } else false;
+        if (allowed) {
+            changed += 1;
+            continue;
+        }
+        if (!std.mem.eql(u8, o.data, n.data)) {
+            std.debug.print("{s} differs from 7b\n", .{rel});
+            different += 1;
+        }
+    }
+    if (different != 0) return error.ChangedSince7b;
+    try testing.expectEqual(changed_since_7b.len, changed);
+    // Every new file is a macOS file.
+    var added: usize = 0;
+    for (new) |n| {
+        if (find(old, n.name) != null) continue;
+        const rel = n.name[root.len..];
+        if (!isMacosPath(rel)) {
+            std.debug.print("{s} is new and not a macOS file\n", .{rel});
+            return error.UnexpectedNewFile;
+        }
+        added += 1;
+    }
+    try testing.expect(added > 0);
 }
 
 test "integration: package from two cache folders gives identical bytes" {
