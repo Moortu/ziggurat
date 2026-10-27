@@ -9,10 +9,19 @@ into a running game (hot reload).
 It is an ordinary Godot add-on (a GDExtension) for the official Godot 4.7
 editor. You do not need a custom engine build.
 
-> **Status: proof of concept (0.1.0-poc).** Linux x86_64 is the tested
-> platform. Windows x86_64 is tested under Wine only. macOS (universal,
-> 11.0 or newer) is built and checked on Linux but has never run on a Mac.
-> Expect rough edges.
+> **Status: proof of concept (0.1.0-poc).** This project shows that Zig
+> scripting in stock Godot can work. It will probably not be developed
+> further, so do not build anything important on it. Linux x86_64 is the
+> tested platform. Windows x86_64 is tested under Wine only. macOS
+> (universal, 11.0 or newer) is built and checked on Linux but has never
+> run on a Mac. Expect rough edges. You are welcome to fork it.
+
+## The name
+
+Godot takes its name from Beckett's play *Waiting for Godot*, and the C++
+scripting framework [Projekt J.E.N.O.V.A](https://github.com/Jenova-Framework/J.E.N.O.V.A)
+gave itself a dotted, all-capitals name. Ziggurat follows both: a name
+with a story, styled Z.I.G.G.U.R.A.T, that starts with **Zig**.
 
 | Platform | Editor | Exported games |
 |---|---|---|
