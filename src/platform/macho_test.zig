@@ -76,6 +76,52 @@ fn commandBoundaries(a: Allocator, thin: []const u8) ![]u64 {
     return out;
 }
 
+/// The end offset of every non-empty file range the load commands of a thin
+/// file name (segments, sections, symbol and string tables, dynamic symbol
+/// table, dyld info and linkedit data), for the cut tests.
+fn rangeEnds(a: Allocator, thin: []const u8) ![]u64 {
+    var out: std.ArrayList(u64) = .empty;
+    errdefer out.deinit(a);
+    const r32 = struct {
+        fn at(b: []const u8, off: usize) u64 {
+            return std.mem.readInt(u32, b[off..][0..4], .little);
+        }
+    }.at;
+    const ncmds = std.mem.readInt(u32, thin[16..20], .little);
+    var off: usize = 32;
+    for (0..ncmds) |_| {
+        const cmd = std.mem.readInt(u32, thin[off..][0..4], .little);
+        const size = std.mem.readInt(u32, thin[off + 4 ..][0..4], .little);
+        const d = thin[off..][0..size];
+        var pairs: std.ArrayList([2]u64) = .empty;
+        defer pairs.deinit(a);
+        switch (cmd) {
+            0x19 => { // LC_SEGMENT_64
+                try pairs.append(a, .{ std.mem.readInt(u64, d[40..48], .little), std.mem.readInt(u64, d[48..56], .little) });
+                for (0..r32(d, 64)) |k| {
+                    const sec = d[72 + k * 80 ..][0..80];
+                    if (r32(sec, 64) & 0xff == 1) continue; // zerofill
+                    try pairs.append(a, .{ r32(sec, 48), std.mem.readInt(u64, sec[40..48], .little) });
+                }
+            },
+            0x2 => { // LC_SYMTAB
+                try pairs.append(a, .{ r32(d, 8), r32(d, 12) * 16 });
+                try pairs.append(a, .{ r32(d, 16), r32(d, 20) });
+            },
+            0xb => try pairs.append(a, .{ r32(d, 56), r32(d, 60) * 4 }), // LC_DYSYMTAB indirect symbols
+            0x22, 0x80000022 => { // LC_DYLD_INFO(_ONLY)
+                var k: usize = 8;
+                while (k < 48) : (k += 8) try pairs.append(a, .{ r32(d, k), r32(d, k + 4) });
+            },
+            0x1d, 0x26, 0x29 => try pairs.append(a, .{ r32(d, 8), r32(d, 12) }), // linkedit data
+            else => {},
+        }
+        for (pairs.items) |pr| if (pr[1] != 0) try out.append(a, pr[0] + pr[1]);
+        off += size;
+    }
+    return out.toOwnedSlice(a);
+}
+
 test "macho: complete thin and fat accepted" {
     const a = std.testing.allocator;
     const t = try Thin.read(a);
@@ -117,6 +163,16 @@ test "macho: truncated at each load command refused" {
         for (bounds) |cut| {
             try std.testing.expectError(error.Truncated, macho.checkComplete(thin[0..@intCast(cut)]));
             try std.testing.expectError(error.Truncated, macho.checkComplete(thin[0..@intCast(cut - 1)]));
+        }
+        // One byte short of the end of each range a load command names:
+        // the load commands stay whole, so the range checks refuse it.
+        const ncmds_end = 32 + @as(u64, std.mem.readInt(u32, thin[20..24], .little));
+        const ends = try rangeEnds(a, thin);
+        defer a.free(ends);
+        try std.testing.expect(ends.len > 8);
+        for (ends) |end| {
+            if (end - 1 < ncmds_end) continue;
+            try std.testing.expectError(error.Truncated, macho.checkComplete(thin[0..@intCast(end - 1)]));
         }
         // Inside the header, in the middle and one byte short of the end.
         for ([_]usize{ 0, 1, 4, 31, thin.len / 2, thin.len - 1 }) |cut| {

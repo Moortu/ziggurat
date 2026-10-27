@@ -51,33 +51,7 @@ pub fn open(a: std.mem.Allocator, io: std.Io, p: path.OsPath, diag: *[256]u8) Lo
 }
 
 fn checkFile(a: std.mem.Allocator, io: std.Io, p: path.OsPath, diag: *[256]u8) LoadError!void {
-    const file = safe_open.openRegular(io, p.bytes, .{}) catch |err| {
-        setDiag(diag, "Cannot open {s} to check it: {s}.", .{ p.bytes, switch (err) {
-            error.NotRegular => "it is not a regular file",
-            else => @errorName(err),
-        } });
-        return error.LoadFailed;
-    };
-    defer file.close(io);
-    const bytes = readAll(a, io, file) catch |err| {
-        setDiag(diag, "Cannot read {s} to check it: {s}.", .{ p.bytes, @errorName(err) });
-        return error.LoadFailed;
-    };
-    defer a.free(bytes);
-    var why: [256]u8 = undefined;
-    pe.checkCompleteDiag(bytes, &why) catch |err| {
-        setDiag(diag, "{s} (while loading {s})", .{ elf.diagText(&why), p.bytes });
-        return err;
-    };
-}
-
-fn readAll(a: std.mem.Allocator, io: std.Io, file: std.Io.File) ![]u8 {
-    const len = try file.length(io);
-    const bytes = try a.alloc(u8, std.math.cast(usize, len) orelse return error.FileTooBig);
-    errdefer a.free(bytes);
-    const n = try file.readPositionalAll(io, bytes, 0);
-    if (n != bytes.len) return error.FileChanged;
-    return bytes;
+    return safe_open.checkWholeFile(a, io, p.bytes, diag, pe.Error, pe.checkCompleteDiag);
 }
 
 /// The system's text for the Windows error `code`, without a final period

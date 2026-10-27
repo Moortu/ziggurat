@@ -174,6 +174,59 @@ fn mkfifo(a: std.mem.Allocator, p: []const u8) !void {
     if (!r.term.success()) return error.MkfifoFailed;
 }
 
+/// Opens the library file at `p` (`openRegular`), reads all of it and runs
+/// `check` (a format's `checkCompleteDiag`, such as `pe.checkCompleteDiag`
+/// or `macho.checkCompleteDiag`) on the bytes. The loaders call it before
+/// they hand the file to the system loader. On failure `diag` holds one
+/// NUL-terminated sentence: `error.LoadFailed` when the file cannot be
+/// opened or read (or changed while it was read), or the check's own error
+/// with the check's reason and the path.
+pub fn checkWholeFile(
+    a: std.mem.Allocator,
+    io: std.Io,
+    p: []const u8,
+    diag: *[256]u8,
+    comptime CheckError: type,
+    comptime check: fn ([]const u8, ?*[256]u8) CheckError!void,
+) (CheckError || error{LoadFailed})!void {
+    const file = openRegular(io, p, .{}) catch |err| {
+        setDiag(diag, "Cannot open {s} to check it: {s}.", .{ p, switch (err) {
+            error.NotRegular => "it is not a regular file",
+            else => @errorName(err),
+        } });
+        return error.LoadFailed;
+    };
+    defer file.close(io);
+    const bytes = readAll(a, io, file) catch |err| {
+        setDiag(diag, "Cannot read {s} to check it: {s}.", .{ p, @errorName(err) });
+        return error.LoadFailed;
+    };
+    defer a.free(bytes);
+    var why: [256]u8 = @splat(0);
+    check(bytes, &why) catch |err| {
+        setDiag(diag, "{s} (while loading {s})", .{ std.mem.sliceTo(&why, 0), p });
+        return err;
+    };
+}
+
+/// All bytes of `file`; `error.FileChanged` when it got shorter while read.
+fn readAll(a: std.mem.Allocator, io: std.Io, file: File) ![]u8 {
+    const len = try file.length(io);
+    const bytes = try a.alloc(u8, std.math.cast(usize, len) orelse return error.FileTooBig);
+    errdefer a.free(bytes);
+    const n = try file.readPositionalAll(io, bytes, 0);
+    if (n != bytes.len) return error.FileChanged;
+    return bytes;
+}
+
+/// Writes one sentence into `diag`, NUL-terminated, cut to fit. Same form
+/// as `elf.setDiag`.
+fn setDiag(diag: *[256]u8, comptime fmt: []const u8, args: anytype) void {
+    @memset(diag, 0);
+    var w: std.Io.Writer = .fixed(diag[0..255]);
+    w.print(fmt, args) catch {};
+}
+
 test "openRegular refuses a FIFO without blocking, a link when asked, and a folder" {
     if (is_windows) return error.SkipZigTest;
     const a = testing.allocator;

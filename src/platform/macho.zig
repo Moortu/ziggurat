@@ -158,7 +158,6 @@ const Image = struct {
     bytes: []const u8,
     cpu: Cpu,
     ncmds: u32,
-    cmds_end: usize,
 
     /// Checks the header, every load command's size, and every file range
     /// a load command names (segments, sections, symbol and string tables,
@@ -190,7 +189,6 @@ const Image = struct {
             .bytes = bytes,
             .cpu = @fromBackingInt(@intCast(readU32(bytes, 4))),
             .ncmds = ncmds,
-            .cmds_end = @intCast(cmds_end),
         };
         var off: u64 = header_size;
         var i: u32 = 0;
@@ -248,6 +246,7 @@ fn minSize(cmd: u32) u32 {
         lc(.DYLD_INFO), lc(.DYLD_INFO_ONLY) => 48,
         lc(.CODE_SIGNATURE), lc(.SEGMENT_SPLIT_INFO), lc(.FUNCTION_STARTS), lc(.DATA_IN_CODE), lc(.DYLIB_CODE_SIGN_DRS), lc(.LINKER_OPTIMIZATION_HINT), lc(.DYLD_EXPORTS_TRIE), lc(.DYLD_CHAINED_FIXUPS), lc_atom_info => 16,
         lc(.ENCRYPTION_INFO_64) => 24,
+        lc(.TWOLEVEL_HINTS) => 16,
         lc(.NOTE) => 40,
         lc(.BUILD_VERSION) => 24,
         lc(.VERSION_MIN_MACOSX) => 16,
@@ -287,6 +286,7 @@ fn checkCommand(c: Command, i: u32, len: u64, diag: ?*[256]u8) Error!void {
                 const kind = readU32(s, 64) & 0xff;
                 if (kind == std.macho.S_ZEROFILL or kind == std.macho.S_GB_ZEROFILL or kind == std.macho.S_THREAD_LOCAL_ZEROFILL) continue;
                 try checkRange("section", i, readU32(s, 48), readU64(s, 40), len, diag);
+                try checkRange("relocations", i, readU32(s, 56), @as(u64, readU32(s, 60)) * 8, len, diag);
             }
         },
         lc(.SYMTAB) => {
@@ -305,6 +305,7 @@ fn checkCommand(c: Command, i: u32, len: u64, diag: ?*[256]u8) Error!void {
         lc(.CODE_SIGNATURE), lc(.SEGMENT_SPLIT_INFO), lc(.FUNCTION_STARTS), lc(.DATA_IN_CODE), lc(.DYLIB_CODE_SIGN_DRS), lc(.LINKER_OPTIMIZATION_HINT), lc(.DYLD_EXPORTS_TRIE), lc(.DYLD_CHAINED_FIXUPS), lc_atom_info => {
             try checkRange("linkedit data", i, readU32(d, 8), readU32(d, 12), len, diag);
         },
+        lc(.TWOLEVEL_HINTS) => try checkRange("two-level hints", i, readU32(d, 8), @as(u64, readU32(d, 12)) * 4, len, diag),
         lc(.ENCRYPTION_INFO_64) => try checkRange("encrypted range", i, readU32(d, 8), readU32(d, 12), len, diag),
         lc(.NOTE) => try checkRange("note", i, readU64(d, 24), readU64(d, 32), len, diag),
         lc(.BUILD_VERSION) => {
@@ -575,7 +576,10 @@ fn symbols(a: Allocator, img: Image, kind: SymbolKind, out: *std.ArrayList([]con
 
 /// The imported symbol names of one thin image (`slice_bytes`): the
 /// symbol table's undefined external symbols, with the leading underscore
-/// (`_getpid`). Zig's Mach-O linker writes `LC_DYLD_INFO_ONLY` bind
+/// (`_getpid`). It does not read bind opcodes or chained fixups, so it is
+/// complete for linker output but not proof against a crafted file that
+/// binds a symbol with no undefined symbol table entry. Zig's Mach-O
+/// linker writes `LC_DYLD_INFO_ONLY` bind
 /// opcodes, not chained fixups, and every bound symbol is also an undefined
 /// symbol table entry. The caller frees the result with `freeList`.
 pub fn imports(a: Allocator, slice_bytes: []const u8) ListError![]const []const u8 {
