@@ -3720,6 +3720,29 @@ test "export: features without a supported target give the platform message" {
     });
 }
 
+test "export: custom features do not choose the platform" {
+    try requireTemplates();
+    var p: Project = undefined;
+    try initExport(&p, null);
+    defer p.deinit();
+    const a = p.arena_state.allocator();
+    // An earlier export's library: it must not ship. The preset is Linux
+    // with the custom features `macos` and `windows`, which Godot adds to
+    // the export's feature list.
+    const old = "an old game library";
+    try writeProjectFile(&p, game_lib_rel, old);
+    try p.run(&.{ "export", "Linux custom features", try std.fs.path.join(a, &.{ p.path, export_out }) }, .{
+        .once = &.{export_building},
+        .reject = &.{ "ERROR:", export_platform_message },
+        .deadline = export_deadline_s,
+    });
+    const lib = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ p.path, "out", "libziggurat_game.so" }), a, .limited(1 << 30));
+    try testing.expect(std.mem.startsWith(u8, lib, "\x7fELF"));
+    try testing.expect(!try projectFileExists(&p, ".godot/ziggurat/export/universal-macos"));
+    try testing.expect(!try projectFileExists(&p, windows_game_lib_rel));
+    try runExported(&p, .{ .once = &export_game_lines, .reject = &.{"ERROR:"} });
+}
+
 /// Where a Windows export writes the game library in the project.
 const windows_game_lib_rel = ".godot/ziggurat/export/x86_64-windows/ziggurat_game.dll";
 
@@ -3772,6 +3795,9 @@ test "export: windows export from the linux editor" {
     try testing.expect(!try projectFileExists(&p, "out/libziggurat_game.so"));
     try expectWindowsGameLibrary(&p);
 }
+
+/// The export plugin's log line for a macOS debug export.
+const export_debug_line_macos = "Ziggurat: debug export leaves the game library's debug information in the build cache, which the export does not ship; the library keeps only the paths of those files, so it is not reproducible. Turn off Export With Debug for a release.";
 
 /// Where a macOS export writes the universal game library in the project.
 const macos_game_lib_rel = ".godot/ziggurat/export/universal-macos/libziggurat_game.dylib";
@@ -3907,6 +3933,19 @@ test "export: macos universal preset" {
     try initMacosExport(&p);
     defer p.deinit();
     try exportMacos(&p, "macOS", "game.zip");
+    // A debug export (the official template has a universal debug binary):
+    // its own log line, and the unstripped library passes the checks.
+    {
+        const a = p.arena_state.allocator();
+        try p.run(&.{ "export-debug", "macOS", try std.fs.path.join(a, &.{ p.path, "out/debug.zip" }) }, .{
+            .once = &.{ export_building, export_debug_line_macos },
+            .reject = &.{ "ERROR:", export_pack_message, export_debug_line, export_debug_line_windows },
+            .deadline = export_deadline_s,
+        });
+        try testing.expect(try zbuild.export_build.zipHoldsLibrary(io, try std.fs.path.join(a, &.{ p.path, "out/debug.zip" }), macos_app_lib));
+        const built = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ p.path, macos_game_lib_rel }), a, .limited(1 << 30));
+        _ = try expectMacosGameLibrary(a, built);
+    }
     // An `.app` export: Godot writes the bundle folder itself.
     const a = p.arena_state.allocator();
     try p.run(&.{ "export", "macOS", try std.fs.path.join(a, &.{ p.path, "out/game.app" }) }, .{

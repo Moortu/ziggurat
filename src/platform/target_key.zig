@@ -26,30 +26,23 @@ pub fn fromTarget(t: std.Target) ?[]const u8 {
     };
 }
 
-/// The key of a Godot export preset from its feature names, or null when
-/// Ziggurat does not export to it as one target: `linux` + `x86_64` and
-/// `windows` + `x86_64`. A macOS preset has no single key (`exportKey`).
-pub fn fromFeatures(features: []const []const u8) ?[]const u8 {
-    if (!has(features, "x86_64")) return null;
-    if (has(features, "linux")) return x86_64_linux;
-    if (has(features, "windows")) return x86_64_windows;
+/// The export output folder (`.godot/ziggurat/export/<it>/`) of a Godot
+/// export, or null when Ziggurat does not export to it. `os_name` is the
+/// export platform's `get_os_name()` (`"Linux"`, `"Windows"`, `"macOS"`;
+/// Godot 4.7.2 `platform/*/export/`), and `arch` the preset's
+/// `binary_format/architecture` option. Neither comes from the export's
+/// feature list, which also holds the preset's custom features: a custom
+/// feature `macos` on a Linux preset must not make it a macOS export.
+///   - `"Linux"` or `"Windows"` with `x86_64`: `x86_64_linux`,
+///     `x86_64_windows`;
+///   - `"macOS"` with any arch: `universal_macos` (the universal library
+///     is right for `universal`, `arm64` and `x86_64`).
+pub fn exportKey(os_name: []const u8, arch: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, os_name, "macOS")) return universal_macos;
+    if (!std.mem.eql(u8, arch, "x86_64")) return null;
+    if (std.mem.eql(u8, os_name, "Linux")) return x86_64_linux;
+    if (std.mem.eql(u8, os_name, "Windows")) return x86_64_windows;
     return null;
-}
-
-/// The export output folder of a Godot export preset from its feature
-/// names (`.godot/ziggurat/export/<it>/`), or null when Ziggurat does not
-/// export to it: `universal_macos` for every preset with the feature
-/// `macos`, whatever its arch (`binary_format/architecture` universal,
-/// arm64 or x86_64: the universal library is right for each), else
-/// `fromFeatures`.
-pub fn exportKey(features: []const []const u8) ?[]const u8 {
-    if (has(features, "macos")) return universal_macos;
-    return fromFeatures(features);
-}
-
-fn has(features: []const []const u8, name: []const u8) bool {
-    for (features) |f| if (std.mem.eql(u8, f, name)) return true;
-    return false;
 }
 
 /// The add-on's file names for one key.
@@ -130,27 +123,21 @@ test "target_key: fromTarget" {
     try std.testing.expect(fromTarget(try target("x86_64-freebsd")) == null);
 }
 
-test "target_key: fromFeatures" {
-    try std.testing.expectEqualStrings("x86_64-linux", fromFeatures(&.{ "pc", "linux", "x86_64", "template" }).?);
-    try std.testing.expectEqualStrings("x86_64-windows", fromFeatures(&.{ "windows", "x86_64", "pc" }).?);
-    try std.testing.expect(fromFeatures(&.{ "linux", "arm64" }) == null);
-    try std.testing.expect(fromFeatures(&.{ "windows", "arm64" }) == null);
-    try std.testing.expect(fromFeatures(&.{ "windows", "x86_32" }) == null);
-    try std.testing.expect(fromFeatures(&.{ "macos", "x86_64", "universal" }) == null);
-    try std.testing.expect(fromFeatures(&.{"x86_64"}) == null);
-    try std.testing.expect(fromFeatures(&.{}) == null);
-}
-
-test "target_key: exportKey maps every macOS preset to the universal folder" {
-    try std.testing.expectEqualStrings(universal_macos, exportKey(&.{ "pc", "macos", "universal", "x86_64", "arm64", "template" }).?);
-    try std.testing.expectEqualStrings(universal_macos, exportKey(&.{ "macos", "arm64" }).?);
-    try std.testing.expectEqualStrings(universal_macos, exportKey(&.{ "macos", "x86_64" }).?);
-    try std.testing.expectEqualStrings(universal_macos, exportKey(&.{"macos"}).?);
-    try std.testing.expectEqualStrings(x86_64_linux, exportKey(&.{ "linux", "x86_64" }).?);
-    try std.testing.expectEqualStrings(x86_64_windows, exportKey(&.{ "windows", "x86_64" }).?);
-    try std.testing.expect(exportKey(&.{ "linux", "arm64" }) == null);
-    try std.testing.expect(exportKey(&.{ "ios", "arm64" }) == null);
-    try std.testing.expect(exportKey(&.{}) == null);
+test "target_key: exportKey takes the platform from the export platform" {
+    try std.testing.expectEqualStrings(x86_64_linux, exportKey("Linux", "x86_64").?);
+    try std.testing.expectEqualStrings(x86_64_windows, exportKey("Windows", "x86_64").?);
+    for ([_][]const u8{ "universal", "arm64", "x86_64" }) |arch| {
+        try std.testing.expectEqualStrings(universal_macos, exportKey("macOS", arch).?);
+    }
+    try std.testing.expect(exportKey("Linux", "arm64") == null);
+    try std.testing.expect(exportKey("Windows", "x86_32") == null);
+    try std.testing.expect(exportKey("Windows", "") == null);
+    try std.testing.expect(exportKey("iOS", "arm64") == null);
+    try std.testing.expect(exportKey("Web", "wasm32") == null);
+    // Godot compares OS names exactly; these are not platforms.
+    try std.testing.expect(exportKey("linux", "x86_64") == null);
+    try std.testing.expect(exportKey("macos", "universal") == null);
+    try std.testing.expect(exportKey("", "x86_64") == null);
 }
 
 test "target_key: files and keys" {

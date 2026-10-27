@@ -7,10 +7,12 @@
 //!
 //! Godot calls every export plugin's `_export_begin` before it writes
 //! anything (the `ExportNotifier` of every export: binary, pack or zip).
-//! For a preset whose features include `linux` and `x86_64`, or `windows`
-//! and `x86_64` (target keys `x86_64-linux` and `x86_64-windows`), or
-//! `macos` with any arch (the folder `universal-macos`;
-//! `platform.target_key.exportKey`) the plugin first deletes the game
+//! For an export whose platform (`get_os_name`) is Linux or Windows with
+//! the preset option `binary_format/architecture` `x86_64` (target keys
+//! `x86_64-linux` and `x86_64-windows`), or macOS with any arch (the folder
+//! `universal-macos`; `platform.target_key.exportKey`; never from the
+//! feature list, which holds the preset's custom features) the plugin
+//! first deletes the game
 //! library `libRel(key)`, so a library of an earlier export can never ship.
 //! When the delete fails, the rule depends on the editor's OS:
 //!   - Linux: it empties the file and removes its permissions, so Godot
@@ -210,8 +212,8 @@ pub const ZigExportPlugin = struct {
         return true;
     }
 
-    pub fn _exportBegin(self: *ZigExportPlugin, features: PackedStringArray, is_debug: bool, path: String, _: u32) void {
-        exportBegin(self, &features, is_debug, &path);
+    pub fn _exportBegin(self: *ZigExportPlugin, _: PackedStringArray, is_debug: bool, path: String, _: u32) void {
+        exportBegin(self, is_debug, &path);
     }
 
     /// Godot calls it after it copied the shared libraries next to the
@@ -252,17 +254,25 @@ pub fn isZigPath(p: []const u8) bool {
     return std.ascii.endsWithIgnoreCase(p, ".zig");
 }
 
-/// True when `features` holds `name`.
-fn hasFeature(features: *const PackedStringArray, comptime name: []const u8) bool {
-    var i: i64 = 0;
-    while (i < features.size()) : (i += 1) {
-        var f = features.get(i);
-        defer f.deinit();
-        var buf: [name.len + 1]u8 = undefined;
-        const text = props.stringText(&f, &buf) orelse continue;
-        if (std.mem.eql(u8, text, name)) return true;
-    }
-    return false;
+/// The export platform's OS name (`get_os_name`: `Linux`, `Windows`,
+/// `macOS`, ...) in `buf`; empty without a platform or when it is longer
+/// than `buf`.
+fn osName(plat: ?*EditorExportPlatform, buf: []u8) []const u8 {
+    const p = plat orelse return "";
+    var s = p.getOsName();
+    defer s.deinit();
+    return props.stringText(&s, buf) orelse "";
+}
+
+/// The export preset's `binary_format/architecture` option in `buf`
+/// (`x86_64`, `arm64`, `universal`, ...); empty when the preset has none
+/// or it is not a String.
+fn presetArch(plugin: *EditorExportPlugin, buf: []u8) []const u8 {
+    const v = plugin.getOption(.fromComptimeLatin1("binary_format/architecture"));
+    defer v.deinit();
+    var s = v.as(String) orelse return "";
+    defer s.deinit();
+    return props.stringText(&s, buf) orelse "";
 }
 
 /// An export to check when it ends (`checkOutput`).
@@ -292,7 +302,7 @@ const Stale = struct {
     lib: []const u8,
 };
 
-fn exportBegin(self: *ZigExportPlugin, features: *const PackedStringArray, is_debug: bool, path: *const String) void {
+fn exportBegin(self: *ZigExportPlugin, is_debug: bool, path: *const String) void {
     if (self.output_check) |c| c.deinit();
     self.output_check = null;
     if (self.stale) |st| st.output.deinit(gpa);
@@ -300,16 +310,15 @@ fn exportBegin(self: *ZigExportPlugin, features: *const PackedStringArray, is_de
     // A `Ref` return: the reference is the caller's.
     const plat = self.base.getExportPlatform();
     defer if (plat) |x| editor_build.releaseRef(x);
-    // The preset's export key.
-    var names: [4][]const u8 = undefined;
-    var n: usize = 0;
-    inline for (.{ "linux", "windows", "macos", "x86_64" }) |name| {
-        if (hasFeature(features, name)) {
-            names[n] = name;
-            n += 1;
-        }
-    }
-    const key = target_key.exportKey(names[0..n]) orelse "";
+    // The export key, from the export platform's OS name and the preset's
+    // arch option. Not from `features`: they hold the preset's custom
+    // features too, so a custom feature `macos` or `linux` would pick
+    // another platform's library, and the old one would ship.
+    var os_buf: [16]u8 = undefined;
+    var arch_buf: [16]u8 = undefined;
+    const os_name = osName(plat, &os_buf);
+    const arch = presetArch(self.base, &arch_buf);
+    const key = target_key.exportKey(os_name, arch) orelse "";
     const game_lib = gameLibFile(key) orelse {
         (Reporter{ .platform = plat }).err("{s}", .{platform_message});
         return;
@@ -342,7 +351,8 @@ fn exportBegin(self: *ZigExportPlugin, features: *const PackedStringArray, is_de
             self.output_check = .{ .kind = .zip, .path = owned, .before = before, .lib = game_lib, .entry = out_lib };
         },
         .app => {
-            const owned = gpa.dupe(u8, out_path) catch return;
+            const owned = gpa.dupe(u8, out_path) catch
+                return r.err("Ziggurat cannot check whether the exported app {s} will hold the game library {s}: out of memory.", .{ out_path, out_lib });
             self.output_check = .{ .kind = .app, .path = owned, .before = null, .lib = game_lib, .entry = out_lib };
         },
     }
@@ -387,15 +397,10 @@ fn checkOutput(self: *ZigExportPlugin, c: OutputCheck) void {
                 return r.err("Ziggurat cannot read the ZIP export {s} ({t}), so it cannot tell whether the zip holds the game library. " ++ pack_message ++ " Only a full export holds the Zig scripts.", .{ c.path, err });
             if (!full) r.err(pack_text, .{c.lib});
         },
-        .app => {
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
-            const lib = std.fmt.bufPrint(&buf, "{s}/{s}", .{ c.path, c.entry }) catch return;
-            if (cwd.statFile(io, lib, .{})) |_| return else |_| {}
-            // Godot empties an existing bundle and writes `Contents/` first;
-            // without it nothing was written.
-            const contents = std.fmt.bufPrint(&buf, "{s}/Contents", .{c.path}) catch return;
-            _ = cwd.statFile(io, contents, .{}) catch return;
-            r.err("Ziggurat cannot find the game library {s} in the exported app {s}: this export does not contain the Zig scripts. " ++ incomplete_note, .{ c.entry, c.path });
+        .app => switch (export_build.appLibrary(gpa, io, c.path, c.entry) catch
+            return r.err("Ziggurat cannot check whether the exported app {s} holds the game library {s}: out of memory.", .{ c.path, c.entry })) {
+            .holds, .not_written => {},
+            .missing => r.err("Ziggurat cannot find the game library {s} in the exported app {s}: this export does not contain the Zig scripts. " ++ incomplete_note, .{ c.entry, c.path }),
         },
     }
 }
@@ -525,6 +530,8 @@ fn buildGameLibrary(a: Allocator, r: Reporter, key: []const u8, kind: export_bui
             return true;
         }
     }
+    // The Zig and the cache folder are the same for every key (the editor's
+    // settings and the project); only the SDK differs per arch.
     const in = inputs[0];
 
     log("Ziggurat: building the game library for the export ({d} Zig scripts, Zig {s} at {s})...", .{ sc.scripts.len, in.zig.version, in.zig.exe.bytes });

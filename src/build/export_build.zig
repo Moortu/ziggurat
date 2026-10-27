@@ -746,6 +746,30 @@ pub fn zipHoldsLibrary(io: std.Io, path: []const u8, lib: []const u8) !bool {
     return false;
 }
 
+/// What a macOS app bundle export left at its path (`appLibrary`).
+pub const AppLibrary = enum {
+    /// The bundle holds the game library.
+    holds,
+    /// The bundle was written (it has `Contents/`) without the library.
+    missing,
+    /// No bundle: the export failed before writing it (Godot empties an
+    /// existing bundle and writes `Contents/` first).
+    not_written,
+};
+
+/// Whether the app bundle folder `app` holds the game library at `entry`
+/// (`macos_app_frameworks ++ <library file>`).
+pub fn appLibrary(a: std.mem.Allocator, io: std.Io, app: []const u8, entry: []const u8) std.mem.Allocator.Error!AppLibrary {
+    const cwd = std.Io.Dir.cwd();
+    const lib = try std.fs.path.join(a, &.{ app, entry });
+    defer a.free(lib);
+    if (cwd.statFile(io, lib, .{})) |_| return .holds else |_| {}
+    const contents = try std.fs.path.join(a, &.{ app, "Contents" });
+    defer a.free(contents);
+    _ = cwd.statFile(io, contents, .{}) catch return .not_written;
+    return .missing;
+}
+
 /// True when the zip entry `name` is `lib` (a file name, or a relative
 /// path with `/`), at the top or below a folder.
 fn entryIs(name: []const u8, lib: []const u8) bool {
@@ -1022,6 +1046,29 @@ test "macosOutputKind follows Godot's macOS routing by file name" {
     try testing.expectEqual(OutputKind.image, macosOutputKind("out/game.dmg"));
     try testing.expectEqual(OutputKind.image, macosOutputKind("out/game.pkg"));
     try testing.expectEqual(OutputKind.image, macosOutputKind("out/game.APP"));
+}
+
+test "appLibrary tells a bundle with the library from one without" {
+    const io = testing.io;
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const entry = macos_app_frameworks ++ "libziggurat_game.dylib";
+    const base = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+    const app = try std.fs.path.join(a, &.{ base, "Game.app" });
+    defer a.free(app);
+    // Nothing written: the export failed before the bundle.
+    try testing.expectEqual(AppLibrary.not_written, try appLibrary(a, io, app, entry));
+    // A bundle without the library: Godot failed to copy it.
+    try tmp.dir.createDirPath(io, "Game.app/Contents/Frameworks");
+    try testing.expectEqual(AppLibrary.missing, try appLibrary(a, io, app, entry));
+    // A file of that name elsewhere in the bundle does not count.
+    try tmp.dir.createDirPath(io, "Game.app/Contents/Resources");
+    try tmp.dir.writeFile(io, .{ .sub_path = "Game.app/Contents/Resources/libziggurat_game.dylib", .data = "x" });
+    try testing.expectEqual(AppLibrary.missing, try appLibrary(a, io, app, entry));
+    try tmp.dir.writeFile(io, .{ .sub_path = "Game.app/" ++ entry, .data = "x" });
+    try testing.expectEqual(AppLibrary.holds, try appLibrary(a, io, app, entry));
 }
 
 test "zipHoldsLibrary finds the library in a macOS app's Frameworks folder" {
