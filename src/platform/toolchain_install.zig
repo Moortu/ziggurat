@@ -11,6 +11,7 @@ const builtin = @import("builtin");
 const pins = @import("pins.zig");
 const minisign = @import("minisign.zig");
 const process = @import("process.zig");
+const win32 = @import("win32.zig");
 
 const Io = std.Io;
 const Dir = Io.Dir;
@@ -161,6 +162,15 @@ fn toError(err: anyerror) Error {
     return error.FileSystem;
 }
 
+/// Opens the archive for reading. On Windows the handle allows only read
+/// sharing, so no other process can write to or delete the file while the
+/// install hashes and unpacks it (std's open shares write and delete, and
+/// its shared lock does not run under Wine). Elsewhere, a plain open.
+fn openArchive(io: Io, gpa: std.mem.Allocator, path: []const u8) !Io.File {
+    if (builtin.os.tag == .windows) return win32.openReadShareRead(gpa, path);
+    return Dir.cwd().openFile(io, path, .{});
+}
+
 fn installAny(io: Io, gpa: std.mem.Allocator, opts: Options) !Result {
     const parts = splitName(opts.archive_name) orelse return error.BadArchiveName;
 
@@ -172,7 +182,7 @@ fn installAny(io: Io, gpa: std.mem.Allocator, opts: Options) !Result {
     if (try targetWorks(io, gpa, tc_abs, opts.version_timeout_ms)) return .already_present;
 
     // One handle for the check and the unpack.
-    var file = try Dir.cwd().openFile(io, opts.archive_path, .{});
+    var file = try openArchive(io, gpa, opts.archive_path);
     defer file.close(io);
     try checkArchive(io, gpa, file, opts);
     runHook(opts, "after_check");
@@ -1424,4 +1434,40 @@ test "leftovers of a crashed run are swept after an hour" {
     _ = try d.statFile(io, "toolchains/notes.txt", .{});
     // A missing folder is no error.
     try testing.expectEqual(@as(u32, 0), sweepLeftovers(io, "/nonexistent/ziggurat-toolchains", now, leftover_age_ns));
+}
+
+test "windows: the archive is open without write or delete sharing" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zip", .data = "0123456789" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    const path = try std.fs.path.join(testing.allocator, &.{ root, "a.zip" });
+    defer testing.allocator.free(path);
+
+    var file = try openArchive(io, testing.allocator, path);
+    defer file.close(io);
+
+    // Another handle cannot write to it or delete it.
+    try testing.expectError(error.FileBusy, openForTest(path, win32.GENERIC_READ | 0x4000_0000, 0x7)); // GENERIC_WRITE
+    try testing.expectError(error.FileBusy, openForTest(path, win32.GENERIC_READ | 0x0001_0000, 0x7)); // DELETE
+    // Reading through a second handle still works, and so does ours.
+    const other = try openForTest(path, win32.GENERIC_READ, 0x7);
+    _ = win32.CloseHandle(other);
+    var buf: [10]u8 = undefined;
+    try testing.expectEqual(@as(usize, 10), try file.readPositionalAll(io, &buf, 0));
+    try testing.expectEqualStrings("0123456789", &buf);
+}
+
+fn openForTest(path: []const u8, access: u32, share: u32) !win32.HANDLE {
+    const w = try win32.fullPath(testing.allocator, path);
+    defer testing.allocator.free(w);
+    const h = win32.CreateFileW(w.ptr, access, share, null, win32.OPEN_EXISTING, win32.FILE_ATTRIBUTE_NORMAL, null);
+    if (h == @as(win32.HANDLE, @ptrFromInt(std.math.maxInt(usize)))) return switch (win32.GetLastError()) {
+        32 => error.FileBusy,
+        else => error.Unexpected,
+    };
+    return h;
 }

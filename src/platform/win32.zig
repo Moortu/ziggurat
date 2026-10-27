@@ -107,6 +107,41 @@ pub fn moveFile(a: std.mem.Allocator, from: []const u8, to: []const u8) MoveErro
     };
 }
 
+// ---------------------------------------------------------------- open with sharing
+
+pub const GENERIC_READ: u32 = 0x8000_0000;
+pub const FILE_SHARE_READ: u32 = 0x1;
+pub const OPEN_EXISTING: u32 = 3;
+pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+/// `CreateFileW` returns this (all bits set) on failure, not null.
+const INVALID_HANDLE_VALUE: HANDLE = @ptrFromInt(std.math.maxInt(usize));
+
+pub extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: u32, share: u32, attributes: ?*anyopaque, disposition: u32, flags: u32, template: ?HANDLE) callconv(.winapi) HANDLE;
+
+pub const OpenError = error{ FileNotFound, AccessDenied, FileBusy, BadPath, Unexpected } || std.mem.Allocator.Error;
+
+/// Opens the existing file `p` for reading with `FILE_SHARE_READ` only: while
+/// the handle is open, no other handle can open the file for writing or
+/// deleting (a sharing violation, `error.FileBusy`). std opens with read,
+/// write and delete sharing, and its `.lock = .shared` calls `NtLockFile`,
+/// which Wine does not run. The handle is synchronous; close it with
+/// `File.close`.
+pub fn openReadShareRead(a: std.mem.Allocator, p: []const u8) OpenError!std.Io.File {
+    const w = fullPath(a, p) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.BadPath,
+    };
+    defer a.free(w);
+    const h = CreateFileW(w.ptr, GENERIC_READ, FILE_SHARE_READ, null, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null);
+    if (h == INVALID_HANDLE_VALUE) return switch (GetLastError()) {
+        2, 3 => error.FileNotFound, // ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
+        5 => error.AccessDenied, // ERROR_ACCESS_DENIED
+        32, 33 => error.FileBusy, // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+        else => error.Unexpected,
+    };
+    return .{ .handle = h, .flags = .{ .nonblocking = false } };
+}
+
 // ---------------------------------------------------------------- file identity
 
 pub const FILETIME = extern struct { low: u32, high: u32 };
