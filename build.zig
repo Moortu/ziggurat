@@ -1177,6 +1177,17 @@ fn addTestSet(
         }),
     });
     options.addOptionPath("answer_dll", pe_fixture.getEmittedBin());
+    // A fake compiler `.exe` for the Windows process tests (a job tree that
+    // must die on a timeout, an update that never ends), for the same reason.
+    const fake_compiler = b.addExecutable(.{
+        .name = "fake_compiler",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/fixtures/process/fake_compiler.zig"),
+            .target = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = "x86_64-windows-gnu" }) catch unreachable),
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    options.addOptionPath("fake_compiler_exe", fake_compiler.getEmittedBin());
     // Toolchain install fixtures (test/fixtures/toolchain/make.sh).
     for ([_][2][]const u8{
         .{ "toolchain_good_tar", "zig-x86_64-linux-0.17.0.tar.xz" },
@@ -1334,9 +1345,10 @@ fn addTestSet(
     // The host's language helpers that import only std: the global class
     // scan, the template text, the diagnostics cache and the main-thread
     // queue (the last two lock with the C-allocated process Io), and the
-    // Zig syntax colours of the script editor.
-    var host_std: [5]*std.Build.Module = undefined;
-    for (&host_std, [_][]const u8{ "global_class", "template", "diag_cache", "main_queue", "highlight" }) |*m, name| {
+    // Zig syntax colours of the script editor, and the command-line check
+    // for non-interactive editor runs.
+    var host_std: [6]*std.Build.Module = undefined;
+    for (&host_std, [_][]const u8{ "global_class", "template", "diag_cache", "main_queue", "highlight", "cmdline" }) |*m, name| {
         m.* = b.createModule(.{
             .root_source_file = b.path(b.fmt("src/host/{s}.zig", .{name})),
             .target = target,
@@ -1397,7 +1409,7 @@ fn addTestSet(
         step.dependOn(&names_test.step);
     }
 
-    for ([_]*std.Build.Module{ platform, build_mod, abi, snake, fmtlog, host_version, output_scan, host_std[0], host_std[1], host_std[2], host_std[3], host_std[4], host_manifest, class_kind, ar_normalize, sdk_stage_tool }) |mod| {
+    for ([_]*std.Build.Module{ platform, build_mod, abi, snake, fmtlog, host_version, output_scan, host_std[0], host_std[1], host_std[2], host_std[3], host_std[4], host_std[5], host_manifest, class_kind, ar_normalize, sdk_stage_tool }) |mod| {
         const t = b.addTest(.{ .root_module = mod });
         if (runTest(b, runner, t)) |r| {
             step.dependOn(&r.step);

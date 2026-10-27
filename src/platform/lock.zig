@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const path = @import("path.zig");
 const safe_open = @import("safe_open.zig");
+const win32 = @import("win32.zig");
 
 pub const Mode = enum { shared, exclusive };
 
@@ -55,41 +56,26 @@ fn tryLock(io: std.Io, file: std.Io.File, mode: Mode) std.Io.File.LockError!bool
         .shared => .shared,
         .exclusive => .exclusive,
     });
-    var flags: u32 = LOCKFILE_FAIL_IMMEDIATELY;
-    if (mode == .exclusive) flags |= LOCKFILE_EXCLUSIVE_LOCK;
-    var ov: OVERLAPPED = .{};
-    if (LockFileEx(file.handle, flags, 0, whole_low, whole_high, &ov) != 0) return true;
-    return switch (GetLastError()) {
-        ERROR_LOCK_VIOLATION => false,
-        else => error.Unexpected,
-    };
+    var flags: u32 = win32.LOCKFILE_FAIL_IMMEDIATELY;
+    if (mode == .exclusive) flags |= win32.LOCKFILE_EXCLUSIVE_LOCK;
+    var ov: win32.OVERLAPPED = .{};
+    if (win32.LockFileEx(file.handle, flags, 0, whole_low, whole_high, &ov) != 0) return true;
+    const code = win32.GetLastError();
+    if (code == win32.ERROR_LOCK_VIOLATION) return false;
+    std.log.warn("LockFileEx failed with Windows error {d}", .{code});
+    return error.Unexpected;
 }
 
 fn unlock(io: std.Io, file: std.Io.File) void {
     if (!is_windows) return file.unlock(io);
-    var ov: OVERLAPPED = .{};
-    _ = UnlockFileEx(file.handle, 0, whole_low, whole_high, &ov);
+    var ov: win32.OVERLAPPED = .{};
+    _ = win32.UnlockFileEx(file.handle, 0, whole_low, whole_high, &ov);
 }
 
-// kernel32 file locks. The range is the whole file: offset 0 (in `ov`),
-// length 2^64 - 1, as std uses.
-const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x1;
-const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x2;
-const ERROR_LOCK_VIOLATION: u32 = 33;
+// The range is the whole file: offset 0 (in `ov`), length 2^64 - 1, as
+// std uses.
 const whole_low: u32 = 0xffff_ffff;
 const whole_high: u32 = 0xffff_ffff;
-
-const OVERLAPPED = extern struct {
-    internal: usize = 0,
-    internal_high: usize = 0,
-    offset: u32 = 0,
-    offset_high: u32 = 0,
-    event: ?*anyopaque = null,
-};
-
-extern "kernel32" fn LockFileEx(file: *anyopaque, flags: u32, reserved: u32, len_low: u32, len_high: u32, ov: *OVERLAPPED) callconv(.winapi) c_int;
-extern "kernel32" fn UnlockFileEx(file: *anyopaque, reserved: u32, len_low: u32, len_high: u32, ov: *OVERLAPPED) callconv(.winapi) c_int;
-extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 
 fn tmpPath(a: std.mem.Allocator, tmp: std.testing.TmpDir, name: []const u8) !path.OsPath {
     const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);

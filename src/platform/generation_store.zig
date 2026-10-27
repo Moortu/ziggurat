@@ -13,6 +13,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const path = @import("path.zig");
 const elf = @import("elf.zig");
+const pe = @import("pe.zig");
 const lock = @import("lock.zig");
 const testing_support = @import("testing_support.zig");
 const Allocator = std.mem.Allocator;
@@ -20,6 +21,10 @@ const OsPath = path.OsPath;
 const Dir = std.Io.Dir;
 
 pub const FileLock = lock.FileLock;
+
+/// The folder under the store root where generations go that a sweep could
+/// not delete (Windows: a loaded DLL); each sweep deletes what it can there.
+pub const trash_dir = ".trash";
 
 /// Paths are allocated; free them with `deinit`.
 pub const Generation = struct {
@@ -118,8 +123,9 @@ pub const GenerationStore = struct {
 
     /// Copies `built` (never moves it) to `gen/<n>/<libName>` where n is the
     /// highest existing generation plus one, and copies each of `extras` into
-    /// the same folder under its own file name. On an ELF target the built file
-    /// is checked with `elf.checkComplete` first. On any error no `gen/<n>`
+    /// the same folder under its own file name. The staged copy is checked
+    /// with `elf.checkComplete` on an ELF target and with
+    /// `pe.checkCompleteDiag` on Windows. On any error no `gen/<n>`
     /// folder is left behind. The new generation comes back pinned
     /// (`Staged.pin`, taken before `store.lock` is released), so no sweep can
     /// delete it before its user loads it (spec risk 20). The caller frees
@@ -130,7 +136,7 @@ pub const GenerationStore = struct {
     }
 
     /// Like `stage`, and on any failure `diag` holds one NUL-terminated
-    /// sentence (read it with `elf.diagText`): the ELF check's text, or a
+    /// sentence (read it with `elf.diagText`): the ELF or PE check's text, or a
     /// generic sentence naming the error and the built file.
     pub fn stageDiag(self: *GenerationStore, built: OsPath, extras: []const OsPath, diag: *[256]u8) !Staged {
         @memset(diag, 0);
@@ -179,6 +185,10 @@ pub const GenerationStore = struct {
             const f = try Dir.cwd().openFile(io, lib.bytes, .{});
             defer f.close(io);
             try elf.checkComplete(io, f, diag);
+        } else if (self.os == .windows) {
+            const bytes = try Dir.cwd().readFileAlloc(io, lib.bytes, a, .unlimited);
+            defer a.free(bytes);
+            try pe.checkCompleteDiag(bytes, diag);
         }
 
         for (extras) |extra| {
@@ -230,6 +240,12 @@ pub const GenerationStore = struct {
     /// not loaded yet) and deleting others frees none of their bytes, so
     /// they do not count toward `max_bytes` (spec risk 20). Never deletes
     /// the newest generation or a pinned one.
+    ///
+    /// A generation folder that cannot be deleted (Windows: a loaded DLL, or
+    /// a file another process holds open) is renamed into
+    /// `<root>/.trash/<n>-<16 hex>` and counts as deleted; each sweep first
+    /// deletes what it can from `.trash/`, quietly leaving what is still in
+    /// use. A pinned generation is never renamed.
     pub fn sweep(self: *GenerationStore) !SweepReport {
         const a = self.a;
         const io = self.io;
@@ -239,6 +255,7 @@ pub const GenerationStore = struct {
 
         var store_lock = try self.lockStore(.exclusive);
         defer store_lock.release();
+        self.emptyTrash();
 
         const gens = try self.listGens(gen_root);
         defer a.free(gens);
@@ -396,12 +413,65 @@ pub const GenerationStore = struct {
             // Windows cannot delete a file that is still open. `store.lock`
             // is held exclusive, so no `pin` can slip in.
             l.release();
-            try Dir.cwd().deleteTree(self.io, dp.bytes);
+            Dir.cwd().deleteTree(self.io, dp.bytes) catch |err| {
+                // A loaded DLL cannot be deleted, but it can be renamed.
+                self.moveToTrash(dp, n) catch return err;
+            };
         } else {
             defer l.release();
             try Dir.cwd().deleteTree(self.io, dp.bytes);
         }
         return true;
+    }
+
+    /// Renames the generation folder `dp` into `<root>/.trash/<n>-<16 hex>`.
+    /// When the folder itself cannot be renamed (Windows refuses to rename a
+    /// folder while a file in it is open), its files are renamed one by one
+    /// into such a folder and the emptied folder is deleted.
+    fn moveToTrash(self: *GenerationStore, dp: OsPath, n: u32) !void {
+        const a = self.a;
+        const io = self.io;
+        const trash = try path.join(a, self.root, &.{trash_dir});
+        defer a.free(trash.bytes);
+        try Dir.cwd().createDirPath(io, trash.bytes);
+        var rnd: [8]u8 = undefined;
+        io.random(&rnd);
+        var nb: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&nb, "{d}-{s}", .{ n, &std.fmt.bytesToHex(rnd, .lower) });
+        const dst = try path.join(a, trash, &.{name});
+        defer a.free(dst.bytes);
+        if (Dir.cwd().rename(dp.bytes, Dir.cwd(), dst.bytes, io)) |_| return else |_| {}
+
+        try Dir.cwd().createDir(io, dst.bytes, .default_dir);
+        var d = try Dir.cwd().openDir(io, dp.bytes, .{ .iterate = true });
+        defer d.close(io);
+        var to = try Dir.cwd().openDir(io, dst.bytes, .{});
+        defer to.close(io);
+        var it = d.iterate();
+        while (try it.next(io)) |entry| try d.rename(entry.name, to, entry.name, io);
+        try Dir.cwd().deleteDir(io, dp.bytes);
+    }
+
+    /// Deletes each entry of `<root>/.trash/` that can be deleted now, and
+    /// the folder itself once it is empty. What is still in use stays for a
+    /// later sweep; nothing is reported.
+    fn emptyTrash(self: *GenerationStore) void {
+        const a = self.a;
+        const io = self.io;
+        const trash = path.join(a, self.root, &.{trash_dir}) catch return;
+        defer a.free(trash.bytes);
+        var d = Dir.cwd().openDir(io, trash.bytes, .{ .iterate = true }) catch return;
+        var left = false;
+        {
+            defer d.close(io);
+            var it = d.iterate();
+            while (it.next(io) catch null) |entry| {
+                d.deleteTree(io, entry.name) catch {
+                    left = true;
+                };
+            }
+        }
+        if (!left) Dir.cwd().deleteDir(io, trash.bytes) catch {};
     }
 };
 
@@ -493,6 +563,39 @@ const Fixture = struct {
     fn store(f: *Fixture, a: Allocator, caps: Caps) GenerationStore {
         return GenerationStore.init(a, std.testing.io, f.root, os_tag, "demo", caps);
     }
+    /// A library the store's check accepts for this target, holding
+    /// `payload`: `writePe` on Windows, `writeElf` elsewhere.
+    fn writeLib(f: *Fixture, name: []const u8, payload: []const u8) !void {
+        if (os_tag == .windows) return f.writePe(name, payload);
+        return f.writeElf(name, payload);
+    }
+    /// A minimal complete PE32+ file: headers up to byte 0x200, then one
+    /// section holding `payload`.
+    fn writePe(f: *Fixture, name: []const u8, payload: []const u8) !void {
+        var b: [0x200]u8 = @splat(0);
+        @memcpy(b[0..2], "MZ");
+        std.mem.writeInt(u32, b[0x3c..][0..4], 0x40, .little);
+        @memcpy(b[0x40..0x44], "PE\x00\x00");
+        std.mem.writeInt(u16, b[0x44..][0..2], 0x8664, .little); // machine
+        std.mem.writeInt(u16, b[0x46..][0..2], 1, .little); // sections
+        std.mem.writeInt(u16, b[0x54..][0..2], 240, .little); // optional header size
+        const opt = 0x58;
+        std.mem.writeInt(u16, b[opt..][0..2], 0x20b, .little); // PE32+
+        std.mem.writeInt(u64, b[opt + 24 ..][0..8], 0x1_8000_0000, .little); // image base
+        std.mem.writeInt(u32, b[opt + 60 ..][0..4], 0x200, .little); // SizeOfHeaders
+        std.mem.writeInt(u32, b[opt + 108 ..][0..4], 16, .little); // data directories
+        const sec = opt + 240;
+        const len: u32 = @intCast(payload.len);
+        @memcpy(b[sec..][0..5], ".data");
+        std.mem.writeInt(u32, b[sec + 8 ..][0..4], len, .little); // VirtualSize
+        std.mem.writeInt(u32, b[sec + 12 ..][0..4], 0x1000, .little); // VirtualAddress
+        std.mem.writeInt(u32, b[sec + 16 ..][0..4], len, .little); // SizeOfRawData
+        std.mem.writeInt(u32, b[sec + 20 ..][0..4], 0x200, .little); // PointerToRawData
+        var file = try f.tmp.dir.createFile(std.testing.io, name, .{});
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, &b, 0);
+        try file.writePositionalAll(std.testing.io, payload, 0x200);
+    }
     /// A minimal valid ELF64 header (no program or section headers) followed
     /// by `payload` bytes.
     fn writeElf(f: *Fixture, name: []const u8, payload: []const u8) !void {
@@ -540,7 +643,7 @@ test "stage numbers" {
     const a = std.testing.allocator;
     var f = try Fixture.init(a);
     defer f.deinit(a);
-    try f.writeElf("built.so", "hello");
+    try f.writeLib("built.so", "hello");
     const built = try f.p(a, &.{"built.so"});
     defer a.free(built.bytes);
     var s = f.store(a, .{});
@@ -556,7 +659,7 @@ test "remove deletes and never reuses the number" {
     const a = std.testing.allocator;
     var f = try Fixture.init(a);
     defer f.deinit(a);
-    try f.writeElf("built.so", "hello");
+    try f.writeLib("built.so", "hello");
     const built = try f.p(a, &.{"built.so"});
     defer a.free(built.bytes);
     var s = f.store(a, .{});
@@ -582,7 +685,7 @@ test "stage copies, never moves" {
     const io = std.testing.io;
     var f = try Fixture.init(a);
     defer f.deinit(a);
-    try f.writeElf("built.so", "payload bytes");
+    try f.writeLib("built.so", "payload bytes");
     const built = try f.p(a, &.{"built.so"});
     defer a.free(built.bytes);
     const extra = try f.p(a, &.{"extra.txt"});
@@ -616,7 +719,7 @@ test "stage keeps holes" {
     const io = std.testing.io;
     var f = try Fixture.init(a);
     defer f.deinit(a);
-    try f.writeElf("built.so", "");
+    try f.writeLib("built.so", "");
     {
         var file = try f.tmp.dir.openFile(io, "built.so", .{ .mode = .read_write });
         defer file.close(io);
@@ -654,7 +757,7 @@ test "sweep counts allocated bytes" {
     // A sparse 64 MiB library with one 4 KiB data block: about 8 KiB on
     // disk, far below the 32 MiB cap, so a sweep that measures allocated
     // blocks keeps both generations.
-    try f.writeElf("built.so", "");
+    try f.writeLib("built.so", "");
     {
         var file = try f.tmp.dir.openFile(io, "built.so", .{ .mode = .read_write });
         defer file.close(io);
@@ -685,7 +788,7 @@ test "pin blocks sweep" {
     const a = std.testing.allocator;
     var f = try Fixture.init(a);
     defer f.deinit(a);
-    try f.writeElf("built.so", "hello");
+    try f.writeLib("built.so", "hello");
     const built = try f.p(a, &.{"built.so"});
     defer a.free(built.bytes);
     var s = f.store(a, .{ .max_count = 3 });
@@ -707,7 +810,7 @@ test "a game's pin keeps its generation from an editor's sweep" {
     const a = std.testing.allocator;
     var f = try Fixture.init(a);
     defer f.deinit(a);
-    try f.writeElf("built.so", "hello");
+    try f.writeLib("built.so", "hello");
     const built = try f.p(a, &.{"built.so"});
     defer a.free(built.bytes);
     // The editor that staged the generations, and a game process with a
@@ -732,7 +835,7 @@ test "pin never follows a linked lock file" {
     const a = std.testing.allocator;
     var f = try Fixture.init(a);
     defer f.deinit(a);
-    try f.writeElf("built.so", "hello");
+    try f.writeLib("built.so", "hello");
     const built = try f.p(a, &.{"built.so"});
     defer a.free(built.bytes);
     var s = f.store(a, .{});
@@ -753,7 +856,7 @@ test "a lock that cannot be checked does not end the sweep" {
     const a = std.testing.allocator;
     var f = try Fixture.init(a);
     defer f.deinit(a);
-    try f.writeElf("built.so", "hello");
+    try f.writeLib("built.so", "hello");
     const built = try f.p(a, &.{"built.so"});
     defer a.free(built.bytes);
     var s = f.store(a, .{ .max_count = 1 });
@@ -781,7 +884,7 @@ test "sweep keeps newest" {
     const a = std.testing.allocator;
     var f = try Fixture.init(a);
     defer f.deinit(a);
-    try f.writeElf("built.so", "hello");
+    try f.writeLib("built.so", "hello");
     const built = try f.p(a, &.{"built.so"});
     defer a.free(built.bytes);
     var s = f.store(a, .{ .max_bytes = 1 });
@@ -841,7 +944,7 @@ test "stage with a missing extra leaves no folder" {
     const a = std.testing.allocator;
     var f = try Fixture.init(a);
     defer f.deinit(a);
-    try f.writeElf("built.so", "hello");
+    try f.writeLib("built.so", "hello");
     const built = try f.p(a, &.{"built.so"});
     defer a.free(built.bytes);
     const missing = try f.p(a, &.{"nope.txt"});
@@ -857,7 +960,7 @@ test "pin of a missing generation" {
     const a = std.testing.allocator;
     var f = try Fixture.init(a);
     defer f.deinit(a);
-    try f.writeElf("built.so", "hello");
+    try f.writeLib("built.so", "hello");
     const built = try f.p(a, &.{"built.so"});
     defer a.free(built.bytes);
     var s = f.store(a, .{});
@@ -870,7 +973,7 @@ test "sweep by bytes keeps a pinned oldest" {
     const a = std.testing.allocator;
     var f = try Fixture.init(a);
     defer f.deinit(a);
-    try f.writeElf("built.so", "hello");
+    try f.writeLib("built.so", "hello");
     const built = try f.p(a, &.{"built.so"});
     defer a.free(built.bytes);
     var s = f.store(a, .{ .max_bytes = 1 });
@@ -890,7 +993,7 @@ test "staged build survives a sweep before load" {
     const a = std.testing.allocator;
     var f = try Fixture.init(a);
     defer f.deinit(a);
-    try f.writeElf("built.so", "hello");
+    try f.writeLib("built.so", "hello");
     const built = try f.p(a, &.{"built.so"});
     defer a.free(built.bytes);
     // Spec risk 20: build 1 is staged and its outcome waits for the main
@@ -921,11 +1024,11 @@ test "pinned bytes do not evict" {
     defer f.deinit(a);
     // A tool project in the editor: three loaded (pinned) builds hold far
     // more than the byte cap; the unpinned builds are small.
-    try f.writeElf("small.so", "hello");
+    try f.writeLib("small.so", "hello");
     const big_payload = try a.alloc(u8, 256 << 10);
     defer a.free(big_payload);
     @memset(big_payload, 0xAB);
-    try f.writeElf("big.so", big_payload);
+    try f.writeLib("big.so", big_payload);
     const small = try f.p(a, &.{"small.so"});
     defer a.free(small.bytes);
     const big = try f.p(a, &.{"big.so"});
@@ -961,7 +1064,7 @@ test "folders with non-canonical names are ignored" {
     const io = std.testing.io;
     var f = try Fixture.init(a);
     defer f.deinit(a);
-    try f.writeElf("built.so", "hello");
+    try f.writeLib("built.so", "hello");
     const built = try f.p(a, &.{"built.so"});
     defer a.free(built.bytes);
     var s = f.store(a, .{ .max_count = 1 });
@@ -976,4 +1079,94 @@ test "folders with non-canonical names are ignored" {
     const rep = try s.sweep();
     try std.testing.expectEqual(@as(u32, 1), rep.deleted);
     try std.testing.expectEqual(@as(u32, 0), rep.failed);
+}
+
+/// Entries in `<store>/.trash`, or 0 when it does not exist.
+fn trashCount(a: Allocator, f: *Fixture) !u32 {
+    const q = try path.join(a, f.root, &.{trash_dir});
+    defer a.free(q.bytes);
+    var d = Dir.cwd().openDir(std.testing.io, q.bytes, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound => return 0,
+        else => return e,
+    };
+    defer d.close(std.testing.io);
+    var n: u32 = 0;
+    var it = d.iterate();
+    while (try it.next(std.testing.io)) |_| n += 1;
+    return n;
+}
+
+/// Copies the fixture DLL (`build_options.answer_dll`) to `<tmp>/<name>`,
+/// cut to half its size when `cut`; the caller frees the path.
+fn copyAnswerDll(a: Allocator, f: *Fixture, name: []const u8, cut: bool) !OsPath {
+    const io = std.testing.io;
+    const bytes = try Dir.cwd().readFileAlloc(io, @import("build_options").answer_dll, a, .unlimited);
+    defer a.free(bytes);
+    try f.tmp.dir.writeFile(io, .{ .sub_path = name, .data = if (cut) bytes[0 .. bytes.len / 2] else bytes });
+    return f.p(a, &.{name});
+}
+
+test "store: a loaded DLL's generation is renamed into trash and deleted later" {
+    if (os_tag != .windows) return error.SkipZigTest;
+    const loader = @import("loader.zig");
+    const a = std.testing.allocator;
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    const built = try copyAnswerDll(a, &f, "answer.dll", false);
+    defer a.free(built.bytes);
+    var s = f.store(a, .{ .max_count = 1 });
+
+    // Generation 1 is loaded, as the editor keeps it, and no longer pinned.
+    var first = try s.stage(built, &.{});
+    defer first.gen.deinit(a);
+    var diag: [256]u8 = undefined;
+    const lib = loader.open(a, std.testing.io, first.gen.lib, &diag) catch |err| {
+        std.debug.print("{t}: {s}\n", .{ err, elf.diagText(&diag) });
+        return err;
+    };
+    var loaded = true;
+    defer if (loaded) loader.close(lib);
+    first.pin.release();
+    _ = try stageOne(a, &s, built);
+
+    // Windows cannot delete the loaded DLL: the folder goes to the trash,
+    // with no failure.
+    const rep = try s.sweep();
+    try std.testing.expectEqual(@as(u32, 1), rep.deleted);
+    try std.testing.expectEqual(@as(u32, 0), rep.failed);
+    try std.testing.expect(!try genExists(a, &f, 1));
+    try std.testing.expect(try genExists(a, &f, 2));
+    try std.testing.expectEqual(@as(u32, 1), try trashCount(a, &f));
+
+    // While it stays loaded, a sweep leaves it in the trash quietly.
+    const rep2 = try s.sweep();
+    try std.testing.expectEqual(@as(u32, 0), rep2.failed);
+    try std.testing.expectEqual(@as(u32, 1), try trashCount(a, &f));
+
+    // Once it is freed, the next sweep deletes it.
+    loader.close(lib);
+    loaded = false;
+    _ = try s.sweep();
+    try std.testing.expectEqual(@as(u32, 0), try trashCount(a, &f));
+    try std.testing.expect(try genExists(a, &f, 2));
+}
+
+test "store: PE check after staging refuses a truncated DLL" {
+    const a = std.testing.allocator;
+    var f = try Fixture.init(a);
+    defer f.deinit(a);
+    const cut = try copyAnswerDll(a, &f, "cut.dll", true);
+    defer a.free(cut.bytes);
+    var s = GenerationStore.init(a, std.testing.io, f.root, .windows, "demo", .{});
+    var diag: [256]u8 = undefined;
+    try std.testing.expectError(error.Truncated, s.stageDiag(cut, &.{}, &diag));
+    try std.testing.expect(std.mem.indexOf(u8, elf.diagText(&diag), "truncated") != null);
+    try std.testing.expect(!try genExists(a, &f, 1));
+    // The whole DLL is staged.
+    const whole = try copyAnswerDll(a, &f, "whole.dll", false);
+    defer a.free(whole.bytes);
+    var st = try s.stage(whole, &.{});
+    defer st.gen.deinit(a);
+    defer st.pin.release();
+    try std.testing.expectEqual(@as(u32, 1), st.gen.n);
 }

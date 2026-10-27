@@ -6,6 +6,7 @@ const path = @import("path.zig");
 const elf = @import("elf.zig");
 const pe = @import("pe.zig");
 const safe_open = @import("safe_open.zig");
+const win32 = @import("win32.zig");
 
 pub const LoadError = error{ LoadFailed, Unsupported } || elf.ElfError || pe.Error;
 
@@ -25,13 +26,6 @@ const FORMAT_MESSAGE_MAX_WIDTH_MASK: u32 = 0x0000_00ff;
 /// Paths of this many UTF-16 units or more need the `\\?\` prefix.
 const max_path = 260;
 
-extern "kernel32" fn LoadLibraryExW(name: [*:0]const u16, file: ?*anyopaque, flags: u32) callconv(.winapi) ?*anyopaque;
-extern "kernel32" fn GetProcAddress(module: *anyopaque, name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
-extern "kernel32" fn FreeLibrary(module: *anyopaque) callconv(.winapi) c_int;
-extern "kernel32" fn GetFullPathNameW(name: [*:0]const u16, len: u32, buf: ?[*]u16, file_part: ?*?[*:0]u16) callconv(.winapi) u32;
-extern "kernel32" fn FormatMessageW(flags: u32, source: ?*const anyopaque, id: u32, lang: u32, buf: [*]u16, size: u32, args: ?*anyopaque) callconv(.winapi) u32;
-extern "kernel32" fn GetLastError() callconv(.winapi) u32;
-
 /// Opens the DLL at `p` with
 /// `LoadLibraryExW(path, null, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)`:
 /// the DLL's own folder and the system folders are searched for its
@@ -50,8 +44,8 @@ pub fn open(a: std.mem.Allocator, io: std.Io, p: path.OsPath, diag: *[256]u8) Lo
         return error.LoadFailed;
     };
     defer a.free(wide);
-    const handle = LoadLibraryExW(wide.ptr, null, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) orelse {
-        const code = GetLastError();
+    const handle = win32.LoadLibraryExW(wide.ptr, null, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) orelse {
+        const code = win32.GetLastError();
         var buf: [256]u8 = undefined;
         setDiag(diag, "{s} (Windows error {d}, while loading {s})", .{ errorText(code, &buf), code, p.bytes });
         return error.LoadFailed;
@@ -96,14 +90,14 @@ fn fullPath(a: std.mem.Allocator, p: []const u8) ![:0]u16 {
     defer a.free(in);
     var buf: []u16 = try a.alloc(u16, max_path);
     defer a.free(buf);
-    var n = GetFullPathNameW(in.ptr, @intCast(buf.len), buf.ptr, null);
+    var n = win32.GetFullPathNameW(in.ptr, @intCast(buf.len), buf.ptr, null);
     if (n == 0) return error.BadPath;
     if (n >= buf.len) {
         // `n` is the size needed, with the NUL.
         const bigger = try a.alloc(u16, n);
         a.free(buf);
         buf = bigger;
-        n = GetFullPathNameW(in.ptr, @intCast(buf.len), buf.ptr, null);
+        n = win32.GetFullPathNameW(in.ptr, @intCast(buf.len), buf.ptr, null);
         if (n == 0 or n >= buf.len) return error.BadPath;
     }
     const full = buf[0..n];
@@ -125,7 +119,7 @@ fn fullPath(a: std.mem.Allocator, p: []const u8) ![:0]u16 {
 /// or line break, or "unknown error" when there is none.
 fn errorText(code: u32, out: *[256]u8) []const u8 {
     var wbuf: [256]u16 = undefined;
-    const n = FormatMessageW(
+    const n = win32.FormatMessageW(
         FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS | FORMAT_MESSAGE_MAX_WIDTH_MASK,
         null,
         code,
@@ -158,12 +152,12 @@ pub fn lookup(lib: Library, comptime T: type, name: [:0]const u8) ?T {
         };
         if (!ok) @compileError("lookup: T must be a pointer to a function type, got " ++ @typeName(T));
     }
-    const sym = GetProcAddress(lib.handle, name.ptr) orelse return null;
+    const sym = win32.GetProcAddress(lib.handle, name.ptr) orelse return null;
     return @ptrCast(@alignCast(sym));
 }
 
 pub fn close(lib: Library) void {
-    _ = FreeLibrary(lib.handle);
+    _ = win32.FreeLibrary(lib.handle);
 }
 
 const builtin = @import("builtin");

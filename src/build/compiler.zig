@@ -159,13 +159,12 @@ const State = struct {
         // readers finish.
         st.child.signalKill();
         st.mr.deinit();
-        if (comptime builtin.os.tag != .windows) {
-            // The whole group is dead, so stderr normally reaches end of file
-            // and the reader stops by itself after keeping the last bytes. A
-            // process outside the group could still hold the pipe open, so
-            // the wait is bounded and the reader is cancelled after it.
-            st.waitDrain(drain_grace_ms);
-        }
+        // The whole tree is dead (process group or Job Object), so stderr
+        // normally reaches end of file and the reader stops by itself after
+        // keeping the last bytes. A process outside the tree could still
+        // hold the pipe open, so the wait is bounded and the reader is
+        // cancelled after it.
+        st.waitDrain(drain_grace_ms);
         st.drain.cancel(st.io);
         st.child.kill(st.io);
     }
@@ -304,14 +303,14 @@ pub const Session = struct {
         self.* = undefined;
     }
 
-    /// Kills the server's process group. Safe from any thread, also while
-    /// another thread is inside `update` (that update then ends with
-    /// `error.CompilerDied`); the session must not be freed meanwhile. Does
-    /// nothing once the session is released. POSIX only: on Windows it does
-    /// nothing and a running update ends only by itself or by its timeout.
+    /// Kills the server's process tree (POSIX: its process group; Windows:
+    /// its Job Object, which ends the server and every process it started).
+    /// Safe from any thread, also while another thread is inside `update`
+    /// (that update then ends with `error.CompilerDied`); the session must
+    /// not be freed meanwhile. Does nothing once the session is released.
     pub fn interrupt(self: Session) void {
-        // TODO(Stage 7): on Windows, end the server with TerminateProcess on the
-        // child handle (it does not reap, so the handle stays valid here).
+        // Under the mutex, so the tree is never killed after `release`
+        // reaped the server and closed the job.
         const st = self.st;
         st.mutex.lockUncancelable(st.io);
         defer st.mutex.unlock(st.io);
@@ -650,4 +649,29 @@ test "integration: compiler died" {
     try std.posix.kill(s.pid().?, .KILL);
     try testing.expectError(error.CompilerDied, s.update(update_timeout_ms));
     try testing.expect(!s.alive());
+}
+
+test "interrupt ends a running update on Windows" {
+    if (!is_windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = testing.io;
+    // The fake compiler reads its input and never answers: a long update.
+    const exe = try std.Io.Dir.cwd().realPathFileAlloc(io, build_options.fake_compiler_exe, a);
+    defer a.free(exe);
+    const argv = [_][]const u8{ exe, "server", "--cache-dir", "C:\\nonexistent-ziggurat\\cache", "--name", "zz" };
+    var s = try Session.start(a, io, &argv, .fromTrusted("."));
+    defer s.deinit();
+    const Killer = struct {
+        fn run(sess: Session) void {
+            std.Io.sleep(testing.io, .fromMilliseconds(500), .awake) catch {};
+            sess.interrupt();
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Killer.run, .{s});
+    const t0 = std.Io.Clock.awake.now(io);
+    try testing.expectError(error.CompilerDied, s.update(20_000));
+    t.join();
+    try testing.expect(t0.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 10_000);
+    try testing.expect(!s.alive());
+    s.interrupt();
 }

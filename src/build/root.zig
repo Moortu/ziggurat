@@ -22,6 +22,7 @@ test {
     std.testing.refAllDecls(service);
     std.testing.refAllDecls(sdk_manifest);
     std.testing.refAllDecls(export_build);
+    _ = @import("windows_paths_test.zig");
 }
 
 test "build module sees the platform module" {

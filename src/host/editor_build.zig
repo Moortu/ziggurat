@@ -108,6 +108,7 @@ const resource = @import("resource.zig");
 const manifest = @import("manifest.zig");
 const load_checks = @import("load_checks.zig");
 const props = @import("props.zig");
+const cmdline = @import("cmdline.zig");
 const swap = @import("swap.zig");
 const registry = @import("registry.zig");
 const abi = @import("ziggurat_abi");
@@ -769,35 +770,27 @@ pub fn busy() bool {
     return st.svc.stats().updates_active > 0;
 }
 
-/// Command-line arguments of editor runs that are not interactive: an
-/// import, an export, the doc tool, API dumps, and `--quit`/`-q` (which
-/// quits after the first frame). `--quit-after <n>` keeps an interactive
-/// editor (the host tests use it).
-const non_interactive = [_][]const u8{
-    "--import",                 "--doctool",                      "--gdextension-docs",
-    "--dump-extension-api",     "--dump-extension-api-with-docs", "--dump-gdextension-interface",
-    "--validate-extension-api", "--check-only",                   "--quit",
-    "-q",
-};
-
 /// The first argument of this run that makes it non-interactive
-/// (`non_interactive`, or any `--export-*`), or null. Godot consumes
-/// `--import` and `--quit` without keeping them in `OS.get_cmdline_args()`
-/// (main/main.cpp, the argument loop before `set_cmdline`), so on Linux the
-/// process's own command line (`/proc/self/cmdline`) is read too. Main
-/// thread.
+/// (`cmdline.nonInteractive`), or null. Godot consumes `--import` and
+/// `--quit` without keeping them in `OS.get_cmdline_args()` (main/main.cpp,
+/// the argument loop before `set_cmdline`), so the process's own command
+/// line is read too: `/proc/self/cmdline` on Linux, `GetCommandLineW` split
+/// by `CommandLineToArgvW` on Windows. Main thread.
 fn nonInteractiveArg() ?[]const u8 {
     const S = struct {
         var buf: [256]u8 = undefined;
-    };
-    if (@import("builtin").os.tag == .linux) {
         var raw_buf: [64 * 1024]u8 = undefined;
-        if (readCmdline(&raw_buf)) |raw| {
-            if (nonInteractiveIn(raw)) |arg| {
-                const n = @min(arg.len, S.buf.len);
-                @memcpy(S.buf[0..n], arg[0..n]);
-                return S.buf[0..n];
-            }
+    };
+    const raw: ?[]const u8 = switch (@import("builtin").os.tag) {
+        .linux => readCmdline(&S.raw_buf),
+        .windows => cmdline.windowsArgs(&S.raw_buf),
+        else => null,
+    };
+    if (raw) |r| {
+        if (cmdline.nonInteractiveIn(r)) |arg| {
+            const n = @min(arg.len, S.buf.len);
+            @memcpy(S.buf[0..n], arg[0..n]);
+            return S.buf[0..n];
         }
     }
     var args = Os.getCmdlineArgs();
@@ -807,27 +800,9 @@ fn nonInteractiveArg() ?[]const u8 {
         var arg = args.get(i);
         defer arg.deinit();
         const text = props.stringText(&arg, &S.buf) orelse continue;
-        if (nonInteractive(text)) return text;
+        if (cmdline.nonInteractive(text)) return text;
     }
     return null;
-}
-
-/// The first non-interactive argument among the NUL-separated arguments
-/// `raw` (as `/proc/self/cmdline` holds them), or null. The scan stops at
-/// `--` or `++`: Godot hands what follows to the game as user arguments.
-fn nonInteractiveIn(raw: []const u8) ?[]const u8 {
-    var it = std.mem.splitScalar(u8, raw, 0);
-    while (it.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--") or std.mem.eql(u8, arg, "++")) return null;
-        if (nonInteractive(arg)) return arg;
-    }
-    return null;
-}
-
-fn nonInteractive(arg: []const u8) bool {
-    if (std.mem.startsWith(u8, arg, "--export-")) return true;
-    for (non_interactive) |want| if (std.mem.eql(u8, arg, want)) return true;
-    return false;
 }
 
 /// The process's NUL-separated arguments, or null.
@@ -1886,14 +1861,4 @@ test "size text" {
     try std.testing.expectEqualStrings("1.5 KiB", sizeText(&buf, 1536));
     try std.testing.expectEqualStrings("2.0 GiB", sizeText(&buf, 2 << 30));
     try std.testing.expectEqualStrings("2.1 GiB", sizeText(&buf, (2 << 30) + (150 << 20)));
-}
-
-test "nonInteractiveIn stops at the user arguments" {
-    try std.testing.expectEqualStrings("--import", nonInteractiveIn("godot\x00--editor\x00--import\x00").?);
-    try std.testing.expectEqualStrings("--export-release", nonInteractiveIn("godot\x00--export-release\x00x").?);
-    try std.testing.expect(nonInteractiveIn("godot\x00--editor\x00--quit-after\x005") == null);
-    // After `--` or `++` Godot passes the arguments to the game, not the
-    // editor, so they do not make the editor non-interactive.
-    try std.testing.expect(nonInteractiveIn("godot\x00--editor\x00--\x00--quit") == null);
-    try std.testing.expect(nonInteractiveIn("godot\x00-e\x00++\x00-q\x00--import") == null);
 }

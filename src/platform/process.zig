@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const path = @import("path.zig");
+const win32 = @import("win32.zig");
 
 pub const RunResult = struct {
     term: std.process.Child.Term,
@@ -15,11 +16,95 @@ const is_posix = switch (builtin.os.tag) {
     else => true,
 };
 
-/// Kills the child's whole process group, so grandchildren that hold the
-/// pipes cannot keep a read open. POSIX only; elsewhere it does nothing.
-fn killGroup(child: *const std.process.Child) void {
+const is_windows = builtin.os.tag == .windows;
+
+/// The process tree of one child. On POSIX that is the child's process
+/// group (its pid); on Windows a Job Object with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so the child and every process it
+/// starts die together when the job is terminated or its handle is closed.
+const Tree = if (is_windows) ?win32.HANDLE else void;
+
+/// A Job Object that kills its processes when its last handle closes.
+fn createJob() !win32.HANDLE {
+    const job = win32.CreateJobObjectW(null, null) orelse return error.JobObjectFailed;
+    errdefer _ = win32.CloseHandle(job);
+    var info: win32.JOBOBJECT_EXTENDED_LIMIT_INFORMATION = .{};
+    info.basic.limit_flags = win32.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (win32.SetInformationJobObject(job, win32.JobObjectExtendedLimitInformation, &info, @sizeOf(@TypeOf(info))) == 0)
+        return error.JobObjectFailed;
+    return job;
+}
+
+/// Spawns `opts` as a new process tree. On Windows the child is created
+/// suspended (std's `start_suspended`), assigned to a new job, and only then
+/// resumed, so no process it starts can escape the job.
+fn spawnTree(io: std.Io, opts: std.process.SpawnOptions) !struct { std.process.Child, Tree } {
+    if (comptime !is_windows) {
+        var o = opts;
+        o.pgid = if (is_posix) 0 else null;
+        return .{ try std.process.spawn(io, o), {} };
+    }
+    const job = try createJob();
+    errdefer _ = win32.CloseHandle(job);
+    var o = opts;
+    o.start_suspended = true;
+    var child = try std.process.spawn(io, o);
+    errdefer {
+        _ = win32.TerminateProcess(child.id.?, 1);
+        _ = child.wait(io) catch {};
+    }
+    if (win32.AssignProcessToJobObject(job, child.id.?) == 0) return error.JobObjectFailed;
+    if (win32.ResumeThread(child.thread_handle) == std.math.maxInt(u32)) return error.JobObjectFailed;
+    return .{ child, job };
+}
+
+/// Kills the child's whole tree (POSIX: its process group; Windows: its
+/// job), so grandchildren that hold the pipes cannot keep a read open. Does
+/// not reap the child.
+fn killTree(child: *const std.process.Child, tree: Tree) void {
+    if (comptime is_windows) {
+        if (tree) |job| _ = win32.TerminateJobObject(job, 1);
+        return;
+    }
     if (comptime !is_posix) return;
     if (child.id) |pid| std.posix.kill(-pid, .KILL) catch {};
+}
+
+/// Kills the child's tree, reaps the child and closes its pipes (and on
+/// Windows the job). Safe after `wait`.
+///
+/// On Windows std's `Child.kill` is not used: it calls
+/// `RtlReportSilentProcessExit`, which Wine does not implement (the process
+/// aborts). The job is terminated instead and the child reaped with `wait`.
+fn killReap(io: std.Io, child: *std.process.Child, tree: *Tree) void {
+    if (comptime is_windows) {
+        if (child.id) |h| {
+            if (tree.*) |job| {
+                _ = win32.TerminateJobObject(job, 1);
+            } else {
+                _ = win32.TerminateProcess(h, 1);
+            }
+            _ = waitHandle(h, win32.INFINITE);
+            _ = child.wait(io) catch {};
+        }
+        closeTree(tree);
+        return;
+    }
+    killTree(child, tree.*);
+    child.kill(io);
+}
+
+/// Closes the job handle (Windows), which also kills what is left of the
+/// tree. Idempotent.
+fn closeTree(tree: *Tree) void {
+    if (comptime !is_windows) return;
+    if (tree.*) |job| _ = win32.CloseHandle(job);
+    tree.* = null;
+}
+
+/// Windows: waits up to `ms` for `handle` to be signalled. True when it was.
+fn waitHandle(handle: win32.HANDLE, ms: u32) bool {
+    return win32.WaitForSingleObject(handle, ms) == win32.WAIT_OBJECT_0;
 }
 
 fn watchdog(io: std.Io, deadline: std.Io.Timeout, pid: std.posix.pid_t, timed_out: *std.atomic.Value(bool)) std.Io.Cancelable!void {
@@ -44,13 +129,14 @@ fn waitExitNoReap(pid: std.posix.pid_t) void {
 }
 
 /// Runs `argv` to completion and returns its exit status and output.
-/// The child gets no stdin and runs in its own process group (POSIX).
+/// The child gets no stdin and runs in its own process tree: a process group
+/// on POSIX, a Job Object on Windows (`spawnTree`).
 /// If it does not finish within `timeout_ms` (reads and exit together), it is
-/// killed with its group and the result is `error.Timeout`. If stdout or
-/// stderr passes `max_output` bytes, the child is always killed (POSIX) and
-/// each stream is cut to its first `max_output` bytes; `term` then shows the
-/// kill. On Windows the exit wait has no deadline and an over-cap child is
-/// not killed. The caller frees `stdout` and `stderr`.
+/// killed with its tree and the result is `error.Timeout`. If stdout or
+/// stderr passes `max_output` bytes, the child is always killed with its
+/// tree and each stream is cut to its first `max_output` bytes; `term` then
+/// shows the kill. On Windows the job is closed on return, so processes the
+/// child left running end with it. The caller frees `stdout` and `stderr`.
 pub fn runCapture(
     a: std.mem.Allocator,
     io: std.Io,
@@ -59,23 +145,24 @@ pub fn runCapture(
     timeout_ms: u32,
     max_output: usize,
 ) !RunResult {
-    var child = try std.process.spawn(io, .{
+    const t0 = std.Io.Clock.awake.now(io);
+    var child, var tree = try spawnTree(io, .{
         .argv = argv,
         .cwd = if (cwd) |c| .{ .path = c.bytes } else .inherit,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
-        .pgid = if (is_posix) 0 else null,
     });
-    errdefer {
-        killGroup(&child);
-        child.kill(io);
-    }
+    defer closeTree(&tree);
+    errdefer killReap(io, &child, &tree);
 
     var buf: std.Io.File.MultiReader.Buffer(2) = undefined;
     var mr: std.Io.File.MultiReader = undefined;
     mr.init(a, io, buf.toStreams(), &.{ child.stdout.?, child.stderr.? });
     defer mr.deinit();
+    // On an error the tree dies before `mr.deinit`, which may wait for its
+    // reads to end: a grandchild holding the pipes must not keep it waiting.
+    errdefer killTree(&child, tree);
 
     const deadline = (std.Io.Timeout{ .duration = .{
         .raw = .fromMilliseconds(timeout_ms),
@@ -95,7 +182,7 @@ pub fn runCapture(
     }
     if (mr.reader(0).buffered().len > max_output or mr.reader(1).buffered().len > max_output)
         over_cap = true;
-    if (over_cap) killGroup(&child) else try mr.checkAnyError();
+    if (over_cap) killTree(&child, tree) else try mr.checkAnyError();
 
     // The pipes are closed or full, but the child may still run. Bound the
     // wait with the same deadline: a watchdog kills the group when it expires.
@@ -110,6 +197,17 @@ pub fn runCapture(
             var dog = try io.concurrent(watchdog, .{ io, deadline, child.id.?, &timed_out });
             waitExitNoReap(child.id.?);
             dog.cancel(io) catch {};
+        }
+    } else if (comptime is_windows) {
+        if (!over_cap) {
+            // A Windows process handle stays valid until it is closed, so
+            // the tree can be killed at the deadline without a race.
+            const spent = t0.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+            const left: u32 = @intCast(std.math.clamp(@as(i64, timeout_ms) - spent, 0, timeout_ms));
+            if (!waitHandle(child.id.?, left)) {
+                timed_out.store(true, .release);
+                killTree(&child, tree);
+            }
         }
     }
     const term = try child.wait(io);
@@ -127,19 +225,21 @@ pub fn runCapture(
 }
 
 /// A running child with piped stdin, stdout and stderr, in its own process
-/// group on POSIX. Task 7 reads and writes the pipes through `inner`.
+/// tree: a process group on POSIX, a Job Object on Windows. Task 7 reads and
+/// writes the pipes through `inner`.
 pub const Child = struct {
     inner: std.process.Child,
+    tree: Tree,
 
     pub fn spawn(io: std.Io, argv: []const []const u8, cwd: ?path.OsPath) !Child {
-        return .{ .inner = try std.process.spawn(io, .{
+        const inner, const tree = try spawnTree(io, .{
             .argv = argv,
             .cwd = if (cwd) |c| .{ .path = c.bytes } else .inherit,
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .pipe,
-            .pgid = if (is_posix) 0 else null,
-        }) };
+        });
+        return .{ .inner = inner, .tree = tree };
     }
 
     /// Same as `kill`; call it (for example with `defer`) so the pipes and the
@@ -148,30 +248,37 @@ pub const Child = struct {
         self.kill(io);
     }
 
-    /// Kills the child and its group, then reaps it. Safe after `wait`.
+    /// Kills the child and its tree, then reaps it. Safe after `wait`.
     pub fn kill(self: *Child, io: std.Io) void {
-        killGroup(&self.inner);
-        self.inner.kill(io);
+        killReap(io, &self.inner, &self.tree);
     }
 
-    /// Waits for the child to exit and closes its pipes.
+    /// Waits for the child to exit and closes its pipes. On Windows the job
+    /// is closed too, so processes the child left running end with it.
     pub fn wait(self: *Child, io: std.Io) !std.process.Child.Term {
+        defer closeTree(&self.tree);
         return self.inner.wait(io);
     }
 
-    /// Sends SIGKILL to the child's process group without reaping it, so its
-    /// pipes stay open until readers are done; `kill` or `wait` must follow.
-    /// POSIX only; elsewhere it does nothing.
+    /// Kills the child's tree (POSIX: SIGKILL to its process group; Windows:
+    /// `TerminateJobObject`) without reaping it, so its pipes stay open
+    /// until readers are done; `kill` or `wait` must follow.
     pub fn signalKill(self: *Child) void {
-        killGroup(&self.inner);
+        killTree(&self.inner, self.tree);
     }
 
     /// Waits up to `timeout_ms` for the child to exit, without reaping it, so
     /// `kill` or `wait` must follow. Returns true when the child exited by
-    /// itself. On timeout its group is killed and the wait goes on until the
-    /// child is gone, and the result is false. On Windows it returns false at
-    /// once (the caller then uses `kill`).
+    /// itself. On timeout its tree is killed and the wait goes on until the
+    /// child is gone, and the result is false.
     pub fn waitExit(self: *Child, io: std.Io, timeout_ms: u32) bool {
+        if (comptime is_windows) {
+            const handle = self.inner.id orelse return true;
+            if (waitHandle(handle, timeout_ms)) return true;
+            killTree(&self.inner, self.tree);
+            _ = waitHandle(handle, win32.INFINITE);
+            return false;
+        }
         if (comptime !is_posix) return false;
         const pid = self.inner.id orelse return true;
         const deadline = (std.Io.Timeout{ .duration = .{
@@ -182,7 +289,7 @@ pub const Child = struct {
         // Same order as in `runCapture`: the watchdog may only kill while the
         // child is unreaped, so it is joined before anyone reaps.
         var dog = io.concurrent(watchdog, .{ io, deadline, pid, &timed_out }) catch {
-            killGroup(&self.inner);
+            killTree(&self.inner, self.tree);
             waitExitNoReap(pid);
             return false;
         };
@@ -297,4 +404,40 @@ test "Child.waitExit: a child that hangs is killed after the timeout" {
     const term = try c.wait(io);
     try std.testing.expect(!term.success());
     try std.testing.expect(start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 5000);
+}
+
+/// True when process `pid` has ended within `ms` (or no longer exists).
+fn processGone(pid: u32, ms: u32) bool {
+    const h = win32.OpenProcess(win32.SYNCHRONIZE | win32.PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) orelse return true;
+    defer _ = win32.CloseHandle(h);
+    return win32.WaitForSingleObject(h, ms) == win32.WAIT_OBJECT_0;
+}
+
+test "process: timeout kills the job tree" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+    const pid_file = try std.fs.path.join(a, &.{ base, "pids" });
+    defer a.free(pid_file);
+    const exe = try std.Io.Dir.cwd().realPathFileAlloc(io, @import("build_options").fake_compiler_exe, a);
+    defer a.free(exe);
+
+    // The fake compiler starts a sleeping child, which holds the output
+    // pipes too, and sleeps itself (60 s each).
+    const t0 = std.Io.Clock.awake.now(io);
+    try std.testing.expectError(error.Timeout, runCapture(a, io, &.{ exe, "tree", pid_file }, null, 3000, 1024));
+    // The deadline ended it, not the end of the sleeps.
+    try std.testing.expect(t0.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 20_000);
+
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, pid_file, a, .limited(64));
+    defer a.free(text);
+    var it = std.mem.tokenizeScalar(u8, text, ' ');
+    const parent = try std.fmt.parseInt(u32, it.next() orelse return error.NoPid, 10);
+    const child = try std.fmt.parseInt(u32, it.next() orelse return error.NoPid, 10);
+    try std.testing.expect(processGone(parent, 5000));
+    try std.testing.expect(processGone(child, 5000));
 }

@@ -7,11 +7,13 @@
 //! On POSIX the file is opened with `O_NONBLOCK` (an open of a FIFO with no
 //! writer returns at once instead of waiting), checked with `fstat`, and
 //! switched back to blocking mode. Windows has no FIFOs in the file system;
-//! there the ordinary open is used and the identity is unavailable.
+//! there the ordinary open is used, and the identity comes from
+//! `GetFileInformationByHandle`.
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const File = std.Io.File;
+const win32 = @import("win32.zig");
 
 const is_windows = builtin.os.tag == .windows;
 
@@ -110,10 +112,23 @@ pub const Identity = struct {
 
 pub const IdentityError = error{ Unsupported, Unreadable };
 
-/// The identity of the open file `f`. `error.Unsupported` on Windows.
+/// The identity of the open file `f`. On Windows (`GetFileInformationByHandle`)
+/// `dev` is the volume serial number, `ino` the 64-bit file index, and
+/// `mtime_ns` the last-write time in nanoseconds since 1601.
 pub fn identity(f: File) IdentityError!Identity {
     switch (builtin.os.tag) {
-        .windows => return error.Unsupported,
+        .windows => {
+            var info: win32.BY_HANDLE_FILE_INFORMATION = undefined;
+            if (win32.GetFileInformationByHandle(f.handle, &info) == 0) return error.Unreadable;
+            const t = (@as(u64, info.last_write_time.high) << 32) | info.last_write_time.low;
+            return .{
+                .dev = info.volume_serial,
+                .ino = (@as(u64, info.index_high) << 32) | info.index_low,
+                .size = (@as(u64, info.size_high) << 32) | info.size_low,
+                // FILETIME counts 100 ns steps.
+                .mtime_ns = @as(i128, t) * 100,
+            };
+        },
         .linux => {
             const linux = std.os.linux;
             var sx: linux.Statx = undefined;
@@ -218,4 +233,35 @@ test "identity tells hard links apart from copies and sees changes" {
     const changed = try identityOfPath(io, one, .{});
     try testing.expect(changed.sameFile(id_one));
     try testing.expect(!changed.eql(id_one));
+}
+
+test "safe_open: identity on Windows changes when the file is replaced" {
+    if (!is_windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const one = try std.fs.path.join(a, &.{ root, "one" });
+    defer a.free(one);
+    try tmp.dir.writeFile(io, .{ .sub_path = "one", .data = "abc" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "copy", .data = "abc" });
+
+    const first = try identityOfPath(io, one, .{});
+    try testing.expectEqual(@as(u64, 3), first.size);
+    // The same file read twice is equal.
+    try testing.expect(first.eql(try identityOfPath(io, one, .{})));
+
+    // Replaced by another file with the same bytes: another file.
+    try tmp.dir.rename("copy", tmp.dir, "one", io);
+    const replaced = try identityOfPath(io, one, .{});
+    try testing.expect(!replaced.sameFile(first));
+    try testing.expect(!replaced.eql(first));
+
+    // Rewritten in place with another size: the same file, changed.
+    try tmp.dir.writeFile(io, .{ .sub_path = "one", .data = "abcd" });
+    const rewritten = try identityOfPath(io, one, .{});
+    try testing.expect(rewritten.sameFile(replaced));
+    try testing.expect(!rewritten.eql(replaced));
 }
