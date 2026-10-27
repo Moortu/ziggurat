@@ -24,6 +24,14 @@ exports a Linux game from a project without Zig scripts.
    zip already starts with `addons/`).
 2. Restart the editor. Godot loads the extension at startup; there is no
    plugin to turn on.
+3. If the Zig panel does not appear, Godot has not listed the extension
+   yet: it writes that list only after it scans the project. Close the
+   editor, create the file `.godot/extension_list.cfg` in the project with
+   this one line, and open the project again:
+
+   ```
+   res://addons/ziggurat/ziggurat.gdextension
+   ```
 
 Upgrading from an older version: close the editor and delete the old
 `addons/ziggurat/` folder first, then unpack the new one. Unpacking over an

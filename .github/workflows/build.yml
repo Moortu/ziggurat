@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # vendor/gdzig: the gdzig fork with Ziggurat's patches.
           submodules: true
@@ -86,7 +86,7 @@ jobs:
           sha256sum ziggurat-*.zip | tee SHA256SUMS
 
       - name: Upload the package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ziggurat-package
           path: |
@@ -102,10 +102,10 @@ jobs:
       contents: write
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download the package
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ziggurat-package
           path: dist
