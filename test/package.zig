@@ -7,6 +7,7 @@ const options = @import("package_options");
 const platform = @import("ziggurat_platform");
 const zbuild = @import("ziggurat_build");
 const testing = std.testing;
+const macho = platform.macho;
 const io = testing.io;
 
 const root = "addons/ziggurat/";
@@ -192,6 +193,80 @@ fn isPeExecutable(b: []const u8) !bool {
 
 /// Whether an ELF file is an executable: a type other than a shared
 /// object, or a shared object with a program interpreter (a PIE).
+/// Whether `b` starts with a Mach-O magic number: thin 64-bit or 32-bit
+/// (little-endian), or fat.
+fn isMachO(b: []const u8) bool {
+    for ([_][]const u8{ "\xcf\xfa\xed\xfe", "\xce\xfa\xed\xfe", "\xca\xfe\xba\xbe", "\xca\xfe\xba\xbf" }) |m| {
+        if (std.mem.startsWith(u8, b, m)) return true;
+    }
+    return false;
+}
+
+/// Why the Mach-O file `b` is not a complete dylib in every slice, or null.
+fn machoNotDylib(a: std.mem.Allocator, b: []const u8) !?[]const u8 {
+    macho.checkComplete(b) catch |err| return @errorName(err);
+    for (try macho.slices(a, b)) |sl| {
+        if (rd(u32, b, @intCast(sl.offset + 12)) != std.macho.MH_DYLIB) return "a slice is not MH_DYLIB";
+    }
+    return null;
+}
+
+/// The number of 64-bit Mach-O objects of `cpu` in the BSD archive `arc`,
+/// walking its members by their headers. Every member but the symbol
+/// table (`__.SYMDEF...`) must be one.
+fn bsdArchiveObjects(arc: []const u8, cpu: macho.Cpu) !usize {
+    if (!std.mem.startsWith(u8, arc, "!<arch>\n")) return error.NotAnArchive;
+    var at: usize = 8;
+    var objects: usize = 0;
+    var symdef = false;
+    while (at < arc.len) {
+        if (arc.len - at < 60) return error.ShortArchive;
+        const h = arc[at..][0..60];
+        if (!std.mem.eql(u8, h[58..60], "`\n")) return error.BadMemberHeader;
+        const size = std.fmt.parseInt(usize, std.mem.trimEnd(u8, h[48..58], " "), 10) catch return error.BadMemberHeader;
+        at += 60;
+        if (arc.len - at < size) return error.ShortArchive;
+        var body = arc[at..][0..size];
+        var name: []const u8 = std.mem.trimEnd(u8, h[0..16], " ");
+        if (std.mem.startsWith(u8, name, "#1/")) {
+            const len = std.fmt.parseInt(usize, name[3..], 10) catch return error.BadMemberHeader;
+            if (len > body.len) return error.BadMemberHeader;
+            name = std.mem.sliceTo(body[0..len], 0);
+            body = body[len..];
+        }
+        at += size + (size & 1);
+        if (std.mem.startsWith(u8, name, "__.SYMDEF")) {
+            symdef = true;
+            continue;
+        }
+        if (body.len < 16 or rd(u32, body, 0) != std.macho.MH_MAGIC_64 or rd(u32, body, 12) != std.macho.MH_OBJECT) {
+            std.debug.print("archive member {s} is not a 64-bit Mach-O object\n", .{name});
+            return error.NotAnObject;
+        }
+        try testing.expectEqual(@backingInt(cpu), rd(u32, body, 4));
+        objects += 1;
+    }
+    if (!symdef) return error.NoSymbolTable;
+    return objects;
+}
+
+test "bsdArchiveObjects: short and broken archives fail cleanly" {
+    try testing.expectError(error.NotAnArchive, bsdArchiveObjects("", .arm64));
+    try testing.expectError(error.NotAnArchive, bsdArchiveObjects("!<arch>", .arm64));
+    try testing.expectError(error.NoSymbolTable, bsdArchiveObjects("!<arch>\n", .arm64));
+    try testing.expectError(error.ShortArchive, bsdArchiveObjects("!<arch>\n__.SYMDEF", .arm64));
+    const header = "__.SYMDEF       0           0     0     644     99        `\n";
+    try testing.expectError(error.ShortArchive, bsdArchiveObjects("!<arch>\n" ++ header, .arm64));
+    const bad = "__.SYMDEF       0           0     0     644     x         `\n";
+    try testing.expectError(error.BadMemberHeader, bsdArchiveObjects("!<arch>\n" ++ bad, .arm64));
+    const long = "#1/400          0           0     0     644     4         `\n";
+    try testing.expectError(error.BadMemberHeader, bsdArchiveObjects("!<arch>\n" ++ long ++ "abcd", .arm64));
+    const empty_symdef = "__.SYMDEF       0           0     0     644     0         `\n";
+    try testing.expectEqual(@as(usize, 0), try bsdArchiveObjects("!<arch>\n" ++ empty_symdef, .arm64));
+    const text = "a.o             0           0     0     644     4         `\n";
+    try testing.expectError(error.NotAnObject, bsdArchiveObjects("!<arch>\n" ++ empty_symdef ++ text ++ "abcd", .arm64));
+}
+
 fn isElfExecutable(b: []const u8) !bool {
     if (b.len < 64) return error.ShortElf;
     try testing.expectEqual(@as(u8, 2), b[4]); // 64-bit
@@ -259,6 +334,11 @@ test "integration: package contents" {
             std.debug.print("{s} is a PE executable\n", .{e.name});
             return error.Executable;
         }
+        // Every Mach-O file is a dylib, in every slice (spec section 1).
+        if (isMachO(e.data)) if (try machoNotDylib(a, e.data)) |why| {
+            std.debug.print("{s} is a Mach-O file but not a dylib: {s}\n", .{ e.name, why });
+            return error.NotADylib;
+        };
         // No path of the machine that built the package.
         for (machine_paths) |needle| {
             if (std.mem.indexOf(u8, e.data, needle) != null) {
@@ -575,7 +655,6 @@ test "package: holds macOS files" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const entries = try readZip(a, try readFile(a, options.package_zip));
-    const macho = platform.macho;
     for ([_][]const u8{
         "bin/libziggurat_host.dylib",
         "bin/aarch64-macos/libziggurat_host_export.a",
@@ -637,20 +716,9 @@ test "package: holds macOS files" {
         try testing.expectEqualSlices(u8, thin, try sliceOf(a, universal_empty, t[1]));
 
         const arc = try data(a, entries, try std.fmt.allocPrint(a, "bin/{s}/libziggurat_host_export.a", .{t[0]}));
-        try testing.expect(std.mem.startsWith(u8, arc, "!<arch>\n"));
         try testing.expect(std.mem.indexOf(u8, arc, "zig-cache") == null);
-        const first = arc[8..][0..16];
-        try testing.expect(std.mem.startsWith(u8, first, "__.SYMDEF") or std.mem.startsWith(u8, first, "#1/"));
-        // Every 64-bit Mach-O object in the archive is of this CPU.
-        var objects: usize = 0;
-        var at: usize = 0;
-        const magic = std.mem.toBytes(std.macho.MH_MAGIC_64);
-        while (std.mem.indexOfPos(u8, arc, at, &magic)) |i| : (at = i + 1) {
-            if (i + 16 > arc.len or rd(u32, arc, i + 12) != std.macho.MH_OBJECT) continue;
-            try testing.expectEqual(@backingInt(t[1]), rd(u32, arc, i + 4));
-            objects += 1;
-        }
-        try testing.expect(objects >= 1);
+        // A symbol table, then 64-bit Mach-O objects of this CPU only.
+        try testing.expect(try bsdArchiveObjects(arc, t[1]) >= 1);
     }
 }
 

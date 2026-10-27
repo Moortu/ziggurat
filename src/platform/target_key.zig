@@ -96,7 +96,7 @@ pub fn files(key: []const u8) ?Files {
     return null;
 }
 
-/// The keys the release package holds (`files` is non-null for each).
+/// The keys that are also export keys, Linux and Windows (`files` is non-null for each; macOS exports use `universal_macos`).
 pub const packaged = [_][]const u8{ x86_64_linux, x86_64_windows };
 
 /// `key` as one of the constants of this file (so it outlives the

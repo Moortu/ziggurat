@@ -3,6 +3,7 @@
 //! x86_64-macos.11.0 and joined by tools/macho_fat.zig. It is checked with
 //! our Mach-O reader only (no Mac runs it); `rcodesign` is an optional
 //! oracle for the arm64 signature and is skipped when it is not on PATH.
+//! The arm64 signatures' page hashes are recomputed here (std SHA-256).
 const std = @import("std");
 const builtin = @import("builtin");
 const options = @import("macos_host_options");
@@ -76,6 +77,70 @@ test "host dylib: universal, minos 11.0, exports _ziggurat_host_init, arm64 slic
         const unsigned = std.mem.indexOf(u8, info, " signature: null") orelse return error.OracleFailed;
         try std.testing.expect(x86_entry < unsigned and unsigned < arm_entry);
     }
+}
+
+test "ad-hoc signatures: every page hash matches (editor library and universal empty game library)" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ options.macos_editor_lib, options.macos_game_empty }) |file| {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, file, a, .unlimited);
+        defer a.free(bytes);
+        const list = try macho.slices(a, bytes);
+        defer a.free(list);
+        try std.testing.expectEqual(@as(usize, 2), list.len);
+        try std.testing.expectEqual(macho.Cpu.arm64, list[1].cpu);
+        const arm = bytes[@intCast(list[1].offset)..][0..@intCast(list[1].size)];
+        try std.testing.expect(try pageHashesMatch(arm));
+        // A changed byte in the first page is seen.
+        const copy = try a.dupe(u8, arm);
+        defer a.free(copy);
+        copy[100] +%= 1;
+        try std.testing.expect(!try pageHashesMatch(copy));
+    }
+}
+
+fn readBe(b: []const u8, off: usize) !u32 {
+    if (off > b.len or b.len - off < 4) return error.BadSignature;
+    return std.mem.readInt(u32, b[off..][0..4], .big);
+}
+
+/// Recomputes the SHA-256 page hashes of the code directory in the
+/// image's `LC_CODE_SIGNATURE` blob (an embedded-signature super blob,
+/// big-endian) and compares them with the hash slots. Errors for a blob
+/// this check cannot read.
+fn pageHashesMatch(slice: []const u8) !bool {
+    const sig = macho.codeSignature(slice) orelse return error.NoSignature;
+    const blob = slice[sig.offset..][0..sig.size];
+    if (try readBe(blob, 0) != 0xfade0cc0) return error.BadSignature; // CSMAGIC_EMBEDDED_SIGNATURE
+    const count = try readBe(blob, 8);
+    if (count > 64) return error.BadSignature;
+    for (0..count) |i| {
+        if (try readBe(blob, 12 + 8 * i) != 0) continue; // CSSLOT_CODEDIRECTORY
+        const off = try readBe(blob, 12 + 8 * i + 4);
+        if (off > blob.len or blob.len - off < 40) return error.BadSignature;
+        const cd = blob[off..];
+        if (try readBe(cd, 0) != 0xfade0c02) return error.BadSignature; // CSMAGIC_CODEDIRECTORY
+        const hash_offset = try readBe(cd, 16);
+        const n_code = try readBe(cd, 28);
+        const code_limit = try readBe(cd, 32);
+        const hash_size = cd[36];
+        const hash_type = cd[37];
+        const page_log = cd[39];
+        if (hash_type != 2 or hash_size != 32) return error.BadSignature; // CS_HASHTYPE_SHA256
+        if (page_log < 12 or page_log > 16) return error.BadSignature;
+        const page = @as(u32, 1) << @intCast(page_log);
+        if (code_limit > sig.offset) return error.BadSignature;
+        if (n_code != (code_limit + page - 1) / page) return error.BadSignature;
+        if (hash_offset > cd.len or (cd.len - hash_offset) / 32 < n_code) return error.BadSignature;
+        for (0..n_code) |k| {
+            const start = k * page;
+            const end = @min(start + page, code_limit);
+            var h: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(slice[start..end], &h, .{});
+            if (!std.mem.eql(u8, &h, cd[hash_offset + 32 * k ..][0..32])) return false;
+        }
+        return true;
+    }
+    return error.NoCodeDirectory;
 }
 
 /// `rcodesign print-signature-info <file>`, or null when it is missing.

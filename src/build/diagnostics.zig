@@ -28,7 +28,8 @@ pub fn free(a: std.mem.Allocator, list: []Diagnostic) void {
     a.free(list);
 }
 
-fn freeOne(a: std.mem.Allocator, d: Diagnostic) void {
+/// Frees one diagnostic of a list returned by `decode`.
+pub fn freeOne(a: std.mem.Allocator, d: Diagnostic) void {
     if (d.rel) |r| a.free(r);
     a.free(d.message);
     for (d.notes) |n| a.free(n);

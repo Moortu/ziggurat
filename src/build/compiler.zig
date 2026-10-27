@@ -543,7 +543,7 @@ const Project = struct {
 
     fn argv(p: *Project, incremental: bool) ![]const []const u8 {
         const zig: platform.zig_locator.ZigInstall = .{ .exe = .fromTrusted(build_options.zig_exe), .version = "0.17.0" };
-        return p.ws.argv(p.arena_state.allocator(), zig, .{ .incremental = incremental, .use_llvm = false, .optimize = .Debug });
+        return p.ws.argv(p.arena_state.allocator(), zig, .{ .incremental = incremental, .use_llvm = false, .optimize = .Debug }, 1);
     }
 
     fn write(p: *Project, sub: []const u8, data: []const u8) !void {
@@ -643,6 +643,39 @@ test "integration: non-incremental one-shot" {
     s.exit();
     try testing.expect(!s.alive());
     try std.Io.Dir.cwd().access(testing.io, r.output.?.bytes, .{});
+}
+
+test "integration: macOS editor builds carry one install name per image" {
+    try platform.testing_support.requireIntegration();
+    // Editor builds run on the host; here the macOS command line is
+    // cross-compiled by adding `-target` to every module.
+    if (is_windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    var p: Project = undefined;
+    try p.init();
+    defer p.deinit();
+    p.ws.os = .macos;
+    const arena = p.arena_state.allocator();
+    const zig: platform.zig_locator.ZigInstall = .{ .exe = .fromTrusted(build_options.zig_exe), .version = "0.17.0" };
+    var names: [2][]const u8 = undefined;
+    for ([_]u32{ 1, 2 }, 0..) |image, i| {
+        const base = try p.ws.argv(arena, zig, .{ .incremental = false, .use_llvm = true, .optimize = .Debug }, image);
+        var argv: std.ArrayList([]const u8) = .empty;
+        for (base) |arg| {
+            if (std.mem.startsWith(u8, arg, "-M")) try argv.appendSlice(arena, &.{ "-target", "aarch64-macos.11.0" });
+            try argv.append(arena, arg);
+        }
+        var s = try Session.start(a, testing.io, argv.items, p.ws.build_dir);
+        defer s.deinit();
+        var r = try s.update(update_timeout_ms);
+        defer r.deinit(a);
+        try testing.expectEqual(@as(u32, 0), r.bundle.errorMessageCount());
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, r.output.?.bytes, arena, .unlimited);
+        try platform.macho.checkComplete(bytes);
+        names[i] = try arena.dupe(u8, platform.macho.installName(bytes) orelse return error.NoInstallName);
+    }
+    try testing.expectEqualStrings("@rpath/libzmod-1.dylib", names[0]);
+    try testing.expectEqualStrings("@rpath/libzmod-2.dylib", names[1]);
 }
 
 test "interrupt from another thread ends a running update" {

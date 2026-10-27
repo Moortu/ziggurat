@@ -1317,6 +1317,8 @@ test "integration: export build macos universal library" {
     for (sl) |s| {
         try testing.expectEqual(@as(u64, 0), s.offset % (1 << 14));
         try expectMacosSlice(lib, s);
+        const slice = lib[@intCast(s.offset)..][0..@intCast(s.size)];
+        try testing.expectEqualStrings("@rpath/libziggurat_game.dylib", platform.macho.installName(slice).?);
     }
     // No absolute path: neither the temp folder (project and cache), nor
     // the SDK's, nor the compiler's. The install name is the fixed one.
@@ -1339,6 +1341,41 @@ test "integration: export build macos universal library" {
     const esl = try platform.macho.slices(a, empty);
     defer a.free(esl);
     for (esl) |s| try expectMacosSlice(empty, s);
+}
+
+test "integration: export build macos names the slice that fails" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const a = testing.allocator;
+    var fx: ExportFx = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const arena = fx.arena_state.allocator();
+    var mfx: MacosFx = undefined;
+    try mfx.init(arena);
+    defer mfx.deinit();
+    // Builds for arm64 (built first) and fails for x86_64 only.
+    const source = try std.mem.replaceOwned(u8, arena, alpha_source, "pub fn _ready(self: *@This()) void {\n",
+        \\pub fn _ready(self: *@This()) void {
+        \\    if (comptime @import("builtin").cpu.arch == .x86_64) @compileError("this script is arm64 only");
+        \\
+    );
+    try testing.expect(!std.mem.eql(u8, source, alpha_source));
+    const proj = try fx.project("proj", &.{.{ .rel = "alpha.zig", .data = source }});
+    const out_path = try std.fs.path.join(arena, &.{ fx.base, "out", "libziggurat_game.dylib" });
+    const r = try mfx.build(&fx, proj, out_path);
+    defer r.deinit(a);
+    try testing.expect(!r.ok);
+    try testing.expectEqualStrings("The build of the x86_64 slice (x86_64-macos) has the errors above.", r.message.?);
+    var seen = false;
+    for (r.diagnostics) |d| {
+        if (std.mem.indexOf(u8, d.message, "this script is arm64 only") != null) {
+            try testing.expectEqualStrings("alpha.zig", d.rel.?);
+            seen = true;
+        }
+    }
+    try testing.expect(seen);
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, out_path, .{}));
 }
 
 test "integration: export build macos two folders give identical bytes" {

@@ -202,7 +202,7 @@ pub const Stats = struct {
 pub const stale_note = "The fast rebuild returned stale code, so this build ran in full.";
 
 /// File stem of the staged library (`--name zmod` in `Workspace.argv`).
-pub const lib_stem = "zmod";
+pub const lib_stem = workspace.editor_lib_name;
 
 /// Threads of any `BuildService` that are running now.
 var live_threads: std.atomic.Value(u32) = .init(0);
@@ -412,6 +412,14 @@ pub const BuildService = struct {
     /// Command line of the newest warm server. Written by the build thread
     /// only, after joining the previous warm thread; freed by `deinit`.
     warm_argv: ?[]const []const u8 = null,
+    /// The last image number given to a compiler command line
+    /// (`Workspace.argv`): each full build and each warm server takes the
+    /// next one, so no two libraries this process loads share a macOS
+    /// install name, except the generations of one incremental server.
+    /// Build thread only.
+    image_seq: u32 = 0,
+    /// The image number in `warm_argv`. Build thread only.
+    warm_image: u32 = 0,
     /// Scan results from earlier builds. Used by the build thread only.
     scan_cache: scan_mod.Cache,
     /// Build id of the last build that staged a generation. Build thread only.
@@ -1113,7 +1121,7 @@ pub const BuildService = struct {
     fn fullBuild(self: *BuildService, arena: std.mem.Allocator, ws: *const workspace.Workspace, zig: ZigInstall, build_id: []const u8, o: *Outcome) !void {
         const a = self.a;
         const mode = self.modeFor(.session_start);
-        const argv = try ws.argv(arena, zig, mode);
+        const argv = try ws.argv(arena, zig, mode, self.nextImage());
         self.beginUpdate();
         defer self.endUpdate();
         var s = Session.start(a, self.io, argv, ws.build_dir) catch |err| {
@@ -1168,7 +1176,7 @@ pub const BuildService = struct {
         defer self.session_mu.unlock(io);
         // The server compiles what its command line named at warm-up time.
         const mode = self.modeFor(.warm);
-        const now_argv = try ws.argv(arena, zig, mode);
+        const now_argv = try ws.argv(arena, zig, mode, self.warm_image);
         if (self.warm_argv == null or !argvEql(self.warm_argv.?, now_argv)) {
             self.dropWarm(false);
             return false;
@@ -1398,10 +1406,19 @@ pub const BuildService = struct {
         };
     }
 
+    /// The next `image_seq`. It wraps after 2^32 compiler starts, far more
+    /// than one editor session makes. Build thread only.
+    fn nextImage(self: *BuildService) u32 {
+        self.image_seq +%= 1;
+        return self.image_seq;
+    }
+
     fn spawnWarm(self: *BuildService, ws: *const workspace.Workspace, zig: ZigInstall, mode: BuildMode) !std.Thread {
         const a = self.a;
-        const argv = try ws.argv(a, zig, mode);
+        const image = self.nextImage();
+        const argv = try ws.argv(a, zig, mode, image);
         self.warm_argv = argv;
+        self.warm_image = image;
         const cwd: OsPath = .{ .bytes = try a.dupe(u8, ws.build_dir.bytes) };
         errdefer a.free(cwd.bytes);
         const lock_path = try platform.path.joinFor(ws.os, a, ws.cache_dir, &.{incremental_lock_name});

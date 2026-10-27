@@ -420,6 +420,7 @@ pub fn build(b: *std.Build) void {
     {
         const options = b.addOptions();
         options.addOptionPath("macos_editor_lib", macos_editor_lib.file);
+        options.addOptionPath("macos_game_empty", macos_game_empty);
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path("test/macos_host.zig"),
             .target = b.graph.host,
@@ -1109,7 +1110,11 @@ fn hostTestRun(
     // compiled from source by a child compiler; Godot is an input too.
     addSourceInputs(b, run, &.{ "test/host", "test/fixtures", "sdk", "src/abi" });
     run.addFileInput(.{ .cwd_relative = in.godot_exe });
-    if (in.macos_zig_tarball) |f| run.addFileInput(.{ .cwd_relative = f });
+    if (in.macos_zig_tarball) |f| {
+        // The test reads the signature next to the tarball as well.
+        run.addFileInput(.{ .cwd_relative = f });
+        run.addFileInput(.{ .cwd_relative = b.fmt("{s}.minisig", .{f}) });
+    }
     return run;
 }
 

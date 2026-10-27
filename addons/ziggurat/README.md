@@ -67,9 +67,10 @@ experimental and has not been tested on a Mac."
   one file holds the Apple silicon (arm64) and the Intel (x86_64) code.
 - The libraries are not notarized. The arm64 code carries an ad-hoc
   signature (no developer identity), and the x86_64 code is not signed.
-  A zip that you download with a browser is marked as "quarantined", and
-  macOS may then refuse to load the add-on's library. Remove the mark
-  from the add-on folder before you open the project. In a terminal, in
+  Whether macOS accepts these two is not tested. A zip that you download
+  with a browser is marked as "quarantined", and macOS may then refuse
+  to load the add-on's library. Remove the mark from the add-on folder
+  before you open the project (not tested on a Mac). In a terminal, in
   your project folder:
 
   ```
@@ -81,20 +82,28 @@ experimental and has not been tested on a Mac."
   `~/Library/Application Support/ziggurat/toolchains/`. The download
   checks the file's size, SHA-256 and signature. This was tested on Linux
   with the real macOS files, up to the point where the downloaded `zig`
-  would run; that `zig` was never started on a Mac.
+  would run; that `zig` was never started on a Mac. The folder name has
+  a space; a test on Linux installs, finds and runs Zig from a folder
+  with a space.
 - Export with a **universal** preset (the macOS preset option Binary
-  Format > Architecture set to `universal`, Godot's default). Godot's official export templates hold only
-  universal programs, so a preset set to `arm64` or `x86_64` alone fails
-  in Godot itself. Ziggurat always builds a universal game library; the
-  game has it in `<game>.app/Contents/Frameworks/libziggurat_game.dylib`.
+  Format > Architecture set to `universal`, Godot's default). Godot's
+  official export templates hold only universal programs, so a preset
+  set to `arm64` or `x86_64` alone fails in Godot itself. Ziggurat
+  always builds a universal game library; the game has it in
+  `<game>.app/Contents/Frameworks/libziggurat_game.dylib`.
 - Ziggurat checks a macOS export to a `.zip` or an `.app`. It does not
   check a `.dmg` or `.pkg` export (only a macOS editor can write those):
   make sure that the app inside holds
   `Contents/Frameworks/libziggurat_game.dylib`.
 - When the export preset signs the app (Code Signing), Godot signs the
-  game library again with that signature; with the built-in ad-hoc
-  signing Godot also turns on the "Disable Library Validation"
-  entitlement. How macOS treats the app with the hardened runtime and
+  game library again. On a Linux or Windows editor, use "Built-in
+  (ad-hoc only)", Godot's default there; Godot then also turns on the
+  "Disable Library Validation" entitlement. Godot 4.7.2 does not support
+  `rcodesign` for an app that holds a GDExtension library: the export
+  log shows the error "'rcodesign' doesn't support signing applications
+  with embedded dynamic libraries." A signature with a developer
+  identity needs Xcode `codesign`, which only a macOS editor offers (not
+  tested). How macOS treats the app with the hardened runtime and
   library validation is not tested.
 - A script's own `export fn` (a C symbol) makes the macOS export fail. On
   Linux and Windows the export hides such symbols, but Zig 0.17 cannot
@@ -102,6 +111,15 @@ experimental and has not been tested on a Mac."
   ("The export library's ... slice exports ...; it may export only
   _ziggurat_host_init."). Use `fn` or `pub fn` without `export` in
   scripts.
+- Each editor build gets its own library name inside the file (its
+  "install name", `@rpath/libzmod-<n>.dylib`), so that macOS loads every
+  new build instead of an older one it already loaded. All builds of one
+  `self_hosted_incremental` compiler share one name. Hot reload on a Mac
+  is not tested.
+- The project setting `ziggurat/dev/sdk_manifest` (for working on
+  Ziggurat itself) replaces the SDK of the Mac's own arch only. A macOS
+  export then builds the other arch with the shipped SDK, so the two
+  halves of the universal game library can differ.
 
 ## Download Zig
 
@@ -169,7 +187,8 @@ debug information.
 ## Export
 
 - Exports work for Linux x86_64 and Windows x86_64 in this version, from
-  either editor, and for macOS (experimental, see "macOS" above). An
+  either editor, and for macOS (experimental, see "macOS" above; macOS
+  exports were tested from the Linux editor only). An
   export for another platform finishes without Zig scripts, and the
   export log shows the error "Ziggurat exports Linux x86_64, Windows
   x86_64 and macOS (universal) in this version".

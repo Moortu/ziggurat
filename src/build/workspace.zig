@@ -81,6 +81,19 @@ pub fn entryLinkName(format: Format) []const u8 {
     return if (format == .macho) "_" ++ entry_symbol else entry_symbol;
 }
 
+/// The `--name` of an editor build's library.
+pub const editor_lib_name = "zmod";
+
+/// The install name of an editor build's library on macOS:
+/// `@rpath/libzmod-<image>.dylib`.
+pub fn editorInstallName(image: u32) std.fmt.Alt(u32, formatInstallName) {
+    return .{ .data = image };
+}
+
+fn formatInstallName(image: u32, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.print("@rpath/lib" ++ editor_lib_name ++ "-{d}.dylib", .{image});
+}
+
 pub const Workspace = struct {
     cache_dir: OsPath,
     build_dir: OsPath,
@@ -110,7 +123,12 @@ pub const Workspace = struct {
 
     /// The compiler command line; run it with `build_dir` as the working folder.
     /// Free with `freeArgv`, or use an arena.
-    pub fn argv(self: Workspace, a: std.mem.Allocator, zig: ZigInstall, mode: BuildMode) ![]const []const u8 {
+    ///
+    /// On macOS, `image` numbers the library's install name
+    /// (`editorInstallName`); other systems ignore it. The caller gives
+    /// each compiler it starts a number that no earlier library loaded in
+    /// this process has used.
+    pub fn argv(self: Workspace, a: std.mem.Allocator, zig: ZigInstall, mode: BuildMode, image: u32) ![]const []const u8 {
         var out: std.ArrayList([]const u8) = .empty;
         errdefer freeArgv(a, out.items);
         try push(a, &out, "{s}", .{zig.exe.bytes});
@@ -125,7 +143,17 @@ pub const Workspace = struct {
         // names a withheld helper deep inside other code (spec risk 24).
         // Measured at 300 scripts: no change in the median body edit.
         try push(a, &out, reference_trace_flag, .{});
-        try self.pushOutput(a, &out, "zmod");
+        try self.pushOutput(a, &out, editor_lib_name);
+        // Without `-install_name`, Zig's Mach-O linker writes the output's
+        // absolute path in the compiler cache as the install name
+        // (`LC_ID_DYLIB`), the same for every build. dyld may then hand
+        // back an image it already loaded with that name in place of a new
+        // generation (spec risk 39). A relative name that differs per
+        // compiler avoids both. Two arguments, as in `exportArgv`.
+        if (self.os == .macos) {
+            try push(a, &out, "-install_name", .{});
+            try push(a, &out, "{f}", .{editorInstallName(image)});
+        }
         // `-O` is a per-module option: each `-M` gets its own, so no module
         // depends on how the compiler fills in a missing one.
         try self.pushModules(a, &out, &.{optFlag(mode.optimize)});
@@ -664,24 +692,86 @@ test "argv golden" {
         .build_dir = .fromTrusted("/c/projects/p/build"),
         .source_root = .fromTrusted("/proj"),
         .mirrored = false,
-        .os = builtin.os.tag,
+        .os = .linux, // not .macos: no install name
         .sdk = &deps,
         .lock = undefined,
     };
-    const inc = try ws.argv(arena, dummyZig(), .{ .incremental = true, .use_llvm = false, .optimize = .Debug });
+    const inc = try ws.argv(arena, dummyZig(), .{ .incremental = true, .use_llvm = false, .optimize = .Debug }, 1);
     const want_inc: []const []const u8 = &.{
         "/opt/zig/zig", "build-lib",                    "-dynamic",   "-lc",     "-fno-llvm", "-fincremental", "-freference-trace=16",            "--name",  "zmod",
         "--cache-dir",  "/c/projects/p/zig-cache",      "--listen=-", "-ODebug", "--dep",     "ziggurat",      "-Mroot=/proj/.ziggurat_root.zig", "-ODebug", "--dep",
         "gdzig",        "-Mziggurat=/sdk/ziggurat.zig",
     };
     try expectArgv(want_inc, inc);
-    const full = try ws.argv(arena, dummyZig(), .{ .incremental = false, .use_llvm = true, .optimize = .ReleaseFast });
+    const full = try ws.argv(arena, dummyZig(), .{ .incremental = false, .use_llvm = true, .optimize = .ReleaseFast }, 1);
     const want_full: []const []const u8 = &.{
         "/opt/zig/zig",                 "build-lib",  "-dynamic",      "-lc",   "-fllvm",   "-freference-trace=16",            "--name",        "zmod",  "--cache-dir",
         "/c/projects/p/zig-cache",      "--listen=-", "-OReleaseFast", "--dep", "ziggurat", "-Mroot=/proj/.ziggurat_root.zig", "-OReleaseFast", "--dep", "gdzig",
         "-Mziggurat=/sdk/ziggurat.zig",
     };
     try expectArgv(want_full, full);
+}
+
+test "argv golden on macOS: a numbered relative install name" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const deps = [_]ModuleDep{.{ .name = "ziggurat", .root = .fromTrusted("/sdk/ziggurat.zig"), .deps = &.{"gdzig"} }};
+    const ws: Workspace = .{
+        .cache_dir = .fromTrusted("/c/projects/p"),
+        .build_dir = .fromTrusted("/c/projects/p/build"),
+        .source_root = .fromTrusted("/proj"),
+        .mirrored = false,
+        .os = .macos,
+        .sdk = &deps,
+        .lock = undefined,
+    };
+    const inc = try ws.argv(arena, dummyZig(), .{ .incremental = true, .use_llvm = false, .optimize = .Debug }, 3);
+    const want_inc: []const []const u8 = &.{
+        "/opt/zig/zig",                 "build-lib", "-dynamic",    "-lc",                             "-fno-llvm",  "-fincremental", "-freference-trace=16",
+        "--name",                       "zmod",      "--cache-dir", "/c/projects/p/zig-cache",         "--listen=-", "-install_name", "@rpath/libzmod-3.dylib",
+        "-ODebug",                      "--dep",     "ziggurat",    "-Mroot=/proj/.ziggurat_root.zig", "-ODebug",    "--dep",         "gdzig",
+        "-Mziggurat=/sdk/ziggurat.zig",
+    };
+    try expectArgv(want_inc, inc);
+    const full = try ws.argv(arena, dummyZig(), .{ .incremental = false, .use_llvm = true, .optimize = .ReleaseFast }, 4294967295);
+    const want_full: []const []const u8 = &.{
+        "/opt/zig/zig",                    "build-lib",     "-dynamic",                     "-lc",                     "-fllvm",                          "-freference-trace=16",
+        "--name",                          "zmod",          "--cache-dir",                  "/c/projects/p/zig-cache", "--listen=-",                      "-install_name",
+        "@rpath/libzmod-4294967295.dylib", "-OReleaseFast", "--dep",                        "ziggurat",                "-Mroot=/proj/.ziggurat_root.zig", "-OReleaseFast",
+        "--dep",                           "gdzig",         "-Mziggurat=/sdk/ziggurat.zig",
+    };
+    try expectArgv(want_full, full);
+    // Two images get two names; nothing else differs.
+    const other = try ws.argv(arena, dummyZig(), .{ .incremental = true, .use_llvm = false, .optimize = .Debug }, 4);
+    try testing.expectEqual(inc.len, other.len);
+    for (inc, other, 0..) |x, y, i| {
+        if (i == 13) {
+            try testing.expectEqualStrings("@rpath/libzmod-4.dylib", y);
+        } else try testing.expectEqualStrings(x, y);
+    }
+}
+
+test "argv on Linux and Windows ignores the image number" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const deps = [_]ModuleDep{.{ .name = "ziggurat", .root = .fromTrusted("/sdk/ziggurat.zig"), .deps = &.{} }};
+    for ([_]std.Target.Os.Tag{ .linux, .windows }) |os| {
+        const ws: Workspace = .{
+            .cache_dir = .fromTrusted("/c/projects/p"),
+            .build_dir = .fromTrusted("/c/projects/p/build"),
+            .source_root = .fromTrusted("/proj"),
+            .mirrored = false,
+            .os = os,
+            .sdk = &deps,
+            .lock = undefined,
+        };
+        const x = try ws.argv(arena, dummyZig(), .{ .incremental = false, .use_llvm = true, .optimize = .Debug }, 1);
+        const y = try ws.argv(arena, dummyZig(), .{ .incremental = false, .use_llvm = true, .optimize = .Debug }, 2);
+        try expectArgv(x, y);
+        for (x) |arg| try testing.expect(!std.mem.eql(u8, arg, "-install_name"));
+    }
 }
 
 test "argv repeats optimize" {
@@ -699,11 +789,11 @@ test "argv repeats optimize" {
         .build_dir = .fromTrusted("/c/projects/p/build"),
         .source_root = .fromTrusted("/proj"),
         .mirrored = false,
-        .os = builtin.os.tag,
+        .os = .linux, // not .macos: no install name
         .sdk = &deps,
         .lock = undefined,
     };
-    const got = try ws.argv(arena, dummyZig(), .{ .incremental = false, .use_llvm = false, .optimize = .Debug });
+    const got = try ws.argv(arena, dummyZig(), .{ .incremental = false, .use_llvm = false, .optimize = .Debug }, 1);
     const want: []const []const u8 = &.{
         "/opt/zig/zig",            "build-lib",   "-dynamic",                     "-lc",     "-fno-llvm", "-freference-trace=16",            "--name",               "zmod",    "--cache-dir",
         "/c/projects/p/zig-cache", "--listen=-",  "-ODebug",                      "--dep",   "ziggurat",  "-Mroot=/proj/.ziggurat_root.zig", "-ODebug",              "--dep",   "gdzig",

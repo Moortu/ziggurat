@@ -536,10 +536,17 @@ pub const UniversalOptions = struct {
 /// (`platform.macho_fat.join`: x86_64 then arm64, each slice at a multiple
 /// of 2^14; the arm64 slice keeps the linker's ad-hoc signature), checked
 /// again (`checkUniversal`) and written to `out_path`. The first slice that
-/// fails gives the result; `out_path` is then not touched. Errors as `run`.
+/// fails gives the result, its message naming the slice's arch;
+/// `out_path` is then not touched. On success the result holds the
+/// diagnostics of both slices, each one once. Errors as `run`.
 pub fn runUniversal(a: std.mem.Allocator, io: std.Io, u: UniversalOptions, diag: *[256]u8) !Result {
     var thin: [2]?[]u8 = .{ null, null };
     defer for (thin) |t| if (t) |b| a.free(b);
+    var kept: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (kept.items) |d| diagnostics.freeOne(a, d);
+        kept.deinit(a);
+    }
     for (macos_keys, u.slices, &thin) |key, s, *keep| {
         const res = try runOne(a, io, .{
             .zig = u.zig,
@@ -554,8 +561,18 @@ pub fn runUniversal(a: std.mem.Allocator, io: std.Io, u: UniversalOptions, diag:
             .update_timeout_ms = u.update_timeout_ms,
             .strip = u.strip,
         }, diag, keep);
-        if (!res.ok) return res;
-        res.deinit(a);
+        if (!res.ok) return sliceFailed(a, res, key);
+        kept.ensureUnusedCapacity(a, res.diagnostics.len) catch |err| {
+            res.deinit(a);
+            return err;
+        };
+        // Both slices build the same scripts, so most diagnostics come
+        // twice; the items move into `kept` or are freed here.
+        for (res.diagnostics) |d| {
+            if (hasDiagnostic(kept.items, d)) diagnostics.freeOne(a, d) else kept.appendAssumeCapacity(d);
+        }
+        a.free(res.diagnostics);
+        if (res.message) |m| a.free(m);
     }
     var out: Builder = .{ .a = a, .problems = &.{} };
     errdefer out.deinit();
@@ -571,7 +588,40 @@ pub fn runUniversal(a: std.mem.Allocator, io: std.Io, u: UniversalOptions, diag:
     }) |sentence| return out.fail("{s}", .{sentence});
     platform.atomic_file.write(io, u.out_path, fat) catch |err|
         return out.fail("Writing the export library {s} failed: {t}.", .{ u.out_path.bytes, err });
+    out.compile = try kept.toOwnedSlice(a);
     return out.finish(true);
+}
+
+/// The arch name of a `macos_keys` key, as Apple writes it.
+fn sliceArch(key: []const u8) []const u8 {
+    return if (std.mem.eql(u8, key, target_key.aarch64_macos)) "arm64" else "x86_64";
+}
+
+/// `res` (failed, for the slice of `key`) with a message that names the
+/// slice: a user on one Mac never builds the other arch in the editor.
+/// Takes `res`.
+fn sliceFailed(a: std.mem.Allocator, res: Result, key: []const u8) !Result {
+    var out = res;
+    errdefer out.deinit(a);
+    const arch = sliceArch(key);
+    const m = if (res.message) |old|
+        try std.fmt.allocPrint(a, "The build of the {s} slice failed: {s}", .{ arch, old })
+    else
+        try std.fmt.allocPrint(a, "The build of the {s} slice ({s}) has the errors above.", .{ arch, key });
+    if (res.message) |old| a.free(old);
+    out.message = m;
+    return out;
+}
+
+fn hasDiagnostic(list: []const Diagnostic, d: Diagnostic) bool {
+    for (list) |x| {
+        if (x.line != d.line or x.column != d.column) continue;
+        if (!std.mem.eql(u8, x.message, d.message)) continue;
+        if ((x.rel == null) != (d.rel == null)) continue;
+        if (x.rel) |r| if (!std.mem.eql(u8, r, d.rel.?)) continue;
+        return true;
+    }
+    return false;
 }
 
 /// Why the dynamic symbols `syms` are wrong for an export library, or null:
@@ -1652,4 +1702,25 @@ test "sdkMismatchMessage names the manifest, both versions and the advice" {
     const shipped = try sdkMismatchMessage(a, "x86_64-windows/ziggurat_host_export.lib", "/p/addons/ziggurat/sdk/x86_64-windows/sdk-manifest.json", "0.2.0", "0.1.0", false);
     defer a.free(shipped);
     try testing.expectEqualStrings("Ziggurat cannot export: the SDK at /p/addons/ziggurat/sdk/x86_64-windows/sdk-manifest.json is version 0.2.0, but this add-on's export library (addons/ziggurat/bin/x86_64-windows/ziggurat_host_export.lib) needs SDK version 0.1.0. Reinstall the add-on.", shipped);
+}
+
+test "a failed universal build names the slice" {
+    const a = testing.allocator;
+    {
+        const r = try sliceFailed(a, .{ .ok = false, .diagnostics = try a.alloc(Diagnostic, 0), .message = try a.dupe(u8, "Starting the Zig compiler failed.") }, target_key.x86_64_macos);
+        defer r.deinit(a);
+        try testing.expect(!r.ok);
+        try testing.expectEqualStrings("The build of the x86_64 slice failed: Starting the Zig compiler failed.", r.message.?);
+    }
+    {
+        const r = try sliceFailed(a, .{ .ok = false, .diagnostics = try a.alloc(Diagnostic, 0), .message = null }, target_key.aarch64_macos);
+        defer r.deinit(a);
+        try testing.expectEqualStrings("The build of the arm64 slice (aarch64-macos) has the errors above.", r.message.?);
+    }
+    const d1: Diagnostic = .{ .rel = "a.zig", .line = 3, .column = 1, .message = "m", .notes = &.{} };
+    const d2: Diagnostic = .{ .rel = null, .line = 3, .column = 1, .message = "m", .notes = &.{} };
+    try testing.expect(hasDiagnostic(&.{d1}, d1));
+    try testing.expect(!hasDiagnostic(&.{d1}, d2));
+    try testing.expect(!hasDiagnostic(&.{d2}, d1));
+    try testing.expect(hasDiagnostic(&.{ d1, d2 }, d2));
 }

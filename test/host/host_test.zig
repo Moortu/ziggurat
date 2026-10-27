@@ -1960,6 +1960,30 @@ test "download installs and builds" {
     try testing.expect(fileExists(try std.fs.path.join(a, &.{ d.data, "mirrors.txt" })));
 }
 
+test "download: a toolchain folder with a space installs and builds" {
+    // The macOS toolchain folder, `~/Library/Application Support/...`,
+    // has a space; here the Linux one gets one through XDG_DATA_HOME, so
+    // the install, the locator, the `zig version` probe and the build
+    // all run a Zig whose path has a space.
+    try requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var p: Project = undefined;
+    try p.initProbe("highlighter");
+    defer p.deinit();
+    var d = try setupDownload(&p, "installs", &.{"good"}, false);
+    defer d.deinit();
+    errdefer d.server.dump();
+    const a = p.arena_state.allocator();
+    try p.tmp.dir.createDirPath(io, "user data");
+    const root = try p.tmp.dir.realPathFileAlloc(io, ".", a);
+    try p.env.?.put("XDG_DATA_HOME", try std.fs.path.join(a, &.{ root, "user data" }));
+    const toolchains = try std.fs.path.join(a, &.{ root, "user data", "ziggurat", "toolchains" });
+    try p.runEditorChecked("10000000", .{ .expect = &dl_installs_expect, .reject = &.{"ZTEST FAIL"} });
+    try testing.expect(fileExists(try std.fs.path.join(a, &.{ toolchains, "zig-0.17.0", "zig" })));
+    try testing.expect(!fileExists(try std.fs.path.join(a, &.{ d.toolchains, "zig-0.17.0", "zig" })));
+    try expectNoTemp(toolchains);
+}
+
 test "download falls through bad mirrors" {
     try requireIntegration();
     if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;

@@ -656,6 +656,23 @@ pub fn codeSignature(slice_bytes: []const u8) ?CodeSignature {
     return .{ .offset = readU32(d, 8), .size = size };
 }
 
+/// The install name of one thin image (the name in `LC_ID_DYLIB`, which
+/// dyld treats as the image's identity), or null when it has none, the
+/// name does not lie inside the command or has no terminating NUL, or the
+/// image is not complete. The result points into `slice_bytes`.
+pub fn installName(slice_bytes: []const u8) ?[]const u8 {
+    const img = Image.parse(slice_bytes, false, null) catch return null;
+    const d = img.find(lc(.ID_DYLIB)) orelse return null;
+    // dylib_command: cmd, cmdsize, name offset, timestamp, versions.
+    if (d.len < 24) return null;
+    const off = readU32(d, 8);
+    if (off < 24 or off >= d.len) return null;
+    const name = d[off..];
+    const end = std.mem.indexOfScalar(u8, name, 0) orelse return null;
+    if (end == 0) return null;
+    return name[0..end];
+}
+
 // Forged images. The tests against real dylibs are in `macho_test.zig`.
 
 /// Test helper: a thin arm64 image with the given load commands (each a
@@ -759,6 +776,54 @@ test "forged images: load command sizes and ranges" {
         const b = try forge(a, &.{&seg}, 0);
         defer a.free(b);
         try std.testing.expectError(error.BadHeader, checkComplete(b));
+    }
+}
+
+test "forged images: install name" {
+    const a = std.testing.allocator;
+    const Id = struct {
+        /// An LC_ID_DYLIB of 48 bytes whose name starts at `off`.
+        fn make(off: u32, name: []const u8) [48]u8 {
+            var b: [48]u8 = @splat(0);
+            std.mem.writeInt(u32, b[0..4], lc(.ID_DYLIB), .little);
+            std.mem.writeInt(u32, b[4..8], b.len, .little);
+            std.mem.writeInt(u32, b[8..12], off, .little);
+            if (off < b.len) @memcpy(b[off..][0..name.len], name);
+            return b;
+        }
+    };
+    {
+        const id = Id.make(24, "@rpath/libzmod-7.dylib");
+        const b = try forge(a, &.{&id}, 0);
+        defer a.free(b);
+        try std.testing.expectEqualStrings("@rpath/libzmod-7.dylib", installName(b).?);
+    }
+    {
+        // No LC_ID_DYLIB.
+        const b = try forge(a, &.{}, 0);
+        defer a.free(b);
+        try std.testing.expect(installName(b) == null);
+    }
+    {
+        // The name offset points inside the fixed fields or past the command.
+        for ([_]u32{ 0, 8, 23, 48, 0xffff_ffff }) |off| {
+            const id = Id.make(off, "x");
+            const b = try forge(a, &.{&id}, 0);
+            defer a.free(b);
+            try std.testing.expect(installName(b) == null);
+        }
+    }
+    {
+        // A name with no NUL inside the command, and an empty name.
+        var id = Id.make(24, "");
+        @memset(id[24..], 'a');
+        const b = try forge(a, &.{&id}, 0);
+        defer a.free(b);
+        try std.testing.expect(installName(b) == null);
+        const e = Id.make(24, "");
+        const b2 = try forge(a, &.{&e}, 0);
+        defer a.free(b2);
+        try std.testing.expect(installName(b2) == null);
     }
 }
 
