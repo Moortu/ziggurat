@@ -3,6 +3,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 
 pub const pins = @import("pins.zig");
+pub const target_key = @import("target_key.zig");
 pub const path = @import("path.zig");
 pub const elf = @import("elf.zig");
 pub const pe = @import("pe.zig");
@@ -33,6 +34,7 @@ test {
     std.testing.refAllDecls(process);
     std.testing.refAllDecls(zig_locator);
     std.testing.refAllDecls(pins);
+    std.testing.refAllDecls(target_key);
     std.testing.refAllDecls(minisign);
     std.testing.refAllDecls(mirrors);
     std.testing.refAllDecls(toolchain_install);

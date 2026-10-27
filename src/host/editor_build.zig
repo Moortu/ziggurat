@@ -5,8 +5,10 @@
 //! - `start` (SCENE init, editor only) registers the project settings
 //!   `ziggurat/zig_path` (the project's override of the Zig path) and
 //!   `ziggurat/dev/sdk_manifest` (absolute path of an SDK module manifest;
-//!   a developer override: when it is empty, the shipped SDK's manifest
-//!   `res://addons/ziggurat/sdk/sdk-manifest.json` is used, `sdkManifest`),
+//!   a developer override for the editor's own target only: when it is
+//!   empty, the shipped SDK's manifest
+//!   `res://addons/ziggurat/sdk/<target key>/sdk-manifest.json` of the
+//!   editor's own target is used, `sdkManifest`),
 //!   starts a `BuildService` for the project and requests the build at
 //!   project open: at once when the project setting `ziggurat/zig_path` is
 //!   set (it wins over the editor setting), otherwise when the editor
@@ -87,7 +89,7 @@
 //! - For the export plugin (export_plugin.zig): `projectRoot` (the
 //!   project folder as editor builds key their cache by it) and
 //!   `exportInputs` (the Zig located as editor builds locate it, the SDK
-//!   modules and the per-user cache folder). Both work without a service:
+//!   modules of the export target's key and the per-user cache folder). Both work without a service:
 //!   an `--export-*` run starts none.
 //! - `stop` (SCENE exit, before the main-thread queue closes and the
 //!   language is destroyed) clears the save hook and stops the service,
@@ -134,8 +136,41 @@ const Os = godot.class.Os;
 
 pub const setting_zig_path = "ziggurat/zig_path";
 pub const setting_sdk_manifest = "ziggurat/dev/sdk_manifest";
-/// The shipped SDK's manifest, used when `setting_sdk_manifest` is empty.
-pub const shipped_sdk_manifest = "res://addons/ziggurat/sdk/sdk-manifest.json";
+/// The editor's own target key (`platform.target_key`); null on a
+/// platform Ziggurat ships no SDK for.
+pub const own_key: ?[]const u8 = platform.target_key.fromTarget(@import("builtin").target);
+
+/// The shipped SDK's manifest for the target key `key`, or null when
+/// `key` is not a target key. The editor uses its own key's when
+/// `setting_sdk_manifest` is empty; an export uses the export target's.
+pub fn shippedSdkManifest(key: []const u8) ?[]const u8 {
+    inline for (platform.target_key.all) |k| {
+        if (std.mem.eql(u8, k, key)) return "res://addons/ziggurat/sdk/" ++ k ++ "/sdk-manifest.json";
+    }
+    return null;
+}
+
+/// Which SDK manifest a build uses (`sdkChoice`).
+pub const SdkChoice = union(enum) {
+    /// The one the project setting `ziggurat/dev/sdk_manifest` names.
+    setting,
+    /// The shipped SDK's, at this `res://` path.
+    shipped: []const u8,
+    /// None: no setting applies and there is no shipped SDK for the key.
+    none,
+};
+
+/// The SDK manifest for a build for target key `key` (null: the editor's
+/// own target) by an editor whose own key is `own` (`own_key`), with the
+/// project setting `ziggurat/dev/sdk_manifest` set to `setting` (empty:
+/// not set). The setting overrides only the editor's own target; other
+/// targets use their shipped SDK.
+pub fn sdkChoice(own: ?[]const u8, key: ?[]const u8, setting: []const u8) SdkChoice {
+    const is_own = if (key) |k| (if (own) |o| std.mem.eql(u8, o, k) else false) else true;
+    if (is_own and setting.len != 0) return .setting;
+    const k = key orelse own orelse return .none;
+    return if (shippedSdkManifest(k)) |p| .{ .shipped = p } else .none;
+}
 /// Whether Play builds the Zig scripts first (the editor plugin's
 /// `_build`); a bool, true by default.
 pub const setting_build_on_play = "ziggurat/build/build_on_play";
@@ -912,7 +947,7 @@ fn startService() Allocator.Error!void {
 
     var msg: std.ArrayList(u8) = .empty;
     defer msg.deinit(gpa);
-    const loaded = sdkManifest(gpa, a, &msg) catch |err| switch (err) {
+    const loaded = sdkManifest(gpa, a, null, &msg) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Unusable => {
             log("Ziggurat does not build Zig scripts: {s}", .{msg.items});
@@ -995,51 +1030,66 @@ fn startService() Allocator.Error!void {
     }
 }
 
-/// Loads the SDK manifest builds use: the one the project setting
+/// Loads the SDK manifest for a build for target key `key` (null: the
+/// editor's own target, `own_key`), as `sdkChoice` picks it: for the
+/// editor's own target the one the project setting
 /// `ziggurat/dev/sdk_manifest` names (absolute), else the shipped SDK's
-/// (`shipped_sdk_manifest`, globalized) when that file exists. The
-/// manifest is allocated with `ga`, scratch text (and the returned path)
-/// with `a`. On
-/// `error.Unusable` `msg` (allocated with `ga`) holds one sentence that
+/// (`shippedSdkManifest`, globalized) when that file exists. The manifest
+/// is allocated with `ga`, scratch text (and the returned path) with `a`.
+/// On `error.Unusable` `msg` (allocated with `ga`) holds one sentence that
 /// starts in lower case and names what is missing or wrong. Main thread.
-fn sdkManifest(ga: Allocator, a: Allocator, msg: *std.ArrayList(u8)) error{ OutOfMemory, Unusable }!LoadedSdk {
+fn sdkManifest(ga: Allocator, a: Allocator, key: ?[]const u8, msg: *std.ArrayList(u8)) error{ OutOfMemory, Unusable }!LoadedSdk {
     const io = host_io.get();
     msg.clearRetainingCapacity();
     const set = try settingText(a, setting_sdk_manifest);
-    if (set.len != 0 and !isAbsolute(set)) {
+    const choice = sdkChoice(own_key, key, set);
+    if (choice == .setting and !isAbsolute(set)) {
         try msg.print(ga, "the project setting " ++ setting_sdk_manifest ++ " ({s}) is not usable, because it is not an absolute path.", .{set});
         return error.Unusable;
     }
-    const path = if (set.len != 0) set else blk: {
-        var res = String.fromLatin1(shipped_sdk_manifest);
-        defer res.deinit();
-        var abs = ProjectSettings.globalizePath(res);
-        defer abs.deinit();
-        const shipped = try props.utf8Alloc(a, &abs);
-        if (!isAbsolute(shipped)) {
-            try msg.print(ga, "the shipped SDK's manifest {s} has no absolute path ({s}), and the project setting " ++ setting_sdk_manifest ++ " is not set.", .{ shipped_sdk_manifest, shipped });
-            return error.Unusable;
-        }
-        std.Io.Dir.cwd().access(io, shipped, .{}) catch |err| {
-            switch (err) {
-                error.FileNotFound => try msg.appendSlice(ga, "there is no SDK at " ++ shipped_sdk_manifest ++ " (the add-on's sdk folder is missing), and the project setting " ++ setting_sdk_manifest ++ " is not set."),
-                else => try msg.print(ga, "the shipped SDK's manifest {s} cannot be read ({t}), and the project setting " ++ setting_sdk_manifest ++ " is not set.", .{ shipped, err }),
+    const path = switch (choice) {
+        .setting => set,
+        .none => {
+            if (key) |k| {
+                try msg.print(ga, "Ziggurat ships no SDK for the target {s}.", .{k});
+            } else {
+                try msg.appendSlice(ga, "Ziggurat ships no SDK for this editor's platform, and the project setting " ++ setting_sdk_manifest ++ " is not set.");
             }
             return error.Unusable;
-        };
-        break :blk shipped;
+        },
+        .shipped => |res_path| blk: {
+            // The project setting applies only to the editor's own target.
+            const unset = if (key != null) "" else ", and the project setting " ++ setting_sdk_manifest ++ " is not set";
+            var res = String.fromLatin1(res_path);
+            defer res.deinit();
+            var abs = ProjectSettings.globalizePath(res);
+            defer abs.deinit();
+            const shipped = try props.utf8Alloc(a, &abs);
+            if (!isAbsolute(shipped)) {
+                try msg.print(ga, "the shipped SDK's manifest {s} has no absolute path ({s}){s}.", .{ res_path, shipped, unset });
+                return error.Unusable;
+            }
+            std.Io.Dir.cwd().access(io, shipped, .{}) catch |err| {
+                switch (err) {
+                    error.FileNotFound => try msg.print(ga, "there is no SDK at {s} (the add-on's sdk folder is missing){s}.", .{ res_path, unset }),
+                    else => try msg.print(ga, "the shipped SDK's manifest {s} cannot be read ({t}){s}.", .{ shipped, err, unset }),
+                }
+                return error.Unusable;
+            };
+            break :blk shipped;
+        },
     };
     var why: std.ArrayList(u8) = .empty;
     defer why.deinit(ga);
     const loaded = zbuild.sdk_manifest.load(ga, io, .fromTrusted(path), &why) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            const what = if (set.len != 0) "the project setting " ++ setting_sdk_manifest else "the shipped SDK";
+            const what = if (choice == .setting) "the project setting " ++ setting_sdk_manifest else "the shipped SDK";
             try msg.print(ga, "{s} is not usable: {s}", .{ what, if (why.items.len != 0) why.items else @errorName(err) });
             return error.Unusable;
         },
     };
-    return .{ .manifest = loaded, .path = path, .from_setting = set.len != 0 };
+    return .{ .manifest = loaded, .path = path, .from_setting = choice == .setting };
 }
 
 /// What `sdkManifest` chose and loaded.
@@ -1079,9 +1129,10 @@ pub const ExportInputs = struct {
     /// `ziggurat/zig_path`, the editor setting, the downloaded toolchain,
     /// then `PATH`.
     zig: platform.zig_locator.ZigInstall,
-    /// The SDK modules: the running service's, else the manifest the
-    /// project setting `ziggurat/dev/sdk_manifest` names, else the shipped
-    /// SDK's (`sdkManifest`).
+    /// The SDK modules: for the editor's own target the running
+    /// service's, else the manifest the project setting
+    /// `ziggurat/dev/sdk_manifest` names, else the shipped SDK's; for
+    /// another target that target's shipped SDK (`sdkManifest`).
     sdk: []const zbuild.workspace.ModuleDep,
     /// The `sdk_version` of the manifest `sdk` came from, and that
     /// manifest's path. Owned like `sdk`.
@@ -1094,18 +1145,21 @@ pub const ExportInputs = struct {
     cache_dir: OsPath,
 };
 
-/// The located Zig, the SDK modules and the per-user cache folder for an
-/// export build of the project `project` (`projectRoot`), allocated with
+/// The located Zig, the SDK modules of the export target's key `key`
+/// (`platform.target_key`) and the per-user cache folder for an export
+/// build of the project `project` (`projectRoot`), allocated with
 /// `a` (an arena: nothing is freed piecemeal). It works without a build
 /// service (an `--export-*` run starts none). On `error.Unusable` `msg`
 /// holds one sentence that names what is missing. Main thread.
-pub fn exportInputs(a: Allocator, project: []const u8, msg: *std.ArrayList(u8)) error{ OutOfMemory, Unusable }!ExportInputs {
+pub fn exportInputs(a: Allocator, project: []const u8, key: []const u8, msg: *std.ArrayList(u8)) error{ OutOfMemory, Unusable }!ExportInputs {
     const io = host_io.get();
     msg.clearRetainingCapacity();
-    const chosen: struct { modules: []const zbuild.workspace.ModuleDep, version: []const u8, path: []const u8, from_setting: bool } = if (state) |*st|
-        .{ .modules = st.sdk.modules, .version = st.sdk.sdk_version, .path = st.sdk_path, .from_setting = st.sdk_from_setting }
+    // The running service built with the editor's own target's SDK.
+    const is_own = if (own_key) |o| std.mem.eql(u8, o, key) else false;
+    const chosen: struct { modules: []const zbuild.workspace.ModuleDep, version: []const u8, path: []const u8, from_setting: bool } = if (state != null and is_own)
+        .{ .modules = state.?.sdk.modules, .version = state.?.sdk.sdk_version, .path = state.?.sdk_path, .from_setting = state.?.sdk_from_setting }
     else blk: {
-        const l = try sdkManifest(a, a, msg);
+        const l = try sdkManifest(a, a, if (is_own) null else key, msg);
         break :blk .{ .modules = l.manifest.modules, .version = l.manifest.sdk_version, .path = l.path, .from_setting = l.from_setting };
     };
 
@@ -1861,4 +1915,39 @@ test "size text" {
     try std.testing.expectEqualStrings("1.5 KiB", sizeText(&buf, 1536));
     try std.testing.expectEqualStrings("2.0 GiB", sizeText(&buf, 2 << 30));
     try std.testing.expectEqualStrings("2.1 GiB", sizeText(&buf, (2 << 30) + (150 << 20)));
+}
+
+test "editor uses its own target's SDK" {
+    const t = std.testing;
+    // The shipped SDK of the editor's own target, unless the project
+    // setting names one.
+    try t.expectEqualStrings("res://addons/ziggurat/sdk/x86_64-linux/sdk-manifest.json", sdkChoice("x86_64-linux", null, "").shipped);
+    try t.expectEqualStrings("res://addons/ziggurat/sdk/x86_64-windows/sdk-manifest.json", sdkChoice("x86_64-windows", null, "").shipped);
+    try t.expectEqual(SdkChoice.setting, sdkChoice("x86_64-linux", null, "/dev/sdk/sdk-manifest.json"));
+    try t.expectEqual(SdkChoice.setting, sdkChoice("x86_64-windows", null, "C:\\dev\\sdk-manifest.json"));
+    // An editor on a platform without a shipped SDK has only the setting.
+    try t.expectEqual(SdkChoice.none, sdkChoice(null, null, ""));
+    try t.expectEqual(SdkChoice.setting, sdkChoice(null, null, "/dev/sdk/sdk-manifest.json"));
+    // The running editor's own key.
+    try t.expectEqualStrings(platform.target_key.fromTarget(@import("builtin").target).?, own_key.?);
+    for (platform.target_key.all) |k| {
+        const p = shippedSdkManifest(k).?;
+        try t.expect(std.mem.startsWith(u8, p, "res://addons/ziggurat/sdk/"));
+        try t.expect(std.mem.indexOf(u8, p, k) != null);
+    }
+    try t.expect(shippedSdkManifest("linux.x86_64") == null);
+}
+
+test "export inputs pick the export target's SDK" {
+    const t = std.testing;
+    // The export target's shipped SDK; the project setting overrides only
+    // the editor's own target.
+    try t.expectEqualStrings("res://addons/ziggurat/sdk/x86_64-windows/sdk-manifest.json", sdkChoice("x86_64-linux", "x86_64-windows", "/dev/sdk/sdk-manifest.json").shipped);
+    try t.expectEqualStrings("res://addons/ziggurat/sdk/x86_64-linux/sdk-manifest.json", sdkChoice("x86_64-windows", "x86_64-linux", "C:\\dev\\sdk-manifest.json").shipped);
+    try t.expectEqual(SdkChoice.setting, sdkChoice("x86_64-linux", "x86_64-linux", "/dev/sdk/sdk-manifest.json"));
+    try t.expectEqualStrings("res://addons/ziggurat/sdk/x86_64-linux/sdk-manifest.json", sdkChoice("x86_64-linux", "x86_64-linux", "").shipped);
+    // An editor without a shipped SDK of its own still exports with the
+    // export target's shipped SDK.
+    try t.expectEqualStrings("res://addons/ziggurat/sdk/x86_64-linux/sdk-manifest.json", sdkChoice(null, "x86_64-linux", "/dev/sdk/sdk-manifest.json").shipped);
+    try t.expectEqual(SdkChoice.none, sdkChoice("x86_64-linux", "linux.x86_64", ""));
 }

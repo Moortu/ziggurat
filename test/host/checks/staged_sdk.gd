@@ -2,7 +2,8 @@
 extends Node
 # Host test "staged SDK builds a project", editor pass: a tool autoload in
 # the headless editor of a project that has the shipped SDK in
-# res://addons/ziggurat/sdk/ and an empty ziggurat/dev/sdk_manifest. The
+# res://addons/ziggurat/sdk/x86_64-linux/ (the editor's own target) and an
+# empty ziggurat/dev/sdk_manifest. The
 # build at open must use that SDK and stage generation 1, and the editor's
 # file system must not list any file of the SDK folder (it has a .gdignore).
 # Prints one ZTEST line per case, then ZTEST DONE, and quits. In a game it
@@ -11,6 +12,7 @@ extends Node
 const WAIT_MS := 600000
 const MANIFEST := "res://.godot/ziggurat/manifest"
 const SDK := "res://addons/ziggurat/sdk/"
+const KEY_SDK := SDK + "x86_64-linux/"
 
 
 func report(name: String, ok: bool, why: String) -> void:
@@ -42,7 +44,7 @@ func run() -> void:
 		await get_tree().process_frame
 	# The add-on folder is scanned; the SDK folder under it is not.
 	report("staged_sdk_addon_scanned", efs.get_filesystem_path("res://addons/ziggurat/") != null, "res://addons/ziggurat/ is not in the editor's file system")
-	report("staged_sdk_not_scanned", efs.get_filesystem_path(SDK) == null and efs.get_file_type(SDK + "ziggurat/ziggurat.zig") == "",
+	report("staged_sdk_not_scanned", efs.get_filesystem_path(SDK) == null and efs.get_file_type(KEY_SDK + "ziggurat/ziggurat.zig") == "",
 		"the editor's file system lists %s" % SDK)
 	# The SDK files are there on disk.
-	report("staged_sdk_on_disk", FileAccess.file_exists(SDK + "sdk-manifest.json"), "no %ssdk-manifest.json" % SDK)
+	report("staged_sdk_on_disk", FileAccess.file_exists(KEY_SDK + "sdk-manifest.json"), "no %ssdk-manifest.json" % KEY_SDK)

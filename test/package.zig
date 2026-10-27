@@ -18,16 +18,28 @@ const export_dir = "res://.godot/ziggurat/export/";
 /// The Asset Store limit per version (1 GB).
 const max_size = 1_000_000_000;
 
-/// Every file outside `sdk/`, relative to the add-on folder.
+/// Every file outside `sdk/`, relative to the add-on folder, in name
+/// order: the editor libraries in `bin/`, and per target key the export
+/// host archive and the empty game library in `bin/<key>/`.
 const top_files = [_][]const u8{
     "LICENSE",
     "README.md",
     "THIRD_PARTY_LICENSES.md",
-    "bin/libziggurat_game_empty.so",
     "bin/libziggurat_host.so",
-    "bin/libziggurat_host_export.a",
+    "bin/x86_64-linux/libziggurat_game_empty.so",
+    "bin/x86_64-linux/libziggurat_host_export.a",
+    "bin/x86_64-windows/ziggurat_game_empty.dll",
+    "bin/x86_64-windows/ziggurat_host_export.lib",
+    "bin/ziggurat_host.dll",
     "gdzig-PATCHES.md",
     "ziggurat.gdextension",
+};
+
+/// The target keys the package holds, with the staged SDK of each (the
+/// path of its `sdk-manifest.json`).
+const packaged = [_]struct { key: []const u8, staged_manifest: []const u8 }{
+    .{ .key = "x86_64-linux", .staged_manifest = options.staged_sdk_x86_64_linux },
+    .{ .key = "x86_64-windows", .staged_manifest = options.staged_sdk_x86_64_windows },
 };
 
 /// gdzig's change list (vendor/gdzig/PATCHES.md), which THIRD_PARTY_LICENSES.md
@@ -128,6 +140,17 @@ fn find(entries: []const Entry, name: []const u8) ?Entry {
     return null;
 }
 
+/// Whether a PE file (`MZ`) is an executable: its COFF header lacks the
+/// DLL flag.
+fn isPeExecutable(b: []const u8) !bool {
+    if (b.len < 0x40) return error.ShortPe;
+    const pe_at = rd(u32, b, 0x3c);
+    if (pe_at > b.len - 24) return error.ShortPe;
+    try testing.expectEqualSlices(u8, "PE\x00\x00", b[pe_at..][0..4]);
+    const characteristics = rd(u16, b, pe_at + 4 + 18);
+    return characteristics & 0x2000 == 0; // IMAGE_FILE_DLL
+}
+
 /// Whether an ELF file is an executable: a type other than a shared
 /// object, or a shared object with a program interpreter (a PIE).
 fn isElfExecutable(b: []const u8) !bool {
@@ -193,6 +216,10 @@ test "integration: package contents" {
             std.debug.print("{s} is an ELF executable\n", .{e.name});
             return error.Executable;
         }
+        if (std.mem.startsWith(u8, e.data, "MZ") and try isPeExecutable(e.data)) {
+            std.debug.print("{s} is a PE executable\n", .{e.name});
+            return error.Executable;
+        }
         // No path of the machine that built the package.
         for (machine_paths) |needle| {
             if (std.mem.indexOf(u8, e.data, needle) != null) {
@@ -211,32 +238,33 @@ test "integration: package contents" {
     try testing.expectEqual(top_files.len, outside.items.len);
     for (top_files, outside.items) |want, got| try testing.expectEqualStrings(want, got);
 
-    // sdk/ is exactly the staged SDK, byte for byte.
-    var staged: std.ArrayList([]const u8) = .empty;
-    // The staged SDK folder holds the manifest.
-    var dir = try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(options.staged_sdk_manifest).?, .{ .iterate = true });
-    defer dir.close(io);
-    var walker = try dir.walk(a);
-    defer walker.deinit();
-    while (try walker.next(io)) |w| {
-        if (w.kind == .directory) continue;
-        try testing.expectEqual(std.Io.File.Kind.file, w.kind);
-        try staged.append(a, try a.dupe(u8, w.path));
-    }
+    // sdk/ is `.gdignore` and, per target key, exactly that key's staged
+    // SDK, byte for byte, in sdk/<key>/.
     var sdk_count: usize = 0;
     for (entries) |e| {
         if (std.mem.startsWith(u8, e.name, root ++ "sdk/")) sdk_count += 1;
     }
-    try testing.expectEqual(staged.items.len, sdk_count);
-    for (staged.items) |rel| {
-        const e = find(entries, try std.fmt.allocPrint(a, root ++ "sdk/{s}", .{rel})) orelse {
-            std.debug.print("staged file missing from the package: sdk/{s}\n", .{rel});
-            return error.MissingSdkFile;
-        };
-        try testing.expectEqualSlices(u8, try dir.readFileAlloc(io, rel, a, .limited(max_size)), e.data);
-    }
+    var staged_count: usize = 1; // sdk/.gdignore
     try testing.expect(find(entries, root ++ "sdk/.gdignore") != null);
-    try testing.expect(find(entries, root ++ "sdk/sdk-manifest.json") != null);
+    for (packaged) |t| {
+        var dir = try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(t.staged_manifest).?, .{ .iterate = true });
+        defer dir.close(io);
+        var walker = try dir.walk(a);
+        defer walker.deinit();
+        while (try walker.next(io)) |w| {
+            if (w.kind == .directory) continue;
+            try testing.expectEqual(std.Io.File.Kind.file, w.kind);
+            staged_count += 1;
+            const name = try std.fmt.allocPrint(a, root ++ "sdk/{s}/{s}", .{ t.key, w.path });
+            const e = find(entries, name) orelse {
+                std.debug.print("staged file missing from the package: {s}\n", .{name});
+                return error.MissingSdkFile;
+            };
+            try testing.expectEqualSlices(u8, try dir.readFileAlloc(io, w.path, a, .limited(max_size)), e.data);
+        }
+        try testing.expect(find(entries, try std.fmt.allocPrint(a, root ++ "sdk/{s}/sdk-manifest.json", .{t.key})) != null);
+    }
+    try testing.expectEqual(staged_count, sdk_count);
 
     // gdzig's change list is the repository's, byte for byte.
     const patches_src = try std.fs.path.join(a, &.{ options.build_machine_repo, "vendor/gdzig/PATCHES.md" });
@@ -253,7 +281,7 @@ test "integration: package contents" {
     }
 
     // The libraries load on the pinned glibc, like an exported game.
-    for ([_][]const u8{ "bin/libziggurat_host.so", "bin/libziggurat_game_empty.so" }) |rel| {
+    for ([_][]const u8{ "bin/libziggurat_host.so", "bin/x86_64-linux/libziggurat_game_empty.so" }) |rel| {
         const data = find(entries, try std.fmt.allocPrint(a, root ++ "{s}", .{rel})).?.data;
         const versions = try platform.elf.neededVersions(a, data);
         if (zbuild.export_build.glibcAbove(versions, platform.pins.export_glibc)) |v| {
@@ -261,11 +289,95 @@ test "integration: package contents" {
             return error.GlibcTooNew;
         }
     }
-    // The export host is the archive the export build links.
-    try testing.expect(std.mem.startsWith(u8, find(entries, root ++ "bin/libziggurat_host_export.a").?.data, "!<arch>\n"));
 }
 
-test "integration: package is deterministic" {
+test "package: holds both targets" {
+    try platform.testing_support.requireIntegration();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const zip = try readFile(a, options.package_zip);
+    const entries = try readZip(a, zip);
+    // Every path of the plan's package layout.
+    for ([_][]const u8{
+        "bin/libziggurat_host.so",
+        "bin/ziggurat_host.dll",
+        "bin/x86_64-linux/libziggurat_host_export.a",
+        "bin/x86_64-windows/ziggurat_host_export.lib",
+        "bin/x86_64-linux/libziggurat_game_empty.so",
+        "bin/x86_64-windows/ziggurat_game_empty.dll",
+        "sdk/.gdignore",
+        "sdk/x86_64-linux/sdk-manifest.json",
+        "sdk/x86_64-windows/sdk-manifest.json",
+    }) |rel| {
+        if (find(entries, try std.fmt.allocPrint(a, root ++ "{s}", .{rel})) == null) {
+            std.debug.print("the package lacks {s}\n", .{rel});
+            return error.MissingFile;
+        }
+    }
+    // The ELF libraries are x86_64 shared objects, the PE libraries
+    // complete x86_64 DLLs.
+    for ([_][]const u8{ "bin/libziggurat_host.so", "bin/x86_64-linux/libziggurat_game_empty.so" }) |rel| {
+        const data = find(entries, try std.fmt.allocPrint(a, root ++ "{s}", .{rel})).?.data;
+        try testing.expect(std.mem.startsWith(u8, data, "\x7fELF"));
+        try testing.expectEqual(@as(u16, 62), rd(u16, data, 18)); // EM_X86_64
+        try testing.expect(!try isElfExecutable(data));
+    }
+    for ([_][]const u8{ "bin/ziggurat_host.dll", "bin/x86_64-windows/ziggurat_game_empty.dll" }) |rel| {
+        const data = find(entries, try std.fmt.allocPrint(a, root ++ "{s}", .{rel})).?.data;
+        try platform.pe.checkComplete(data);
+        try testing.expectEqual(@as(u16, 0x8664), rd(u16, data, rd(u32, data, 0x3c) + 4)); // AMD64
+        try testing.expect(!try isPeExecutable(data));
+    }
+    // The export host archives: a GNU archive and a COFF archive (two
+    // linker members `/`), each with base names only, so no cache path.
+    for ([_]struct { []const u8, bool }{
+        .{ "bin/x86_64-linux/libziggurat_host_export.a", false },
+        .{ "bin/x86_64-windows/ziggurat_host_export.lib", true },
+    }) |arc| {
+        const data = find(entries, try std.fmt.allocPrint(a, root ++ "{s}", .{arc[0]})).?.data;
+        try testing.expect(std.mem.startsWith(u8, data, "!<arch>\n"));
+        try testing.expect(std.mem.indexOf(u8, data, "zig-cache") == null);
+        const first_size = try std.fmt.parseInt(usize, std.mem.trimEnd(u8, data[8 + 48 ..][0..10], " "), 10);
+        const second_at = 8 + 60 + first_size + (first_size & 1);
+        try testing.expectEqualStrings("/", std.mem.trimEnd(u8, data[8..][0..16], " "));
+        try testing.expectEqual(arc[1], std.mem.eql(u8, std.mem.trimEnd(u8, data[second_at..][0..16], " "), "/"));
+    }
+
+    // Both shipped manifests load from the unpacked add-on, and every
+    // module root is inside that key's folder.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var f = try std.Io.Dir.cwd().openFile(io, options.package_zip, .{});
+        defer f.close(io);
+        var buf: [64 * 1024]u8 = undefined;
+        var reader = f.reader(io, &buf);
+        try tmp.dir.createDirPath(io, "unpacked");
+        var dst = try tmp.dir.openDir(io, "unpacked", .{});
+        defer dst.close(io);
+        try std.zip.extract(dst, &reader, .{});
+    }
+    const unpacked = try tmp.dir.realPathFileAlloc(io, "unpacked", a);
+    for (packaged) |t| {
+        const folder = try std.fs.path.join(a, &.{ unpacked, root, "sdk", t.key });
+        const path = try std.fs.path.join(a, &.{ folder, "sdk-manifest.json" });
+        var why: std.ArrayList(u8) = .empty;
+        var m = zbuild.sdk_manifest.load(a, io, .fromTrusted(path), &why) catch |err| {
+            std.debug.print("{s} does not load: {s} ({t})\n", .{ path, why.items, err });
+            return err;
+        };
+        defer m.deinit(a);
+        try testing.expectEqualStrings(options.sdk_version, m.sdk_version);
+        try testing.expect(m.modules.len > 0);
+        for (m.modules) |mod| {
+            try testing.expect(std.mem.startsWith(u8, mod.root.bytes, folder));
+            _ = try std.Io.Dir.cwd().statFile(io, mod.root.bytes, .{});
+        }
+    }
+}
+
+test "package: deterministic" {
     try platform.testing_support.requireIntegration();
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();

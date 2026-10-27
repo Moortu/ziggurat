@@ -3318,13 +3318,23 @@ const export_marker = "ZIGG_EXPORT_SOURCE_MARKER_5c2e";
 const export_out = "out/game.x86_64";
 /// Where the export plugin writes the game library (the `.gdextension`'s
 /// template keys name it).
-const game_lib_rel = ".godot/ziggurat/export/linux.x86_64/libziggurat_game.so";
+const game_lib_rel = ".godot/ziggurat/export/x86_64-linux/libziggurat_game.so";
 /// What the export plugin says for any preset but Linux x86_64.
 const export_platform_message = "Ziggurat exports Linux x86_64 only in this version";
 /// The plugin's progress line before an export build.
 const export_building = "Ziggurat: building the game library for the export";
 /// The end of every error after which the export fails.
 const export_incomplete = "the files in the export's output folder are incomplete";
+
+/// Copies the export host archive and the empty-project game library into
+/// the project's `addons/ziggurat/bin/x86_64-linux/`, where the export
+/// plugin looks for a Linux export's inputs.
+fn copyExportInputs(dir: Io.Dir) !void {
+    const cwd = Io.Dir.cwd();
+    try dir.createDirPath(io, "addons/ziggurat/bin/x86_64-linux");
+    try cwd.copyFile(opts.export_host_archive, dir, "addons/ziggurat/bin/x86_64-linux/libziggurat_host_export.a", io, .{});
+    try cwd.copyFile(opts.game_empty_lib, dir, "addons/ziggurat/bin/x86_64-linux/libziggurat_game_empty.so", io, .{});
+}
 
 /// Skips the test when `-Dexport-templates` is unset (ruling R3). The test
 /// prints nothing (a passing test that writes to stderr is labelled
@@ -3337,7 +3347,7 @@ fn requireTemplates() !void {
 
 /// A copy of test/host/projects/export with the add-on, its export inputs
 /// (the export host archive and the empty-project game library in
-/// `addons/ziggurat/bin/`), the build settings (the test's Zig and SDK
+/// `addons/ziggurat/bin/x86_64-linux/`), the build settings (the test's Zig and SDK
 /// manifest; `zig` instead when given), per-user folders inside the test's
 /// folder, the presets pointing at `-Dexport-templates`, and the export
 /// tests' shared build cache.
@@ -3348,8 +3358,7 @@ fn initExport(p: *Project, zig: ?[]const u8) !void {
     const cwd = Io.Dir.cwd();
     var dir = try cwd.openDir(io, p.path, .{});
     defer dir.close(io);
-    try cwd.copyFile(opts.export_host_archive, dir, "addons/ziggurat/bin/libziggurat_host_export.a", io, .{});
-    try cwd.copyFile(opts.game_empty_lib, dir, "addons/ziggurat/bin/libziggurat_game_empty.so", io, .{});
+    try copyExportInputs(dir);
     try addBuildSettingsWith(p, zig orelse opts.zig_exe);
     try isolateUserFolders(p);
     // One build cache for every export test, kept between runs: only the
@@ -3835,7 +3844,7 @@ test "export: a foreign SDK version fails the export" {
     if (std.mem.eql(u8, swapped, cfg)) return error.SettingNotFound;
     try dir.writeFile(io, .{ .sub_path = "project.godot", .data = swapped });
 
-    const sentence = try std.fmt.allocPrint(a, "Ziggurat cannot export: the SDK at {s} is version 9.9.9, but this add-on's export library (addons/ziggurat/bin/libziggurat_host_export.a) needs SDK version {s}. Clear the project setting ziggurat/dev/sdk_manifest, or install the add-on that matches the SDK.", .{ copy, sdk_options.sdk_version });
+    const sentence = try std.fmt.allocPrint(a, "Ziggurat cannot export: the SDK at {s} is version 9.9.9, but this add-on's export library (addons/ziggurat/bin/x86_64-linux/libziggurat_host_export.a) needs SDK version {s}. Clear the project setting ziggurat/dev/sdk_manifest, or install the add-on that matches the SDK.", .{ copy, sdk_options.sdk_version });
     try exportGame(&p, .{
         .expect = &.{ sentence, export_incomplete },
         .reject = &.{export_building},
@@ -3938,10 +3947,15 @@ test "install from the zip" {
         for ([_][]const u8{
             "addons/ziggurat/ziggurat.gdextension",
             "addons/ziggurat/bin/libziggurat_host.so",
-            "addons/ziggurat/bin/libziggurat_host_export.a",
-            "addons/ziggurat/bin/libziggurat_game_empty.so",
-            "addons/ziggurat/sdk/sdk-manifest.json",
-        }) |f| try dir.access(io, f, .{});
+            "addons/ziggurat/bin/x86_64-linux/libziggurat_host_export.a",
+            "addons/ziggurat/bin/x86_64-linux/libziggurat_game_empty.so",
+            "addons/ziggurat/sdk/.gdignore",
+            "addons/ziggurat/sdk/x86_64-linux/sdk-manifest.json",
+            "addons/ziggurat/bin/ziggurat_host.dll",
+            "addons/ziggurat/bin/x86_64-windows/ziggurat_host_export.lib",
+            "addons/ziggurat/bin/x86_64-windows/ziggurat_game_empty.dll",
+            "addons/ziggurat/sdk/x86_64-windows/sdk-manifest.json",
+        }) |f| _ = try dir.statFile(io, f, .{});
         const settings = try dir.readFileAlloc(io, "project.godot", p.arena_state.allocator(), .limited(64 * 1024));
         try testing.expect(std.mem.indexOf(u8, settings, "sdk_manifest") == null);
     }
@@ -3968,8 +3982,9 @@ fn stagedDir() []const u8 {
 }
 
 /// Copies the staged SDK (`stagedDir`) into the project as
-/// res://addons/ziggurat/sdk/, the folder the host uses when the project
-/// setting `ziggurat/dev/sdk_manifest` is empty.
+/// res://addons/ziggurat/sdk/x86_64-linux/, the folder of the editor's own
+/// target that the host uses when the project setting
+/// `ziggurat/dev/sdk_manifest` is empty, with the `.gdignore` at sdk/.
 fn addStagedSdk(p: *Project) !void {
     const a = p.arena_state.allocator();
     const cwd = Io.Dir.cwd();
@@ -3977,8 +3992,9 @@ fn addStagedSdk(p: *Project) !void {
     defer src.close(io);
     var proj = try cwd.openDir(io, p.path, .{});
     defer proj.close(io);
-    try proj.createDirPath(io, "addons/ziggurat/sdk");
-    var dst = try proj.openDir(io, "addons/ziggurat/sdk", .{});
+    try proj.createDirPath(io, "addons/ziggurat/sdk/x86_64-linux");
+    try proj.writeFile(io, .{ .sub_path = "addons/ziggurat/sdk/.gdignore", .data = "" });
+    var dst = try proj.openDir(io, "addons/ziggurat/sdk/x86_64-linux", .{});
     defer dst.close(io);
     var walker = try src.walk(a);
     defer walker.deinit();
@@ -4000,8 +4016,7 @@ test "staged SDK builds a project" {
     const cwd = Io.Dir.cwd();
     var dir = try cwd.openDir(io, p.path, .{});
     defer dir.close(io);
-    try cwd.copyFile(opts.export_host_archive, dir, "addons/ziggurat/bin/libziggurat_host_export.a", io, .{});
-    try cwd.copyFile(opts.game_empty_lib, dir, "addons/ziggurat/bin/libziggurat_game_empty.so", io, .{});
+    try copyExportInputs(dir);
     try addStagedSdk(&p);
     // Only the Zig path is set: the SDK is the one in the add-on folder.
     const old = try dir.readFileAlloc(io, "project.godot", a, .limited(64 * 1024));

@@ -19,9 +19,9 @@ Build steps that are not tests:
 
 | Command | What it writes |
 |---|---|
-| `zig build package` | the release package `zig-out/ziggurat-0.1.0.zip` (root `addons/ziggurat/`; the release download and the Asset Store upload are this file). Deterministic: the same commit gives the same bytes from any checkout and any cache folder (`tools/ar_normalize.zig` gives the export archive's member a base name). |
-| `zig build host -p <project>` | the add-on into `<project>/addons/ziggurat/` for development: the Debug editor library, the export host archive, the empty game library, `ziggurat.gdextension` and the staged SDK. A project set up before Stage 6 also has an old `addon/` folder, which makes Godot load a second host: delete it. |
-| `zig build host-archive` | the export host archive `zig-out/lib/libziggurat_host_export.a` |
+| `zig build package` | the release package `zig-out/ziggurat-0.1.0.zip` (root `addons/ziggurat/`; the release download and the Asset Store upload are this file). It holds every packaged target (`x86_64-linux`, `x86_64-windows`): the editor libraries in `bin/`, the export host archive and empty game library of each target in `bin/<target key>/`, and each target's SDK in `sdk/<target key>/`. Deterministic: the same commit gives the same bytes from any checkout and any cache folder (`tools/ar_normalize.zig` gives the export archives' members, GNU and COFF, base names). |
+| `zig build host -p <project>` | the add-on into `<project>/addons/ziggurat/` for development: the Debug editor library for `-Dtarget` (`libziggurat_host.so` or `ziggurat_host.dll`), and the package's `bin/<target key>/` export inputs, `sdk/<target key>/` SDKs and `ziggurat.gdextension`. A project set up before Stage 6 also has an old `addon/` folder, which makes Godot load a second host: delete it. |
+| `zig build host-archive` | the export host archives `zig-out/lib/x86_64-linux/libziggurat_host_export.a` and `zig-out/lib/x86_64-windows/ziggurat_host_export.lib` |
 | `zig build sdk-stage -Dsdk-out=<absolute folder>` | the shipped SDK (sources, `.gdignore`, `sdk-manifest.json` with relative roots) into an empty or missing folder |
 
 On NixOS:

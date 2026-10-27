@@ -15,8 +15,15 @@ games for Linux x86_64 only.
 2. Restart the editor. Godot loads the extension at startup; there is no
    plugin to turn on.
 
-The `sdk/` folder holds the Zig sources your scripts build against. It has
-a `.gdignore` file, so Godot does not import it and exports leave it out.
+The `sdk/` folder holds the Zig sources your scripts build against, one
+folder per platform (`sdk/x86_64-linux/`, `sdk/x86_64-windows/`): the
+editor uses its own platform's folder, and an export uses the folder of
+the platform it exports to. `sdk/` has a `.gdignore` file, so Godot does
+not import it and exports leave it out. The export inputs of each platform
+are in `bin/<platform>/`.
+
+One zip holds the add-on for every platform: `ziggurat-0.1.0.zip` is
+about 30 MiB (about 310 MiB unpacked), most of it the two SDK copies.
 
 ## Download Zig
 

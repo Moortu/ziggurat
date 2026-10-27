@@ -2,11 +2,28 @@ const std = @import("std");
 const gdzig_build = @import("gdzig");
 const pins = @import("src/platform/pins.zig");
 const empty_root = @import("src/build/empty_root.zig");
+const target_key = @import("src/platform/target_key.zig");
 
 const cross_targets = [_][]const u8{ "x86_64-windows-gnu", "aarch64-macos", "x86_64-macos", "aarch64-linux-gnu" };
 
 /// The SDK version written into `sdk_options` and the SDK manifest.
 const sdk_version = "0.1.0";
+
+/// A target the release package and `host` ship (plan decision "Package
+/// layout"): its key (`src/platform/target_key.zig`) and the Zig target
+/// its export host archive, empty game library, release editor library
+/// and SDK are built for.
+const PackagedTarget = struct { key: []const u8, triple: []const u8 };
+const packaged_targets = [_]PackagedTarget{
+    .{ .key = target_key.x86_64_linux, .triple = pins.export_target },
+    .{ .key = target_key.x86_64_windows, .triple = "x86_64-windows-gnu" },
+};
+comptime {
+    if (packaged_targets.len != target_key.packaged.len) @compileError("packaged_targets and target_key.packaged differ");
+    for (packaged_targets, target_key.packaged) |t, k| {
+        if (!std.mem.eql(u8, t.key, k)) @compileError("packaged_targets and target_key.packaged differ");
+    }
+}
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -41,7 +58,7 @@ pub fn build(b: *std.Build) void {
     const stage_step = b.step("sdk-stage", "Write the shipped SDK (sources and a manifest with relative roots) into -Dsdk-out=<absolute path>");
     const godot_step = b.step("test-godot", "Run the SDK tests inside a headless Godot (needs Godot)");
     const host_step = b.step("host", "Install the host library and its .gdextension into <prefix>/addons/ziggurat (zig build host -p <project>)");
-    const archive_step = b.step("host-archive", "Install the export host archive <prefix>/lib/libziggurat_host_export.a (ReleaseSafe, " ++ pins.export_target ++ ")");
+    const archive_step = b.step("host-archive", "Install the export host archives <prefix>/lib/<target key>/ (ReleaseSafe; x86_64-linux: " ++ pins.export_target ++ ")");
     const host_test_step = b.step("test-host", "Run the host tests in a headless Godot (needs Godot)");
     const gui_test_step = b.step("test-gui", "Run the GUI editor test under Xvfb (needs Godot and xvfb-run); not part of test");
     const stress_step = b.step("test-stress", "Run the reload stress test with 300 edits in a headless editor (needs Godot); not part of test");
@@ -152,68 +169,49 @@ pub fn build(b: *std.Build) void {
     // working add-on folder, with the library under bin/.
     const addon_dir: std.Build.InstallDir = .{ .custom = "addons/ziggurat" };
     const addon_bin_dir: std.Build.InstallDir = .{ .custom = "addons/ziggurat/bin" };
-    host_step.dependOn(&b.addInstallFileWithDir(host.getEmittedBin(), addon_bin_dir, "libziggurat_host.so").step);
+    host_step.dependOn(&b.addInstallFileWithDir(host.getEmittedBin(), addon_bin_dir, editorLibName(target.result)).step);
     host_step.dependOn(&b.addInstallFileWithDir(gdextension_file, addon_dir, "ziggurat.gdextension").step);
-    // The shipped SDK, where the host looks for it when the project setting
-    // `ziggurat/dev/sdk_manifest` is empty.
-    host_step.dependOn(&b.addInstallDirectory(.{
-        .source_dir = staged_sdk,
-        .install_dir = .{ .custom = "addons/ziggurat/sdk" },
-        .install_subdir = "",
-    }).step);
 
-    // The export host (spec section 10): a static archive that the export
-    // build links with the scripts into an exported game's library. Built
-    // like that library: ReleaseSafe, LLVM, the pinned export target, no
-    // debug information (it would carry this checkout's paths).
-    const export_target = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = pins.export_target }) catch
-        @panic("bad export target triple"));
-    const export_sdk = addSdk(b, export_target, .ReleaseSafe, godot_path);
-    const export_sdk_options = export_sdk.import_table.get("sdk_options").?;
-    const export_host_archive = addHost(b, export_target, .ReleaseSafe, godot_path, zig_exe, export_sdk_options, .{
-        .export_build = true,
-        .linkage = .static,
-        .use_llvm = true,
-        .strip = true,
+    // Per packaged target (spec section 10): the export host archive that
+    // the export build links with the scripts into an exported game's
+    // library, the game library of a project without Zig scripts, the
+    // release editor library and the shipped SDK.
+    const ar_tool = b.addExecutable(.{
+        .name = "ar_normalize",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/ar_normalize.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
     });
-    // Zig names the archive's member after its path in the build cache,
-    // which holds the cache folder (absolute with an absolute --cache-dir)
-    // and differs per checkout; the shipped archive names it by base name.
-    const shipped_archive = blk: {
-        const tool = b.addExecutable(.{
-            .name = "ar_normalize",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("tools/ar_normalize.zig"),
-                .target = b.graph.host,
-                .optimize = .ReleaseSafe,
-            }),
-        });
-        const run = b.addRunArtifact(tool);
-        run.addArtifactArg(export_host_archive);
-        break :blk run.addOutputFileArg("libziggurat_host_export.a");
-    };
-    archive_step.dependOn(&b.addInstallFileWithDir(shipped_archive, .lib, "libziggurat_host_export.a").step);
-    // The game library of a project without Zig scripts (the export plugin
-    // ships it instead of building one): the empty generated root linked
-    // with the export host archive, built as an export build builds.
-    const game_empty = linkedLibrary(b, emptyRootObject(b, export_target, export_sdk), export_host_archive, .{
-        .name = "ziggurat_game_empty",
-        .use_llvm = true,
-        .strip = true,
-    });
-    // The add-on's export inputs go next to the editor library, where the
-    // export plugin looks for them.
-    host_step.dependOn(&b.addInstallFileWithDir(shipped_archive, addon_bin_dir, "libziggurat_host_export.a").step);
-    host_step.dependOn(&b.addInstallFileWithDir(game_empty.getEmittedBin(), addon_bin_dir, "libziggurat_game_empty.so").step);
+    var shipped: [packaged_targets.len]TargetBuild = undefined;
+    for (&shipped, packaged_targets) |*out, t| out.* = addTargetBuild(b, t, godot_path, zig_exe, stage_tool, ar_tool);
+    // x86_64-linux: the archive and empty game library the tests use.
+    const linux_build = shipped[0];
+    const export_host_archive = linux_build.archive;
+    const game_empty = linux_build.game_empty;
+
+    // `.gdignore` at sdk/: Godot neither imports nor exports the SDKs.
+    const gdignore = b.addWriteFiles().add("gdignore", "");
+    // The export inputs go into bin/<key>/ next to the editor library,
+    // where the export plugin looks for them, and each SDK into
+    // sdk/<key>/, where the host looks for it when the project setting
+    // `ziggurat/dev/sdk_manifest` is empty.
+    host_step.dependOn(&b.addInstallFileWithDir(gdignore, .{ .custom = "addons/ziggurat/sdk" }, ".gdignore").step);
+    for (shipped) |t| {
+        const key_bin: std.Build.InstallDir = .{ .custom = b.fmt("addons/ziggurat/bin/{s}", .{t.key}) };
+        host_step.dependOn(&b.addInstallFileWithDir(t.shipped_archive, key_bin, t.files.host_archive).step);
+        host_step.dependOn(&b.addInstallFileWithDir(t.game_empty.getEmittedBin(), key_bin, t.files.game_empty).step);
+        host_step.dependOn(&b.addInstallDirectory(.{
+            .source_dir = t.staged_sdk,
+            .install_dir = .{ .custom = b.fmt("addons/ziggurat/sdk/{s}", .{t.key}) },
+            .install_subdir = "",
+        }).step);
+        archive_step.dependOn(&b.addInstallFileWithDir(t.shipped_archive, .{ .custom = b.fmt("lib/{s}", .{t.key}) }, t.files.host_archive).step);
+    }
 
     // The release package (spec section 1): the add-on folder in one
-    // deterministic zip. Its editor library is built like the export
-    // host: ReleaseSafe, the pinned glibc, no debug information (it would
-    // carry this checkout's paths).
-    const release_host = addHost(b, export_target, .ReleaseSafe, godot_path, zig_exe, export_sdk_options, .{
-        .use_llvm = true,
-        .strip = true,
-    });
+    // deterministic zip, with every packaged target.
     const package_tool = b.addExecutable(.{
         .name = "package",
         .root_module = b.createModule(.{
@@ -235,17 +233,25 @@ pub fn build(b: *std.Build) void {
             .{ "gdzig-PATCHES.md", b.path("vendor/gdzig/PATCHES.md") },
             .{ "README.md", b.path("addons/ziggurat/README.md") },
             .{ "ziggurat.gdextension", gdextension_file },
-            .{ "bin/libziggurat_host.so", release_host.getEmittedBin() },
-            .{ "bin/libziggurat_host_export.a", shipped_archive },
-            .{ "bin/libziggurat_game_empty.so", game_empty.getEmittedBin() },
+            .{ "sdk/.gdignore", gdignore },
         }) |f| {
             run.addArg(b.fmt("addons/ziggurat/{s}", .{f[0]}));
             run.addFileArg(f[1]);
         }
-        run.addArg("addons/ziggurat/sdk");
-        run.addDirectoryArg(staged_sdk);
+        for (shipped) |t| {
+            run.addArg(b.fmt("addons/ziggurat/bin/{s}", .{t.files.editor_lib}));
+            run.addFileArg(t.release_host.getEmittedBin());
+            run.addArg(b.fmt("addons/ziggurat/bin/{s}/{s}", .{ t.key, t.files.host_archive }));
+            run.addFileArg(t.shipped_archive);
+            run.addArg(b.fmt("addons/ziggurat/bin/{s}/{s}", .{ t.key, t.files.game_empty }));
+            run.addFileArg(t.game_empty.getEmittedBin());
+            run.addArg(b.fmt("addons/ziggurat/sdk/{s}", .{t.key}));
+            run.addDirectoryArg(t.staged_sdk);
+        }
     }
     package_step.dependOn(&b.addInstallFile(packages[0], package_name).step);
+    var package_staged: [packaged_targets.len]std.Build.LazyPath = undefined;
+    for (&package_staged, shipped) |*out, t| out.* = t.staged_sdk;
 
     if (godot_found == null) {
         host_test_step.dependOn(&b.addFail("test-host needs Godot on PATH or -Dgodot-path=<absolute path>").step);
@@ -278,7 +284,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(host_test_step);
 
     // Native: integration on for `test`, off for `test-unit`.
-    addTestSet(b, test_step, target, optimize, zig_exe, true, .native, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) }, sdk_options, sdk, sdk.import_table.get("gdzig").?, export_host_archive, staged_sdk, .{ .zips = packages, .step = package_test_step });
+    addTestSet(b, test_step, target, optimize, zig_exe, true, .native, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) }, sdk_options, sdk, sdk.import_table.get("gdzig").?, export_host_archive, staged_sdk, .{ .zips = packages, .staged = package_staged, .step = package_test_step });
     // Windows: the unit test set under Wine. One Wine prefix per build cache.
     {
         const windows = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = "x86_64-windows-gnu" }) catch
@@ -305,10 +311,19 @@ pub fn build(b: *std.Build) void {
         addTestSet(b, cross_step, resolved, optimize, zig_exe, false, .compile, null, null, sdk_options, sdk, sdkGdzig(b, resolved, optimize, godot_path), null, null, null);
 
         // The host library, the export archive and the empty game library,
-        // built as an export build builds them.
-        const cross_sdk = addSdk(b, resolved, .ReleaseSafe, godot_path);
+        // built as an export build builds them; a packaged target's are
+        // the package's own.
+        const packaged: ?TargetBuild = for (shipped, packaged_targets) |t, pt| {
+            if (std.mem.eql(u8, pt.triple, triple)) break t;
+        } else null;
+        const cross_sdk = if (packaged) |t| t.sdk else addSdk(b, resolved, .ReleaseSafe, godot_path);
         const cross_options = cross_sdk.import_table.get("sdk_options").?;
         cross_step.dependOn(&addHost(b, resolved, optimize, godot_path, zig_exe, cross_options, .{}).step);
+        if (packaged) |t| {
+            cross_step.dependOn(&t.archive.step);
+            cross_step.dependOn(&t.game_empty.step);
+            continue;
+        }
         const cross_archive = addHost(b, resolved, .ReleaseSafe, godot_path, zig_exe, cross_options, .{
             .export_build = true,
             .linkage = .static,
@@ -326,6 +341,99 @@ pub fn build(b: *std.Build) void {
             }).step);
         }
     }
+}
+
+/// The editor library's file name for target `t`: the packaged name for a
+/// target key (`target_key.Files.editor_lib`), else the platform's usual
+/// name.
+fn editorLibName(t: std.Target) []const u8 {
+    if (target_key.fromTarget(t)) |k| if (target_key.files(k)) |f| return f.editor_lib;
+    return switch (t.os.tag) {
+        .windows => "ziggurat_host.dll",
+        .macos => "libziggurat_host.dylib",
+        else => "libziggurat_host.so",
+    };
+}
+
+/// What one packaged target ships (`addTargetBuild`).
+const TargetBuild = struct {
+    key: []const u8,
+    files: target_key.Files,
+    /// The SDK built for the target (ReleaseSafe).
+    sdk: *std.Build.Module,
+    /// The shipped SDK folder (`sdk-stage`) of `sdk`.
+    staged_sdk: std.Build.LazyPath,
+    /// The export host archive as Zig wrote it (with cache paths in its
+    /// member names), and as shipped (`tools/ar_normalize.zig`).
+    archive: *std.Build.Step.Compile,
+    shipped_archive: std.Build.LazyPath,
+    /// The game library of a project without Zig scripts.
+    game_empty: *std.Build.Step.Compile,
+    /// The editor library the package ships.
+    release_host: *std.Build.Step.Compile,
+};
+
+/// The export inputs, the release editor library and the shipped SDK of
+/// the packaged target `t`. All are built like an export build builds:
+/// ReleaseSafe, LLVM, no debug information (it would carry this
+/// checkout's paths).
+fn addTargetBuild(
+    b: *std.Build,
+    t: PackagedTarget,
+    godot_path: []const u8,
+    zig_exe: []const u8,
+    stage_tool: *std.Build.Step.Compile,
+    ar_tool: *std.Build.Step.Compile,
+) TargetBuild {
+    const resolved = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = t.triple }) catch
+        std.debug.panic("bad packaged target triple {s}", .{t.triple}));
+    const files = target_key.files(t.key) orelse std.debug.panic("no file names for the packaged target {s}", .{t.key});
+    const sdk = addSdk(b, resolved, .ReleaseSafe, godot_path);
+    const options = sdk.import_table.get("sdk_options").?;
+    const staged_sdk = blk: {
+        const run = b.addRunArtifact(stage_tool);
+        // The output folder is in the build cache and an interrupted run
+        // may have left it half-filled: the tool replaces it.
+        run.addArg("--replace");
+        const out = run.addOutputDirectoryArg("sdk");
+        addStageModules(b, run, sdk);
+        break :blk out;
+    };
+    const archive = addHost(b, resolved, .ReleaseSafe, godot_path, zig_exe, options, .{
+        .export_build = true,
+        .linkage = .static,
+        .use_llvm = true,
+        .strip = true,
+    });
+    // Zig names the archive's member after its path in the build cache,
+    // which holds the cache folder (absolute with an absolute --cache-dir)
+    // and differs per checkout; the shipped archive names it by base name.
+    const shipped_archive = blk: {
+        const run = b.addRunArtifact(ar_tool);
+        run.addArtifactArg(archive);
+        break :blk run.addOutputFileArg(files.host_archive);
+    };
+    // The empty generated root linked with the export host archive.
+    const game_empty = linkedLibrary(b, emptyRootObject(b, resolved, sdk), archive, .{
+        .name = "ziggurat_game_empty",
+        .use_llvm = true,
+        .strip = true,
+    });
+    // The pinned glibc on Linux.
+    const release_host = addHost(b, resolved, .ReleaseSafe, godot_path, zig_exe, options, .{
+        .use_llvm = true,
+        .strip = true,
+    });
+    return .{
+        .key = t.key,
+        .files = files,
+        .sdk = sdk,
+        .staged_sdk = staged_sdk,
+        .archive = archive,
+        .shipped_archive = shipped_archive,
+        .game_empty = game_empty,
+        .release_host = release_host,
+    };
 }
 
 /// The SDK's gdzig dependency. One set of arguments gives one dependency
@@ -1099,6 +1207,8 @@ const ProbeSdks = struct { debug: *std.Build.Module, safe: *std.Build.Module };
 const PackageTests = struct {
     /// The package from two packager runs on the same inputs.
     zips: [2]std.Build.LazyPath,
+    /// The staged SDK of each packaged target, in `packaged_targets` order.
+    staged: [packaged_targets.len]std.Build.LazyPath,
     /// `test-package`, which runs only these tests.
     step: *std.Build.Step,
 };
@@ -1457,7 +1567,10 @@ fn addTestSet(
             const package_options = b.addOptions();
             package_options.addOptionPath("package_zip", zips[0]);
             package_options.addOptionPath("package_zip_again", zips[1]);
-            package_options.addOptionPath("staged_sdk_manifest", staged.?.path(b, "sdk-manifest.json"));
+            for (packaged_targets, pkg.staged) |pt, dir| {
+                const name = std.mem.replaceOwned(u8, b.allocator, pt.key, "-", "_") catch @panic("OOM");
+                package_options.addOptionPath(b.fmt("staged_sdk_{s}", .{name}), dir.path(b, "sdk-manifest.json"));
+            }
             package_options.addOption([]const u8, "zig_exe", zig_exe);
             package_options.addOption([]const u8, "sdk_version", sdk_version);
             package_options.addOption([]const u8, "build_machine_repo", b.root.joinString(b.allocator, "") catch @panic("OOM"));
