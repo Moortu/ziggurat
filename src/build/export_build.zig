@@ -516,11 +516,7 @@ pub const FileOps = struct {
     fn renameFile(io: std.Io, from: []const u8, to: []const u8) anyerror!void {
         // std's rename opens the file for writing too, which Windows
         // refuses while another process has the DLL loaded.
-        if (builtin.os.tag == .windows) {
-            var buf: [4 * std.fs.max_path_bytes]u8 = undefined;
-            var fba: std.heap.FixedBufferAllocator = .init(&buf);
-            return platform.win32.moveFile(fba.allocator(), from, to);
-        }
+        if (builtin.os.tag == .windows) return platform.moveFile(std.heap.page_allocator, from, to);
         const cwd = std.Io.Dir.cwd();
         return cwd.rename(from, cwd, to, io);
     }

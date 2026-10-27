@@ -303,6 +303,16 @@ fn windowsZigGap() !bool {
     return gap;
 }
 
+/// Says which Wine gap a test stops at, then skips it.
+fn gapSkip(cause: []const u8) error{SkipZigTest} {
+    std.debug.print("skipped at a known Wine gap: {s}\n", .{cause});
+    return error.SkipZigTest;
+}
+
+/// The gap's text in the Windows editor's output, for its builds and its
+/// export builds (the compiler's message, passed on by the build service).
+const zig_gap_editor = zig_gap_cache;
+
 /// The Windows Zig's two messages for the gap.
 const zig_gap_load = "unable to load \"std.zig\": Unexpected";
 const zig_gap_cache = "checking cache failed: manifest_create Unexpected";
@@ -315,17 +325,19 @@ test "wine editor builds and runs a script" {
     try p.init(.windows, true);
     defer p.deinit();
     if (try windowsZigGap()) {
-        _ = wine_gaps.e2eGap("wine editor builds and runs a script");
+        const cause = wine_gaps.e2eGap("wine editor builds and runs a script");
         // Up to the gap: the Windows host loads, accepts the Windows Zig
         // (`zig version` runs), prepares the build and starts the
         // compiler, which stops at its cache lock.
         try p.addAutoloadCheck("wine_editor.gd");
         try p.run(true, &.{ "build", "30" }, .{
-            .expect = &.{ "ziggurat_host 0.1.0 ready", "ziggurat: build failed (play, ", "Ziggurat cancelled the run because the Zig build failed" },
+            // The compiler's own gap text: any other zig.exe failure
+            // (argument quoting, a `Z:` path, the SDK roots) fails the test.
+            .expect = &.{ "ziggurat_host 0.1.0 ready", zig_gap_editor, "ziggurat: build failed (play, ", "Ziggurat cancelled the run because the Zig build failed" },
             .reject = &.{ "is not set", "is not usable", "no zig was found", "Preparing the build folder" },
             .exit_code = "1",
         });
-        return error.SkipZigTest;
+        return gapSkip(cause);
     }
     // Play's build in the headless editor (`--build-solutions`), then a
     // game run of the main scene with the staged generation.
@@ -364,18 +376,18 @@ test "linux export from the windows editor" {
     try p.init(.windows, true);
     defer p.deinit();
     if (try windowsZigGap()) {
-        _ = wine_gaps.e2eGap("linux export from the windows editor");
+        const cause = wine_gaps.e2eGap("linux export from the windows editor");
         // Up to the gap: the export finds the Windows Zig and the Linux SDK
         // and starts the export build, which stops at the compiler's cache
         // lock; the export fails cleanly.
         try p.exportWindowsEditor("Linux", "game.x86_64", .{
             .once = &.{export_building},
-            .expect = &.{ "Ziggurat: The Zig build for the export failed", export_incomplete },
+            .expect = &.{ zig_gap_editor, "Ziggurat: The Zig build for the export failed", export_incomplete },
             .reject = &.{ "is not set", "is not usable" },
             .exit_code = "1",
         });
         try testing.expect(!try p.exists("out/libziggurat_game.so"));
-        return error.SkipZigTest;
+        return gapSkip(cause);
     }
     try p.exportWindowsEditor("Linux", "game.x86_64", .{
         .once = &.{export_building},

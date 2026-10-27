@@ -101,7 +101,7 @@ pub fn moveFile(a: std.mem.Allocator, from: []const u8, to: []const u8) MoveErro
     return switch (GetLastError()) {
         2, 3 => error.FileNotFound, // ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
         5 => error.AccessDenied, // ERROR_ACCESS_DENIED
-        32 => error.FileBusy, // ERROR_SHARING_VIOLATION
+        32, 33 => error.FileBusy, // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
         80, 183 => error.PathAlreadyExists, // ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS
         else => error.Unexpected,
     };
