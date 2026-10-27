@@ -7,15 +7,21 @@
 //!
 //! Godot calls every export plugin's `_export_begin` before it writes
 //! anything (the `ExportNotifier` of every export: binary, pack or zip).
-//! For a preset whose features include `linux` and `x86_64` (target key
-//! `x86_64-linux`, `platform.target_key.fromFeatures`) the plugin
-//! first deletes the game library `libRel(key)`, so a library of an
-//! earlier export can never ship (when the delete fails it empties the
-//! file and removes its permissions, so Godot cannot copy it and the
-//! export fails; when that fails too, the error says what the export
-//! ships). A full export also deletes the game library in its output
-//! folder, so a failed export does not leave the previous one's library
-//! next to the new game files. Then:
+//! For a preset whose features include `linux` and `x86_64`, or `windows`
+//! and `x86_64` (target keys `x86_64-linux` and `x86_64-windows`,
+//! `platform.target_key.fromFeatures`) the plugin first deletes the game
+//! library `libRel(key)`, so a library of an earlier export can never ship.
+//! When the delete fails, the rule depends on the editor's OS:
+//!   - Linux: it empties the file and removes its permissions, so Godot
+//!     cannot copy it and the export fails; when that fails too, the error
+//!     says what the export ships;
+//!   - Windows (a DLL another program has open or loaded): it renames the
+//!     file aside to `<name>.old-<16 hex>`, which the next export deletes;
+//!     when the rename fails too, the export fails with
+//!     `export_build.removeOldLibrary`'s sentence and writes nothing.
+//! A full export also deletes the game library in its output folder, so a
+//! failed export does not leave the previous one's library next to the new
+//! game files. Then:
 //!   - with Zig scripts (the build service's scan, which leaves out
 //!     `addons/`), it runs the export build (`export_build.run`, blocking,
 //!     with progress lines). The build uses the Zig and SDK editor builds
@@ -46,8 +52,8 @@
 //! libraries, so it never contains the Zig scripts, and Godot gives an
 //! export plugin no way to stop it. For a project with Zig scripts the
 //! plugin still builds (so errors show) and then sends the error
-//! `pack_message`. A path ending in `zip` is either a pack or a full Linux
-//! export that Godot zips, so `_export_end` decides from the written zip
+//! `pack_message`. A path ending in `zip` is either a pack or a full export
+//! that Godot zips, so `_export_end` decides from the written zip
 //! (`export_build.zipHoldsLibrary`).
 //!
 //! The `.gdextension` names the game library for the `template_debug` and
@@ -81,8 +87,9 @@ const target_key = platform.target_key;
 
 /// The plugin's name (`_get_name`) and its messages' category.
 pub const plugin_name = "Ziggurat";
-/// The error message for a preset that is not Linux x86_64.
-pub const platform_message = "Ziggurat exports Linux x86_64 only in this version";
+/// The error message for a preset whose features name no target Ziggurat
+/// exports to.
+pub const platform_message = "Ziggurat exports Linux x86_64 and Windows x86_64 in this version";
 /// The log line of a debug export with Zig scripts.
 pub const debug_export_line = "Ziggurat: debug export keeps debug information, with this computer's file paths, and is not reproducible. Turn off Export With Debug for a release.";
 /// The folder, relative to the project, that holds one folder per target
@@ -104,7 +111,8 @@ pub fn libRel(key: []const u8) ?[]const u8 {
 pub const incomplete_note = "This export fails: the files in the export's output folder are incomplete.";
 /// The start of the error for a pack export of a project with Zig scripts.
 pub const pack_message = "Ziggurat exports Zig scripts only with a full export: this PCK/ZIP export does not contain them.";
-const pack_text = pack_message ++ " They are compiled into the game library " ++ export_build.lib_file ++ ", and only a full export (Export Project, --export-release or --export-debug) copies it next to the game executable. A game that runs this pack with the game library of an earlier export runs that export's Zig code, and scripts added since do not load. Godot finishes a pack export despite this error. Export the project instead.";
+/// The whole error, with the game library's file name as `{s}`.
+const pack_text = pack_message ++ " They are compiled into the game library {s}, and only a full export (Export Project, --export-release or --export-debug) copies it next to the game executable. A game that runs this pack with the game library of an earlier export runs that export's Zig code, and scripts added since do not load. Godot finishes a pack export despite this error. Export the project instead.";
 /// How long an export waits for an editor build of the same project.
 const lock_timeout_ms = 120_000;
 /// Compile errors listed as messages; the rest are counted.
@@ -189,11 +197,13 @@ fn hasFeature(features: *const PackedStringArray, comptime name: []const u8) boo
 }
 
 /// A `zip` export to check when it ends: the zip's path (absolute or
-/// relative to the working folder) and its modification time before the
-/// export, null when it did not exist.
+/// relative to the working folder), its modification time before the
+/// export (null when it did not exist), and the game library's file name
+/// for the export's target (static).
 const ZipCheck = struct {
     path: []u8,
     before: ?std.Io.Timestamp,
+    lib: []const u8,
 
     fn deinit(c: ZipCheck) void {
         gpa.free(c.path);
@@ -206,7 +216,7 @@ fn exportBegin(self: *ZigExportPlugin, features: *const PackedStringArray, is_de
     // A `Ref` return: the reference is the caller's.
     const plat = self.base.getExportPlatform();
     defer if (plat) |x| editor_build.releaseRef(x);
-    // The preset's target key. Windows presets export from Task 5 on.
+    // The preset's target key.
     var names: [3][]const u8 = undefined;
     var n: usize = 0;
     inline for (.{ "linux", "windows", "x86_64" }) |name| {
@@ -216,10 +226,10 @@ fn exportBegin(self: *ZigExportPlugin, features: *const PackedStringArray, is_de
         }
     }
     const key = target_key.fromFeatures(names[0..n]) orelse "";
-    if (!std.mem.eql(u8, key, target_key.x86_64_linux)) {
+    const game_lib = export_build.libFile(key) orelse {
         (Reporter{ .platform = plat }).err("{s}", .{platform_message});
         return;
-    }
+    };
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -237,12 +247,12 @@ fn exportBegin(self: *ZigExportPlugin, features: *const PackedStringArray, is_de
     if (!has_scripts) return;
     switch (kind) {
         .full => {},
-        .pack => r.err("{s}", .{pack_text}),
+        .pack => r.err(pack_text, .{game_lib}),
         .zip => {
             const io = host_io.get();
             const before: ?std.Io.Timestamp = if (std.Io.Dir.cwd().statFile(io, out_path, .{})) |st| st.mtime else |_| null;
-            const owned = gpa.dupe(u8, out_path) catch return r.err("{s}", .{pack_text});
-            self.zip_check = .{ .path = owned, .before = before };
+            const owned = gpa.dupe(u8, out_path) catch return r.err(pack_text, .{game_lib});
+            self.zip_check = .{ .path = owned, .before = before, .lib = game_lib };
         },
     }
 }
@@ -265,13 +275,13 @@ fn checkZip(self: *ZigExportPlugin, c: ZipCheck) void {
     const io = host_io.get();
     const st = std.Io.Dir.cwd().statFile(io, c.path, .{}) catch return; // nothing written: the export failed
     if (c.before) |b| if (st.mtime.nanoseconds == b.nanoseconds) return; // an earlier export's file
-    const full = export_build.zipHoldsLibrary(io, c.path) catch |err|
+    const full = export_build.zipHoldsLibrary(io, c.path, c.lib) catch |err|
         return r.err("Ziggurat cannot read the ZIP export {s} ({t}), so it cannot tell whether the zip holds the game library. " ++ pack_message ++ " Only a full export holds the Zig scripts.", .{ c.path, err });
-    if (!full) r.err("{s}", .{pack_text});
+    if (!full) r.err(pack_text, .{c.lib});
 }
 
 /// Builds or copies the game library for an export for target key `key`
-/// (one of `target_key.packaged`) to `out_path`. True when the project has
+/// (one `export_build.libFile` knows) to `out_path`. True when the project has
 /// Zig scripts. A debug export
 /// (`is_debug`) builds the library with its debug information
 /// (`export_build.Options.strip` false) and logs `debug_export_line`.
@@ -293,15 +303,31 @@ fn buildGameLibrary(a: Allocator, r: Reporter, key: []const u8, kind: export_bui
     };
     const out: platform.path.OsPath = .fromTrusted(try std.fs.path.join(a, &.{ project, lib_rel }));
 
+    // Libraries an earlier export renamed aside (Windows) and that are no
+    // longer in use.
+    if (std.fs.path.dirname(out.bytes)) |dir| export_build.sweepRenamedLibraries(io, dir, files.game_lib);
     // Never ship an old library: from here on it exists only when this
     // export wrote it.
-    cwd.deleteFile(io, out.bytes) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => {
-            oldLibraryStays(r, out.bytes, err);
-            return false;
+    switch (builtin.os.tag) {
+        .windows => {
+            const old = try export_build.removeOldLibrary(a, io, out.bytes, .{});
+            switch (old) {
+                .gone => {},
+                .renamed => |aside| log("Ziggurat: the game library of an earlier export {s} is in use, so it was renamed to {s}; the next export deletes it.", .{ out.bytes, aside }),
+                .stays => |sentence| {
+                    r.fail("{s}", .{sentence});
+                    return false;
+                },
+            }
         },
-    };
+        else => cwd.deleteFile(io, out.bytes) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => {
+                oldLibraryStays(r, out.bytes, err);
+                return false;
+            },
+        },
+    }
     // Nor leave one next to the new game files when this export fails.
     if (kind == .full and out_path.len != 0) {
         const dir = std.fs.path.dirname(out_path) orelse ".";
@@ -345,7 +371,9 @@ fn buildGameLibrary(a: Allocator, r: Reporter, key: []const u8, kind: export_bui
     }
 
     const archive: platform.path.OsPath = .fromTrusted(try std.fs.path.join(a, &.{ bin, key, files.host_archive }));
-    cwd.access(io, archive.bytes, .{}) catch |err| {
+    // `statFile`, not `access`: folder-relative `access` finds nothing
+    // under Wine.
+    _ = cwd.statFile(io, archive.bytes, .{}) catch |err| {
         r.fail("Ziggurat cannot build the game library for the export: the export host archive {s} is missing ({t}); reinstall the add-on.", .{ archive.bytes, err });
         return true;
     };
@@ -374,6 +402,7 @@ fn buildGameLibrary(a: Allocator, r: Reporter, key: []const u8, kind: export_bui
         .zig = in.zig,
         .project_root = .fromTrusted(project),
         .sdk = in.sdk,
+        .target_key = key,
         .host_archive = archive,
         .out_path = out,
         .cache_dir = in.cache_dir,
@@ -406,24 +435,23 @@ fn buildGameLibrary(a: Allocator, r: Reporter, key: []const u8, kind: export_bui
     return true;
 }
 
-/// An old game library that could not be deleted must not ship. It is
-/// emptied, then all its permissions are removed (that needs ownership,
+/// POSIX: an old game library that could not be deleted must not ship. It
+/// is emptied, then all its permissions are removed (that needs ownership,
 /// not write access to the folder), so Godot's GDExtension export cannot
 /// copy it ("Failed to copy shared object") and the export fails, as on
 /// every other failure path. When the permissions stay, the message says
-/// plainly what this export ships instead.
+/// plainly what this export ships instead. Windows renames the library
+/// aside instead (`export_build.removeOldLibrary`); this function is not
+/// compiled there.
 fn oldLibraryStays(r: Reporter, path: []const u8, err: anyerror) void {
+    comptime std.debug.assert(builtin.os.tag != .windows);
     const io = host_io.get();
     const cwd = std.Io.Dir.cwd();
     const emptied: ?anyerror = if (cwd.createFile(io, path, .{ .truncate = true })) |f| blk: {
         f.close(io);
         break :blk null;
     } else |e| e;
-    // Windows has no permission bits here; its behaviour comes with the
-    // Windows export work.
-    const locked: ?anyerror = if (builtin.os.tag == .windows)
-        error.Unsupported
-    else if (cwd.setFilePermissions(io, path, .fromMode(0), .{})) |_| null else |e| e;
+    const locked: ?anyerror = if (cwd.setFilePermissions(io, path, .fromMode(0), .{})) |_| null else |e| e;
     const head = "Ziggurat cannot delete the game library of an earlier export {s} ({t})";
     if (locked == null) {
         if (emptied == null)

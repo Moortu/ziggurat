@@ -3319,8 +3319,8 @@ const export_out = "out/game.x86_64";
 /// Where the export plugin writes the game library (the `.gdextension`'s
 /// template keys name it).
 const game_lib_rel = ".godot/ziggurat/export/x86_64-linux/libziggurat_game.so";
-/// What the export plugin says for any preset but Linux x86_64.
-const export_platform_message = "Ziggurat exports Linux x86_64 only in this version";
+/// What the export plugin says for a preset without a supported target.
+const export_platform_message = "Ziggurat exports Linux x86_64 and Windows x86_64 in this version";
 /// The plugin's progress line before an export build.
 const export_building = "Ziggurat: building the game library for the export";
 /// The end of every error after which the export fails.
@@ -3661,18 +3661,67 @@ fn removeExportScripts(p: *Project) !void {
     });
 }
 
-test "export: non-Linux preset gives the error message" {
+test "export: features without a supported target give the platform message" {
     try requireTemplates();
     var p: Project = undefined;
     try initExport(&p, null);
     defer p.deinit();
     const a = p.arena_state.allocator();
-    // A pack export needs no template.
-    try p.run(&.{ "export-pack", "Windows", try std.fs.path.join(a, &.{ p.path, "out/game.pck" }) }, .{
+    // `linux` + `arm64`: no target key. A pack export needs no template.
+    try p.run(&.{ "export-pack", "Linux arm64", try std.fs.path.join(a, &.{ p.path, "out/game.pck" }) }, .{
         .once = &.{"Ziggurat: " ++ export_platform_message},
         .reject = &.{export_building},
         .deadline = export_deadline_s,
     });
+}
+
+/// Where a Windows export writes the game library in the project.
+const windows_game_lib_rel = ".godot/ziggurat/export/x86_64-windows/ziggurat_game.dll";
+
+/// Reads the exported `out/ziggurat_game.dll` and checks it as an export
+/// build checks its output: it exports only `ziggurat_host_init` and
+/// imports no `LoadLibrary*` or `GetProcAddress`.
+fn expectWindowsGameLibrary(p: *Project) !void {
+    const a = p.arena_state.allocator();
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ p.path, "out", "ziggurat_game.dll" }), a, .limited(1 << 30));
+    var why: [256]u8 = undefined;
+    if (try zbuild.export_build.checkLibrary(a, .pe, bytes, &why)) |sentence| {
+        std.debug.print("the exported game DLL: {s}\n", .{sentence});
+        return error.WindowsGameLibraryRefused;
+    }
+    const ex = try platform.pe.exports(a, bytes);
+    try testing.expectEqual(@as(usize, 1), ex.len);
+    try testing.expectEqualStrings("ziggurat_host_init", ex[0]);
+}
+
+test "export: windows export from the linux editor" {
+    try requireTemplates();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var p: Project = undefined;
+    // The release package holds the Windows export archive, the empty
+    // game DLL and the Windows SDK (sdk/x86_64-windows/), which an export
+    // for another target than the editor's always uses.
+    try initInstalled(&p);
+    defer p.deinit();
+    const a = p.arena_state.allocator();
+    const exe = try std.fs.path.join(a, &.{ p.path, "out/game.exe" });
+    // A debug export first: the same log line as on Linux.
+    try p.run(&.{ "export-debug", "Windows", exe }, .{
+        .once = &.{ export_building, export_debug_line },
+        .reject = &.{ "ERROR:", "is not set", "is not usable" },
+        .deadline = export_deadline_s,
+    });
+    for ([_][]const u8{ "out/game.exe", "out/game.pck", "out/ziggurat_game.dll", windows_game_lib_rel }) |f| try testing.expect(try projectFileExists(&p, f));
+    try expectWindowsGameLibrary(&p);
+    // Then a release export, without that line.
+    try p.run(&.{ "export", "Windows", exe }, .{
+        .once = &.{export_building},
+        .reject = &.{ "ERROR:", export_debug_line, "is not set", "is not usable" },
+        .deadline = export_deadline_s,
+    });
+    for ([_][]const u8{ "out/game.exe", "out/game.pck", "out/ziggurat_game.dll" }) |f| try testing.expect(try projectFileExists(&p, f));
+    try testing.expect(!try projectFileExists(&p, "out/libziggurat_game.so"));
+    try expectWindowsGameLibrary(&p);
 }
 
 /// The start of the error for a pack export of a project with Zig scripts.
@@ -3726,7 +3775,7 @@ test "export: full ZIP export holds the game library" {
         .reject = &.{ "ERROR:", export_pack_message },
         .deadline = export_deadline_s,
     });
-    try testing.expect(try zbuild.export_build.zipHoldsLibrary(io, try std.fs.path.join(a, &.{ p.path, "out/game.zip" })));
+    try testing.expect(try zbuild.export_build.zipHoldsLibrary(io, try std.fs.path.join(a, &.{ p.path, "out/game.zip" }), "libziggurat_game.so"));
 }
 
 test "export: pack export without Zig scripts is unaffected" {
@@ -3865,7 +3914,7 @@ test "export: project without Zig scripts exports" {
     const a = p.arena_state.allocator();
     const empty = try Io.Dir.cwd().readFileAlloc(io, opts.game_empty_lib, a, .limited(1 << 30));
     var why: [256]u8 = undefined;
-    if (try zbuild.export_build.checkLibrary(a, empty, &why)) |sentence| {
+    if (try zbuild.export_build.checkLibrary(a, .elf, empty, &why)) |sentence| {
         std.debug.print("the empty game library: {s}\n", .{sentence});
         return error.EmptyGameLibraryRefused;
     }

@@ -882,7 +882,9 @@ fn linkedFixtureObject(
 
 /// The empty generated root (src/build/empty_root.zig) compiled on its own
 /// into an object with the SDK `sdk`, as an export build compiles a
-/// project's root: ReleaseSafe, LLVM, no debug information.
+/// project's root: ReleaseSafe, LLVM, no debug information. For Windows it
+/// is the root with hidden entry points (`empty_root.hidden_text`), as a
+/// Windows export build writes it.
 fn emptyRootObject(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -893,7 +895,7 @@ fn emptyRootObject(
         .name = "empty_root",
         .use_llvm = true,
         .root_module = b.createModule(.{
-            .root_source_file = files.add(".ziggurat_root.zig", empty_root.text),
+            .root_source_file = files.add(".ziggurat_root.zig", if (target.result.os.tag == .windows) empty_root.hidden_text else empty_root.text),
             .target = target,
             .optimize = .ReleaseSafe,
             .link_libc = true,
@@ -916,7 +918,11 @@ const LinkedOptions = struct {
 /// the SDK) and the export host archive (`addHost` with `export_build` and
 /// `.static`): the host's extern `ziggurat_describe` and `ziggurat_init`
 /// resolve to the module's, so nothing is loaded at run time. Godot's
-/// entry `ziggurat_host_init` is the only symbol the library exports.
+/// entry `ziggurat_host_init` is the only symbol the library exports: a
+/// version script says so on ELF, a module-definition file on Windows
+/// (`export_build.module_definition`; without it the COFF linker also
+/// exports the MinGW runtime's `_CRT_INIT`, `__mingw_module_is_dll` and
+/// `atexit`).
 fn linkedLibrary(
     b: *std.Build,
     module_object: *std.Build.Step.Compile,
@@ -924,10 +930,13 @@ fn linkedLibrary(
     o: LinkedOptions,
 ) *std.Build.Step.Compile {
     const mod = module_object.root_module;
+    const is_windows = mod.resolved_target.?.result.os.tag == .windows;
+    const files = b.addWriteFiles();
     const lib = b.addLibrary(.{
         .linkage = .dynamic,
         .name = o.name,
         .use_llvm = o.use_llvm,
+        .win32_module_definition = if (is_windows) files.add("exports.def", "EXPORTS\n    ziggurat_host_init\n") else null,
         .root_module = b.createModule(.{
             .target = mod.resolved_target,
             .optimize = mod.optimize,
@@ -942,8 +951,7 @@ fn linkedLibrary(
     lib.forceUndefinedSymbol("ziggurat_host_init");
     // The module's `ziggurat_describe` and `ziggurat_init` resolve inside
     // the library and are not exported.
-    const files = b.addWriteFiles();
-    lib.setVersionScript(files.add("exports.map", "{ global: ziggurat_host_init; local: *; };\n"));
+    if (!is_windows) lib.setVersionScript(files.add("exports.map", "{ global: ziggurat_host_init; local: *; };\n"));
     return lib;
 }
 

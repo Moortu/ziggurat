@@ -192,6 +192,16 @@ fn argAfter(argv: []const []const u8, flag: []const u8) ?[]const u8 {
     return null;
 }
 
+/// The OS the library is built for: the first `-target` in `argv` (an
+/// export build cross-compiles, for example a Windows DLL from a Linux
+/// editor), else this host's. A `-target` that does not parse counts as
+/// this host's; the compiler then refuses it itself.
+fn outputOs(argv: []const []const u8) std.Target.Os.Tag {
+    const triple = argAfter(argv, "-target") orelse return builtin.os.tag;
+    const q = std.Target.Query.parse(.{ .arch_os_abi = triple }) catch return builtin.os.tag;
+    return q.os_tag orelse builtin.os.tag;
+}
+
 /// File name of the dynamic library `zig build-lib -dynamic --name <name>` writes.
 fn libFileName(a: std.mem.Allocator, os: std.Target.Os.Tag, name: []const u8) ![]const u8 {
     return switch (os) {
@@ -219,7 +229,7 @@ pub const Session = struct {
         errdefer a.destroy(st);
         const cache_copy = try a.dupe(u8, cache_dir);
         errdefer a.free(cache_copy);
-        const lib_file = try libFileName(a, builtin.os.tag, name);
+        const lib_file = try libFileName(a, outputOs(argv), name);
         errdefer a.free(lib_file);
 
         st.* = .{
@@ -412,6 +422,28 @@ const digest_script =
     \\printf '\001\000\000\000\010\000\000\000\000\000\000\000\000\000\000\000'
     \\cat >/dev/null
 ;
+
+test "the output file name follows -target" {
+    const a = testing.allocator;
+    const cases = [_]struct { argv: []const []const u8, want: []const u8 }{
+        .{ .argv = &.{ "zig", "build-lib", "--name", "g", "-target", "x86_64-windows-gnu", "-Mroot=r.zig" }, .want = "g.dll" },
+        .{ .argv = &.{ "zig", "build-lib", "--name", "g", "-target", "x86_64-linux-gnu.2.28", "-Mroot=r.zig" }, .want = "libg.so" },
+        .{ .argv = &.{ "zig", "build-lib", "--name", "g", "-target", "aarch64-macos", "-Mroot=r.zig" }, .want = "libg.dylib" },
+    };
+    for (cases) |c| {
+        const got = try libFileName(a, outputOs(c.argv), "g");
+        defer a.free(got);
+        try testing.expectEqualStrings(c.want, got);
+    }
+    // No `-target`, or one that does not parse: this host's name.
+    const host = try libFileName(a, builtin.os.tag, "g");
+    defer a.free(host);
+    for ([_][]const []const u8{ &.{ "zig", "build-lib", "--name", "g" }, &.{ "zig", "-target", "not a triple", "x" } }) |argv| {
+        const got = try libFileName(a, outputOs(argv), "g");
+        defer a.free(got);
+        try testing.expectEqualStrings(host, got);
+    }
+}
 
 test "emit_digest gives the output path" {
     if (is_windows) return error.SkipZigTest;

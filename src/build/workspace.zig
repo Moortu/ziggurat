@@ -37,6 +37,8 @@ pub const PrepareOptions = struct {
     lock_timeout_ms: u32 = 30000,
     /// The build id written into the generated root; null: the scan's id.
     build_id: ?[]const u8 = null,
+    /// `rootgen.RootOptions.hidden_exports`: a Windows export build.
+    hidden_exports: bool = false,
 };
 
 /// Godot's entry point in the export host archive: the one symbol an
@@ -48,17 +50,26 @@ pub const entry_symbol = "ziggurat_host_init";
 pub const ExportLink = struct {
     /// `-target` value for every module, e.g. `platform.pins.export_target`.
     target: []const u8,
-    /// The export host archive (`libziggurat_host_export.a`).
+    /// The object format of `target`.
+    format: Format = .elf,
+    /// The export host archive (`libziggurat_host_export.a`, or
+    /// `ziggurat_host_export.lib` on Windows).
     host_archive: OsPath,
-    /// A linker version script that exports only `ziggurat_host_init`.
-    version_script: OsPath,
-    /// Library name: the compiler writes `lib<name>.so`.
+    /// The file that limits the exports to `ziggurat_host_init`: a linker
+    /// version script for ELF (`--version-script`), a module-definition
+    /// file (`.def`, given as an input) for PE.
+    exports_file: OsPath,
+    /// Library name: the compiler writes `lib<name>.so` (ELF) or
+    /// `<name>.dll` (PE).
     name: []const u8,
     /// `-fstrip`: no debug information, so the bytes do not depend on the
     /// project's folder. False gives `-fno-strip` (a debug export): the
     /// library keeps its debug information, with absolute paths.
     strip: bool = true,
 };
+
+/// The object format of an export target.
+pub const Format = enum { elf, pe };
 
 pub const Workspace = struct {
     cache_dir: OsPath,
@@ -128,8 +139,15 @@ pub const Workspace = struct {
         try push(a, &out, "-lc", .{});
         try push(a, &out, "-fllvm", .{});
         try self.pushOutput(a, &out, link.name);
-        try push(a, &out, "--version-script", .{});
-        try push(a, &out, "{s}", .{link.version_script.bytes});
+        switch (link.format) {
+            .elf => {
+                try push(a, &out, "--version-script", .{});
+                try push(a, &out, "{s}", .{link.exports_file.bytes});
+            },
+            // The compiler takes a `.def` file as an input and hands it to
+            // the COFF linker; there is no version script on PE.
+            .pe => try push(a, &out, "{s}", .{link.exports_file.bytes}),
+        }
         // Nothing in the scripts refers to Godot's entry point, so the
         // archive member that defines it is pulled in by name.
         try push(a, &out, "--force_undefined", .{});
@@ -321,7 +339,7 @@ pub fn prepareIn(
     };
     errdefer lock.release();
 
-    const root_text = try rootgen.generateRoot(a, os, scan.scripts, opts.build_id orelse &scan.build_id);
+    const root_text = try rootgen.generateRootWith(a, os, scan.scripts, opts.build_id orelse &scan.build_id, .{ .hidden_exports = opts.hidden_exports });
     defer a.free(root_text);
 
     var mirrored = false;
@@ -712,7 +730,7 @@ test "export argv golden" {
     const got = try ws.exportArgv(arena, dummyZig(), .{
         .target = "x86_64-linux-gnu.2.28",
         .host_archive = .fromTrusted("/a/libziggurat_host_export.a"),
-        .version_script = .fromTrusted("/c/projects/p/build/export.map"),
+        .exports_file = .fromTrusted("/c/projects/p/build/export.map"),
         .name = "ziggurat_game",
     });
     const want: []const []const u8 = &.{
@@ -732,7 +750,7 @@ test "export argv golden" {
     const debug = try ws.exportArgv(arena, dummyZig(), .{
         .target = "x86_64-linux-gnu.2.28",
         .host_archive = .fromTrusted("/a/libziggurat_host_export.a"),
-        .version_script = .fromTrusted("/c/projects/p/build/export.map"),
+        .exports_file = .fromTrusted("/c/projects/p/build/export.map"),
         .name = "ziggurat_game",
         .strip = false,
     });
@@ -745,6 +763,42 @@ test "export argv golden" {
         } else try testing.expectEqualStrings(w, d);
     }
     try testing.expectEqual(@as(usize, 3), no_strip);
+}
+
+test "export argv golden for a Windows DLL" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const deps = [_]ModuleDep{
+        .{ .name = "ziggurat", .root = .fromTrusted("/sdk/ziggurat.zig"), .deps = &.{} },
+    };
+    const ws: Workspace = .{
+        .cache_dir = .fromTrusted("/c/projects/p"),
+        .build_dir = .fromTrusted("/c/projects/p/build"),
+        .source_root = .fromTrusted("/proj"),
+        .mirrored = false,
+        .os = .linux,
+        .sdk = &deps,
+        .lock = undefined,
+    };
+    // No version script: a module-definition file, given as an input.
+    const got = try ws.exportArgv(arena, dummyZig(), .{
+        .target = "x86_64-windows-gnu",
+        .format = .pe,
+        .host_archive = .fromTrusted("/a/ziggurat_host_export.lib"),
+        .exports_file = .fromTrusted("/c/projects/p/build/export.def"),
+        .name = "ziggurat_game",
+    });
+    const want: []const []const u8 = &.{
+        "/opt/zig/zig",                    "build-lib",         "-dynamic",           "-lc",                         "-fllvm",
+        "--name",                          "ziggurat_game",     "--cache-dir",        "/c/projects/p/zig-cache",     "--listen=-",
+        "/c/projects/p/build/export.def",  "--force_undefined", "ziggurat_host_init", "/a/ziggurat_host_export.lib", "-target",
+        "x86_64-windows-gnu",              "-OReleaseSafe",     "-fstrip",            "--dep",                       "ziggurat",
+        "-Mroot=/proj/.ziggurat_root.zig", "-target",           "x86_64-windows-gnu", "-OReleaseSafe",               "-fstrip",
+        "-Mziggurat=/sdk/ziggurat.zig",
+    };
+    try expectArgv(want, got);
+    for (got) |arg| try testing.expect(!std.mem.eql(u8, arg, "--version-script"));
 }
 
 test "prepare writes the given build id" {
