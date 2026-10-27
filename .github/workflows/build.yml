@@ -1,0 +1,133 @@
+# Builds the release package on every push and pull request. A pushed tag
+# `v*` also publishes a GitHub release with the package and its SHA-256.
+# The release notes come from docs/releases/<tag>.md.
+#
+# The full test suite (`zig build test`) needs Godot's export templates,
+# Wine and the Windows and macOS inputs, and takes about 20 minutes; it is
+# run locally (docs/testing.md). Here: formatting, the unit tests and the
+# package.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: "0.17.0"
+  # Zig's published minisign public key.
+  ZIG_MINISIGN_KEY: "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
+  GODOT_VERSION: "4.7.2-stable"
+  GODOT_ZIP: "Godot_v4.7.2-stable_linux.x86_64.zip"
+  # From SHA512-SUMS.txt of the official 4.7.2-stable release
+  # (github.com/godotengine/godot/releases/tag/4.7.2-stable).
+  GODOT_SHA512: "9aa00f7a605200940bce3027a567b782f49bd8e940dd06ae9e987bd65aee1b1467edd56ed84fcdcbdd44354bf613bdbb4e5d2913e925850368e150c59ed54c65"
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign xz-utils unzip \
+            libx11-6 libxcursor1 libxinerama1 libxrandr2 libxi6 libgl1 libfontconfig1
+
+      # ThreadSanitizer (in test-unit) cannot map its shadow memory with the
+      # runner kernel's default of 32 random mmap bits.
+      - name: Allow ThreadSanitizer
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Download and verify Zig
+        run: |
+          set -eu
+          file="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl -fsSLO "https://ziglang.org/download/${ZIG_VERSION}/${file}"
+          curl -fsSLO "https://ziglang.org/download/${ZIG_VERSION}/${file}.minisig"
+          minisign -Vm "$file" -P "$ZIG_MINISIGN_KEY"
+          mkdir -p "$HOME/zig"
+          tar -xJf "$file" -C "$HOME/zig" --strip-components=1
+          rm "$file" "$file.minisig"
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+
+      - name: Download and verify Godot
+        run: |
+          set -eu
+          curl -fsSLO "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/${GODOT_ZIP}"
+          echo "${GODOT_SHA512}  ${GODOT_ZIP}" | sha512sum -c -
+          mkdir -p "$HOME/godot"
+          unzip -o -q "$GODOT_ZIP" -d "$HOME/godot"
+          rm "$GODOT_ZIP"
+          chmod 755 "$HOME/godot/Godot_v${GODOT_VERSION}_linux.x86_64"
+          echo "GODOT_BIN=$HOME/godot/Godot_v${GODOT_VERSION}_linux.x86_64" >> "$GITHUB_ENV"
+
+      - name: Check formatting
+        run: zig fmt --check src test sdk tools build.zig
+
+      - name: Unit tests
+        run: zig build test-unit --summary all -Dgodot-path="$GODOT_BIN"
+
+      - name: Build the package
+        run: |
+          set -eu
+          zig build package --summary all -Dgodot-path="$GODOT_BIN"
+          cd zig-out
+          sha256sum ziggurat-*.zip | tee SHA256SUMS
+
+      - name: Upload the package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ziggurat-package
+          path: |
+            zig-out/ziggurat-*.zip
+            zig-out/SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Download the package
+        uses: actions/download-artifact@v4
+        with:
+          name: ziggurat-package
+          path: dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          notes="docs/releases/${TAG}.md"
+          if [ ! -f "$notes" ]; then
+            echo "Missing release notes: $notes" >&2
+            exit 1
+          fi
+          {
+            cat "$notes"
+            echo
+            echo "## SHA-256"
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } > notes.md
+          prerelease=""
+          case "$TAG" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$TAG" dist/ziggurat-*.zip dist/SHA256SUMS \
+            --title "Ziggurat ${TAG#v}" --notes-file notes.md $prerelease
