@@ -3320,7 +3320,7 @@ const export_out = "out/game.x86_64";
 /// template keys name it).
 const game_lib_rel = ".godot/ziggurat/export/x86_64-linux/libziggurat_game.so";
 /// What the export plugin says for a preset without a supported target.
-const export_platform_message = "Ziggurat exports Linux x86_64 and Windows x86_64 in this version";
+const export_platform_message = "Ziggurat exports Linux x86_64, Windows x86_64 and macOS (universal) in this version";
 /// The plugin's progress line before an export build.
 const export_building = "Ziggurat: building the game library for the export";
 /// The end of every error after which the export fails.
@@ -3771,6 +3771,270 @@ test "export: windows export from the linux editor" {
     for ([_][]const u8{ "out/game.exe", "out/game.pck", "out/ziggurat_game.dll" }) |f| try testing.expect(try projectFileExists(&p, f));
     try testing.expect(!try projectFileExists(&p, "out/libziggurat_game.so"));
     try expectWindowsGameLibrary(&p);
+}
+
+/// Where a macOS export writes the universal game library in the project.
+const macos_game_lib_rel = ".godot/ziggurat/export/universal-macos/libziggurat_game.dylib";
+/// The app bundle Godot's macOS export writes: the project name
+/// (`application/config/name`) and `.app`.
+const macos_app_name = "ziggurat-host-test-export.app";
+/// Where Godot's macOS export puts a GDExtension library in the app.
+const macos_app_lib = "Contents/Frameworks/libziggurat_game.dylib";
+
+/// Skips the test unless `-Dexport-templates` is set and the host is
+/// x86_64 Linux (the macOS inputs are built only there).
+fn requireMacosExport() !void {
+    try requireTemplates();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    if (opts.macos_game_empty.len == 0) return error.SkipZigTest;
+}
+
+/// The export fixture (`initExport`) with the macOS export inputs where the
+/// release package puts them: each arch's export host archive in
+/// `addons/ziggurat/bin/<arch>-macos/`, the universal empty game library
+/// in `addons/ziggurat/bin/universal-macos/`, and each arch's SDK in
+/// `addons/ziggurat/sdk/<arch>-macos/`.
+fn initMacosExport(p: *Project) !void {
+    try initExport(p, null);
+    errdefer p.deinit();
+    const a = p.arena_state.allocator();
+    const cwd = Io.Dir.cwd();
+    var dir = try cwd.openDir(io, p.path, .{});
+    defer dir.close(io);
+    const inputs = [_]struct { key: []const u8, manifest: []const u8, archive: []const u8 }{
+        .{ .key = "aarch64-macos", .manifest = opts.macos_sdk_manifest_aarch64, .archive = opts.macos_host_archive_aarch64 },
+        .{ .key = "x86_64-macos", .manifest = opts.macos_sdk_manifest_x86_64, .archive = opts.macos_host_archive_x86_64 },
+    };
+    for (inputs) |in| {
+        const bin = try std.fmt.allocPrint(a, "addons/ziggurat/bin/{s}", .{in.key});
+        try dir.createDirPath(io, bin);
+        try cwd.copyFile(in.archive, dir, try std.fmt.allocPrint(a, "{s}/libziggurat_host_export.a", .{bin}), io, .{});
+        const sdk = try std.fmt.allocPrint(a, "addons/ziggurat/sdk/{s}", .{in.key});
+        try dir.createDirPath(io, sdk);
+        var dst = try dir.openDir(io, sdk, .{});
+        defer dst.close(io);
+        var src = try cwd.openDir(io, std.fs.path.dirname(in.manifest).?, .{ .iterate = true });
+        defer src.close(io);
+        try copyTree(a, src, dst);
+    }
+    try dir.createDirPath(io, "addons/ziggurat/bin/universal-macos");
+    try cwd.copyFile(opts.macos_game_empty, dir, "addons/ziggurat/bin/universal-macos/libziggurat_game_empty.dylib", io, .{});
+}
+
+/// Checks a macOS game library as the export build checks its output: a
+/// universal file (x86_64 and arm64) whose slices export only
+/// `_ziggurat_host_init` (and the linker's two symbols), import symbols
+/// but not `_dlopen`, and are built for macOS 11.0. Returns the slices
+/// (allocated with `a`).
+fn expectMacosGameLibrary(a: std.mem.Allocator, bytes: []const u8) ![]platform.macho.Slice {
+    var why: [256]u8 = undefined;
+    if (try zbuild.export_build.checkUniversal(a, bytes, &why)) |sentence| {
+        std.debug.print("the macOS game library: {s}\n", .{sentence});
+        return error.MacosGameLibraryRefused;
+    }
+    const sl = try platform.macho.slices(a, bytes);
+    try testing.expectEqual(@as(usize, 2), sl.len);
+    for (sl) |s| {
+        const slice = bytes[@intCast(s.offset)..][0..@intCast(s.size)];
+        const im = try platform.macho.imports(a, slice);
+        // An empty list would make the `_dlopen` check below pass for nothing.
+        try testing.expect(im.len > 0);
+        for (im) |name| try testing.expect(!std.mem.eql(u8, name, "_dlopen"));
+        try testing.expectEqual(std.SemanticVersion{ .major = 11, .minor = 0, .patch = 0 }, platform.macho.minOs(slice).?);
+    }
+    return sl;
+}
+
+/// Exports the macOS preset `preset` (release) to `out/<rel>` and checks
+/// the game library in the zip it wrote: `<app>/Contents/Frameworks/`
+/// holds the universal library, as Godot copied and signed it.
+fn exportMacos(p: *Project, preset: []const u8, rel: []const u8) !void {
+    const a = p.arena_state.allocator();
+    const zip = try std.fs.path.join(a, &.{ p.path, "out", rel });
+    try p.run(&.{ "export", preset, zip }, .{
+        .once = &.{export_building},
+        .reject = &.{ "ERROR:", export_pack_message, export_platform_message },
+        .deadline = export_deadline_s,
+    });
+    // The library the export built: universal, whatever the preset's arch.
+    const built = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ p.path, macos_game_lib_rel }), a, .limited(1 << 30));
+    _ = try expectMacosGameLibrary(a, built);
+    try testing.expect(try zbuild.export_build.zipHoldsLibrary(io, zip, macos_app_lib));
+    // The copy in the app, unpacked from the zip.
+    const unzipped = try std.fs.path.join(a, &.{ p.path, "out", "unzipped" });
+    try Io.Dir.cwd().createDirPath(io, unzipped);
+    {
+        var dst = try Io.Dir.cwd().openDir(io, unzipped, .{});
+        defer dst.close(io);
+        var f = try Io.Dir.cwd().openFile(io, zip, .{});
+        defer f.close(io);
+        var buf: [64 * 1024]u8 = undefined;
+        var reader = f.reader(io, &buf);
+        try std.zip.extract(dst, &reader, .{});
+    }
+    const shipped = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ unzipped, macos_app_name, macos_app_lib }), a, .limited(1 << 30));
+    try expectShippedMacosLibrary(a, built, shipped);
+}
+
+/// The library Godot shipped in the app (`shipped`) against the one the
+/// export built (`built`). Godot's built-in ad-hoc signing
+/// (`codesign/codesign = 1`, `CodeSign::_codesign_file`) splits a universal
+/// file, signs every slice again (it adds a signature to the unsigned
+/// x86_64 slice and replaces the arm64 slice's linker signature) and joins
+/// them again with its own alignment (`LipO::create_file`). So the shipped
+/// file differs from the built one, and both its slices are signed; it
+/// still passes the export checks.
+fn expectShippedMacosLibrary(a: std.mem.Allocator, built: []const u8, shipped: []const u8) !void {
+    const bsl = try platform.macho.slices(a, built);
+    try testing.expectEqual(@as(usize, 2), bsl.len);
+    for (bsl) |s| {
+        const slice = built[@intCast(s.offset)..][0..@intCast(s.size)];
+        // As Zig's linker wrote them: arm64 signed, x86_64 not.
+        try testing.expectEqual(s.cpu == .arm64, platform.macho.codeSignature(slice) != null);
+    }
+    const sl = try expectMacosGameLibrary(a, shipped);
+    try testing.expect(!std.mem.eql(u8, built, shipped));
+    for (bsl, sl) |b, s| {
+        try testing.expectEqual(b.cpu, s.cpu);
+        const slice = shipped[@intCast(s.offset)..][0..@intCast(s.size)];
+        try testing.expect(platform.macho.codeSignature(slice) != null);
+    }
+}
+
+test "export: macos universal preset" {
+    try requireMacosExport();
+    var p: Project = undefined;
+    try initMacosExport(&p);
+    defer p.deinit();
+    try exportMacos(&p, "macOS", "game.zip");
+    // An `.app` export: Godot writes the bundle folder itself.
+    const a = p.arena_state.allocator();
+    try p.run(&.{ "export", "macOS", try std.fs.path.join(a, &.{ p.path, "out/game.app" }) }, .{
+        .once = &.{export_building},
+        .reject = &.{ "ERROR:", export_pack_message },
+        .deadline = export_deadline_s,
+    });
+    const built = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ p.path, macos_game_lib_rel }), a, .limited(1 << 30));
+    const shipped = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ p.path, "out/game.app", macos_app_lib }), a, .limited(1 << 30));
+    try expectShippedMacosLibrary(a, built, shipped);
+}
+
+/// Godot 4.7.2's official `macos.zip` holds only universal game binaries
+/// (`godot_macos_{debug,release}.universal`), and a preset whose
+/// `binary_format/architecture` is `arm64` asks for
+/// `godot_macos_release.arm64` ("Requested template binary ... not
+/// found"). Writes a custom template into the test's folder: `macos.zip`'s
+/// files, with the arm64 slice of the universal release binary under that
+/// name, and points the "macOS arm64" preset at it.
+fn useArm64MacosTemplate(p: *Project) !void {
+    const a = p.arena_state.allocator();
+    const cwd = Io.Dir.cwd();
+    try p.tmp.dir.createDirPath(io, "macos-template");
+    var tpl = try p.tmp.dir.openDir(io, "macos-template", .{ .iterate = true });
+    defer tpl.close(io);
+    {
+        var f = try cwd.openFile(io, try std.fs.path.join(a, &.{ opts.export_templates, "macos.zip" }), .{});
+        defer f.close(io);
+        var buf: [64 * 1024]u8 = undefined;
+        var reader = f.reader(io, &buf);
+        try std.zip.extract(tpl, &reader, .{});
+    }
+    const bin_dir = "macos_template.app/Contents/MacOS/";
+    const universal = try tpl.readFileAlloc(io, bin_dir ++ "godot_macos_release.universal", a, .limited(1 << 30));
+    const sl = try platform.macho.slices(a, universal);
+    const arm = for (sl) |s| {
+        if (s.cpu == .arm64) break s;
+    } else return error.NoArm64Slice;
+    try tpl.writeFile(io, .{ .sub_path = bin_dir ++ "godot_macos_release.arm64", .data = universal[@intCast(arm.offset)..][0..@intCast(arm.size)] });
+    try tpl.deleteFile(io, bin_dir ++ "godot_macos_release.universal");
+    try tpl.deleteFile(io, bin_dir ++ "godot_macos_debug.universal");
+    const zip_path = try std.fs.path.join(a, &.{ try p.tmp.dir.realPathFileAlloc(io, ".", a), "macos_arm64.zip" });
+    try writeStoredZip(a, tpl, zip_path);
+    var dir = try cwd.openDir(io, p.path, .{});
+    defer dir.close(io);
+    const presets = try dir.readFileAlloc(io, "export_presets.cfg", a, .limited(64 * 1024));
+    try dir.writeFile(io, .{ .sub_path = "export_presets.cfg", .data = try std.mem.replaceOwned(u8, a, presets, "@MACOS_ARM64_TEMPLATE@", zip_path) });
+}
+
+/// Writes every file below `dir` into a new zip at `path`, stored
+/// (uncompressed), in walk order.
+fn writeStoredZip(a: std.mem.Allocator, dir: Io.Dir, path: []const u8) !void {
+    var out: std.ArrayList(u8) = .empty;
+    var central: std.ArrayList(u8) = .empty;
+    var count: u16 = 0;
+    var walker = try dir.walk(a);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const data = try dir.readFileAlloc(io, entry.path, a, .limited(1 << 30));
+        const crc = std.hash.Crc32.hash(data);
+        const offset: u32 = @intCast(out.items.len);
+        // Version 2.0, no flags, stored, 1980-01-01 00:00.
+        const common = [_]u16{ 20, 0, 0, 0, 0x21 };
+        try out.appendSlice(a, "PK\x03\x04");
+        for (common) |v| try appendLe(a, &out, u16, v);
+        for ([_]u32{ crc, @intCast(data.len), @intCast(data.len) }) |v| try appendLe(a, &out, u32, v);
+        try appendLe(a, &out, u16, @intCast(entry.path.len));
+        try appendLe(a, &out, u16, 0);
+        try out.appendSlice(a, entry.path);
+        try out.appendSlice(a, data);
+        try central.appendSlice(a, "PK\x01\x02");
+        try appendLe(a, &central, u16, (3 << 8) | 20);
+        for (common) |v| try appendLe(a, &central, u16, v);
+        for ([_]u32{ crc, @intCast(data.len), @intCast(data.len) }) |v| try appendLe(a, &central, u32, v);
+        // Name, extra and comment lengths, disk, internal attributes.
+        for ([_]u16{ @intCast(entry.path.len), 0, 0, 0, 0 }) |v| try appendLe(a, &central, u16, v);
+        try appendLe(a, &central, u32, 0o100644 << 16);
+        try appendLe(a, &central, u32, offset);
+        try central.appendSlice(a, entry.path);
+        count += 1;
+    }
+    const cd_start: u32 = @intCast(out.items.len);
+    try out.appendSlice(a, central.items);
+    try out.appendSlice(a, "PK\x05\x06");
+    for ([_]u16{ 0, 0, count, count }) |v| try appendLe(a, &out, u16, v);
+    try appendLe(a, &out, u32, @intCast(central.items.len));
+    try appendLe(a, &out, u32, cd_start);
+    try appendLe(a, &out, u16, 0);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
+}
+
+fn appendLe(a: std.mem.Allocator, out: *std.ArrayList(u8), comptime T: type, v: T) !void {
+    var b: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &b, v, .little);
+    try out.appendSlice(a, &b);
+}
+
+test "export: macos arm64 preset" {
+    try requireMacosExport();
+    var p: Project = undefined;
+    try initMacosExport(&p);
+    defer p.deinit();
+    try useArm64MacosTemplate(&p);
+    // `binary_format/architecture = "arm64"`: still the universal library.
+    try exportMacos(&p, "macOS arm64", "game.zip");
+}
+
+test "export: macos pack-only export fails with the full-export message" {
+    try requireMacosExport();
+    var p: Project = undefined;
+    try initMacosExport(&p);
+    defer p.deinit();
+    const a = p.arena_state.allocator();
+    // A `.zip` pack: the build runs, then the zip has no app library.
+    try p.run(&.{ "export-pack", "macOS", try std.fs.path.join(a, &.{ p.path, "out/game.zip" }) }, .{
+        .once = &.{ export_building, export_pack_message },
+        .reject = &.{export_platform_message},
+        .deadline = export_deadline_s,
+    });
+    try testing.expect(try projectFileExists(&p, "out/game.zip"));
+    try testing.expect(!try zbuild.export_build.zipHoldsLibrary(io, try std.fs.path.join(a, &.{ p.path, "out/game.zip" }), macos_app_lib));
+    // A `.pck` pack says so at once.
+    try p.run(&.{ "export-pack", "macOS", try std.fs.path.join(a, &.{ p.path, "out/game.pck" }) }, .{
+        .once = &.{ export_building, export_pack_message },
+        .reject = &.{ export_platform_message, export_incomplete },
+        .deadline = export_deadline_s,
+    });
 }
 
 /// The start of the error for a pack export of a project with Zig scripts.

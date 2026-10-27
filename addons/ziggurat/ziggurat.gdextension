@@ -3,6 +3,9 @@
 ; project's Zig scripts (res://.godot/ziggurat/export/<target key>/...);
 ; Godot copies it next to the game. A game started with Play from the
 ; editor has the `editor` feature too, so it keeps the editor library.
+; The macOS keys have no arch suffix: both libraries are universal (x86_64
+; and arm64), so they match every macOS arch; a macOS export copies the game
+; library into the app's Contents/Frameworks/.
 [configuration]
 entry_symbol = "ziggurat_host_init"
 compatibility_minimum = "4.7"
@@ -15,3 +18,6 @@ linux.template_release.x86_64 = "res://.godot/ziggurat/export/x86_64-linux/libzi
 windows.editor.x86_64 = "bin/ziggurat_host.dll"
 windows.template_debug.x86_64 = "res://.godot/ziggurat/export/x86_64-windows/ziggurat_game.dll"
 windows.template_release.x86_64 = "res://.godot/ziggurat/export/x86_64-windows/ziggurat_game.dll"
+macos.editor = "bin/libziggurat_host.dylib"
+macos.template_debug = "res://.godot/ziggurat/export/universal-macos/libziggurat_game.dylib"
+macos.template_release = "res://.godot/ziggurat/export/universal-macos/libziggurat_game.dylib"

@@ -1230,11 +1230,58 @@ fn expectMacosSlice(lib: []const u8, s: platform.macho.Slice) !void {
     try testing.expect(has_entry);
     const im = try platform.macho.imports(a, bytes);
     defer platform.macho.freeList(a, im);
+    // An empty list would make the `_dlopen` check pass for nothing.
+    try testing.expect(im.len > 0);
     for (im) |name| try testing.expect(!std.mem.eql(u8, name, "_dlopen"));
     try testing.expectEqual(std.SemanticVersion{ .major = 11, .minor = 0, .patch = 0 }, platform.macho.minOs(bytes).?);
     // Zig's linker signs the arm64 slice ad hoc; the x86_64 one stays unsigned.
     try testing.expectEqual(s.cpu == .arm64, platform.macho.codeSignature(bytes) != null);
 }
+
+/// The macOS SDK manifests of `macos_inputs`, loaded, and the slice
+/// inputs of `export_build.runUniversal` built from them.
+const MacosFx = struct {
+    manifests: [2]zbuild.sdk_manifest.Manifest = undefined,
+    loaded: usize = 0,
+    slices: [2]export_build.SliceInput = undefined,
+
+    fn init(m: *MacosFx, arena: std.mem.Allocator) !void {
+        const a = testing.allocator;
+        m.* = .{};
+        errdefer m.deinit();
+        for (macos_inputs, &m.manifests, &m.slices) |in, *mf, *si| {
+            var msg: std.ArrayList(u8) = .empty;
+            defer msg.deinit(a);
+            const path = try std.Io.Dir.cwd().realPathFileAlloc(io, in.manifest, arena);
+            mf.* = zbuild.sdk_manifest.load(a, io, .fromTrusted(path), &msg) catch |err| {
+                std.debug.print("manifest {s}: {s}\n", .{ path, msg.items });
+                return err;
+            };
+            m.loaded += 1;
+            si.* = .{ .sdk = mf.modules, .host_archive = .fromTrusted(try std.Io.Dir.cwd().realPathFileAlloc(io, in.archive, arena)) };
+        }
+    }
+
+    fn deinit(m: *MacosFx) void {
+        for (m.manifests[0..m.loaded]) |*mf| mf.deinit(testing.allocator);
+    }
+
+    /// Builds the universal library of `proj` to `out_path`; prints why
+    /// it failed.
+    fn build(m: *MacosFx, fx: *ExportFx, proj: []const u8, out_path: []const u8) !export_build.Result {
+        var diag: [256]u8 = undefined;
+        return export_build.runUniversal(testing.allocator, io, .{
+            .zig = .{ .exe = .fromTrusted(build_options.zig_exe), .version = platform.pins.zig_version },
+            .project_root = .fromTrusted(proj),
+            .slices = m.slices,
+            .out_path = .fromTrusted(out_path),
+            .cache_dir = .fromTrusted(fx.cache),
+        }, &diag) catch |err| {
+            std.debug.print("export build error {t}: {s}\n", .{ err, platform.elf.diagText(&diag) });
+            return err;
+        };
+    }
+};
 
 test "integration: export build macos universal library" {
     try platform.testing_support.requireIntegration();
@@ -1244,34 +1291,13 @@ test "integration: export build macos universal library" {
     try fx.init();
     defer fx.deinit();
     const arena = fx.arena_state.allocator();
-    var manifests: [2]zbuild.sdk_manifest.Manifest = undefined;
-    var loaded: usize = 0;
-    defer for (manifests[0..loaded]) |*m| m.deinit(a);
-    var slice_inputs: [2]export_build.SliceInput = undefined;
-    for (macos_inputs, &manifests, &slice_inputs) |in, *m, *si| {
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(a);
-        const path = try std.Io.Dir.cwd().realPathFileAlloc(io, in.manifest, arena);
-        m.* = zbuild.sdk_manifest.load(a, io, .fromTrusted(path), &msg) catch |err| {
-            std.debug.print("manifest {s}: {s}\n", .{ path, msg.items });
-            return err;
-        };
-        loaded += 1;
-        si.* = .{ .sdk = m.modules, .host_archive = .fromTrusted(try std.Io.Dir.cwd().realPathFileAlloc(io, in.archive, arena)) };
-    }
+    var mfx: MacosFx = undefined;
+    try mfx.init(arena);
+    defer mfx.deinit();
+    const manifests = &mfx.manifests;
     const proj = try fx.project("proj", &two_scripts);
     const out_path = try std.fs.path.join(arena, &.{ fx.base, "out", "libziggurat_game.dylib" });
-    var diag: [256]u8 = undefined;
-    const r = export_build.runUniversal(a, io, .{
-        .zig = .{ .exe = .fromTrusted(build_options.zig_exe), .version = platform.pins.zig_version },
-        .project_root = .fromTrusted(proj),
-        .slices = slice_inputs,
-        .out_path = .fromTrusted(out_path),
-        .cache_dir = .fromTrusted(fx.cache),
-    }, &diag) catch |err| {
-        std.debug.print("export build error {t}: {s}\n", .{ err, platform.elf.diagText(&diag) });
-        return err;
-    };
+    const r = try mfx.build(&fx, proj, out_path);
     defer r.deinit(a);
     try expectExportOk(r);
 
@@ -1313,6 +1339,42 @@ test "integration: export build macos universal library" {
     const esl = try platform.macho.slices(a, empty);
     defer a.free(esl);
     for (esl) |s| try expectMacosSlice(empty, s);
+}
+
+test "integration: export build macos two folders give identical bytes" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const a = testing.allocator;
+    var fx: ExportFx = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const arena = fx.arena_state.allocator();
+    var mfx: MacosFx = undefined;
+    try mfx.init(arena);
+    defer mfx.deinit();
+    const p1 = try fx.project("one/proj", &two_scripts);
+    const p2 = try fx.project("two dir \u{e4}\u{f6}/\u{30d7}\u{30ed} ject", &two_scripts);
+    const o1 = try std.fs.path.join(arena, &.{ fx.base, "one", "libziggurat_game.dylib" });
+    const o2 = try std.fs.path.join(arena, &.{ fx.base, "two dir \u{e4}\u{f6}", "libziggurat_game.dylib" });
+    const r1 = try mfx.build(&fx, p1, o1);
+    defer r1.deinit(a);
+    try expectExportOk(r1);
+    const r2 = try mfx.build(&fx, p2, o2);
+    defer r2.deinit(a);
+    try expectExportOk(r2);
+    const b1 = try readAll(o1);
+    defer a.free(b1);
+    const b2 = try readAll(o2);
+    defer a.free(b2);
+    // Both slices, and the arm64 slice's ad-hoc signature (a hash of its
+    // content), are the same bytes.
+    try testing.expect(std.mem.eql(u8, b1, b2));
+    for ([_][]const u8{ fx.base, "\u{30d7}\u{30ed}", "/nix/store/", "/lib/std/" }) |needle| {
+        if (std.mem.indexOf(u8, b1, needle) != null) {
+            std.debug.print("the library holds '{s}'\n", .{needle});
+            return error.AbsolutePathInLibrary;
+        }
+    }
 }
 
 test "integration: export build of a read-only project goes through the mirror" {

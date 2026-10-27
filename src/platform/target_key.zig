@@ -27,13 +27,24 @@ pub fn fromTarget(t: std.Target) ?[]const u8 {
 }
 
 /// The key of a Godot export preset from its feature names, or null when
-/// Ziggurat does not export to it: `linux` + `x86_64` and `windows` +
-/// `x86_64`. macOS presets are mapped in 7c.
+/// Ziggurat does not export to it as one target: `linux` + `x86_64` and
+/// `windows` + `x86_64`. A macOS preset has no single key (`exportKey`).
 pub fn fromFeatures(features: []const []const u8) ?[]const u8 {
     if (!has(features, "x86_64")) return null;
     if (has(features, "linux")) return x86_64_linux;
     if (has(features, "windows")) return x86_64_windows;
     return null;
+}
+
+/// The export output folder of a Godot export preset from its feature
+/// names (`.godot/ziggurat/export/<it>/`), or null when Ziggurat does not
+/// export to it: `universal_macos` for every preset with the feature
+/// `macos`, whatever its arch (`binary_format/architecture` universal,
+/// arm64 or x86_64: the universal library is right for each), else
+/// `fromFeatures`.
+pub fn exportKey(features: []const []const u8) ?[]const u8 {
+    if (has(features, "macos")) return universal_macos;
+    return fromFeatures(features);
 }
 
 fn has(features: []const []const u8, name: []const u8) bool {
@@ -128,6 +139,18 @@ test "target_key: fromFeatures" {
     try std.testing.expect(fromFeatures(&.{ "macos", "x86_64", "universal" }) == null);
     try std.testing.expect(fromFeatures(&.{"x86_64"}) == null);
     try std.testing.expect(fromFeatures(&.{}) == null);
+}
+
+test "target_key: exportKey maps every macOS preset to the universal folder" {
+    try std.testing.expectEqualStrings(universal_macos, exportKey(&.{ "pc", "macos", "universal", "x86_64", "arm64", "template" }).?);
+    try std.testing.expectEqualStrings(universal_macos, exportKey(&.{ "macos", "arm64" }).?);
+    try std.testing.expectEqualStrings(universal_macos, exportKey(&.{ "macos", "x86_64" }).?);
+    try std.testing.expectEqualStrings(universal_macos, exportKey(&.{"macos"}).?);
+    try std.testing.expectEqualStrings(x86_64_linux, exportKey(&.{ "linux", "x86_64" }).?);
+    try std.testing.expectEqualStrings(x86_64_windows, exportKey(&.{ "windows", "x86_64" }).?);
+    try std.testing.expect(exportKey(&.{ "linux", "arm64" }) == null);
+    try std.testing.expect(exportKey(&.{ "ios", "arm64" }) == null);
+    try std.testing.expect(exportKey(&.{}) == null);
 }
 
 test "target_key: files and keys" {

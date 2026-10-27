@@ -25,6 +25,7 @@ const top_files = [_][]const u8{
     "LICENSE",
     "README.md",
     "THIRD_PARTY_LICENSES.md",
+    "bin/libziggurat_host.dylib",
     "bin/libziggurat_host.so",
     "bin/x86_64-linux/libziggurat_game_empty.so",
     "bin/x86_64-linux/libziggurat_host_export.a",

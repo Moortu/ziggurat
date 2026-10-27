@@ -3,3 +3,7 @@ config_version=5
 [application]
 config/name="ziggurat-host-test-export"
 run/main_scene="res://main.tscn"
+
+[rendering]
+
+textures/vram_compression/import_etc2_astc=true

@@ -679,10 +679,26 @@ pub const OutputKind = enum {
     /// library.
     pack,
     /// A path ending in `zip`: a pack export to `.zip` (no shared library),
-    /// or a full Linux or Windows export that Godot zips (with the
-    /// library). The zip tells which (`zipHoldsLibrary`).
+    /// or a full export that Godot zips (with the library; a macOS export
+    /// zips the app bundle, with the library in
+    /// `<name>.app/Contents/Frameworks/`). The zip tells which
+    /// (`zipHoldsLibrary`).
     zip,
+    /// A full macOS export to an app bundle: Godot writes the folder at
+    /// the path and copies the library to `Contents/Frameworks/`
+    /// (`macos_app_frameworks`).
+    app,
+    /// Any other macOS output path: a full export to a disk image (`dmg`)
+    /// or an installer (`pkg`), which only a macOS editor writes. It holds
+    /// the app, but Ziggurat does not look inside. (A Linux or Windows
+    /// editor refuses other paths: "Invalid export format".)
+    image,
 };
+
+/// Where Godot's macOS export copies a GDExtension library inside the app
+/// bundle (`EditorExportPlatformMacOS::export_project`: shared objects
+/// without a target folder go to `<app>/Contents/Frameworks/`).
+pub const macos_app_frameworks = "Contents/Frameworks/";
 
 /// The kind of export that writes `path`. Godot compares case-sensitively:
 /// a pack export needs a path ending in `.pck` or `.zip` (`EditorNode`,
@@ -695,9 +711,24 @@ pub fn outputKind(path: []const u8) OutputKind {
     return .full;
 }
 
-/// True when the zip at `path` has an entry named `lib` (the target's
-/// `libFile`, in any folder): a full export that Godot zipped. Reads only
-/// the central directory.
+/// The kind of macOS export that writes `path`. A pack export needs a path
+/// ending in `.pck` or `.zip`, as for every platform; the macOS platform
+/// then routes by the end of the path, case-sensitively: `zip` is a zipped
+/// app bundle, `app` the bundle folder, and `dmg` and `pkg` (macOS editors
+/// only) a disk image and an installer (`EditorExportPlatformMacOS::
+/// export_project`).
+pub fn macosOutputKind(path: []const u8) OutputKind {
+    if (std.mem.endsWith(u8, path, ".pck")) return .pack;
+    if (std.mem.endsWith(u8, path, "zip")) return .zip;
+    if (std.mem.endsWith(u8, path, "app")) return .app;
+    return .image;
+}
+
+/// True when the zip at `path` has an entry named `lib` in any folder: a
+/// full export that Godot zipped. `lib` is the target's `libFile`, or a
+/// path inside the export such as `macos_app_frameworks ++ libFile`, which
+/// then matches as a whole (`<any folders>/Contents/Frameworks/<lib>`).
+/// Reads only the central directory.
 pub fn zipHoldsLibrary(io: std.Io, path: []const u8, lib: []const u8) !bool {
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
@@ -710,10 +741,18 @@ pub fn zipHoldsLibrary(io: std.Io, path: []const u8, lib: []const u8) !bool {
         const name = name_buf[0..entry.filename_len];
         try reader.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
         try reader.interface.readSliceAll(name);
-        const base = if (std.mem.lastIndexOfAny(u8, name, "/\\")) |i| name[i + 1 ..] else name;
-        if (std.mem.eql(u8, base, lib)) return true;
+        if (entryIs(name, lib)) return true;
     }
     return false;
+}
+
+/// True when the zip entry `name` is `lib` (a file name, or a relative
+/// path with `/`), at the top or below a folder.
+fn entryIs(name: []const u8, lib: []const u8) bool {
+    if (!std.mem.endsWith(u8, name, lib)) return false;
+    if (name.len == lib.len) return true;
+    const sep = name[name.len - lib.len - 1];
+    return sep == '/' or sep == '\\';
 }
 
 /// What `removeOldLibrary` did. Free with `deinit`.
@@ -812,16 +851,33 @@ pub fn outputLibraryPath(a: std.mem.Allocator, project: []const u8, out_path: []
     return std.fs.path.join(a, &.{ project, dir, lib });
 }
 
+/// The game library a full export of `kind` writes for the output path
+/// `out_path` (absolute, or relative to `project`): next to the executable
+/// (`.full`, `lib` the library file), or inside the app bundle at
+/// `out_path` (`.app`, `lib` the path in the bundle:
+/// `macos_app_frameworks ++ <library file>`). Null for the other kinds
+/// and an empty path. Allocated with `a`.
+pub fn exportedLibraryPath(a: std.mem.Allocator, kind: OutputKind, project: []const u8, out_path: []const u8, lib: []const u8) std.mem.Allocator.Error!?[]u8 {
+    if (out_path.len == 0) return null;
+    return switch (kind) {
+        .full => try outputLibraryPath(a, project, out_path, lib),
+        .app => if (std.fs.path.isAbsolute(out_path)) try std.fs.path.join(a, &.{ out_path, lib }) else try std.fs.path.join(a, &.{ project, out_path, lib }),
+        .pack, .zip, .image => null,
+    };
+}
+
 /// What an export must remove at its end (`_export_end`) when the game
 /// library of an earlier export could not be removed (`OldLibrary.stays`,
 /// or the POSIX rule's failure). Godot does not stop an export for an
 /// error message, and it copies whatever file the `.gdextension` names,
 /// so the old library may have shipped. Free with `deinit`.
 pub const StaleOutput = union(enum) {
-    /// A pack export (`.pck`): it holds no shared library.
+    /// A pack export (`.pck`): it holds no shared library. Also a macOS
+    /// disk image or installer, which Ziggurat cannot look into.
     none,
     /// A full export: Godot copied the library to this path, next to the
-    /// game executable, before `_export_end`.
+    /// game executable (or into the macOS app bundle), before
+    /// `_export_end`.
     library: []u8,
     /// A `zip` export: Godot wrote the zip before `_export_end`. It holds
     /// the old library when it is a full export (`zipHoldsLibrary`).
@@ -839,11 +895,13 @@ pub const StaleOutput = union(enum) {
 };
 
 /// The `StaleOutput` of an export of `kind` to `out_path` (absolute, or
-/// relative to `project`) for the library file `lib`. Allocated with `a`.
+/// relative to `project`) for the library `lib` (the file name, or for a
+/// macOS export `macos_app_frameworks ++ <file name>`, its path in the app).
+/// Allocated with `a`.
 pub fn staleOutput(a: std.mem.Allocator, kind: OutputKind, project: []const u8, out_path: []const u8, lib: []const u8, zip_before: ?std.Io.Timestamp) std.mem.Allocator.Error!StaleOutput {
     return switch (kind) {
-        .pack => .none,
-        .full => if (out_path.len == 0) .none else .{ .library = try outputLibraryPath(a, project, out_path, lib) },
+        .pack, .image => .none,
+        .full, .app => if (try exportedLibraryPath(a, kind, project, out_path, lib)) |p| .{ .library = p } else .none,
         .zip => .{ .zip = .{
             .path = if (std.fs.path.isAbsolute(out_path)) try a.dupe(u8, out_path) else try std.fs.path.join(a, &.{ project, out_path }),
             .before = zip_before,
@@ -950,6 +1008,43 @@ test "outputKind follows Godot's routing by file name" {
     try testing.expectEqual(OutputKind.full, outputKind("out/game.ZIP"));
     // The Linux platform zips a full export whose path ends in "zip".
     try testing.expectEqual(OutputKind.zip, outputKind("out/gamezip"));
+}
+
+test "macosOutputKind follows Godot's macOS routing by file name" {
+    try testing.expectEqual(OutputKind.zip, macosOutputKind("out/game.zip"));
+    try testing.expectEqual(OutputKind.pack, macosOutputKind("out/game.pck"));
+    try testing.expectEqual(OutputKind.app, macosOutputKind("/abs/out/My Game.app"));
+    // Godot compares the end of the path, case-sensitively.
+    try testing.expectEqual(OutputKind.app, macosOutputKind("out/gameapp"));
+    try testing.expectEqual(OutputKind.zip, macosOutputKind("out/gamezip"));
+    // A disk image or installer (macOS editors only) holds the app too,
+    // but Ziggurat does not look inside.
+    try testing.expectEqual(OutputKind.image, macosOutputKind("out/game.dmg"));
+    try testing.expectEqual(OutputKind.image, macosOutputKind("out/game.pkg"));
+    try testing.expectEqual(OutputKind.image, macosOutputKind("out/game.APP"));
+}
+
+test "zipHoldsLibrary finds the library in a macOS app's Frameworks folder" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const entry = macos_app_frameworks ++ "libziggurat_game.dylib";
+    const cases = [_]struct { name: []const u8, entries: []const []const u8, want: bool }{
+        .{ .name = "full.zip", .entries = &.{ "Game.app/Contents/MacOS/Game", "Game.app/Contents/Resources/Game.pck", "Game.app/" ++ entry }, .want = true },
+        .{ .name = "top.zip", .entries = &.{entry}, .want = true },
+        // A file of that name anywhere else is not the app's library.
+        .{ .name = "elsewhere.zip", .entries = &.{ "Game.app/Contents/Resources/libziggurat_game.dylib", "libziggurat_game.dylib" }, .want = false },
+        .{ .name = "near.zip", .entries = &.{ "Game.app/Contents/Frameworks/libziggurat_game.dylib.bak", "Game.app/XContents/Frameworks/libziggurat_game.dylib" }, .want = false },
+        .{ .name = "pack.zip", .entries = &.{ "project.binary", "main.tscn" }, .want = false },
+    };
+    for (cases) |c| {
+        const bytes = try testZip(testing.allocator, c.entries);
+        defer testing.allocator.free(bytes);
+        try tmp.dir.writeFile(io, .{ .sub_path = c.name, .data = bytes });
+        const path = try tmp.dir.realPathFileAlloc(io, c.name, testing.allocator);
+        defer testing.allocator.free(path);
+        try testing.expectEqual(c.want, try zipHoldsLibrary(io, path, entry));
+    }
 }
 
 /// A zip of empty stored files named `names`.
@@ -1416,6 +1511,18 @@ test "export: what a failed old-library removal must remove at the end" {
         const s = try staleOutput(a, .zip, "/p", "out/game.zip", "ziggurat_game.dll", null);
         defer s.deinit(a);
         try testing.expectEqualStrings("/p/out/game.zip", s.zip.path);
+    }
+    {
+        // A macOS app bundle: the library is in its Frameworks folder.
+        const entry = macos_app_frameworks ++ "libziggurat_game.dylib";
+        const s = try staleOutput(a, .app, "/p", "out/My Game.app", entry, null);
+        defer s.deinit(a);
+        try testing.expectEqualStrings("/p/out/My Game.app/Contents/Frameworks/libziggurat_game.dylib", s.library);
+        const abs = try staleOutput(a, .app, "/p", "/abs/Game.app", entry, null);
+        defer abs.deinit(a);
+        try testing.expectEqualStrings("/abs/Game.app/Contents/Frameworks/libziggurat_game.dylib", abs.library);
+        // A disk image or installer cannot be looked into.
+        try testing.expect(try staleOutput(a, .image, "/p", "out/game.dmg", entry, null) == .none);
     }
     // A pack holds no shared library; an empty path names nothing.
     try testing.expect(try staleOutput(a, .pack, "/p", "out/game.pck", lib_file, null) == .none);

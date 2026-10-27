@@ -247,6 +247,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const package_name = "ziggurat-" ++ sdk_version ++ ".zip";
+    // macOS (7c): the universal editor library, built for both arches and
+    // joined by tools/macho_fat.zig.
+    const macos_editor_lib = addMacosEditorLib(b, godot_path, zig_exe);
     // Two runs on the same inputs (the output names differ, so the cache
     // keeps them apart); the tests compare them.
     var packages: [2]std.Build.LazyPath = undefined;
@@ -274,6 +277,9 @@ pub fn build(b: *std.Build) void {
             run.addArg(b.fmt("addons/ziggurat/sdk/{s}", .{t.key}));
             run.addDirectoryArg(t.staged_sdk);
         }
+        // The `.gdextension`'s `macos.editor` key names it.
+        run.addArg("addons/ziggurat/bin/" ++ comptime target_key.files(target_key.aarch64_macos).?.editor_lib);
+        run.addFileArg(macos_editor_lib.file);
     }
     package_step.dependOn(&b.addInstallFile(packages[0], package_name).step);
     var package_staged: [packaged_targets.len]std.Build.LazyPath = undefined;
@@ -302,6 +308,8 @@ pub fn build(b: *std.Build) void {
             .sdk_manifest = test_manifest,
             .staged_sdk = staged_sdk,
             .sdk_options = sdk_options,
+            // Built only for a run that can export (the macOS export tests).
+            .macos_export = if (export_templates != null) .{ .builds = macos_builds, .game_empty = macos_game_empty } else null,
             .filter = host_test_filter,
             .gui_step = gui_test_step,
             .stress_step = stress_step,
@@ -387,9 +395,7 @@ pub fn build(b: *std.Build) void {
     }
     macos_game_empty.addStepDependencies(cross_step);
 
-    // macOS (7c): the universal editor library, built for both arches and
-    // joined by tools/macho_fat.zig, and its check.
-    const macos_editor_lib = addMacosEditorLib(b, godot_path, zig_exe);
+    // macOS (7c): the universal editor library's check.
     cross_step.dependOn(macos_editor_lib.step);
     {
         const options = b.addOptions();
@@ -867,6 +873,10 @@ const HostTestInputs = struct {
     /// The shipped SDK folder (`sdk-stage`).
     staged_sdk: std.Build.LazyPath,
     sdk_options: *std.Build.Module,
+    /// The macOS export inputs (each arch's SDK and export host archive,
+    /// and the universal empty game library) the macOS export tests put
+    /// into the add-on; null when the export tests skip.
+    macos_export: ?MacosExportInputs = null,
     /// Runs only the host tests whose name contains this text.
     filter: ?[]const u8 = null,
     /// The step that runs the GUI test (`test-gui`): the host tests named
@@ -943,6 +953,16 @@ fn addHostTests(
     options.addOptionPath("stub_sdk_path", b.path("test/stub_sdk/ziggurat.zig"));
     options.addOptionPath("sdk_manifest_path", in.sdk_manifest);
     options.addOptionPath("staged_sdk_manifest", in.staged_sdk.path(b, "sdk-manifest.json"));
+    for ([_][]const u8{ "aarch64", "x86_64" }, 0..) |arch, i| {
+        if (in.macos_export) |m| {
+            options.addOptionPath(b.fmt("macos_sdk_manifest_{s}", .{arch}), m.builds[i].staged_sdk.path(b, "sdk-manifest.json"));
+            options.addOptionPath(b.fmt("macos_host_archive_{s}", .{arch}), m.builds[i].shipped_archive);
+        } else {
+            options.addOption([]const u8, b.fmt("macos_sdk_manifest_{s}", .{arch}), "");
+            options.addOption([]const u8, b.fmt("macos_host_archive_{s}", .{arch}), "");
+        }
+    }
+    if (in.macos_export) |m| options.addOptionPath("macos_game_empty", m.game_empty) else options.addOption([]const u8, "macos_game_empty", "");
     const options_mod = options.createModule();
 
     const platform = b.createModule(.{
