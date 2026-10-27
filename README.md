@@ -16,26 +16,29 @@ editor. You do not need a custom engine build.
 > (universal, 11.0 or newer) is built and checked on Linux but has never
 > run on a Mac. Expect rough edges. You are welcome to fork it.
 
-## The name
-
-The names around this project point at the gods:
-
-- **Godot** comes from Beckett's play *Waiting for Godot*. The name is
-  often read as *God* plus the French diminutive *-ot*: a little god.
-- **Jenova**, the name of the C++ scripting framework
-  [Projekt J.E.N.O.V.A](https://github.com/Jenova-Framework/J.E.N.O.V.A),
-  is often read as *Jehovah* plus *nova*.
-- A **ziggurat** is the stepped temple tower of ancient Mesopotamia, built
-  to bring people closer to their gods.
-
-So a Zig layer for Godot became a temple you build up towards Godot:
-**Zig**gurat, styled Z.I.G.G.U.R.A.T after J.E.N.O.V.A.
-
 | Platform | Editor | Exported games |
 |---|---|---|
 | Linux x86_64 | tested | tested (glibc 2.28 or newer) |
 | Windows x86_64 | tested under Wine only; building Zig scripts in a Windows editor is untested | tested under Wine |
 | macOS 11.0+ (arm64 and x86_64) | experimental, never run on a Mac | experimental, never run on a Mac |
+
+## The name
+
+- **Godot** translates to "small god".
+- **Jenova** is derived from "Jehovah", meaning "new god": a new god
+  emerging from a small god. That is how the C++ scripting framework
+  [Projekt J.E.N.O.V.A](https://github.com/Jenova-Framework/J.E.N.O.V.A)
+  explains its own name.
+- A **ziggurat** is the stepped temple tower of ancient Mesopotamia. It
+  was built as the house of a city's god and as a stair between earth and
+  heaven, so that people could climb up to their god and the god could
+  come down to them.
+
+Ziggurat continues that line. Where Jenova is a new god born from the
+small god, Ziggurat is the temple built for the small god: a stepped
+tower that lets Zig code climb up to Godot, and Godot reach down into
+Zig. And the word already starts with **Zig**. It is styled
+Z.I.G.G.U.R.A.T like J.E.N.O.V.A.
 
 ## Requirements
 
