@@ -37,7 +37,8 @@ pub const PrepareOptions = struct {
     lock_timeout_ms: u32 = 30000,
     /// The build id written into the generated root; null: the scan's id.
     build_id: ?[]const u8 = null,
-    /// `rootgen.RootOptions.hidden_exports`: a Windows export build.
+    /// `rootgen.RootOptions.hidden_exports`: a Windows or macOS export
+    /// build.
     hidden_exports: bool = false,
 };
 
@@ -57,10 +58,13 @@ pub const ExportLink = struct {
     host_archive: OsPath,
     /// The file that limits the exports to `ziggurat_host_init`: a linker
     /// version script for ELF (`--version-script`), a module-definition
-    /// file (`.def`, given as an input) for PE.
-    exports_file: OsPath,
-    /// Library name: the compiler writes `lib<name>.so` (ELF) or
-    /// `<name>.dll` (PE).
+    /// file (`.def`, given as an input) for PE. Mach-O has none (null):
+    /// Zig 0.17's Mach-O linker ignores a version script and takes no
+    /// exported-symbols list, so the generated root's hidden visibility
+    /// keeps the scripts' entry points out of the exports.
+    exports_file: ?OsPath = null,
+    /// Library name: the compiler writes `lib<name>.so` (ELF),
+    /// `<name>.dll` (PE) or `lib<name>.dylib` (Mach-O).
     name: []const u8,
     /// `-fstrip`: no debug information, so the bytes do not depend on the
     /// project's folder. False gives `-fno-strip` (a debug export): the
@@ -69,7 +73,13 @@ pub const ExportLink = struct {
 };
 
 /// The object format of an export target.
-pub const Format = enum { elf, pe };
+pub const Format = enum { elf, pe, macho };
+
+/// The name `--force_undefined` takes for Godot's entry point in `format`:
+/// Mach-O symbol names carry a leading underscore.
+pub fn entryLinkName(format: Format) []const u8 {
+    return if (format == .macho) "_" ++ entry_symbol else entry_symbol;
+}
 
 pub const Workspace = struct {
     cache_dir: OsPath,
@@ -142,16 +152,26 @@ pub const Workspace = struct {
         switch (link.format) {
             .elf => {
                 try push(a, &out, "--version-script", .{});
-                try push(a, &out, "{s}", .{link.exports_file.bytes});
+                try push(a, &out, "{s}", .{(link.exports_file orelse return error.MissingExportsFile).bytes});
             },
             // The compiler takes a `.def` file as an input and hands it to
             // the COFF linker; there is no version script on PE.
-            .pe => try push(a, &out, "{s}", .{link.exports_file.bytes}),
+            .pe => try push(a, &out, "{s}", .{(link.exports_file orelse return error.MissingExportsFile).bytes}),
+            // No exports file (`ExportLink.exports_file`). The install
+            // name would otherwise be the output's path in the compiler
+            // cache, an absolute path that differs per project folder and
+            // machine; this is the name `zig build` gives a dylib. Two
+            // arguments, as `zig build` passes them: `build-lib` refuses
+            // the `-install_name=<name>` form its help text shows.
+            .macho => {
+                try push(a, &out, "-install_name", .{});
+                try push(a, &out, "@rpath/lib{s}.dylib", .{link.name});
+            },
         }
         // Nothing in the scripts refers to Godot's entry point, so the
         // archive member that defines it is pulled in by name.
         try push(a, &out, "--force_undefined", .{});
-        try push(a, &out, entry_symbol, .{});
+        try push(a, &out, "{s}", .{entryLinkName(link.format)});
         try push(a, &out, "{s}", .{link.host_archive.bytes});
         // `-target`, `-O` and `-fstrip` are per-module options.
         try self.pushModules(a, &out, &.{ "-target", link.target, optFlag(.ReleaseSafe), if (link.strip) "-fstrip" else "-fno-strip" });
@@ -796,6 +816,44 @@ test "export argv golden for a Windows DLL" {
         "x86_64-windows-gnu",              "-OReleaseSafe",     "-fstrip",            "--dep",                       "ziggurat",
         "-Mroot=/proj/.ziggurat_root.zig", "-target",           "x86_64-windows-gnu", "-OReleaseSafe",               "-fstrip",
         "-Mziggurat=/sdk/ziggurat.zig",
+    };
+    try expectArgv(want, got);
+    for (got) |arg| try testing.expect(!std.mem.eql(u8, arg, "--version-script"));
+}
+
+test "export argv golden for a macOS dylib" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const deps = [_]ModuleDep{
+        .{ .name = "ziggurat", .root = .fromTrusted("/sdk/ziggurat.zig"), .deps = &.{} },
+    };
+    const ws: Workspace = .{
+        .cache_dir = .fromTrusted("/c/projects/p"),
+        .build_dir = .fromTrusted("/c/projects/p/build"),
+        .source_root = .fromTrusted("/proj"),
+        .mirrored = false,
+        .os = .linux,
+        .sdk = &deps,
+        .lock = undefined,
+    };
+    // No exports file: Zig 0.17's Mach-O linker ignores a version script
+    // and takes no exported-symbols list. Mach-O symbols carry a leading
+    // underscore, so the entry point is forced in by that name. The
+    // install name is fixed, not the cache path.
+    const got = try ws.exportArgv(arena, dummyZig(), .{
+        .target = "aarch64-macos.11.0",
+        .format = .macho,
+        .host_archive = .fromTrusted("/a/libziggurat_host_export.a"),
+        .name = "ziggurat_game",
+    });
+    const want: []const []const u8 = &.{
+        "/opt/zig/zig",  "build-lib",                       "-dynamic",          "-lc",                     "-fllvm",
+        "--name",        "ziggurat_game",                   "--cache-dir",       "/c/projects/p/zig-cache", "--listen=-",
+        "-install_name", "@rpath/libziggurat_game.dylib",   "--force_undefined", "_ziggurat_host_init",     "/a/libziggurat_host_export.a",
+        "-target",       "aarch64-macos.11.0",              "-OReleaseSafe",     "-fstrip",                 "--dep",
+        "ziggurat",      "-Mroot=/proj/.ziggurat_root.zig", "-target",           "aarch64-macos.11.0",      "-OReleaseSafe",
+        "-fstrip",       "-Mziggurat=/sdk/ziggurat.zig",
     };
     try expectArgv(want, got);
     for (got) |arg| try testing.expect(!std.mem.eql(u8, arg, "--version-script"));

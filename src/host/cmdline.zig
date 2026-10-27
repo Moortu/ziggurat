@@ -4,7 +4,7 @@
 //! `set_cmdline`), so the host reads the command line the process started
 //! with: `/proc/self/cmdline` on Linux (editor_build.zig), on Windows
 //! `GetCommandLineW` split by `CommandLineToArgvW` (`windowsArgs`), and on
-//! macOS libSystem's `_NSGetArgc`/`_NSGetArgv` (`darwinArgs`).
+//! macOS libSystem's `_NSGetArgc`/`_NSGetArgv` (`darwinNonInteractive`).
 //! Imports only std.
 const std = @import("std");
 const builtin = @import("builtin");
@@ -76,38 +76,33 @@ pub fn argsFromCommandLine(line: [*:0]const u16, buf: []u8) ?[]const u8 {
     return buf[0..n];
 }
 
-/// This process's arguments on macOS (`_NSGetArgc`/`_NSGetArgv`, the
-/// `argc`/`argv` the process started with), NUL-separated like
-/// `/proc/self/cmdline` (`argsFromArgv`), or null; null on every other OS.
-/// Arguments longer than `buf` give null, and the caller reads only
-/// Godot's own list. Compiled for macOS, never run there (no Mac tests it).
-pub fn darwinArgs(buf: []u8) ?[]const u8 {
+/// The first non-interactive argument of this process on macOS
+/// (`_NSGetArgc`/`_NSGetArgv`, the `argc`/`argv` it started with), or null;
+/// null on every other OS. The arguments are read in place
+/// (`nonInteractiveInArgv`), so no buffer limits them (macOS allows 1 MiB,
+/// `ARG_MAX`). The result points into the process's own argument memory,
+/// which lives as long as the process. Compiled for macOS, never run there
+/// (no Mac tests it).
+pub fn darwinNonInteractive() ?[]const u8 {
     if (builtin.os.tag != .macos) return null;
     const argc_ptr = _NSGetArgc() orelse return null;
     const argv_ptr = _NSGetArgv() orelse return null;
     const argv = argv_ptr.* orelse return null;
     const argc = argc_ptr.*;
-    if (argc <= 0) return if (argc == 0) buf[0..0] else null;
-    return argsFromArgv(argv[0..@intCast(argc)], buf);
+    if (argc <= 0) return null;
+    return nonInteractiveInArgv(argv[0..@intCast(argc)]);
 }
 
-/// Writes the C arguments `argv` into `buf`, NUL-separated like
-/// `/proc/self/cmdline` (without the last NUL). A null entry ends the list.
-/// Null when they do not fit `buf`.
-pub fn argsFromArgv(argv: []const ?[*:0]const u8, buf: []u8) ?[]const u8 {
-    var n: usize = 0;
-    for (argv, 0..) |entry, i| {
-        const arg = std.mem.span(entry orelse break);
-        if (i != 0) {
-            if (n >= buf.len) return null;
-            buf[n] = 0;
-            n += 1;
-        }
-        if (arg.len > buf.len - n) return null;
-        @memcpy(buf[n..][0..arg.len], arg);
-        n += arg.len;
+/// `nonInteractiveIn` for the C arguments `argv`: the first non-interactive
+/// argument, or null. A null entry ends the list, as in a C `argv`; the
+/// scan stops at `--` or `++`.
+pub fn nonInteractiveInArgv(argv: []const ?[*:0]const u8) ?[]const u8 {
+    for (argv) |entry| {
+        const arg = std.mem.span(entry orelse return null);
+        if (std.mem.eql(u8, arg, "--") or std.mem.eql(u8, arg, "++")) return null;
+        if (nonInteractive(arg)) return arg;
     }
-    return buf[0..n];
+    return null;
 }
 
 // libSystem (crt_externs.h). Referenced on macOS only.
@@ -176,26 +171,31 @@ test "cmdline: the longest Windows command line fits and still shows --import" {
     try std.testing.expectEqualStrings("--import", nonInteractiveIn(raw).?);
 }
 
-test "argsFromArgv joins the C arguments like /proc/self/cmdline" {
-    var buf: [64]u8 = undefined;
+test "nonInteractiveInArgv reads the C arguments in place" {
     const argv = [_]?[*:0]const u8{ "godot", "--editor", "--import" };
-    try std.testing.expectEqualStrings("godot\x00--editor\x00--import", argsFromArgv(&argv, &buf).?);
-    try std.testing.expectEqualStrings("--import", nonInteractiveIn(argsFromArgv(&argv, &buf).?).?);
-    try std.testing.expectEqualStrings("", argsFromArgv(&.{}, &buf).?);
+    try std.testing.expectEqualStrings("--import", nonInteractiveInArgv(&argv).?);
+    try std.testing.expect(nonInteractiveInArgv(&.{}) == null);
+    try std.testing.expect(nonInteractiveInArgv(&.{ "godot", "-e", "--quit-after", "5" }) == null);
     // A null entry ends the list, as in a C argv.
-    const short = [_]?[*:0]const u8{ "godot", null, "--import" };
-    try std.testing.expectEqualStrings("godot", argsFromArgv(&short, &buf).?);
-    // Arguments that do not fit give null, never a cut list.
-    var small: [14]u8 = undefined;
-    try std.testing.expect(argsFromArgv(&argv, &small) == null);
-    var exact: [23]u8 = undefined;
-    try std.testing.expectEqualStrings("godot\x00--editor\x00--import", argsFromArgv(&argv, &exact).?);
-    var one_short: [22]u8 = undefined;
-    try std.testing.expect(argsFromArgv(&argv, &one_short) == null);
+    try std.testing.expect(nonInteractiveInArgv(&.{ "godot", null, "--import" }) == null);
+    // User arguments after `--` or `++` do not count.
+    try std.testing.expect(nonInteractiveInArgv(&.{ "godot", "-e", "--", "--import" }) == null);
+    try std.testing.expect(nonInteractiveInArgv(&.{ "godot", "-e", "++", "-q" }) == null);
+    try std.testing.expectEqualStrings("--export-release", nonInteractiveInArgv(&.{ "godot", "--export-release", "mac" }).?);
 }
 
-test "darwinArgs is null off macOS" {
+test "cmdline: a macOS command line longer than the old 98,304-byte buffer still shows --import" {
+    // macOS allows 1 MiB of arguments (ARG_MAX); nothing is copied, so no
+    // buffer size limits what is seen.
+    const a = std.testing.allocator;
+    const long = try a.allocSentinel(u8, 1 << 20, 0);
+    defer a.free(long);
+    @memset(long, 'x');
+    const argv = [_]?[*:0]const u8{ "godot", "--path", long.ptr, "--headless", "--import" };
+    try std.testing.expectEqualStrings("--import", nonInteractiveInArgv(&argv).?);
+}
+
+test "darwinNonInteractive is null off macOS" {
     if (builtin.os.tag == .macos) return error.SkipZigTest;
-    var buf: [16]u8 = undefined;
-    try std.testing.expect(darwinArgs(&buf) == null);
+    try std.testing.expect(darwinNonInteractive() == null);
 }

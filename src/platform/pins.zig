@@ -13,6 +13,14 @@ pub const export_glibc = "2.28";
 /// built for (baseline CPU).
 pub const export_target = "x86_64-linux-gnu." ++ export_glibc;
 
+/// The minimum macOS version of every shipped and exported Mach-O file
+/// (its `minos`), on both architectures.
+pub const macos_min = "11.0";
+
+/// The targets of the macOS libraries, arm64 then x86_64: the order
+/// `macho_fat.join` takes the thin dylibs in.
+pub const macos_targets = [2][]const u8{ "aarch64-macos." ++ macos_min, "x86_64-macos." ++ macos_min };
+
 /// The Zig Software Foundation's minisign public key, as published on
 /// https://ziglang.org/download/. Every downloaded Zig archive must carry a
 /// signature from this key.
@@ -93,4 +101,14 @@ test "pins: export target parses with the pinned glibc" {
     try std.testing.expectEqual(std.Target.Os.Tag.linux, q.os_tag.?);
     try std.testing.expectEqual(std.Target.Abi.gnu, q.abi.?);
     try std.testing.expectEqual(std.SemanticVersion{ .major = 2, .minor = 28, .patch = 0 }, q.glibc_version.?);
+}
+
+test "pins: the macOS targets parse with the minimum version, arm64 first" {
+    for (macos_targets, [_]std.Target.Cpu.Arch{ .aarch64, .x86_64 }) |triple, arch| {
+        const q = try std.Target.Query.parse(.{ .arch_os_abi = triple });
+        try std.testing.expectEqual(arch, q.cpu_arch.?);
+        try std.testing.expectEqual(std.Target.Os.Tag.macos, q.os_tag.?);
+        try std.testing.expectEqual(@as(usize, 11), q.os_version_min.?.semver.major);
+        try std.testing.expectEqual(@as(usize, 0), q.os_version_min.?.semver.minor);
+    }
 }

@@ -8,7 +8,14 @@ const cross_targets = [_][]const u8{ "x86_64-windows-gnu", macos_triples[0], mac
 
 /// The macOS targets (plan, Global Constraints: minimum macOS 11.0), in the
 /// order `tools/macho_fat.zig` takes them: arm64, then x86_64.
-const macos_triples = [_][]const u8{ "aarch64-macos.11.0", "x86_64-macos.11.0" };
+const macos_triples = pins.macos_targets;
+
+/// The macOS targets as built for export (`addTargetBuild`): each arch's
+/// export host archive, empty game library and SDK. Not packaged yet.
+const macos_export_targets = [_]PackagedTarget{
+    .{ .key = target_key.aarch64_macos, .triple = macos_triples[0] },
+    .{ .key = target_key.x86_64_macos, .triple = macos_triples[1] },
+};
 
 /// The SDK version written into `sdk_options` and the SDK manifest.
 const sdk_version = "0.1.0";
@@ -192,6 +199,19 @@ pub fn build(b: *std.Build) void {
     });
     var shipped: [packaged_targets.len]TargetBuild = undefined;
     for (&shipped, packaged_targets) |*out, t| out.* = addTargetBuild(b, t, godot_path, zig_exe, stage_tool, ar_tool);
+    // macOS (7c), not packaged yet: per arch the export host archive (a BSD
+    // archive, through tools/ar_normalize.zig), the empty game library and
+    // the SDK, and the universal empty game library joined from the two
+    // (tools/macho_fat.zig, x86_64 then arm64).
+    var macos_builds: [macos_export_targets.len]TargetBuild = undefined;
+    for (&macos_builds, macos_export_targets) |*out, t| out.* = addTargetBuild(b, t, godot_path, zig_exe, stage_tool, ar_tool);
+    const macos_game_empty = blk: {
+        const run = b.addRunArtifact(machoFatTool(b));
+        const out = run.addOutputFileArg(macos_builds[0].files.game_empty);
+        run.addArtifactArg(macos_builds[0].game_empty);
+        run.addArtifactArg(macos_builds[1].game_empty);
+        break :blk out;
+    };
     // x86_64-linux: the archive and empty game library the tests use.
     const linux_build = shipped[0];
     const export_host_archive = linux_build.archive;
@@ -290,7 +310,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(host_test_step);
 
     // Native: integration on for `test`, off for `test-unit`.
-    addTestSet(b, test_step, target, optimize, zig_exe, true, .native, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) }, sdk_options, sdk, sdk.import_table.get("gdzig").?, export_host_archive, staged_sdk, .{ .zips = packages, .staged = package_staged, .step = package_test_step });
+    addTestSet(b, test_step, target, optimize, zig_exe, true, .native, test_manifest, .{ .debug = sdk, .safe = addSdk(b, target, .ReleaseSafe, godot_path) }, sdk_options, sdk, sdk.import_table.get("gdzig").?, export_host_archive, staged_sdk, .{ .zips = packages, .staged = package_staged, .step = package_test_step }, .{ .builds = macos_builds, .game_empty = macos_game_empty });
     // Windows: the unit test set under Wine. One Wine prefix per build cache.
     {
         const windows = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = "x86_64-windows-gnu" }) catch
@@ -304,7 +324,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         const runner: Runner = .{ .wine = .{ .tool = wine_run, .state = std.Build.LazyPath.cache_root.path(b, "ziggurat-wine") } };
-        addTestSet(b, windows_step, windows, optimize, zig_exe, false, runner, null, null, sdk_options, sdk, sdkGdzig(b, windows, optimize, godot_path), null, null, null);
+        addTestSet(b, windows_step, windows, optimize, zig_exe, false, runner, null, null, sdk_options, sdk, sdkGdzig(b, windows, optimize, godot_path), null, null, null, null);
         addWineE2e(b, wine_e2e_step, .{
             .windows = windows,
             .windows_build = for (shipped) |t| {
@@ -326,19 +346,21 @@ pub fn build(b: *std.Build) void {
             test_step.dependOn(wine_e2e_step);
         }
     }
-    addTestSet(b, unit_step, target, optimize, zig_exe, false, .native, null, null, sdk_options, sdk, sdk.import_table.get("gdzig").?, null, null, null);
+    addTestSet(b, unit_step, target, optimize, zig_exe, false, .native, null, null, sdk_options, sdk, sdk.import_table.get("gdzig").?, null, null, null, null);
 
     // Cross: compile only.
     for (cross_targets) |triple| {
         const query = std.Target.Query.parse(.{ .arch_os_abi = triple }) catch
             @panic("bad cross target triple");
         const resolved = b.resolveTargetQuery(query);
-        addTestSet(b, cross_step, resolved, optimize, zig_exe, false, .compile, null, null, sdk_options, sdk, sdkGdzig(b, resolved, optimize, godot_path), null, null, null);
+        addTestSet(b, cross_step, resolved, optimize, zig_exe, false, .compile, null, null, sdk_options, sdk, sdkGdzig(b, resolved, optimize, godot_path), null, null, null, null);
 
         // The host library, the export archive and the empty game library,
         // built as an export build builds them; a packaged target's are
         // the package's own.
         const packaged: ?TargetBuild = for (shipped, packaged_targets) |t, pt| {
+            if (std.mem.eql(u8, pt.triple, triple)) break t;
+        } else for (macos_builds, macos_export_targets) |t, pt| {
             if (std.mem.eql(u8, pt.triple, triple)) break t;
         } else null;
         const cross_sdk = if (packaged) |t| t.sdk else addSdk(b, resolved, .ReleaseSafe, godot_path);
@@ -346,6 +368,7 @@ pub fn build(b: *std.Build) void {
         cross_step.dependOn(&addHost(b, resolved, optimize, godot_path, zig_exe, cross_options, .{}).step);
         if (packaged) |t| {
             cross_step.dependOn(&t.archive.step);
+            t.shipped_archive.addStepDependencies(cross_step);
             cross_step.dependOn(&t.game_empty.step);
             continue;
         }
@@ -356,16 +379,13 @@ pub fn build(b: *std.Build) void {
             .strip = true,
         });
         cross_step.dependOn(&cross_archive.step);
-        // 7c: the macOS empty game library does not link yet
-        // (undefined symbol: ziggurat_host_init).
-        if (resolved.result.os.tag != .macos) {
-            cross_step.dependOn(&linkedLibrary(b, emptyRootObject(b, resolved, cross_sdk), cross_archive, .{
-                .name = "ziggurat_game_empty",
-                .use_llvm = true,
-                .strip = true,
-            }).step);
-        }
+        cross_step.dependOn(&linkedLibrary(b, emptyRootObject(b, resolved, cross_sdk), cross_archive, .{
+            .name = "ziggurat_game_empty",
+            .use_llvm = true,
+            .strip = true,
+        }).step);
     }
+    macos_game_empty.addStepDependencies(cross_step);
 
     // macOS (7c): the universal editor library, built for both arches and
     // joined by tools/macho_fat.zig, and its check.
@@ -537,6 +557,13 @@ fn editorLibName(t: std.Target) []const u8 {
         else => "libziggurat_host.so",
     };
 }
+
+/// The macOS export inputs of the macOS export build test: each arch's
+/// build (arm64, then x86_64) and the universal empty game library.
+const MacosExportInputs = struct {
+    builds: [macos_export_targets.len]TargetBuild,
+    game_empty: std.Build.LazyPath,
+};
 
 /// What one packaged target ships (`addTargetBuild`).
 const TargetBuild = struct {
@@ -1065,9 +1092,9 @@ fn linkedFixtureObject(
 
 /// The empty generated root (src/build/empty_root.zig) compiled on its own
 /// into an object with the SDK `sdk`, as an export build compiles a
-/// project's root: ReleaseSafe, LLVM, no debug information. For Windows it
-/// is the root with hidden entry points (`empty_root.hidden_text`), as a
-/// Windows export build writes it.
+/// project's root: ReleaseSafe, LLVM, no debug information. For Windows and
+/// macOS it is the root with hidden entry points (`empty_root.hidden_text`),
+/// as an export build for them writes it.
 fn emptyRootObject(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -1078,7 +1105,10 @@ fn emptyRootObject(
         .name = "empty_root",
         .use_llvm = true,
         .root_module = b.createModule(.{
-            .root_source_file = files.add(".ziggurat_root.zig", if (target.result.os.tag == .windows) empty_root.hidden_text else empty_root.text),
+            .root_source_file = files.add(".ziggurat_root.zig", switch (target.result.os.tag) {
+                .windows, .macos => empty_root.hidden_text,
+                else => empty_root.text,
+            }),
             .target = target,
             .optimize = .ReleaseSafe,
             .link_libc = true,
@@ -1105,7 +1135,10 @@ const LinkedOptions = struct {
 /// version script says so on ELF, a module-definition file on Windows
 /// (`empty_root.module_definition`; without it the COFF linker also
 /// exports the MinGW runtime's `_CRT_INIT`, `__mingw_module_is_dll` and
-/// `atexit`).
+/// `atexit`). Mach-O has neither (Zig 0.17's Mach-O linker ignores a version
+/// script): the module's hidden entry points stay in, and the linker adds
+/// its own `__mh_dylib_header` and `___dso_handle` (export_build.zig,
+/// `macho_linker_exports`).
 fn linkedLibrary(
     b: *std.Build,
     module_object: *std.Build.Step.Compile,
@@ -1113,7 +1146,8 @@ fn linkedLibrary(
     o: LinkedOptions,
 ) *std.Build.Step.Compile {
     const mod = module_object.root_module;
-    const is_windows = mod.resolved_target.?.result.os.tag == .windows;
+    const os = mod.resolved_target.?.result.os.tag;
+    const is_windows = os == .windows;
     const files = b.addWriteFiles();
     const lib = b.addLibrary(.{
         .linkage = .dynamic,
@@ -1131,10 +1165,11 @@ fn linkedLibrary(
     lib.root_module.linkLibrary(export_host_archive);
     // Nothing in the module object refers to the entry point, so the
     // archive member that defines it is pulled in by name.
-    lib.forceUndefinedSymbol("ziggurat_host_init");
+    // Mach-O symbol names carry a leading underscore.
+    lib.forceUndefinedSymbol(if (os == .macos) "_ziggurat_host_init" else "ziggurat_host_init");
     // The module's `ziggurat_describe` and `ziggurat_init` resolve inside
     // the library and are not exported.
-    if (!is_windows) lib.setVersionScript(files.add("exports.map", "{ global: ziggurat_host_init; local: *; };\n"));
+    if (!is_windows and os != .macos) lib.setVersionScript(files.add("exports.map", "{ global: ziggurat_host_init; local: *; };\n"));
     return lib;
 }
 
@@ -1460,6 +1495,9 @@ fn addTestSet(
     /// The release package from two packager runs (native sets that run
     /// integration tests only).
     package: ?PackageTests,
+    /// The macOS export inputs the macOS export build test uses (native
+    /// sets that run integration tests only).
+    macos_export: ?MacosExportInputs,
 ) void {
     const options = b.addOptions();
     options.addOption([]const u8, "zig_exe", zig_exe);
@@ -1526,6 +1564,44 @@ fn addTestSet(
         options.addOptionPath("export_host_archive", lib.getEmittedBin());
     } else {
         options.addOption([]const u8, "export_host_archive", "");
+    }
+    // Per macOS arch the staged SDK's manifest and the shipped export host
+    // archive, and the universal empty game library.
+    const macos_arch_names = [_][]const u8{ "aarch64", "x86_64" };
+    if (macos_export) |m| {
+        for (m.builds, macos_arch_names) |t, arch| {
+            options.addOptionPath(b.fmt("macos_sdk_manifest_{s}", .{arch}), t.staged_sdk.path(b, "sdk-manifest.json"));
+            options.addOptionPath(b.fmt("macos_host_archive_{s}", .{arch}), t.shipped_archive);
+        }
+        options.addOptionPath("macos_game_empty", m.game_empty);
+    } else {
+        for (macos_arch_names) |arch| {
+            options.addOption([]const u8, b.fmt("macos_sdk_manifest_{s}", .{arch}), "");
+            options.addOption([]const u8, b.fmt("macos_host_archive_{s}", .{arch}), "");
+        }
+        options.addOption([]const u8, "macos_game_empty", "");
+    }
+    // tools/ar_normalize.zig's BSD test: test/fixtures/ar/ built as a static
+    // library for aarch64-macos twice, each time with its own cache folder.
+    // Both caches and both archives are in this run's one output folder
+    // (the only second Zig cache the tests make, for that byte-identity
+    // check).
+    {
+        const run = b.addSystemCommand(&.{
+            "sh",             "-c",
+            \\set -e
+            \\for n in one two-longer; do
+            \\  "$1" build-lib -static -target "$2" -OReleaseSafe -fstrip -fPIC --name bsd --cache-dir "$3/bsd-cache-$n" "-femit-bin=$3/libbsd-$n.a" "$4" "$5"
+            \\done
+            ,
+            "sh",             zig_exe,
+            macos_triples[0],
+        });
+        const dir = run.addOutputDirectoryArg("bsd-archives");
+        run.addFileArg(b.path("test/fixtures/ar/bsd_root.zig"));
+        run.addFileArg(b.path("test/fixtures/ar/helper.c"));
+        options.addOptionPath("bsd_archive_one", dir.path(b, "libbsd-one.a"));
+        options.addOptionPath("bsd_archive_two", dir.path(b, "libbsd-two-longer.a"));
     }
     // The shipped-SDK tests look in the staged SDK for this checkout's
     // paths and its caches' (`build_machine_*`).
@@ -1676,11 +1752,13 @@ fn addTestSet(
         });
     }
 
-    // The package tool's archive rewrite imports only std.
+    // The package tool's archive rewrite imports only std (its BSD test
+    // reads the fixture archives' paths from the build options).
     const ar_normalize = b.createModule(.{
         .root_source_file = b.path("tools/ar_normalize.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "build_options", .module = options_mod }},
     });
 
     // The SDK stage tool's folder handling imports only std.

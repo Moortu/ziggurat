@@ -51,8 +51,9 @@
 //!       calls `ziggurat.moduleInit(api, gen)`;
 //!       `export fn ziggurat_describe() callconv(.c) *const ziggurat.Table`
 //!       returns `&table`.
-//!     A Windows export build's root declares both as plain functions and
-//!     exports them with hidden visibility instead (`RootOptions`).
+//!     A Windows or macOS export build's root declares both as plain
+//!     functions and exports them with hidden visibility instead
+//!     (`RootOptions`).
 //!   - Scripts are sorted by `rel` (byte order), so the output is deterministic.
 //!
 //! The build around the root:
@@ -99,7 +100,8 @@ pub const RootOptions = struct {
     /// and exports them with hidden visibility (`@export`), so a linked
     /// library resolves them inside itself and does not export them. A
     /// Windows export build sets it: an `export fn` is a DLL export there,
-    /// and a module-definition file does not remove it. The Linux export
+    /// and a module-definition file does not remove it. A macOS export
+    /// build sets it too: its linker takes no exports list. The Linux export
     /// uses its version script instead and keeps the plain root, so its
     /// bytes stay the same.
     hidden_exports: bool = false,

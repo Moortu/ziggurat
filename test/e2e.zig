@@ -1200,6 +1200,121 @@ test "integration: export build broken script fails" {
     try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, out_path, .{}));
 }
 
+/// The macOS SDK manifest and shipped export host archive of each slice,
+/// arm64 then x86_64 (`export_build.macos_keys`), as build.zig made them.
+const macos_inputs = [2]struct { manifest: []const u8, archive: []const u8 }{
+    .{ .manifest = build_options.macos_sdk_manifest_aarch64, .archive = build_options.macos_host_archive_aarch64 },
+    .{ .manifest = build_options.macos_sdk_manifest_x86_64, .archive = build_options.macos_host_archive_x86_64 },
+};
+
+/// The exports of a macOS export library's slice: `_ziggurat_host_init`
+/// and the two linker symbols Zig 0.17 always exports, nothing else.
+fn expectMacosSlice(lib: []const u8, s: platform.macho.Slice) !void {
+    const a = testing.allocator;
+    const bytes = lib[@intCast(s.offset)..][0..@intCast(s.size)];
+    const ex = try platform.macho.exports(a, bytes);
+    defer platform.macho.freeList(a, ex);
+    var has_entry = false;
+    for (ex) |name| {
+        if (std.mem.eql(u8, name, "_ziggurat_host_init")) {
+            has_entry = true;
+            continue;
+        }
+        for (export_build.macho_linker_exports) |allowed| {
+            if (std.mem.eql(u8, name, allowed)) break;
+        } else {
+            std.debug.print("slice {t} exports {s}\n", .{ s.cpu, name });
+            return error.UnexpectedExport;
+        }
+    }
+    try testing.expect(has_entry);
+    const im = try platform.macho.imports(a, bytes);
+    defer platform.macho.freeList(a, im);
+    for (im) |name| try testing.expect(!std.mem.eql(u8, name, "_dlopen"));
+    try testing.expectEqual(std.SemanticVersion{ .major = 11, .minor = 0, .patch = 0 }, platform.macho.minOs(bytes).?);
+    // Zig's linker signs the arm64 slice ad hoc; the x86_64 one stays unsigned.
+    try testing.expectEqual(s.cpu == .arm64, platform.macho.codeSignature(bytes) != null);
+}
+
+test "integration: export build macos universal library" {
+    try platform.testing_support.requireIntegration();
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const a = testing.allocator;
+    var fx: ExportFx = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const arena = fx.arena_state.allocator();
+    var manifests: [2]zbuild.sdk_manifest.Manifest = undefined;
+    var loaded: usize = 0;
+    defer for (manifests[0..loaded]) |*m| m.deinit(a);
+    var slice_inputs: [2]export_build.SliceInput = undefined;
+    for (macos_inputs, &manifests, &slice_inputs) |in, *m, *si| {
+        var msg: std.ArrayList(u8) = .empty;
+        defer msg.deinit(a);
+        const path = try std.Io.Dir.cwd().realPathFileAlloc(io, in.manifest, arena);
+        m.* = zbuild.sdk_manifest.load(a, io, .fromTrusted(path), &msg) catch |err| {
+            std.debug.print("manifest {s}: {s}\n", .{ path, msg.items });
+            return err;
+        };
+        loaded += 1;
+        si.* = .{ .sdk = m.modules, .host_archive = .fromTrusted(try std.Io.Dir.cwd().realPathFileAlloc(io, in.archive, arena)) };
+    }
+    const proj = try fx.project("proj", &two_scripts);
+    const out_path = try std.fs.path.join(arena, &.{ fx.base, "out", "libziggurat_game.dylib" });
+    var diag: [256]u8 = undefined;
+    const r = export_build.runUniversal(a, io, .{
+        .zig = .{ .exe = .fromTrusted(build_options.zig_exe), .version = platform.pins.zig_version },
+        .project_root = .fromTrusted(proj),
+        .slices = slice_inputs,
+        .out_path = .fromTrusted(out_path),
+        .cache_dir = .fromTrusted(fx.cache),
+    }, &diag) catch |err| {
+        std.debug.print("export build error {t}: {s}\n", .{ err, platform.elf.diagText(&diag) });
+        return err;
+    };
+    defer r.deinit(a);
+    try expectExportOk(r);
+
+    const lib = try readAll(out_path);
+    defer a.free(lib);
+    var why: [256]u8 = undefined;
+    if (try export_build.checkUniversal(a, lib, &why)) |sentence| {
+        std.debug.print("{s}\n", .{sentence});
+        return error.Refused;
+    }
+    // Universal: x86_64 then arm64, each at a multiple of 2^14.
+    const sl = try platform.macho.slices(a, lib);
+    defer a.free(sl);
+    try testing.expectEqual(@as(usize, 2), sl.len);
+    try testing.expectEqual(platform.macho.Cpu.x86_64, sl[0].cpu);
+    try testing.expectEqual(platform.macho.Cpu.arm64, sl[1].cpu);
+    for (sl) |s| {
+        try testing.expectEqual(@as(u64, 0), s.offset % (1 << 14));
+        try expectMacosSlice(lib, s);
+    }
+    // No absolute path: neither the temp folder (project and cache), nor
+    // the SDK's, nor the compiler's. The install name is the fixed one.
+    try testing.expect(std.mem.indexOf(u8, lib, "@rpath/libziggurat_game.dylib\x00") != null);
+    for ([_][]const u8{ fx.base, std.fs.path.dirname(manifests[0].modules[0].root.bytes).?, "/nix/store/", "/lib/std/" }) |needle| {
+        if (std.mem.indexOf(u8, lib, needle) != null) {
+            std.debug.print("the library holds '{s}'\n", .{needle});
+            return error.AbsolutePathInLibrary;
+        }
+    }
+
+    // The universal game library of a project without Zig scripts passes
+    // the same checks.
+    const empty = try readAll(build_options.macos_game_empty);
+    defer a.free(empty);
+    if (try export_build.checkUniversal(a, empty, &why)) |sentence| {
+        std.debug.print("empty: {s}\n", .{sentence});
+        return error.Refused;
+    }
+    const esl = try platform.macho.slices(a, empty);
+    defer a.free(esl);
+    for (esl) |s| try expectMacosSlice(empty, s);
+}
+
 test "integration: export build of a read-only project goes through the mirror" {
     try platform.testing_support.requireIntegration();
     if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;

@@ -69,11 +69,26 @@ const windows_files: Files = .{
     .game_lib = "ziggurat_game.dll",
 };
 
-/// The file names for `key`, or null for a key whose files are not
-/// shipped yet (macOS: 7c) or an unknown one.
+/// Both macOS keys. The editor library and the game library an export
+/// writes are universal files (`universal_macos`); the export host archive
+/// and the empty game library are per arch.
+const macos_files: Files = .{
+    .editor_lib = "libziggurat_host.dylib",
+    .host_archive = "libziggurat_host_export.a",
+    .game_empty = "libziggurat_game_empty.dylib",
+    .game_lib = "libziggurat_game.dylib",
+};
+
+/// The folder name of the universal macOS files: the editor library and
+/// the export output folder (plan decision "Target keys"). Not a target
+/// key: no SDK or archive is built for it.
+pub const universal_macos = "universal-macos";
+
+/// The file names for `key`, or null for an unknown key.
 pub fn files(key: []const u8) ?Files {
     if (std.mem.eql(u8, key, x86_64_linux)) return linux_files;
     if (std.mem.eql(u8, key, x86_64_windows)) return windows_files;
+    if (std.mem.eql(u8, key, aarch64_macos) or std.mem.eql(u8, key, x86_64_macos)) return macos_files;
     return null;
 }
 
@@ -119,7 +134,10 @@ test "target_key: files and keys" {
     try std.testing.expectEqualStrings("libziggurat_host_export.a", files("x86_64-linux").?.host_archive);
     try std.testing.expectEqualStrings("ziggurat_host.dll", files("x86_64-windows").?.editor_lib);
     try std.testing.expectEqualStrings("ziggurat_game.dll", files("x86_64-windows").?.game_lib);
-    try std.testing.expect(files("aarch64-macos") == null);
+    try std.testing.expectEqualStrings("libziggurat_host_export.a", files("aarch64-macos").?.host_archive);
+    try std.testing.expectEqualStrings("libziggurat_game_empty.dylib", files("x86_64-macos").?.game_empty);
+    try std.testing.expectEqualStrings("libziggurat_game.dylib", files("x86_64-macos").?.game_lib);
+    try std.testing.expect(files(universal_macos) == null);
     try std.testing.expect(files("linux.x86_64") == null);
     for (packaged) |k| try std.testing.expect(files(k) != null);
     var buf: [32]u8 = undefined;

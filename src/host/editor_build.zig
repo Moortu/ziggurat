@@ -825,17 +825,16 @@ fn nonInteractiveArg() ?[]const u8 {
         /// 3 bytes each as UTF-8 (`cmdline.max_windows_args_bytes`).
         var raw_buf: [cmdline.max_windows_args_bytes]u8 = undefined;
     };
-    const raw: ?[]const u8 = switch (@import("builtin").os.tag) {
-        .linux => readCmdline(&S.raw_buf),
-        .windows => cmdline.windowsArgs(&S.raw_buf),
-        else => cmdline.darwinArgs(&S.raw_buf),
+    // macOS reads `argv` in place, with no buffer to outgrow.
+    const found: ?[]const u8 = switch (@import("builtin").os.tag) {
+        .linux => if (readCmdline(&S.raw_buf)) |r| cmdline.nonInteractiveIn(r) else null,
+        .windows => if (cmdline.windowsArgs(&S.raw_buf)) |r| cmdline.nonInteractiveIn(r) else null,
+        else => cmdline.darwinNonInteractive(),
     };
-    if (raw) |r| {
-        if (cmdline.nonInteractiveIn(r)) |arg| {
-            const n = @min(arg.len, S.buf.len);
-            @memcpy(S.buf[0..n], arg[0..n]);
-            return S.buf[0..n];
-        }
+    if (found) |arg| {
+        const n = @min(arg.len, S.buf.len);
+        @memcpy(S.buf[0..n], arg[0..n]);
+        return S.buf[0..n];
     }
     var args = Os.getCmdlineArgs();
     defer args.deinit();

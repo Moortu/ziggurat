@@ -1,6 +1,9 @@
 //! Export build (L2): an exported game's library (`libziggurat_game.so` for
-//! Linux x86_64, `ziggurat_game.dll` for Windows x86_64; `libFile`), built
-//! deterministically (spec section 10).
+//! Linux x86_64, `ziggurat_game.dll` for Windows x86_64,
+//! `libziggurat_game.dylib` for macOS; `libFile`), built deterministically
+//! (spec section 10). The macOS library is universal: `runUniversal` runs
+//! the build once per arch and joins the two thin dylibs
+//! (`platform.macho_fat`).
 //!
 //! One compiler run, driven through the compiler server like the editor's
 //! full builds (`compiler.Session` on `Workspace.exportArgv`), with the Zig
@@ -24,14 +27,23 @@
 //!     generated root exports the scripts' two entry points with hidden
 //!     visibility (an `export fn` is a DLL export there); without the
 //!     `.def` file the COFF linker also exported the MinGW runtime's
-//!     `_CRT_INIT`, `__mingw_module_is_dll` and `atexit`.
+//!     `_CRT_INIT`, `__mingw_module_is_dll` and `atexit`. On macOS there
+//!     is no exports file (Zig 0.17's Mach-O linker ignores a version
+//!     script and takes no exported-symbols list): the generated root's
+//!     hidden visibility, as on Windows, keeps the scripts' entry points
+//!     in, and the linker still exports its own `__mh_dylib_header` and
+//!     `___dso_handle` (`macho_linker_exports`). The entry point is
+//!     `_ziggurat_host_init` there (`workspace.entryLinkName`).
 //!     compiler_rt is added once, by this link (neither the archive nor the
 //!     scripts carry one).
 //! The library is checked before it is written to `Options.out_path`: it
 //! must export only `ziggurat_host_init`; on Linux it must not import
 //! `dlopen` and must need no glibc symbol version newer than
 //! `pins.export_glibc`; on Windows it must import no `LoadLibrary*` and no
-//! `GetProcAddress` (`peProblem`).
+//! `GetProcAddress` (`peProblem`); on macOS each slice must export only
+//! `_ziggurat_host_init` (and the linker's two symbols), import no
+//! `_dlopen`, and be built for macOS `pins.macos_min` (`sliceProblem`), and
+//! the joined file must be universal (`checkUniversal`).
 //!
 //! The workspace is the editor's (`<cache_dir>/projects/<project id>/`), so
 //! an export build and an editor build of the same project take turns on
@@ -75,6 +87,20 @@ const module_definition_name = "export.def";
 /// The target of a Windows export (MinGW ABI, as Godot's own templates).
 pub const windows_target = "x86_64-windows-gnu";
 
+/// The target keys of a universal macOS library's slices, in the order
+/// `runUniversal` builds them and `macho_fat.join` takes them: arm64, then
+/// x86_64 (`pins.macos_targets`).
+pub const macos_keys = [2][]const u8{ target_key.aarch64_macos, target_key.x86_64_macos };
+
+/// Godot's entry point as a Mach-O symbol.
+pub const macho_entry_symbol = "_" ++ entry_symbol;
+
+/// The symbols Zig 0.17's Mach-O linker exports from every dylib, which no
+/// option of `zig build-lib` hides (the Mach-O header and the DSO handle).
+/// A macOS game library may export them next to `macho_entry_symbol`, and
+/// nothing else (ruling of Stage 7c, Task 2).
+pub const macho_linker_exports = [_][]const u8{ "__mh_dylib_header", "___dso_handle" };
+
 /// The object format of an export target.
 pub const Format = workspace.Format;
 
@@ -83,6 +109,9 @@ pub const Format = workspace.Format;
 pub fn targetTriple(key: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, key, target_key.x86_64_linux)) return pins.export_target;
     if (std.mem.eql(u8, key, target_key.x86_64_windows)) return windows_target;
+    for (macos_keys, pins.macos_targets) |k, t| {
+        if (std.mem.eql(u8, key, k)) return t;
+    }
     return null;
 }
 
@@ -90,6 +119,9 @@ pub fn targetTriple(key: []const u8) ?[]const u8 {
 pub fn formatOf(key: []const u8) ?Format {
     if (std.mem.eql(u8, key, target_key.x86_64_linux)) return .elf;
     if (std.mem.eql(u8, key, target_key.x86_64_windows)) return .pe;
+    for (macos_keys) |k| {
+        if (std.mem.eql(u8, key, k)) return .macho;
+    }
     return null;
 }
 
@@ -111,7 +143,8 @@ pub const Options = struct {
     /// The SDK modules; one must be named `ziggurat`.
     sdk: []const ModuleDep,
     /// The target the library is for (`platform.target_key`):
-    /// `x86_64-linux` or `x86_64-windows`.
+    /// `x86_64-linux`, `x86_64-windows`, or one macOS arch (a thin dylib;
+    /// `runUniversal` builds the universal one).
     target_key: []const u8 = "x86_64-linux",
     /// The export host archive for `target_key` (`zig build host-archive`):
     /// `libziggurat_host_export.a`, or `ziggurat_host_export.lib`.
@@ -161,6 +194,13 @@ pub const Result = struct {
 /// sentence in `diag` (read it with `platform.elf.diagText`); every other
 /// failure is a `Result` with `ok == false`.
 pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options, diag: *[256]u8) !Result {
+    return runOne(a, io, opts, diag, null);
+}
+
+/// `run`. When `keep` is not null, the checked library is not written to
+/// `opts.out_path`: on success `keep.*` holds its bytes (allocated with
+/// `a`; the caller frees them).
+fn runOne(a: std.mem.Allocator, io: std.Io, opts: Options, diag: *[256]u8, keep: ?*?[]u8) !Result {
     @memset(diag, 0);
     const setDiag = platform.elf.setDiag;
     const triple = targetTriple(opts.target_key) orelse {
@@ -196,7 +236,9 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options, diag: *[256]u8) !Res
     var ws = workspace.prepareIn(a, io, ps, opts.cache_dir, sc, opts.sdk, .{
         .lock_timeout_ms = opts.lock_timeout_ms,
         .build_id = build_id,
-        .hidden_exports = format == .pe,
+        // An `export fn` is a DLL export on Windows, and Mach-O has no
+        // exports file to hide it.
+        .hidden_exports = format != .elf,
     }, &msg) catch |err| {
         // The lock holder is usually this editor's own build, so the
         // workspace's "another editor" sentence would mislead.
@@ -206,15 +248,20 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options, diag: *[256]u8) !Res
     };
     defer ws.deinit(a);
 
-    const exports_name: []const u8, const exports_text: []const u8 = switch (format) {
+    const exports: ?struct { []const u8, []const u8 } = switch (format) {
         .elf => .{ version_script_name, version_script },
         .pe => .{ module_definition_name, module_definition },
+        .macho => null,
     };
-    const exports_file = try platform.path.joinFor(ws.os, arena, ws.build_dir, &.{exports_name});
-    cwd.writeFile(io, .{ .sub_path = exports_file.bytes, .data = exports_text }) catch |err| {
-        setDiag(diag, "Writing the linker exports file {s} failed: {t}.", .{ exports_file.bytes, err });
-        return err;
-    };
+    var exports_file: ?OsPath = null;
+    if (exports) |e| {
+        const file = try platform.path.joinFor(ws.os, arena, ws.build_dir, &.{e[0]});
+        cwd.writeFile(io, .{ .sub_path = file.bytes, .data = e[1] }) catch |err| {
+            setDiag(diag, "Writing the linker exports file {s} failed: {t}.", .{ file.bytes, err });
+            return err;
+        };
+        exports_file = file;
+    }
     const argv = try ws.exportArgv(arena, opts.zig, .{
         .target = triple,
         .format = format,
@@ -251,17 +298,23 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options, diag: *[256]u8) !Res
         setDiag(diag, "Reading the built library {s} failed: {t}.", .{ built.bytes, err });
         return err;
     };
-    defer a.free(bytes);
+    var kept = false;
+    defer if (!kept) a.free(bytes);
     var why: [256]u8 = undefined;
     // A PE list past `pe`'s limits (`error.TooLarge`) is a failed check too.
     if (checkLibrary(a, format, bytes, &why) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => blk: {
-            platform.elf.setDiag(&why, "The built library {s} is not a readable {s} file ({t}).", .{ built.bytes, if (format == .pe) "PE" else "ELF", err });
+            platform.elf.setDiag(&why, "The built library {s} is not a readable {s} file ({t}).", .{ built.bytes, formatName(format), err });
             break :blk platform.elf.diagText(&why);
         },
     }) |sentence| return out.fail("{s}", .{sentence});
 
+    if (keep) |k| {
+        k.* = bytes;
+        kept = true;
+        return out.finish(true);
+    }
     // Atomic: `Dir.copyFile` writes a temporary file in the destination's
     // folder and renames it over `out_path` (Zig 0.17 `createFileAtomic`
     // and `File.Atomic.replace`), so a reader never sees half a library.
@@ -318,10 +371,12 @@ const Builder = struct {
 /// it may. ELF: what it exports and imports (`exportProblem`) and the glibc
 /// versions it needs (`glibcAbove` with `pins.export_glibc`). PE: the file
 /// is complete (`pe.checkComplete`) and what it exports and imports
-/// (`peProblem`). The sentence is in `buf`. A file that cannot be read is
-/// an error (`pe` gives `error.TooLarge` past its list limits), never a
-/// panic.
+/// (`peProblem`). Mach-O, thin or fat: the file is complete
+/// (`macho.checkComplete`) and each slice passes `sliceProblem`. The
+/// sentence is in `buf`. A file that cannot be read is an error (`pe` and
+/// `macho` give `error.TooLarge` past their list limits), never a panic.
 pub fn checkLibrary(a: std.mem.Allocator, format: Format, bytes: []const u8, buf: *[256]u8) !?[]const u8 {
+    if (format == .macho) return machoProblem(a, bytes, buf);
     if (format == .pe) {
         try platform.pe.checkComplete(bytes);
         const ex = try platform.pe.exports(a, bytes);
@@ -340,6 +395,183 @@ pub fn checkLibrary(a: std.mem.Allocator, format: Format, bytes: []const u8, buf
         return platform.elf.diagText(buf);
     }
     return null;
+}
+
+fn formatName(format: Format) []const u8 {
+    return switch (format) {
+        .elf => "ELF",
+        .pe => "PE",
+        .macho => "Mach-O",
+    };
+}
+
+/// `checkLibrary` for a Mach-O file, thin or fat: every slice passes
+/// `sliceProblem`.
+fn machoProblem(a: std.mem.Allocator, bytes: []const u8, buf: *[256]u8) !?[]const u8 {
+    const macho = platform.macho;
+    try macho.checkComplete(bytes);
+    const sl = try macho.slices(a, bytes);
+    defer a.free(sl);
+    for (sl) |s| {
+        // In the file: `checkComplete` checked every slice range.
+        const sb = bytes[@intCast(s.offset)..][0..@intCast(s.size)];
+        const ex = try macho.exports(a, sb);
+        defer macho.freeList(a, ex);
+        const im = try macho.imports(a, sb);
+        defer macho.freeList(a, im);
+        if (sliceProblem(cpuName(s.cpu), ex, im, macho.minOs(sb), buf)) |sentence| return sentence;
+    }
+    return null;
+}
+
+fn cpuName(cpu: platform.macho.Cpu) []const u8 {
+    return switch (cpu) {
+        .x86_64 => "x86_64",
+        .arm64 => "arm64",
+        _ => "unknown CPU",
+    };
+}
+
+/// Why one slice (of CPU `arch`, for the sentence) of a macOS game library
+/// must not ship, or null: it must export `macho_entry_symbol` and nothing
+/// else but `macho_linker_exports`, import no `_dlopen` (nothing is loaded
+/// at run time), and be built for macOS `pins.macos_min` exactly (`minos`;
+/// null: the slice names none). The sentence is in `buf`.
+pub fn sliceProblem(arch: []const u8, exports: []const []const u8, imports: []const []const u8, minos: ?std.SemanticVersion, buf: *[256]u8) ?[]const u8 {
+    const setDiag = platform.elf.setDiag;
+    var has_entry = false;
+    for (exports) |name| {
+        if (std.mem.eql(u8, name, macho_entry_symbol)) {
+            has_entry = true;
+            continue;
+        }
+        for (macho_linker_exports) |allowed| {
+            if (std.mem.eql(u8, name, allowed)) break;
+        } else {
+            setDiag(buf, "The export library's {s} slice exports {s}; it may export only " ++ macho_entry_symbol ++ ".", .{ arch, name });
+            return platform.elf.diagText(buf);
+        }
+    }
+    for (imports) |name| {
+        if (std.mem.eql(u8, name, "_dlopen")) {
+            setDiag(buf, "The export library's {s} slice imports _dlopen; it must load nothing at run time.", .{arch});
+            return platform.elf.diagText(buf);
+        }
+    }
+    if (!has_entry) {
+        setDiag(buf, "The export library's {s} slice does not export " ++ macho_entry_symbol ++ ".", .{arch});
+        return platform.elf.diagText(buf);
+    }
+    const want = comptime std.SemanticVersion.parse(pins.macos_min ++ ".0") catch unreachable;
+    const v = minos orelse {
+        setDiag(buf, "The export library's {s} slice names no minimum macOS version; it must be built for macOS " ++ pins.macos_min ++ ".", .{arch});
+        return platform.elf.diagText(buf);
+    };
+    if (v.order(want) != .eq) {
+        setDiag(buf, "The export library's {s} slice is built for macOS {f}; it must be built for macOS " ++ pins.macos_min ++ ".", .{ arch, v });
+        return platform.elf.diagText(buf);
+    }
+    return null;
+}
+
+/// Why `bytes` must not ship as a macOS game library, or null: it must be a
+/// universal file of exactly one x86_64 and one arm64 slice, and pass
+/// `checkLibrary` (every slice). The sentence is in `buf`. A file that
+/// cannot be read is an error, never a panic.
+pub fn checkUniversal(a: std.mem.Allocator, bytes: []const u8, buf: *[256]u8) !?[]const u8 {
+    const macho = platform.macho;
+    try macho.checkComplete(bytes);
+    const sl = try macho.slices(a, bytes);
+    defer a.free(sl);
+    const universal = " a macOS export library must be universal, with one x86_64 and one arm64 slice.";
+    // A thin file's one slice starts at 0; a fat file's slices never do.
+    if (sl.len == 1 and sl[0].offset == 0) {
+        platform.elf.setDiag(buf, "The export library is a thin {s} file;" ++ universal, .{cpuName(sl[0].cpu)});
+        return platform.elf.diagText(buf);
+    }
+    var x86 = false;
+    var arm = false;
+    for (sl) |s| switch (s.cpu) {
+        .x86_64 => x86 = true,
+        .arm64 => arm = true,
+        _ => {},
+    };
+    // `checkComplete` refuses two slices of one CPU type.
+    if (sl.len != 2 or !x86 or !arm) {
+        platform.elf.setDiag(buf, "The export library is a fat file of {d} slices;" ++ universal, .{sl.len});
+        return platform.elf.diagText(buf);
+    }
+    return machoProblem(a, bytes, buf);
+}
+
+/// One slice of a universal macOS build: the SDK and the export host
+/// archive of its arch. Borrowed for the call.
+pub const SliceInput = struct {
+    /// The SDK modules for the slice's arch (`sdk/<key>/`); one must be
+    /// named `ziggurat`.
+    sdk: []const ModuleDep,
+    /// The arch's export host archive (`bin/<key>/libziggurat_host_export.a`).
+    host_archive: OsPath,
+};
+
+/// `Options` of a universal macOS build. Everything is borrowed for the
+/// call.
+pub const UniversalOptions = struct {
+    zig: ZigInstall,
+    project_root: OsPath,
+    /// arm64, then x86_64 (`macos_keys`).
+    slices: [2]SliceInput,
+    /// Where the universal library is written (atomically; parent folders
+    /// are created).
+    out_path: OsPath,
+    cache_dir: OsPath,
+    script_dirs: []const []const u8 = scan_mod.default_script_dirs,
+    lock_timeout_ms: u32 = 30000,
+    update_timeout_ms: u32 = 600000,
+    strip: bool = true,
+};
+
+/// Builds the universal macOS library: `run` for each of `macos_keys` (its
+/// own SDK and archive; each thin dylib checked), then the two joined
+/// (`platform.macho_fat.join`: x86_64 then arm64, each slice at a multiple
+/// of 2^14; the arm64 slice keeps the linker's ad-hoc signature), checked
+/// again (`checkUniversal`) and written to `out_path`. The first slice that
+/// fails gives the result; `out_path` is then not touched. Errors as `run`.
+pub fn runUniversal(a: std.mem.Allocator, io: std.Io, u: UniversalOptions, diag: *[256]u8) !Result {
+    var thin: [2]?[]u8 = .{ null, null };
+    defer for (thin) |t| if (t) |b| a.free(b);
+    for (macos_keys, u.slices, &thin) |key, s, *keep| {
+        const res = try runOne(a, io, .{
+            .zig = u.zig,
+            .project_root = u.project_root,
+            .sdk = s.sdk,
+            .target_key = key,
+            .host_archive = s.host_archive,
+            .out_path = u.out_path,
+            .cache_dir = u.cache_dir,
+            .script_dirs = u.script_dirs,
+            .lock_timeout_ms = u.lock_timeout_ms,
+            .update_timeout_ms = u.update_timeout_ms,
+            .strip = u.strip,
+        }, diag, keep);
+        if (!res.ok) return res;
+        res.deinit(a);
+    }
+    var out: Builder = .{ .a = a, .problems = &.{} };
+    errdefer out.deinit();
+    var why: [256]u8 = @splat(0);
+    const fat = platform.macho_fat.join(a, thin[0].?, thin[1].?, &why) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return out.fail("Joining the arm64 and x86_64 game libraries into one universal file failed: {s}", .{std.mem.sliceTo(&why, 0)}),
+    };
+    defer a.free(fat);
+    if (checkUniversal(a, fat, &why) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return out.fail("The universal game library is not a readable Mach-O file ({t}).", .{err}),
+    }) |sentence| return out.fail("{s}", .{sentence});
+    platform.atomic_file.write(io, u.out_path, fat) catch |err|
+        return out.fail("Writing the export library {s} failed: {t}.", .{ u.out_path.bytes, err });
+    return out.finish(true);
 }
 
 /// Why the dynamic symbols `syms` are wrong for an export library, or null:
@@ -962,13 +1194,95 @@ test "export_build: windows output has no LoadLibrary import" {
 test "export_build: target keys give the triple, format and library name" {
     try testing.expectEqualStrings(pins.export_target, targetTriple("x86_64-linux").?);
     try testing.expectEqualStrings("x86_64-windows-gnu", targetTriple("x86_64-windows").?);
-    try testing.expect(targetTriple("aarch64-macos") == null);
+    try testing.expectEqualStrings("aarch64-macos.11.0", targetTriple("aarch64-macos").?);
+    try testing.expectEqualStrings("x86_64-macos.11.0", targetTriple("x86_64-macos").?);
+    try testing.expect(targetTriple("universal-macos") == null);
     try testing.expectEqual(Format.elf, formatOf("x86_64-linux").?);
     try testing.expectEqual(Format.pe, formatOf("x86_64-windows").?);
+    try testing.expectEqual(Format.macho, formatOf("aarch64-macos").?);
+    try testing.expectEqual(Format.macho, formatOf("x86_64-macos").?);
     try testing.expect(formatOf("nope") == null);
     try testing.expectEqualStrings("libziggurat_game.so", libFile("x86_64-linux").?);
     try testing.expectEqualStrings("ziggurat_game.dll", libFile("x86_64-windows").?);
-    try testing.expect(libFile("aarch64-macos") == null);
+    try testing.expectEqualStrings("libziggurat_game.dylib", libFile("aarch64-macos").?);
+    try testing.expectEqualStrings("libziggurat_game.dylib", libFile("x86_64-macos").?);
+    try testing.expect(libFile("universal-macos") == null);
+    // The universal build runs arm64, then x86_64: `macho_fat.join`'s order.
+    try testing.expectEqualStrings("aarch64-macos", macos_keys[0]);
+    try testing.expectEqualStrings("x86_64-macos", macos_keys[1]);
+}
+
+fn readFixture(path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(testing.io, path, testing.allocator, .unlimited);
+}
+
+const v11: std.SemanticVersion = .{ .major = 11, .minor = 0, .patch = 0 };
+
+test "export_build: macos output is universal with only _ziggurat_host_init exported" {
+    const a = testing.allocator;
+    var buf: [256]u8 = undefined;
+    // `_ziggurat_host_init`, and the two symbols Zig 0.17's Mach-O linker
+    // exports from every dylib and cannot be told to hide.
+    const allowed = [_][]const u8{ "_ziggurat_host_init", "__mh_dylib_header", "___dso_handle" };
+    try testing.expect(sliceProblem("arm64", &allowed, &.{"_getpid"}, v11, &buf) == null);
+    try testing.expect(sliceProblem("arm64", &.{"_ziggurat_host_init"}, &.{}, v11, &buf) == null);
+    // The scripts' entry points, any other symbol, and the ELF spelling
+    // without Mach-O's underscore are refused.
+    for ([_][]const u8{ "_ziggurat_describe", "_ziggurat_init", "_answer", "ziggurat_host_init", "__mh_execute_header", "_main" }) |extra| {
+        const want = try std.fmt.allocPrint(a, "The export library's x86_64 slice exports {s}; it may export only _ziggurat_host_init.", .{extra});
+        defer a.free(want);
+        try testing.expectEqualStrings(want, sliceProblem("x86_64", &(allowed ++ [_][]const u8{extra}), &.{}, v11, &buf).?);
+    }
+    try testing.expectEqualStrings("The export library's arm64 slice does not export _ziggurat_host_init.", sliceProblem("arm64", allowed[1..], &.{}, v11, &buf).?);
+
+    // Real dylibs: the answer fixtures (built for macOS 11.0) export
+    // `_answer` and `_answer_pid`.
+    const arm = try readFixture(build_options.macho_arm64_dylib);
+    defer a.free(arm);
+    const x86 = try readFixture(build_options.macho_x86_64_dylib);
+    defer a.free(x86);
+    const fat = try platform.macho_fat.join(a, arm, x86, null);
+    defer a.free(fat);
+    // A thin file is not universal, whatever it exports.
+    try testing.expectEqualStrings("The export library is a thin x86_64 file; a macOS export library must be universal, with one x86_64 and one arm64 slice.", (try checkUniversal(a, x86, &buf)).?);
+    try testing.expectEqualStrings("The export library is a thin arm64 file; a macOS export library must be universal, with one x86_64 and one arm64 slice.", (try checkUniversal(a, arm, &buf)).?);
+    // The universal file is checked per slice: the x86_64 slice comes first.
+    const refused = (try checkUniversal(a, fat, &buf)).?;
+    try testing.expect(std.mem.startsWith(u8, refused, "The export library's x86_64 slice exports _answer"));
+    try testing.expect(std.mem.endsWith(u8, refused, "; it may export only _ziggurat_host_init."));
+    // `checkLibrary` checks a thin slice by itself.
+    const thin = (try checkLibrary(a, .macho, arm, &buf)).?;
+    try testing.expect(std.mem.startsWith(u8, thin, "The export library's arm64 slice exports _answer"));
+    // Not Mach-O, or cut: errors, never a panic.
+    try testing.expectError(error.NotMachO, checkUniversal(a, "\x7fELF not a Mach-O file at all, but long enough for a header", &buf));
+    try testing.expectError(error.Truncated, checkUniversal(a, fat[0 .. fat.len / 2], &buf));
+    try testing.expectError(error.Truncated, checkLibrary(a, .macho, arm[0 .. arm.len / 2], &buf));
+}
+
+test "export_build: macos slices have minos 11.0 and no dlopen import" {
+    const a = testing.allocator;
+    var buf: [256]u8 = undefined;
+    const entry = [_][]const u8{"_ziggurat_host_init"};
+    // `dlopen` (Mach-O `_dlopen`) would let the game load code at run time.
+    try testing.expectEqualStrings("The export library's arm64 slice imports _dlopen; it must load nothing at run time.", sliceProblem("arm64", &entry, &.{ "_getpid", "_dlopen" }, v11, &buf).?);
+    try testing.expect(sliceProblem("arm64", &entry, &.{ "_getpid", "_dlsym_like", "_dlopen_preflight" }, v11, &buf) == null);
+    // Exactly macOS 11.0: newer would not load on 11, older is not what
+    // the add-on is built and documented for.
+    try testing.expectEqualStrings("The export library's x86_64 slice is built for macOS 12.0.0; it must be built for macOS 11.0.", sliceProblem("x86_64", &entry, &.{}, .{ .major = 12, .minor = 0, .patch = 0 }, &buf).?);
+    try testing.expectEqualStrings("The export library's x86_64 slice is built for macOS 10.15.0; it must be built for macOS 11.0.", sliceProblem("x86_64", &entry, &.{}, .{ .major = 10, .minor = 15, .patch = 0 }, &buf).?);
+    try testing.expectEqualStrings("The export library's arm64 slice names no minimum macOS version; it must be built for macOS 11.0.", sliceProblem("arm64", &entry, &.{}, null, &buf).?);
+    // Both real fixture slices are built for macOS 11.0 and import no
+    // `_dlopen`, so only their exports are refused.
+    const arm = try readFixture(build_options.macho_arm64_dylib);
+    defer a.free(arm);
+    const x86 = try readFixture(build_options.macho_x86_64_dylib);
+    defer a.free(x86);
+    for ([_][]const u8{ arm, x86 }) |thin| {
+        try testing.expectEqual(v11, platform.macho.minOs(thin).?);
+        const im = try platform.macho.imports(a, thin);
+        defer platform.macho.freeList(a, im);
+        try testing.expect(sliceProblem("arm64", &entry, im, platform.macho.minOs(thin), &buf) == null);
+    }
 }
 
 test "the empty game root of a Windows export is the hidden generated root" {
