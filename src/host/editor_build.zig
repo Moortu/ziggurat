@@ -749,10 +749,17 @@ fn copyFileDiagnostics(a: Allocator, from: []const FileDiagnostics) Allocator.Er
 
 // ------------------------------------------------------------ start, stop
 
-/// Registers the settings, installs the save hook and starts the service
-/// with a build for project open. Main thread, SCENE init, in the editor,
-/// after the language and the loader and saver are registered.
+/// The line the editor logs once when the macOS host starts (plan, Global
+/// Constraints): the macOS library is built on Linux and has never run on
+/// a Mac.
+pub const macos_experimental = "Ziggurat on macOS is experimental and has not been tested on a Mac.";
+
+/// Logs `macos_experimental` on macOS, registers the settings, installs
+/// the save hook and starts the service with a build for project open.
+/// Main thread, SCENE init, in the editor, after the language and the
+/// loader and saver are registered.
 pub fn start() void {
+    if (comptime @import("builtin").os.tag == .macos) log(macos_experimental, .{});
     registerSettings();
     if (nonInteractiveArg()) |arg| {
         log("Ziggurat does not build Zig scripts in this run ({s}).", .{arg});
@@ -810,7 +817,7 @@ pub fn busy() bool {
 /// `--quit` without keeping them in `OS.get_cmdline_args()` (main/main.cpp,
 /// the argument loop before `set_cmdline`), so the process's own command
 /// line is read too: `/proc/self/cmdline` on Linux, `GetCommandLineW` split
-/// by `CommandLineToArgvW` on Windows. Main thread.
+/// by `CommandLineToArgvW` on Windows, `_NSGetArgv` on macOS. Main thread.
 fn nonInteractiveArg() ?[]const u8 {
     const S = struct {
         var buf: [256]u8 = undefined;
@@ -821,7 +828,7 @@ fn nonInteractiveArg() ?[]const u8 {
     const raw: ?[]const u8 = switch (@import("builtin").os.tag) {
         .linux => readCmdline(&S.raw_buf),
         .windows => cmdline.windowsArgs(&S.raw_buf),
-        else => null,
+        else => cmdline.darwinArgs(&S.raw_buf),
     };
     if (raw) |r| {
         if (cmdline.nonInteractiveIn(r)) |arg| {

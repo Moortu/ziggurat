@@ -60,17 +60,23 @@ pub const Caps = struct {
 };
 
 /// The bytes `file` occupies on disk. On Linux that is the allocated block
-/// count (`statx` blocks, 512 bytes each), so the holes of a sparse file do
-/// not count. Elsewhere, and on a Linux file system whose `statx` reports no
-/// block count, it is the apparent size (`File.stat().size`): the
-/// allocated size on Windows and macOS is not measured yet (planned with
-/// the other platform work).
+/// count (`statx` blocks, 512 bytes each), and on macOS the `fstat` block
+/// count (`st_blocks`, 512 bytes each), so the holes of a sparse file do
+/// not count. Elsewhere, and when the block count is missing or does not
+/// fit, it is the apparent size (`File.stat().size`): the allocated size
+/// on Windows is not measured yet. The macOS path is compiled, never run.
 pub fn allocatedBytes(io: std.Io, file: std.Io.File) !u64 {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
         var stx: linux.Statx = undefined;
         const rc = linux.statx(file.handle, "", linux.AT.EMPTY_PATH, .{ .BLOCKS = true }, &stx);
         if (linux.errno(rc) == .SUCCESS and stx.mask.BLOCKS) return stx.blocks * 512;
+    }
+    if (builtin.os.tag == .macos) {
+        var st: std.c.Stat = undefined;
+        if (std.c.fstat(file.handle, &st) == 0 and st.blocks >= 0) {
+            if (std.math.mul(u64, @intCast(st.blocks), 512)) |bytes| return bytes else |_| {}
+        }
     }
     return (try file.stat(io)).size;
 }

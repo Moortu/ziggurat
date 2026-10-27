@@ -329,9 +329,23 @@ fn fatEntry(bytes: []const u8, wide: bool, i: usize) Slice {
     return .{ .cpu = @fromBackingInt(@intCast(readU32Be(bytes, e))), .offset = readU32Be(bytes, e + 8), .size = readU32Be(bytes, e + 12) };
 }
 
+/// The alignment (a power of two) of the fat header's arch entry `i`
+/// (caller checked the table is in the file).
+fn fatAlignLog2(bytes: []const u8, wide: bool, i: usize) u32 {
+    const entry: usize = if (wide) fat_arch_64_size else fat_arch_size;
+    const field: usize = if (wide) 24 else 16;
+    return readU32Be(bytes, fat_header_size + i * entry + field);
+}
+
+/// The largest slice alignment a fat file may declare: 2^15, as `lipo`
+/// allows (cctools MAXSECTALIGN).
+const max_fat_align_log2 = 15;
+
 /// Checks a fat file's header and arch table: each slice is inside the
-/// file, after the table, not empty, and overlaps no other slice. Returns
-/// the slice count. Does not look inside the slices.
+/// file, after the table, not empty, at an offset that is a multiple of its
+/// declared alignment, overlaps no other slice, and has a CPU type no other
+/// slice has (the loader and the export checks must agree on which slice
+/// is used). Returns the slice count. Does not look inside the slices.
 fn checkFatTable(bytes: []const u8, wide: bool, diag: ?*[256]u8) Error!usize {
     const len: u64 = bytes.len;
     if (len < fat_header_size) {
@@ -355,6 +369,15 @@ fn checkFatTable(bytes: []const u8, wide: bool, diag: ?*[256]u8) Error!usize {
             setDiag(diag, "Slice {d} of the fat Mach-O file is empty or starts inside the fat header (offset {d}).", .{ i, s.offset });
             return error.BadHeader;
         }
+        const align_log2 = fatAlignLog2(bytes, wide, i);
+        if (align_log2 > max_fat_align_log2) {
+            setDiag(diag, "Slice {d} of the fat Mach-O file declares the alignment 2^{d}; at most 2^{d} is allowed.", .{ i, align_log2, max_fat_align_log2 });
+            return error.BadHeader;
+        }
+        if (s.offset % (@as(u64, 1) << @intCast(align_log2)) != 0) {
+            setDiag(diag, "Slice {d} of the fat Mach-O file starts at byte {d}, which is not a multiple of its alignment 2^{d}.", .{ i, s.offset, align_log2 });
+            return error.BadHeader;
+        }
         const end = std.math.add(u64, s.offset, s.size) catch std.math.maxInt(u64);
         if (end > len) {
             setDiag(diag, "The fat Mach-O file is truncated: slice {d} ends at byte {d}, the file has {d} bytes.", .{ i, end, len });
@@ -364,6 +387,10 @@ fn checkFatTable(bytes: []const u8, wide: bool, diag: ?*[256]u8) Error!usize {
             const o = fatEntry(bytes, wide, k);
             if (s.offset < o.offset + o.size and o.offset < end) {
                 setDiag(diag, "Slices {d} and {d} of the fat Mach-O file overlap.", .{ k, i });
+                return error.BadHeader;
+            }
+            if (o.cpu == s.cpu) {
+                setDiag(diag, "Slices {d} and {d} of the fat Mach-O file have the same CPU type 0x{x}.", .{ k, i, @backingInt(s.cpu) });
                 return error.BadHeader;
             }
         }
@@ -376,8 +403,9 @@ fn checkFatTable(bytes: []const u8, wide: bool, diag: ?*[256]u8) Error!usize {
 /// range they name (segments, sections, symbol and string tables, dyld
 /// info, export trie, chained fixups, code signature, ...) lie inside the
 /// file. A fat file must have a complete arch table whose slices lie inside
-/// the file without overlapping, and every slice must be such an image of
-/// the CPU type its arch entry names. The Mach-O version of
+/// the file without overlapping, each at a multiple of its declared
+/// alignment and each of a different CPU type, and every slice must be such
+/// an image of the CPU type its arch entry names. The Mach-O version of
 /// `pe.checkComplete`.
 pub fn checkComplete(bytes: []const u8) Error!void {
     return checkCompleteDiag(bytes, null);
@@ -924,12 +952,22 @@ fn forgeFat(a: Allocator, thins: []const []const u8) ![]u8 {
     return b;
 }
 
+/// Test helper: `thin` (a forged arm64 image) with its CPU type set to
+/// x86_64. The caller frees the result.
+fn forgeX86(a: Allocator, thin: []const u8) ![]u8 {
+    const b = try a.dupe(u8, thin);
+    std.mem.writeInt(u32, b[4..8], std.macho.CPU_TYPE_X86_64, .little);
+    return b;
+}
+
 test "forged fat files: table checks" {
     const a = std.testing.allocator;
     const thin = try forge(a, &.{}, 32);
     defer a.free(thin);
+    const thin_x86 = try forgeX86(a, thin);
+    defer a.free(thin_x86);
     {
-        const b = try forgeFat(a, &.{ thin, thin });
+        const b = try forgeFat(a, &.{ thin, thin_x86 });
         defer a.free(b);
         try checkComplete(b);
         // Overlapping slices: the second starts inside the first.
@@ -968,6 +1006,65 @@ test "forged fat files: table checks" {
         defer a.free(b);
         try std.testing.expectError(error.BadHeader, checkComplete(b));
         @memset(b[64..][0..4], 'x');
+        try std.testing.expectError(error.BadHeader, checkComplete(b));
+    }
+}
+
+test "forged fat files: slice alignment and duplicate CPUs" {
+    const a = std.testing.allocator;
+    const thin = try forge(a, &.{}, 32);
+    defer a.free(thin);
+    const thin_x86 = try forgeX86(a, thin);
+    defer a.free(thin_x86);
+    {
+        // forgeFat puts the slices at multiples of 64 (2^6).
+        const b = try forgeFat(a, &.{ thin, thin_x86 });
+        defer a.free(b);
+        const align0 = fat_header_size + 16;
+        std.mem.writeInt(u32, b[align0..][0..4], 6, .big);
+        try checkComplete(b);
+        // Slice 0 is at byte 64, which is not a multiple of 2^7.
+        std.mem.writeInt(u32, b[align0..][0..4], 7, .big);
+        try std.testing.expectError(error.BadHeader, checkComplete(b));
+        try std.testing.expectError(error.BadHeader, slices(a, b));
+        // An alignment no file can have.
+        std.mem.writeInt(u32, b[align0..][0..4], 64, .big);
+        try std.testing.expectError(error.BadHeader, checkComplete(b));
+        std.mem.writeInt(u32, b[align0..][0..4], 0xffff_ffff, .big);
+        try std.testing.expectError(error.BadHeader, checkComplete(b));
+    }
+    {
+        // FAT_MAGIC_64: the alignment field is at byte 24 of the entry.
+        const b = try forgeFat(a, &.{thin});
+        defer a.free(b);
+        const w = try a.alloc(u8, b.len + fat_arch_64_size - fat_arch_size);
+        defer a.free(w);
+        @memset(w, 0);
+        std.mem.writeInt(u32, w[0..4], fat_magic_64, .big);
+        std.mem.writeInt(u32, w[4..8], 1, .big);
+        std.mem.writeInt(u32, w[8..12], std.macho.CPU_TYPE_ARM64, .big);
+        std.mem.writeInt(u64, w[16..24], 64, .big);
+        std.mem.writeInt(u64, w[24..32], thin.len, .big);
+        std.mem.writeInt(u32, w[32..36], 6, .big);
+        @memcpy(w[64..][0..thin.len], thin);
+        try checkComplete(w[0 .. 64 + thin.len]);
+        std.mem.writeInt(u32, w[32..36], 7, .big);
+        try std.testing.expectError(error.BadHeader, checkComplete(w[0 .. 64 + thin.len]));
+    }
+    {
+        // Two slices of one CPU type: the loader could not tell which one
+        // the export checks looked at.
+        const b = try forgeFat(a, &.{ thin, thin });
+        defer a.free(b);
+        try std.testing.expectError(error.BadHeader, checkComplete(b));
+        try std.testing.expectError(error.BadHeader, slices(a, b));
+        var diag: [256]u8 = @splat(0);
+        try std.testing.expectError(error.BadHeader, checkCompleteDiag(b, &diag));
+        try std.testing.expect(std.mem.indexOf(u8, diagSpan(&diag), "CPU type") != null);
+    }
+    {
+        const b = try forgeFat(a, &.{ thin_x86, thin, thin_x86 });
+        defer a.free(b);
         try std.testing.expectError(error.BadHeader, checkComplete(b));
     }
 }

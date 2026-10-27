@@ -4,7 +4,11 @@ const pins = @import("src/platform/pins.zig");
 const empty_root = @import("src/build/empty_root.zig");
 const target_key = @import("src/platform/target_key.zig");
 
-const cross_targets = [_][]const u8{ "x86_64-windows-gnu", "aarch64-macos", "x86_64-macos", "aarch64-linux-gnu" };
+const cross_targets = [_][]const u8{ "x86_64-windows-gnu", macos_triples[0], macos_triples[1], "aarch64-linux-gnu" };
+
+/// The macOS targets (plan, Global Constraints: minimum macOS 11.0), in the
+/// order `tools/macho_fat.zig` takes them: arm64, then x86_64.
+const macos_triples = [_][]const u8{ "aarch64-macos.11.0", "x86_64-macos.11.0" };
 
 /// The SDK version written into `sdk_options` and the SDK manifest.
 const sdk_version = "0.1.0";
@@ -66,6 +70,7 @@ pub fn build(b: *std.Build) void {
     const windows_step = b.step("test-windows", "Run the unit tests for x86_64-windows-gnu under Wine (needs wine on PATH)");
     const wine_e2e_step = b.step("test-wine-e2e", "Run the Windows editor, export and download end to end under Wine (needs wine on PATH; the -Dwindows-* options; part of test when one is given)");
     const package_step = b.step("package", "Write the release package <prefix>/ziggurat-" ++ sdk_version ++ ".zip (the release download and the Asset Store upload)");
+    const macos_step = b.step("test-macos", "Check the universal macOS editor library with the Mach-O reader (built, never run; part of test)");
 
     const sdk = addSdk(b, target, optimize, godot_path);
     const manifest_tool = b.addExecutable(.{
@@ -361,6 +366,71 @@ pub fn build(b: *std.Build) void {
             }).step);
         }
     }
+
+    // macOS (7c): the universal editor library, built for both arches and
+    // joined by tools/macho_fat.zig, and its check.
+    const macos_editor_lib = addMacosEditorLib(b, godot_path, zig_exe);
+    cross_step.dependOn(macos_editor_lib.step);
+    {
+        const options = b.addOptions();
+        options.addOptionPath("macos_editor_lib", macos_editor_lib.file);
+        const t = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("test/macos_host.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .imports = &.{
+                .{ .name = "macos_host_options", .module = options.createModule() },
+                .{ .name = "macho", .module = b.createModule(.{
+                    .root_source_file = b.path("src/platform/macho.zig"),
+                    .target = b.graph.host,
+                    .optimize = .Debug,
+                }) },
+            },
+        }) });
+        macos_step.dependOn(&b.addRunArtifact(t).step);
+    }
+    test_step.dependOn(macos_step);
+}
+
+/// `tools/macho_fat.zig`: joins a thin arm64 and a thin x86_64 dylib into
+/// one universal file (src/platform/macho_fat.zig).
+fn machoFatTool(b: *std.Build) *std.Build.Step.Compile {
+    return b.addExecutable(.{
+        .name = "macho_fat",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/macho_fat.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "macho_fat", .module = b.createModule(.{
+                .root_source_file = b.path("src/platform/macho_fat.zig"),
+                .target = b.graph.host,
+                .optimize = .ReleaseSafe,
+            }) }},
+        }),
+    });
+}
+
+/// The universal macOS editor library `libziggurat_host.dylib`: the host
+/// built like the package's editor libraries (ReleaseSafe, LLVM, no debug
+/// information) for `macos_triples`, each with its own SDK options, and
+/// joined x86_64 then arm64 with 2^14 alignment. Zig's linker signs the
+/// arm64 slice ad hoc; the x86_64 slice stays unsigned.
+fn addMacosEditorLib(b: *std.Build, godot_path: []const u8, zig_exe: []const u8) struct { file: std.Build.LazyPath, step: *std.Build.Step } {
+    var thin: [macos_triples.len]*std.Build.Step.Compile = undefined;
+    for (&thin, macos_triples) |*out, triple| {
+        const resolved = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = triple }) catch
+            std.debug.panic("bad macOS target triple {s}", .{triple}));
+        const options = addSdk(b, resolved, .ReleaseSafe, godot_path).import_table.get("sdk_options").?;
+        out.* = addHost(b, resolved, .ReleaseSafe, godot_path, zig_exe, options, .{
+            .use_llvm = true,
+            .strip = true,
+        });
+    }
+    const run = b.addRunArtifact(machoFatTool(b));
+    const out = run.addOutputFileArg("libziggurat_host.dylib");
+    run.addArtifactArg(thin[0]);
+    run.addArtifactArg(thin[1]);
+    return .{ .file = out, .step = &run.step };
 }
 
 const WineE2eInputs = struct {
